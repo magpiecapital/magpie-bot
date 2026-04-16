@@ -4,8 +4,8 @@ import "dotenv/config";
 import { handleStart } from "./commands/start.js";
 import { handleDeposit } from "./commands/deposit.js";
 import { handlePositions } from "./commands/positions.js";
-import { handleBorrow } from "./commands/borrow.js";
-import { handleRepay } from "./commands/repay.js";
+import { handleBorrow, registerBorrowCallbacks } from "./commands/borrow.js";
+import { handleRepay, registerRepayCallbacks } from "./commands/repay.js";
 import { handleHelp } from "./commands/help.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -22,6 +22,9 @@ bot.command("positions", handlePositions);
 bot.command("borrow", handleBorrow);
 bot.command("repay", handleRepay);
 bot.command("help", handleHelp);
+
+registerBorrowCallbacks(bot);
+registerRepayCallbacks(bot);
 
 bot.catch((err) => {
   console.error("Bot error:", err);

@@ -1,14 +1,202 @@
+import { InlineKeyboard } from "grammy";
+import { upsertUser } from "../services/users.js";
+import { ensureWallet } from "../services/wallet.js";
+import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
+import { collateralValueLamports } from "../services/price.js";
+import { executeBorrow, recordLoan } from "../services/loans.js";
+
+const LTV_TIERS = [
+  { option: 0, ltv: 30, days: 2, label: "30% LTV · 2 days (Express)" },
+  { option: 1, ltv: 25, days: 3, label: "25% LTV · 3 days (Quick)" },
+  { option: 2, ltv: 20, days: 7, label: "20% LTV · 7 days (Standard)" },
+];
+
+// In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
+const pending = new Map();
+
+function fmtSol(lamports) {
+  return (Number(lamports) / 1e9).toFixed(4);
+}
+
 export async function handleBorrow(ctx) {
-  // TODO: implement in Phase 1.5 once Anchor program is updated for SOL/wSOL.
-  // Flow:
-  //   1. List user's SPL token balances that match supported_mints
-  //   2. Prompt user to pick collateral mint + amount
-  //   3. Prompt user to pick LTV tier (30%/2d, 25%/3d, 20%/7d)
-  //   4. Fetch oracle price, compute SOL value of collateral
-  //   5. Build Anchor request_and_fund_loan tx, sign with user's custodial keypair
-  //   6. Submit tx, unwrap wSOL → SOL in user's wallet
-  //   7. Record loan in DB
-  await ctx.reply(
-    "🚧 /borrow is coming online — Anchor program migration in progress. Stay tuned.",
-  );
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+
+  const user = await upsertUser(tgUser.id, tgUser.username);
+  const { publicKey } = await ensureWallet(user.id);
+
+  const [balances, sol] = await Promise.all([
+    getSupportedBalances(publicKey),
+    getSolBalance(publicKey),
+  ]);
+
+  if (sol < 5_000_000) {
+    await ctx.reply(
+      `⚠️ You need at least ~0.005 SOL in your BagBank wallet to cover transaction fees.\n\nDeposit SOL to:\n\`${publicKey}\``,
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  if (balances.length === 0) {
+    await ctx.reply(
+      `📭 No supported collateral detected.\n\nDeposit a supported memecoin to:\n\`${publicKey}\``,
+      { parse_mode: "Markdown" },
+    );
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  for (const b of balances) {
+    kb.text(`${b.symbol} (${b.humanAmount.toLocaleString()})`, `borrow:mint:${b.mint}`).row();
+  }
+  kb.text("✕ Cancel", "borrow:cancel");
+
+  await ctx.reply("*Select collateral:*", {
+    parse_mode: "Markdown",
+    reply_markup: kb,
+  });
+}
+
+export function registerBorrowCallbacks(bot) {
+  bot.callbackQuery(/^borrow:cancel$/, async (ctx) => {
+    pending.delete(ctx.chat.id);
+    await ctx.answerCallbackQuery("Cancelled");
+    await ctx.editMessageText("❌ Borrow cancelled.");
+  });
+
+  bot.callbackQuery(/^borrow:mint:(.+)$/, async (ctx) => {
+    const mint = ctx.match[1];
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+    const { publicKey } = await ensureWallet(user.id);
+    const balances = await getSupportedBalances(publicKey);
+    const selected = balances.find((b) => b.mint === mint);
+
+    if (!selected) {
+      await ctx.answerCallbackQuery("Balance no longer available");
+      return;
+    }
+
+    pending.set(ctx.chat.id, { userId: user.id, selected });
+
+    const kb = new InlineKeyboard()
+      .text("25%", "borrow:pct:25").text("50%", "borrow:pct:50")
+      .text("75%", "borrow:pct:75").text("100%", "borrow:pct:100")
+      .row().text("✕ Cancel", "borrow:cancel");
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `Selected: *${selected.symbol}*\nBalance: ${selected.humanAmount.toLocaleString()}\n\n*How much to use as collateral?*`,
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery(/^borrow:pct:(\d+)$/, async (ctx) => {
+    const pct = Number(ctx.match[1]);
+    const state = pending.get(ctx.chat.id);
+    if (!state) {
+      await ctx.answerCallbackQuery("Session expired, run /borrow again");
+      return;
+    }
+
+    const rawBig = (BigInt(state.selected.rawAmount) * BigInt(pct)) / 100n;
+    state.collateralRaw = rawBig;
+    state.humanAmount = state.selected.humanAmount * (pct / 100);
+    pending.set(ctx.chat.id, state);
+
+    // Fetch value in lamports for each LTV tier.
+    const valueLamports = await collateralValueLamports(
+      state.selected.mint,
+      rawBig,
+      state.selected.decimals,
+    );
+    state.collateralValueLamports = valueLamports;
+    pending.set(ctx.chat.id, state);
+
+    const kb = new InlineKeyboard();
+    for (const t of LTV_TIERS) {
+      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
+      const fee = loanSol * 0.015;
+      const receive = loanSol - fee;
+      kb.text(
+        `${t.label} → ~${receive.toFixed(4)} SOL`,
+        `borrow:tier:${t.option}`,
+      ).row();
+    }
+    kb.text("✕ Cancel", "borrow:cancel");
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
+        `*Value:* ${fmtSol(valueLamports)} SOL`,
+        "",
+        "*Choose a loan tier:*",
+        "_(amount shown is what you receive after 1.5% fee)_",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery(/^borrow:tier:(\d+)$/, async (ctx) => {
+    const option = Number(ctx.match[1]);
+    const tier = LTV_TIERS.find((t) => t.option === option);
+    const state = pending.get(ctx.chat.id);
+    if (!state || !tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText("⏳ Submitting on-chain...");
+
+    try {
+      const result = await executeBorrow({
+        userId: state.userId,
+        collateralMint: state.selected.mint,
+        collateralAmountRaw: state.collateralRaw,
+        collateralValueLamports: state.collateralValueLamports,
+        loanOption: option,
+      });
+
+      const loanAmountPreFee = Math.floor((state.collateralValueLamports * tier.ltv) / 100);
+      const fee = Math.floor((loanAmountPreFee * 150) / 10_000);
+      const loanAmountAfterFee = loanAmountPreFee - fee;
+
+      await recordLoan({
+        userId: state.userId,
+        loanId: result.loanId,
+        loanPda: result.loanPda,
+        collateralMint: state.selected.mint,
+        collateralAmount: state.collateralRaw.toString(),
+        loanAmountLamports: loanAmountAfterFee.toString(),
+        originalLoanAmountLamports: loanAmountPreFee.toString(),
+        ltvPercentage: tier.ltv,
+        durationDays: tier.days,
+        txSignature: result.signature,
+      });
+
+      pending.delete(ctx.chat.id);
+
+      await ctx.editMessageText(
+        [
+          "✅ *Loan funded*",
+          "",
+          `Received: *${fmtSol(loanAmountAfterFee)} SOL*`,
+          `Repay by due date: *${fmtSol(loanAmountPreFee)} SOL*`,
+          `Term: ${tier.days} days at ${tier.ltv}% LTV`,
+          "",
+          `[View tx](https://solscan.io/tx/${result.signature})`,
+          "",
+          "Use /positions to check status.",
+        ].join("\n"),
+        { parse_mode: "Markdown", disable_web_page_preview: true },
+      );
+    } catch (err) {
+      console.error("Borrow failed:", err);
+      await ctx.editMessageText(
+        `❌ Loan failed: ${err.message || "unknown error"}\n\nTry again with /borrow.`,
+      );
+    }
+  });
 }
