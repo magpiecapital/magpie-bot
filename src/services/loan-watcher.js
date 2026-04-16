@@ -3,15 +3,18 @@
  *
  * Sends a one-time DM warning to borrowers when any active loan is within 24h
  * of expiry. The `warned_24h_at` column is set atomically so we never send
- * two warnings for the same loan.
+ * two warnings for the same loan. Includes an inline "Repay now" button that
+ * piggybacks on the existing `/repay` callback-query handler.
  */
+import { InlineKeyboard } from "grammy";
 import { query } from "../db/pool.js";
+import { getPrefs } from "./prefs.js";
 
 const POLL_INTERVAL_MS = Number(process.env.LOAN_WATCH_MS) || 60_000;
 
 async function tick(bot) {
   const { rows } = await query(
-    `SELECT l.id, l.loan_id, l.due_timestamp, l.collateral_mint,
+    `SELECT l.id, l.loan_id, l.user_id, l.due_timestamp, l.collateral_mint,
             l.original_loan_amount_lamports,
             u.telegram_id
      FROM loans l JOIN users u ON u.id = l.user_id
@@ -22,6 +25,12 @@ async function tick(bot) {
   );
 
   for (const row of rows) {
+    const prefs = await getPrefs(row.user_id);
+    if (!prefs.notify_loan_warnings) {
+      await query(`UPDATE loans SET warned_24h_at = NOW() WHERE id = $1`, [row.id]);
+      continue;
+    }
+
     const hours = Math.max(
       0,
       Math.round((new Date(row.due_timestamp).getTime() - Date.now()) / 3_600_000),
@@ -31,11 +40,15 @@ async function tick(bot) {
       "⚠️ *Loan due soon*",
       "",
       `Loan #${row.loan_id} is due in ~${hours}h.`,
-      `Repay *${solOwed.toFixed(4)} SOL* with /repay or it will be liquidated.`,
+      `Repay *${solOwed.toFixed(4)} SOL* to reclaim your collateral.`,
     ].join("\n");
+    const kb = new InlineKeyboard().text("🔧 Repay now", `repay:loan:${row.id}`);
 
     try {
-      await bot.api.sendMessage(row.telegram_id, msg, { parse_mode: "Markdown" });
+      await bot.api.sendMessage(row.telegram_id, msg, {
+        parse_mode: "Markdown",
+        reply_markup: kb,
+      });
       await query(`UPDATE loans SET warned_24h_at = NOW() WHERE id = $1`, [row.id]);
     } catch (err) {
       console.error(`[loan-watcher] DM failed for loan ${row.loan_id}: ${err.message}`);

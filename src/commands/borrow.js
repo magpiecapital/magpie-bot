@@ -5,6 +5,7 @@ import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { collateralValueLamports } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
 import { isBorrowingPaused } from "../services/admin.js";
+import { incrementBorrowed } from "../services/reputation.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, label: "30% LTV · 2 days (Express)" },
@@ -180,6 +181,7 @@ export function registerBorrowCallbacks(bot) {
         durationDays: tier.days,
         txSignature: result.signature,
       });
+      await incrementBorrowed(state.userId, loanAmountPreFee);
 
       pending.delete(ctx.chat.id);
 

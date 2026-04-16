@@ -17,6 +17,8 @@ import { PublicKey } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { connection } from "../solana/connection.js";
 import { query, pool } from "../db/pool.js";
+import { getPrefs } from "./prefs.js";
+import { maybeAutoRepay } from "./auto-repay.js";
 
 const SOL_SENTINEL = "SOL";
 const POLL_INTERVAL_MS = Number(process.env.DEPOSIT_POLL_MS) || 20_000;
@@ -103,13 +105,27 @@ async function processWallet(bot, user, supportedMints) {
 
     await client.query("COMMIT");
 
-    for (const n of notifications) {
-      const msg = `💵 *Deposit received*\n\n+${fmt(n.delta, n.decimals)} ${n.symbol}`;
-      try {
-        await bot.api.sendMessage(user.telegram_id, msg, { parse_mode: "Markdown" });
-      } catch (err) {
-        // User may have blocked the bot; don't crash the poller.
-        console.error(`[deposit-watcher] DM failed for ${user.telegram_id}: ${err.message}`);
+    if (notifications.length > 0) {
+      const prefs = await getPrefs(user.id);
+      if (prefs.notify_deposits) {
+        for (const n of notifications) {
+          const msg = `💵 *Deposit received*\n\n+${fmt(n.delta, n.decimals)} ${n.symbol}`;
+          try {
+            await bot.api.sendMessage(user.telegram_id, msg, { parse_mode: "Markdown" });
+          } catch (err) {
+            console.error(`[deposit-watcher] DM failed for ${user.telegram_id}: ${err.message}`);
+          }
+        }
+      }
+
+      // If this batch included a SOL deposit, consider triggering auto-repay.
+      const hadSolDeposit = notifications.some((n) => n.symbol === "SOL");
+      if (hadSolDeposit) {
+        await maybeAutoRepay(bot, {
+          userId: user.id,
+          telegramId: user.telegram_id,
+          publicKey: user.public_key,
+        });
       }
     }
   } catch (err) {

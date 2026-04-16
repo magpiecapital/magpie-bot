@@ -74,6 +74,30 @@ export async function handleEnableMint(ctx) {
   await ctx.reply(`✅ ${symbol.toUpperCase()} enabled.`);
 }
 
+export async function handleBroadcast(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const text = ctx.message.text.replace(/^\/broadcast(\s+|$)/, "").trim();
+  if (!text) {
+    return ctx.reply("Usage: `/broadcast <message>`", { parse_mode: "Markdown" });
+  }
+  const { rows } = await query(`SELECT telegram_id FROM users`);
+  let ok = 0;
+  let fail = 0;
+  for (const r of rows) {
+    try {
+      await ctx.api.sendMessage(r.telegram_id, `📣 *Announcement*\n\n${text}`, {
+        parse_mode: "Markdown",
+      });
+      ok++;
+    } catch {
+      fail++;
+    }
+    // Telegram rate-limits ~30 msgs/s; pacing keeps us safe.
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await ctx.reply(`✅ Sent to ${ok}, failed ${fail}.`);
+}
+
 export async function handleDisableMint(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const arg = ctx.message.text.split(/\s+/)[1];

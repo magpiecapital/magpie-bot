@@ -31,6 +31,41 @@ export async function telegramIdForBorrower(borrowerPubkey) {
   }
 }
 
+/**
+ * Lookup user id + whether they want to be notified about liquidations.
+ */
+export async function userContextForBorrower(borrowerPubkey) {
+  if (!pool) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.telegram_id,
+              COALESCE(p.notify_liquidations, TRUE) AS notify_liquidations
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+       LEFT JOIN user_prefs p ON p.user_id = u.id
+       WHERE w.public_key = $1`,
+      [borrowerPubkey],
+    );
+    return rows[0] ?? null;
+  } catch (err) {
+    console.error("[notifier] user context lookup failed:", err.message);
+    return null;
+  }
+}
+
+export async function incrementLiquidatedCount(userId) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `UPDATE users SET liquidated_count = liquidated_count + 1, updated_at = NOW()
+       WHERE id = $1`,
+      [userId],
+    );
+  } catch (err) {
+    console.error("[notifier] liquidated_count update failed:", err.message);
+  }
+}
+
 export async function notify(telegramId, text) {
   if (!token || !telegramId) return false;
   try {

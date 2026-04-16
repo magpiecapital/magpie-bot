@@ -2,6 +2,7 @@ import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { executeRepay, markLoanRepaid } from "../services/loans.js";
+import { incrementRepaid } from "../services/reputation.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -70,6 +71,7 @@ export function registerRepayCallbacks(bot) {
     try {
       const result = await executeRepay({ userId: user.id, loanDbRow: loan });
       await markLoanRepaid(loan.id, result.signature);
+      await incrementRepaid(user.id);
 
       await ctx.editMessageText(
         [

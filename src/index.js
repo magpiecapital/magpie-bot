@@ -12,16 +12,22 @@ import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
 import { handleStats } from "./commands/stats.js";
 import { handleHistory } from "./commands/history.js";
+import { handleSimulate } from "./commands/simulate.js";
+import { handleMe } from "./commands/me.js";
+import { handleSupported } from "./commands/supported.js";
+import { handleNotify, registerNotifyCallbacks } from "./commands/notify.js";
 import {
   handlePause,
   handleResume,
   handleAdminStatus,
   handleEnableMint,
   handleDisableMint,
+  handleBroadcast,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
 import { startLoanWatcher } from "./services/loan-watcher.js";
+import { startHealthWatcher } from "./services/health-watcher.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -33,6 +39,7 @@ const bot = new Bot(token);
 
 bot.use(rateLimit());
 
+// User commands
 bot.command("start", handleStart);
 bot.command("deposit", handleDeposit);
 bot.command("positions", handlePositions);
@@ -40,22 +47,29 @@ bot.command("history", handleHistory);
 bot.command("borrow", handleBorrow);
 bot.command("repay", handleRepay);
 bot.command("price", handlePrice);
+bot.command("simulate", handleSimulate);
+bot.command("supported", handleSupported);
 bot.command("withdraw", handleWithdraw);
 bot.command("export", handleExport);
 bot.command("stats", handleStats);
+bot.command("me", handleMe);
+bot.command("notify", handleNotify);
 bot.command("help", handleHelp);
 
-// Admin commands (authorization enforced in handlers).
+// Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
 bot.command("enablemint", handleEnableMint);
 bot.command("disablemint", handleDisableMint);
+bot.command("broadcast", handleBroadcast);
 
+// Inline callback registration
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
 registerExportCallbacks(bot);
+registerNotifyCallbacks(bot);
 
 bot.catch((err) => {
   console.error("Bot error:", err);
@@ -65,9 +79,10 @@ console.log("🏦 BagBank bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
-    // Kick off background watchers after the bot is live.
+    // Background watchers — start after bot is online so they can DM users.
     startDepositWatcher(bot);
     startLoanWatcher(bot);
+    startHealthWatcher(bot);
   },
 });
 
