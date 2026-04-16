@@ -82,7 +82,11 @@ export async function handlePositions(ctx) {
     }
     lines.push(`⏱ ${timeLeft(loan.due_timestamp)}`, "");
   }
-  lines.push("_Health <1.1x risks liquidation._");
+  lines.push(
+    "_Health <1.1x risks liquidation._",
+    "",
+    "Actions: /repay · /partialrepay · /topup · /extend",
+  );
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }

@@ -16,6 +16,9 @@ import { handleSimulate } from "./commands/simulate.js";
 import { handleMe } from "./commands/me.js";
 import { handleSupported } from "./commands/supported.js";
 import { handleNotify, registerNotifyCallbacks } from "./commands/notify.js";
+import { handleTopup, registerTopupCallbacks } from "./commands/topup.js";
+import { handlePartialRepay, registerPartialRepayCallbacks } from "./commands/partial-repay.js";
+import { handleExtend, registerExtendCallbacks } from "./commands/extend.js";
 import {
   handlePause,
   handleResume,
@@ -54,6 +57,9 @@ bot.command("export", handleExport);
 bot.command("stats", handleStats);
 bot.command("me", handleMe);
 bot.command("notify", handleNotify);
+bot.command("topup", handleTopup);
+bot.command("partialrepay", handlePartialRepay);
+bot.command("extend", handleExtend);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)
@@ -70,6 +76,9 @@ registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
 registerExportCallbacks(bot);
 registerNotifyCallbacks(bot);
+registerTopupCallbacks(bot);
+registerPartialRepayCallbacks(bot);
+registerExtendCallbacks(bot);
 
 bot.catch((err) => {
   console.error("Bot error:", err);

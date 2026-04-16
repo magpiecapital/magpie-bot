@@ -282,3 +282,226 @@ export async function markLoanRepaid(loanDbId, txSignature) {
     [loanDbId, txSignature],
   );
 }
+
+/**
+ * Add more collateral to an existing loan (improves health ratio).
+ * No fee charged. Collateral can be same mint as original loan.
+ */
+export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }) {
+  const borrower = await loadKeypair(userId);
+  const program = getProgramForSigner(borrower);
+
+  const collateralMintPk = new PublicKey(loanDbRow.collateral_mint);
+  const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
+  const [collateralVault] = collateralVaultPda(loanPdaPk);
+  const collateralTokenProgram = await getMintTokenProgram(loanDbRow.collateral_mint);
+
+  const borrowerCollateralAta = getAssociatedTokenAddressSync(
+    collateralMintPk,
+    borrower.publicKey,
+    false,
+    collateralTokenProgram,
+  );
+
+  const sig = await program.methods
+    .addCollateral(new BN(extraRawAmount.toString()))
+    .accounts({
+      loan: loanPdaPk,
+      collateralVault,
+      collateralMint: collateralMintPk,
+      borrowerCollateralAccount: borrowerCollateralAta,
+      borrower: borrower.publicKey,
+      collateralTokenProgram,
+    })
+    .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })])
+    .rpc({ commitment: "confirmed" });
+
+  return { signature: sig };
+}
+
+/**
+ * Partial repay: pay down part of the loan (collateral stays locked).
+ * Requires amount < original_loan_amount (full repayment must use /repay).
+ */
+export async function executePartialRepay({ userId, loanDbRow, repayLamports }) {
+  const borrower = await loadKeypair(userId);
+  const program = getProgramForSigner(borrower);
+
+  const loanTokenMintPk = NATIVE_MINT;
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
+  const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
+  const loanTokenProgram = TOKEN_PROGRAM_ID;
+
+  const borrowerWsolAta = getAssociatedTokenAddressSync(
+    loanTokenMintPk,
+    borrower.publicKey,
+    false,
+    loanTokenProgram,
+  );
+
+  const preIxs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower.publicKey,
+      borrowerWsolAta,
+      borrower.publicKey,
+      loanTokenMintPk,
+      loanTokenProgram,
+    ),
+    SystemProgram.transfer({
+      fromPubkey: borrower.publicKey,
+      toPubkey: borrowerWsolAta,
+      lamports: BigInt(repayLamports.toString()),
+    }),
+    createSyncNativeInstruction(borrowerWsolAta, loanTokenProgram),
+  ];
+
+  const postIxs = [
+    createCloseAccountInstruction(
+      borrowerWsolAta,
+      borrower.publicKey,
+      borrower.publicKey,
+      [],
+      loanTokenProgram,
+    ),
+  ];
+
+  const sig = await program.methods
+    .partialRepay(new BN(repayLamports.toString()))
+    .accounts({
+      loan: loanPdaPk,
+      lendingPool,
+      loanTokenVault,
+      loanTokenMint: loanTokenMintPk,
+      borrowerLoanTokenAccount: borrowerWsolAta,
+      borrower: borrower.publicKey,
+      loanTokenProgram,
+    })
+    .preInstructions(preIxs)
+    .postInstructions(postIxs)
+    .rpc({ commitment: "confirmed" });
+
+  return { signature: sig };
+}
+
+/**
+ * Extend the loan by its original duration for a 1.5% fee.
+ * If already past due, clock resets from now.
+ */
+export async function executeExtendLoan({ userId, loanDbRow }) {
+  const borrower = await loadKeypair(userId);
+  const program = getProgramForSigner(borrower);
+
+  const loanTokenMintPk = NATIVE_MINT;
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
+  const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
+  const loanTokenProgram = TOKEN_PROGRAM_ID;
+
+  const borrowerWsolAta = getAssociatedTokenAddressSync(
+    loanTokenMintPk,
+    borrower.publicKey,
+    false,
+    loanTokenProgram,
+  );
+  const feeWalletWsolAta = getAssociatedTokenAddressSync(
+    loanTokenMintPk,
+    LENDER_PUBKEY,
+    false,
+    loanTokenProgram,
+  );
+
+  // Fee = 1.5% of current original_loan_amount.
+  const feeLamports = (BigInt(loanDbRow.original_loan_amount_lamports) * 150n) / 10_000n;
+
+  const preIxs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower.publicKey,
+      borrowerWsolAta,
+      borrower.publicKey,
+      loanTokenMintPk,
+      loanTokenProgram,
+    ),
+    SystemProgram.transfer({
+      fromPubkey: borrower.publicKey,
+      toPubkey: borrowerWsolAta,
+      lamports: feeLamports,
+    }),
+    createSyncNativeInstruction(borrowerWsolAta, loanTokenProgram),
+  ];
+
+  const postIxs = [
+    createCloseAccountInstruction(
+      borrowerWsolAta,
+      borrower.publicKey,
+      borrower.publicKey,
+      [],
+      loanTokenProgram,
+    ),
+  ];
+
+  const sig = await program.methods
+    .extendLoan()
+    .accounts({
+      loan: loanPdaPk,
+      lendingPool,
+      loanTokenMint: loanTokenMintPk,
+      borrowerLoanTokenAccount: borrowerWsolAta,
+      feeWalletTokenAccount: feeWalletWsolAta,
+      borrower: borrower.publicKey,
+      loanTokenProgram,
+    })
+    .preInstructions(preIxs)
+    .postInstructions(postIxs)
+    .rpc({ commitment: "confirmed" });
+
+  return { signature: sig, feeLamports: feeLamports.toString() };
+}
+
+/**
+ * Persist collateral top-up in the DB.
+ */
+export async function recordAddCollateral(loanDbId, extraRawAmount) {
+  await query(
+    `UPDATE loans
+     SET collateral_amount = (collateral_amount::numeric + $2::numeric)::text,
+         last_health_alert = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [loanDbId, extraRawAmount.toString()],
+  );
+}
+
+/**
+ * Persist partial repayment in the DB (decrements original_loan_amount).
+ */
+export async function recordPartialRepay(loanDbId, repayLamports) {
+  await query(
+    `UPDATE loans
+     SET original_loan_amount_lamports = (original_loan_amount_lamports::numeric - $2::numeric)::text,
+         last_health_alert = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [loanDbId, repayLamports.toString()],
+  );
+}
+
+/**
+ * Persist loan extension in the DB. Adds duration_days to due_timestamp,
+ * or resets from now if the loan was already past due.
+ */
+export async function recordExtendLoan(loanDbId) {
+  await query(
+    `UPDATE loans
+     SET due_timestamp = CASE
+           WHEN due_timestamp < NOW() THEN NOW() + (duration_days || ' days')::interval
+           ELSE due_timestamp + (duration_days || ' days')::interval
+         END,
+         warned_24h_at = NULL,
+         last_health_alert = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [loanDbId],
+  );
+}

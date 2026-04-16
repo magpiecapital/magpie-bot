@@ -57,3 +57,29 @@ export async function getSolBalance(walletPubkey) {
   const lamports = await connection.getBalance(new PublicKey(walletPubkey));
   return lamports;
 }
+
+/**
+ * Get balance of a specific SPL mint in a wallet.
+ * Returns { rawAmount, humanAmount, decimals } or null if none found.
+ */
+export async function getTokenBalance(walletPubkey, mint) {
+  const owner = new PublicKey(walletPubkey);
+  const mintPk = new PublicKey(mint);
+
+  const res = await connection.getParsedTokenAccountsByOwner(owner, { mint: mintPk });
+
+  let raw = 0n;
+  let decimals = 0;
+  for (const acc of res.value) {
+    const info = acc.account.data.parsed.info;
+    raw += BigInt(info.tokenAmount.amount);
+    decimals = info.tokenAmount.decimals;
+  }
+
+  if (raw === 0n) return null;
+  return {
+    rawAmount: raw.toString(),
+    humanAmount: Number(raw) / 10 ** decimals,
+    decimals,
+  };
+}

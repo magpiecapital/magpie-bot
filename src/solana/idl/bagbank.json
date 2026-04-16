@@ -8,6 +8,201 @@
   },
   "instructions": [
     {
+      "name": "add_collateral",
+      "docs": [
+        "Top up collateral on an active loan. No fee — purely defensive.",
+        "Updates only `collateral_amount`; off-chain components derive current",
+        "value from the mint + price oracle."
+      ],
+      "discriminator": [
+        127,
+        82,
+        121,
+        42,
+        161,
+        176,
+        249,
+        206
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  97,
+                  116,
+                  101,
+                  114,
+                  97,
+                  108,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "borrower_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "extend_loan",
+      "docs": [
+        "Extend the loan by its original `duration_days`, paying a 1.5% fee on",
+        "the current outstanding balance. If the loan is already past due, the",
+        "new deadline is computed from `now`, otherwise from the prior deadline."
+      ],
+      "discriminator": [
+        2,
+        208,
+        222,
+        190,
+        109,
+        148,
+        247,
+        117
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "fee_wallet_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "initialize_lending_pool",
       "docs": [
         "Initialize the lending pool (one-time). Only the lender calls this."
@@ -235,6 +430,136 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "partial_repay",
+      "docs": [
+        "Pay down part of the outstanding balance. Collateral stays locked; a",
+        "subsequent `repay_loan` only requires the reduced balance.",
+        "Must be strictly less than the current `original_loan_amount`; use",
+        "`repay_loan` to close out entirely."
+      ],
+      "discriminator": [
+        142,
+        116,
+        46,
+        250,
+        227,
+        209,
+        60,
+        39
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "repay_loan",
@@ -746,33 +1071,43 @@
     },
     {
       "code": 6003,
+      "name": "InvalidAmount",
+      "msg": "Invalid amount."
+    },
+    {
+      "code": 6004,
       "name": "CalculationOverflow",
       "msg": "Calculation overflow occurred."
     },
     {
-      "code": 6004,
+      "code": 6005,
       "name": "InsufficientLenderFunds",
       "msg": "Insufficient funds in lender's vault."
     },
     {
-      "code": 6005,
+      "code": 6006,
       "name": "LoanNotActive",
       "msg": "Loan is not in Active status."
     },
     {
-      "code": 6006,
+      "code": 6007,
       "name": "UnauthorizedBorrower",
       "msg": "Only the borrower can repay this loan."
     },
     {
-      "code": 6007,
+      "code": 6008,
       "name": "UnauthorizedLender",
       "msg": "Only the lender can liquidate loans."
     },
     {
-      "code": 6008,
+      "code": 6009,
       "name": "LoanNotDue",
       "msg": "Loan is not yet due for liquidation."
+    },
+    {
+      "code": 6010,
+      "name": "InvalidFeeAccount",
+      "msg": "Fee wallet token account does not belong to the configured fee wallet."
     }
   ],
   "types": [

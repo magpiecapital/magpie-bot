@@ -70,7 +70,10 @@ async function checkLoan(bot, row) {
   }
 
   const kb = new InlineKeyboard()
-    .text("🔧 Repay now", `repay:loan:${row.id}`);
+    .text("🔧 Repay now", `repay:loan:${row.id}`)
+    .text("➕ Top up", `topup:loan:${row.id}`)
+    .row()
+    .text("⏱ Extend", `extend:loan:${row.id}`);
 
   const msg = [
     `${alert.emoji} *Loan health alert*`,
@@ -81,7 +84,7 @@ async function checkLoan(bot, row) {
     `Collateral value: ${(valueLamports / 1e9).toFixed(4)} SOL`,
     `Owed: ${(owed / 1e9).toFixed(4)} SOL`,
     "",
-    "Repay or top up collateral to avoid liquidation.",
+    "Options: /repay · /partialrepay · /topup collateral · /extend",
   ].join("\n");
 
   try {
