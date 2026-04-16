@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "db:migrate": "node scripts/migrate.js"
+    "db:migrate": "node scripts/migrate.js",
+    "init-pool": "node scripts/init-pool.js",
+    "backend": "node backend/src/index.js",
+    "backend:dev": "node --watch backend/src/index.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
