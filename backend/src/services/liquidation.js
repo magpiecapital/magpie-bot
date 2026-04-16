@@ -22,6 +22,7 @@ import {
 } from "@solana/spl-token";
 import { lendingPoolPda, collateralVaultPda } from "../utils/anchor-client.js";
 import { swapTokenToSol } from "../utils/jupiter-swap.js";
+import { telegramIdForBorrower, notify, markLiquidatedInDb } from "../utils/notifier.js";
 
 async function getMintTokenProgram(connection, mint) {
   const info = await connection.getAccountInfo(mint);
@@ -87,6 +88,27 @@ export class LiquidationService {
         .rpc({ commitment: "confirmed" });
 
       console.log(`✅ Liquidation tx: ${sig}`);
+
+      // Persist status + notify borrower (best-effort, non-blocking on failures).
+      const borrowerPubkey = loan.borrower.toBase58();
+      await markLiquidatedInDb(loanPda.toBase58(), sig);
+      const tgId = await telegramIdForBorrower(borrowerPubkey);
+      if (tgId) {
+        const reason =
+          flaggedLoan.reason === "Loan expired"
+            ? "your loan expired"
+            : "your collateral value fell below the liquidation threshold";
+        await notify(
+          tgId,
+          [
+            "💀 *Loan liquidated*",
+            "",
+            `Loan #${flaggedLoan.loanId} was liquidated because ${reason}.`,
+            "",
+            `[View tx](https://solscan.io/tx/${sig})`,
+          ].join("\n"),
+        );
+      }
 
       // Swap the collateral we just received → SOL.
       const rawAmount = loan.collateralAmount.toString();

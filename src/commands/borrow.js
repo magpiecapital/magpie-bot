@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { collateralValueLamports } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
+import { isBorrowingPaused } from "../services/admin.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, label: "30% LTV · 2 days (Express)" },
@@ -21,6 +22,10 @@ function fmtSol(lamports) {
 export async function handleBorrow(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
+
+  if (isBorrowingPaused()) {
+    return ctx.reply("⏸ Borrowing is temporarily paused. Try again shortly.");
+  }
 
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
