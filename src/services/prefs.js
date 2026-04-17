@@ -30,16 +30,20 @@ export async function getPrefs(userId) {
   return { ...DEFAULTS };
 }
 
-const ALLOWED = new Set(Object.keys(DEFAULTS));
+const ALLOWED = new Map(
+  Object.keys(DEFAULTS).map((k) => [k, k]),
+);
 
 export async function togglePref(userId, key) {
-  if (!ALLOWED.has(key)) throw new Error(`unknown pref: ${key}`);
+  const col = ALLOWED.get(key);
+  if (!col) throw new Error(`unknown pref: ${key}`);
   await getPrefs(userId); // ensure row exists
+  // col is guaranteed to be one of our hardcoded column names from DEFAULTS
   const { rows } = await query(
-    `UPDATE user_prefs SET ${key} = NOT ${key}, updated_at = NOW()
+    `UPDATE user_prefs SET ${col} = NOT ${col}, updated_at = NOW()
      WHERE user_id = $1
-     RETURNING ${key}`,
+     RETURNING ${col}`,
     [userId],
   );
-  return rows[0][key];
+  return rows[0][col];
 }
