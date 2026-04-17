@@ -12,7 +12,7 @@ export async function handleExport(ctx) {
     [
       "⚠️ *Export private key*",
       "",
-      "This reveals the full secret key for your BagBank wallet.",
+      "This reveals the full secret key for your Magpie wallet.",
       "Anyone with this key has full control of your funds.",
       "",
       "• Save it to a password manager",

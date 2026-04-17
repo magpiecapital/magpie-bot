@@ -84,7 +84,7 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
-console.log("🏦 BagBank bot starting...");
+console.log("🏦 Magpie bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);

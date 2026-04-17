@@ -2,7 +2,7 @@ import { isAdmin } from "../services/admin.js";
 
 export async function handleHelp(ctx) {
   const lines = [
-    "🏦 *BagBank Help*",
+    "🏦 *Magpie Help*",
     "",
     "*Account*",
     "/start — onboard (accepts referral: `/start CODE`)",
@@ -30,7 +30,7 @@ export async function handleHelp(ctx) {
     "/stats — protocol-wide stats",
     "",
     "*How it works*",
-    "1. Deposit memecoins to your BagBank wallet",
+    "1. Deposit memecoins to your Magpie wallet",
     "2. Pick a tier:  30%/2d · 25%/3d · 20%/7d",
     "3. Receive SOL instantly (1.5% origination fee)",
     "4. Repay before due to reclaim your bag",

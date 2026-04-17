@@ -27,7 +27,7 @@ export async function handleStats(ctx) {
     const row = counts[0];
 
     const lines = [
-      "📊 *BagBank Stats*",
+      "📊 *Magpie Stats*",
       "",
       `Program: \`${PROGRAM_ID.toBase58()}\``,
       "",

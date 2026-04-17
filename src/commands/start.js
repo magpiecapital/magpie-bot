@@ -23,7 +23,7 @@ export async function handleStart(ctx) {
       await ctx.api
         .sendMessage(
           referrer.telegram_id,
-          `🎉 *New referral*\n\n@${tgUser.username ?? "someone"} just joined BagBank using your code.`,
+          `🎉 *New referral*\n\n@${tgUser.username ?? "someone"} just joined Magpie using your code.`,
           { parse_mode: "Markdown" },
         )
         .catch(() => {});
@@ -31,7 +31,7 @@ export async function handleStart(ctx) {
   }
 
   const msg = [
-    "🏦 *Welcome to BagBank*",
+    "🏦 *Welcome to Magpie*",
     "",
     "_Where your memecoin bags unlock SOL._",
     "",
