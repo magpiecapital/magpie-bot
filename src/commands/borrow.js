@@ -16,9 +16,27 @@ const LTV_TIERS = [
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
 const pending = new Map();
 
+const QUOTE_TTL_MS = 60_000; // 60-second quote expiry
+const MAX_SLIPPAGE_PCT = 2; // reject if price moved >2% since quote
+
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
+
+function isQuoteExpired(state) {
+  if (!state?.quotedAt) return true;
+  return Date.now() - state.quotedAt > QUOTE_TTL_MS;
+}
+
+// Clean up stale sessions every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [chatId, state] of pending) {
+    if (state.quotedAt && now - state.quotedAt > QUOTE_TTL_MS * 5) {
+      pending.delete(chatId);
+    }
+  }
+}, 5 * 60_000);
 
 export async function handleBorrow(ctx) {
   const tgUser = ctx.from;
@@ -110,13 +128,14 @@ export function registerBorrowCallbacks(bot) {
     state.humanAmount = state.selected.humanAmount * (pct / 100);
     pending.set(ctx.chat.id, state);
 
-    // Fetch value in lamports for each LTV tier.
+    // Fetch value in lamports for each LTV tier and timestamp the quote.
     const valueLamports = await collateralValueLamports(
       state.selected.mint,
       rawBig,
       state.selected.decimals,
     );
     state.collateralValueLamports = valueLamports;
+    state.quotedAt = Date.now();
     pending.set(ctx.chat.id, state);
 
     const kb = new InlineKeyboard();
@@ -139,6 +158,8 @@ export function registerBorrowCallbacks(bot) {
         "",
         "*Choose a loan tier:*",
         "_(amount shown is what you receive after 1.5% fee)_",
+        "",
+        "⏱ _This quote expires in 60 seconds._",
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
@@ -153,7 +174,59 @@ export function registerBorrowCallbacks(bot) {
       return;
     }
 
+    // ── Quote expiry check ──
+    if (isQuoteExpired(state)) {
+      pending.delete(ctx.chat.id);
+      await ctx.answerCallbackQuery("Quote expired");
+      await ctx.editMessageText(
+        "⏱ *Quote expired* — prices may have changed.\n\nRun /borrow to get a fresh quote.",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    // ── Price slippage guard — re-fetch and compare ──
     await ctx.answerCallbackQuery();
+    await ctx.editMessageText("⏳ Verifying price...");
+
+    let currentValueLamports;
+    try {
+      currentValueLamports = await collateralValueLamports(
+        state.selected.mint,
+        state.collateralRaw,
+        state.selected.decimals,
+      );
+    } catch (err) {
+      console.error("Price re-fetch failed:", err);
+      pending.delete(ctx.chat.id);
+      await ctx.editMessageText(
+        "❌ Could not verify current price. Run /borrow to try again.",
+      );
+      return;
+    }
+
+    const quotedValue = state.collateralValueLamports;
+    const priceDrift = Math.abs(currentValueLamports - quotedValue) / quotedValue * 100;
+
+    if (priceDrift > MAX_SLIPPAGE_PCT) {
+      pending.delete(ctx.chat.id);
+      const direction = currentValueLamports < quotedValue ? "dropped" : "increased";
+      await ctx.editMessageText(
+        [
+          `⚠️ *Price moved ${priceDrift.toFixed(1)}%* since your quote (${direction}).`,
+          "",
+          `Quoted value: ${fmtSol(quotedValue)} SOL`,
+          `Current value: ${fmtSol(currentValueLamports)} SOL`,
+          "",
+          "Run /borrow to get a fresh quote at the current price.",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    // Use the freshest price for the actual loan execution
+    state.collateralValueLamports = currentValueLamports;
     await ctx.editMessageText("⏳ Submitting on-chain...");
 
     try {
@@ -161,11 +234,11 @@ export function registerBorrowCallbacks(bot) {
         userId: state.userId,
         collateralMint: state.selected.mint,
         collateralAmountRaw: state.collateralRaw,
-        collateralValueLamports: state.collateralValueLamports,
+        collateralValueLamports: currentValueLamports,
         loanOption: option,
       });
 
-      const loanAmountPreFee = Math.floor((state.collateralValueLamports * tier.ltv) / 100);
+      const loanAmountPreFee = Math.floor((currentValueLamports * tier.ltv) / 100);
       const fee = Math.floor((loanAmountPreFee * 150) / 10_000);
       const loanAmountAfterFee = loanAmountPreFee - fee;
 
