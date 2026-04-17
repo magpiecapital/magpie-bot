@@ -5,7 +5,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: thememebanker/magpie-bot
+  IMAGE_NAME: magpiecapital/magpie-bot
 
 jobs:
   build:
