@@ -38,7 +38,7 @@ export async function handleBorrow(ctx) {
 
   if (sol < 5_000_000) {
     await ctx.reply(
-      `⚠️ You need at least ~0.005 SOL in your BagBank wallet to cover transaction fees.\n\nDeposit SOL to:\n\`${publicKey}\``,
+      `⚠️ You need at least ~0.005 SOL in your Magpie wallet to cover transaction fees.\n\nDeposit SOL to:\n\`${publicKey}\``,
       { parse_mode: "Markdown" },
     );
     return;
