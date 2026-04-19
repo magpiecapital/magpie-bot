@@ -11,6 +11,7 @@
  *   PLATINUM — 25+ repayments AND liquidation rate < 3%
  */
 import { query } from "../db/pool.js";
+import { recordCreditEvent } from "./credit-score.js";
 
 export const TIERS = {
   NEW:      { label: "NEW",      emoji: "🆕", min: 0 },
@@ -46,7 +47,7 @@ export function nextTierHint({ repaid_count, liquidated_count }) {
   return { next, repaysNeeded: need };
 }
 
-export async function incrementBorrowed(userId, lamports) {
+export async function incrementBorrowed(userId, lamports, loanDbId = null) {
   await query(
     `UPDATE users
        SET total_borrowed_lamports = total_borrowed_lamports + $2::numeric,
@@ -54,22 +55,39 @@ export async function incrementBorrowed(userId, lamports) {
      WHERE id = $1`,
     [userId, String(lamports)],
   );
+  // Emit credit event
+  try {
+    await recordCreditEvent(userId, "borrow", loanDbId, { lamports: String(lamports) });
+  } catch (err) {
+    console.error("[reputation] credit event error:", err.message);
+  }
 }
 
-export async function incrementRepaid(userId) {
+export async function incrementRepaid(userId, loanDbId = null, wasEarly = false) {
   await query(
     `UPDATE users SET repaid_count = repaid_count + 1, updated_at = NOW()
      WHERE id = $1`,
     [userId],
   );
+  try {
+    const eventType = wasEarly ? "repay_early" : "repay_ontime";
+    await recordCreditEvent(userId, eventType, loanDbId);
+  } catch (err) {
+    console.error("[reputation] credit event error:", err.message);
+  }
 }
 
-export async function incrementLiquidated(userId) {
+export async function incrementLiquidated(userId, loanDbId = null) {
   await query(
     `UPDATE users SET liquidated_count = liquidated_count + 1, updated_at = NOW()
      WHERE id = $1`,
     [userId],
   );
+  try {
+    await recordCreditEvent(userId, "liquidated", loanDbId);
+  } catch (err) {
+    console.error("[reputation] credit event error:", err.message);
+  }
 }
 
 export async function getUserStats(userId) {

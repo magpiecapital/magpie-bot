@@ -19,6 +19,9 @@ import { handleNotify, registerNotifyCallbacks } from "./commands/notify.js";
 import { handleTopup, registerTopupCallbacks } from "./commands/topup.js";
 import { handlePartialRepay, registerPartialRepayCallbacks } from "./commands/partial-repay.js";
 import { handleExtend, registerExtendCallbacks } from "./commands/extend.js";
+import { handleCredit } from "./commands/credit.js";
+import { handleRisk } from "./commands/risk.js";
+import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import {
   handlePause,
   handleResume,
@@ -31,6 +34,8 @@ import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
 import { startLoanWatcher } from "./services/loan-watcher.js";
 import { startHealthWatcher } from "./services/health-watcher.js";
+import { startRiskEngine } from "./services/risk-engine.js";
+import { startApiServer } from "./api/server.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -60,6 +65,9 @@ bot.command("notify", handleNotify);
 bot.command("topup", handleTopup);
 bot.command("partialrepay", handlePartialRepay);
 bot.command("extend", handleExtend);
+bot.command("credit", handleCredit);
+bot.command("risk", handleRisk);
+bot.command("lend", handleLend);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)
@@ -79,6 +87,7 @@ registerNotifyCallbacks(bot);
 registerTopupCallbacks(bot);
 registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
+registerLendCallbacks(bot);
 
 bot.catch((err) => {
   console.error("Bot error:", err);
@@ -92,6 +101,8 @@ bot.start({
     startDepositWatcher(bot);
     startLoanWatcher(bot);
     startHealthWatcher(bot);
+    startRiskEngine(bot);
+    startApiServer();
   },
 });
 
