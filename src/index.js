@@ -22,6 +22,7 @@ import { handleExtend, registerExtendCallbacks } from "./commands/extend.js";
 import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
+import { handleVault } from "./commands/vault.js";
 import {
   handlePause,
   handleResume,
@@ -69,6 +70,7 @@ bot.command("extend", handleExtend);
 bot.command("credit", handleCredit);
 bot.command("risk", handleRisk);
 bot.command("lend", handleLend);
+bot.command("vault", handleVault);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)

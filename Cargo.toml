@@ -1,5 +1,5 @@
 [workspace]
-members = ["programs/magpie-credit-oracle"]
+members = ["programs/magpie-credit-oracle", "programs/agent-vault"]
 resolver = "2"
 
 [workspace.dependencies]

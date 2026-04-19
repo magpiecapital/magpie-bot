@@ -6,9 +6,11 @@ skip-lint = false
 
 [programs.devnet]
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
+agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
 
 [programs.mainnet]
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
+agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
 
 [registry]
 url = "https://api.apr.dev"
