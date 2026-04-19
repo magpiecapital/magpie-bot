@@ -1,0 +1,142 @@
+{
+  "address": "MagCrEdScoRe1111111111111111111111111111111",
+  "metadata": {
+    "name": "magpie_credit_oracle",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "On-chain composable credit score oracle for the Magpie protocol"
+  },
+  "instructions": [
+    {
+      "name": "initialize_score",
+      "discriminator": [1, 0, 0, 0, 0, 0, 0, 0],
+      "accounts": [
+        { "name": "score_account", "writable": true, "pda": { "seeds": [{ "kind": "const", "value": [99,114,101,100,105,116,45,115,99,111,114,101] }, { "kind": "arg", "path": "wallet" }] } },
+        { "name": "authority", "writable": true, "signer": true },
+        { "name": "system_program", "address": "11111111111111111111111111111111" }
+      ],
+      "args": [
+        { "name": "wallet", "type": "pubkey" }
+      ]
+    },
+    {
+      "name": "update_score",
+      "discriminator": [2, 0, 0, 0, 0, 0, 0, 0],
+      "accounts": [
+        { "name": "score_account", "writable": true },
+        { "name": "authority", "signer": true }
+      ],
+      "args": [
+        { "name": "new_score", "type": "u16" },
+        {
+          "name": "factors",
+          "type": {
+            "defined": { "name": "ScoreFactors" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "transfer_authority",
+      "discriminator": [3, 0, 0, 0, 0, 0, 0, 0],
+      "accounts": [
+        { "name": "score_account", "writable": true },
+        { "name": "authority", "signer": true }
+      ],
+      "args": [
+        { "name": "new_authority", "type": "pubkey" }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "CreditScoreAccount",
+      "discriminator": [100, 114, 101, 100, 105, 116, 115, 99],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "wallet", "type": "pubkey" },
+          { "name": "authority", "type": "pubkey" },
+          { "name": "score", "type": "u16" },
+          { "name": "tier", "type": { "defined": { "name": "CreditTier" } } },
+          { "name": "f_repayment_history", "type": "u8" },
+          { "name": "f_loan_volume", "type": "u8" },
+          { "name": "f_account_age", "type": "u8" },
+          { "name": "f_collateral_diversity", "type": "u8" },
+          { "name": "f_liquidation_ratio", "type": "u8" },
+          { "name": "f_protocol_engagement", "type": "u8" },
+          { "name": "max_ltv_bps", "type": "u16" },
+          { "name": "fee_rate_bps", "type": "u16" },
+          { "name": "max_duration_days", "type": "u8" },
+          { "name": "loans_scored", "type": "u32" },
+          { "name": "last_updated", "type": "i64" },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "CreditTier",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "Bronze" },
+          { "name": "Silver" },
+          { "name": "Gold" },
+          { "name": "Platinum" }
+        ]
+      }
+    },
+    {
+      "name": "ScoreFactors",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "repayment_history", "type": "u8" },
+          { "name": "loan_volume", "type": "u8" },
+          { "name": "account_age", "type": "u8" },
+          { "name": "collateral_diversity", "type": "u8" },
+          { "name": "liquidation_ratio", "type": "u8" },
+          { "name": "protocol_engagement", "type": "u8" },
+          { "name": "loans_scored", "type": "u32" }
+        ]
+      }
+    }
+  ],
+  "events": [
+    {
+      "name": "CreditScoreInitialized",
+      "discriminator": [200, 0, 0, 0, 0, 0, 0, 0],
+      "fields": [
+        { "name": "wallet", "type": "pubkey" },
+        { "name": "authority", "type": "pubkey" },
+        { "name": "timestamp", "type": "i64" }
+      ]
+    },
+    {
+      "name": "CreditScoreUpdated",
+      "discriminator": [201, 0, 0, 0, 0, 0, 0, 0],
+      "fields": [
+        { "name": "wallet", "type": "pubkey" },
+        { "name": "old_score", "type": "u16" },
+        { "name": "new_score", "type": "u16" },
+        { "name": "tier", "type": { "defined": { "name": "CreditTier" } } },
+        { "name": "timestamp", "type": "i64" }
+      ]
+    },
+    {
+      "name": "AuthorityTransferred",
+      "discriminator": [202, 0, 0, 0, 0, 0, 0, 0],
+      "fields": [
+        { "name": "wallet", "type": "pubkey" },
+        { "name": "old_authority", "type": "pubkey" },
+        { "name": "new_authority", "type": "pubkey" }
+      ]
+    }
+  ],
+  "errors": [
+    { "code": 6000, "name": "ScoreOutOfRange", "msg": "Score must be between 300 and 850" },
+    { "code": 6001, "name": "Unauthorized", "msg": "Only the authority can perform this action" }
+  ]
+}
