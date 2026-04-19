@@ -27,6 +27,7 @@ import {
 } from "../solana/pdas.js";
 import { loadKeypair } from "./wallet.js";
 import { query } from "../db/pool.js";
+import { recordCreditEvent } from "./credit-score.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
@@ -462,7 +463,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
 /**
  * Persist collateral top-up in the DB.
  */
-export async function recordAddCollateral(loanDbId, extraRawAmount) {
+export async function recordAddCollateral(loanDbId, extraRawAmount, userId = null) {
   await query(
     `UPDATE loans
      SET collateral_amount = (collateral_amount::numeric + $2::numeric)::text,
@@ -471,12 +472,15 @@ export async function recordAddCollateral(loanDbId, extraRawAmount) {
      WHERE id = $1`,
     [loanDbId, extraRawAmount.toString()],
   );
+  if (userId) {
+    try { await recordCreditEvent(userId, "topup", loanDbId); } catch (_) {}
+  }
 }
 
 /**
  * Persist partial repayment in the DB (decrements original_loan_amount).
  */
-export async function recordPartialRepay(loanDbId, repayLamports) {
+export async function recordPartialRepay(loanDbId, repayLamports, userId = null) {
   await query(
     `UPDATE loans
      SET original_loan_amount_lamports = (original_loan_amount_lamports::numeric - $2::numeric)::text,
@@ -485,13 +489,16 @@ export async function recordPartialRepay(loanDbId, repayLamports) {
      WHERE id = $1`,
     [loanDbId, repayLamports.toString()],
   );
+  if (userId) {
+    try { await recordCreditEvent(userId, "partial_repay", loanDbId); } catch (_) {}
+  }
 }
 
 /**
  * Persist loan extension in the DB. Adds duration_days to due_timestamp,
  * or resets from now if the loan was already past due.
  */
-export async function recordExtendLoan(loanDbId) {
+export async function recordExtendLoan(loanDbId, userId = null) {
   await query(
     `UPDATE loans
      SET due_timestamp = CASE
@@ -504,4 +511,7 @@ export async function recordExtendLoan(loanDbId) {
      WHERE id = $1`,
     [loanDbId],
   );
+  if (userId) {
+    try { await recordCreditEvent(userId, "extend", loanDbId); } catch (_) {}
+  }
 }
