@@ -1,0 +1,38 @@
+{
+  "name": "@magpiecapital/credit-sdk",
+  "version": "0.1.0",
+  "description": "Read Magpie Credit Scores from any Solana program or TypeScript app. Composable credit primitive for DeFi.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "idl"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "solana",
+    "credit-score",
+    "defi",
+    "magpie",
+    "lending",
+    "oracle",
+    "composable"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/magpiecapital/magpie-bot.git",
+    "directory": "sdk"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.90.0"
+  }
+}
