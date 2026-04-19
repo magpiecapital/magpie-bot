@@ -203,17 +203,26 @@ pub mod agent_vault {
     }
 
     /// Owner extends (or sets) the agent's session.
+    /// If the vault was revoked, the owner must explicitly re-activate by calling this.
     pub fn extend_session(ctx: Context<OwnerAction>, duration: i64) -> Result<()> {
         require!(duration > 0, VaultError::InvalidSessionDuration);
 
         let vault = &mut ctx.accounts.vault;
         let clock = Clock::get()?;
 
+        let was_revoked = !vault.is_active;
         vault.session_expiry = clock
             .unix_timestamp
             .checked_add(duration)
             .ok_or(VaultError::Overflow)?;
         vault.is_active = true;
+
+        if was_revoked {
+            emit!(AgentReactivated {
+                vault: vault.key(),
+                timestamp: clock.unix_timestamp,
+            });
+        }
 
         emit!(SessionExtended {
             vault: vault.key(),
@@ -500,16 +509,25 @@ pub mod agent_vault {
     }
 
     /// Owner extends token vault session.
+    /// If the vault was revoked, the owner must explicitly re-activate by calling this.
     pub fn extend_token_session(ctx: Context<TokenOwnerAction>, duration: i64) -> Result<()> {
         require!(duration > 0, VaultError::InvalidSessionDuration);
 
         let tv = &mut ctx.accounts.token_vault;
         let clock = Clock::get()?;
+        let was_revoked = !tv.is_active;
         tv.session_expiry = clock
             .unix_timestamp
             .checked_add(duration)
             .ok_or(VaultError::Overflow)?;
         tv.is_active = true;
+
+        if was_revoked {
+            emit!(AgentReactivated {
+                vault: tv.key(),
+                timestamp: clock.unix_timestamp,
+            });
+        }
 
         Ok(())
     }
@@ -766,6 +784,7 @@ pub struct TokenOwnerAction<'info> {
 #[derive(Accounts)]
 pub struct OwnerWithdrawToken<'info> {
     #[account(
+        mut,
         has_one = owner @ VaultError::Unauthorized,
     )]
     pub token_vault: Account<'info, TokenVault>,
@@ -962,6 +981,12 @@ pub struct SessionExtended {
 pub struct AgentRevoked {
     pub vault: Pubkey,
     pub agent: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct AgentReactivated {
+    pub vault: Pubkey,
     pub timestamp: i64,
 }
 

@@ -102,7 +102,8 @@
           ]
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -152,7 +153,8 @@
           ]
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": []
@@ -253,8 +255,41 @@
                 "path": "token_vault"
               },
               {
-                "kind": "account",
-                "path": "token_program"
+                "kind": "const",
+                "value": [
+                  6,
+                  221,
+                  246,
+                  225,
+                  215,
+                  101,
+                  161,
+                  147,
+                  217,
+                  203,
+                  225,
+                  70,
+                  206,
+                  235,
+                  121,
+                  172,
+                  28,
+                  180,
+                  133,
+                  237,
+                  95,
+                  91,
+                  55,
+                  145,
+                  58,
+                  140,
+                  245,
+                  133,
+                  126,
+                  255,
+                  0,
+                  169
+                ]
               },
               {
                 "kind": "account",
@@ -313,7 +348,8 @@
           "address": "11111111111111111111111111111111"
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
         {
           "name": "associated_token_program",
@@ -487,7 +523,8 @@
           "signer": true
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -500,7 +537,8 @@
     {
       "name": "extend_session",
       "docs": [
-        "Owner extends (or sets) the agent's session."
+        "Owner extends (or sets) the agent's session.",
+        "If the vault was revoked, the owner must explicitly re-activate by calling this."
       ],
       "discriminator": [
         201,
@@ -536,7 +574,8 @@
     {
       "name": "extend_token_session",
       "docs": [
-        "Owner extends token vault session."
+        "Owner extends token vault session.",
+        "If the vault was revoked, the owner must explicitly re-activate by calling this."
       ],
       "discriminator": [
         166,
@@ -622,7 +661,8 @@
       ],
       "accounts": [
         {
-          "name": "token_vault"
+          "name": "token_vault",
+          "writable": true
         },
         {
           "name": "vault_token_account",
@@ -644,7 +684,8 @@
           ]
         },
         {
-          "name": "token_program"
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
       ],
       "args": [
@@ -880,6 +921,19 @@
       ]
     },
     {
+      "name": "AgentReactivated",
+      "discriminator": [
+        23,
+        241,
+        7,
+        252,
+        229,
+        96,
+        117,
+        217
+      ]
+    },
+    {
       "name": "AgentRevoked",
       "discriminator": [
         12,
@@ -1106,6 +1160,22 @@
           {
             "name": "session_expiry",
             "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AgentReactivated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
           },
           {
             "name": "timestamp",
