@@ -106,6 +106,8 @@ POST /api/v1/vault/spend
 
 ## Instructions
 
+### SOL Vault (9 instructions)
+
 | Instruction | Signer | Description |
 |------------|--------|-------------|
 | `create_vault` | Owner | Create vault PDA with agent and policy |
@@ -118,32 +120,64 @@ POST /api/v1/vault/spend
 | `owner_withdraw` | Owner | Withdraw SOL from vault |
 | `close_vault` | Owner | Close vault, reclaim rent |
 
+### SPL Token Vault (8 instructions)
+
+| Instruction | Signer | Description |
+|------------|--------|-------------|
+| `create_token_vault` | Owner | Create token vault PDA + ATA for any SPL mint |
+| `deposit_token` | Anyone | Fund the vault with SPL tokens |
+| `agent_spend_token` | Agent | Spend tokens within policy bounds |
+| `update_token_policy` | Owner | Change token spend/daily limits |
+| `extend_token_session` | Owner | Extend token vault session |
+| `revoke_token_agent` | Owner | Immediately disable token vault agent |
+| `owner_withdraw_token` | Owner | Withdraw tokens from vault |
+| `close_token_vault` | Owner | Drain tokens, close ATA, reclaim rent |
+
+### CPI Composability
+
+Any Solana program can call Agent Vault's instructions via CPI. See the `vault-consumer` reference program for a working example of a Task Escrow that pays rewards through an agent vault.
+
+```rust
+use agent_vault::cpi::accounts::AgentSpend;
+use agent_vault::cpi::agent_spend;
+
+// Other programs can trigger agent spending
+agent_spend(cpi_ctx, amount)?;
+```
+
 ## Program Details
 
 | | |
 |---|---|
 | **Program ID** | `J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t` |
 | **Framework** | Anchor 0.30.1 |
-| **Binary size** | 238 KB |
-| **Account size** | 138 bytes + 8 discriminator |
-| **PDA seeds** | `["vault", owner_pubkey, agent_pubkey]` |
+| **Instructions** | 17 (9 SOL + 8 token) |
+| **SOL Vault size** | 138 bytes + 8 discriminator |
+| **Token Vault size** | 202 bytes + 8 discriminator |
+| **SOL PDA seeds** | `["vault", owner, agent]` |
+| **Token PDA seeds** | `["token_vault", owner, agent, mint]` |
+| **Token support** | Any SPL token (USDC, BONK, etc.) via Token Interface |
+| **CPI** | Full CPI support via `cpi` feature flag |
 
 ## Use Cases
 
-- **AI Trading Agents** — Give a trading bot a vault with a daily budget. It executes autonomously; when the cap hits, it stops.
-- **API Payment Rails** — AI agents that consume paid APIs pay from their vault. Compatible with x402 HTTP 402 payment flows.
-- **Multi-Agent Systems** — Run a fleet of specialized agents, each with its own vault, budget, and session. One owner controls them all.
+- **AI Trading Agents** — Give a trading bot a USDC vault with a daily budget. It executes swaps autonomously; when the cap hits, it stops.
+- **API Payment Rails** — AI agents that consume paid APIs pay from their vault in USDC. Compatible with x402 HTTP 402 payment flows.
+- **Multi-Agent Systems** — Run a fleet of specialized agents, each with its own vault (SOL or tokens), budget, and session. One owner controls them all.
 - **Autonomous DAO Operations** — DAO governance sets vault policy; agents execute within bounds.
+- **Cross-Program Integration** — Other Solana programs call Agent Vault via CPI to trigger agent spending as part of larger workflows (escrow, bounties, task markets).
 
 ## Project Structure
 
 ```
-programs/agent-vault/     Anchor program (Rust)
-sdk/agent-vault/          TypeScript SDK
+programs/agent-vault/     Anchor program — SOL + SPL token vaults (Rust)
+programs/vault-consumer/  CPI reference program — Task Escrow example (Rust)
+sdk/agent-vault/          TypeScript SDK — Owner, Agent, Reader classes
 src/commands/vault.js     Telegram bot commands
 src/api/vault-api.js      REST API for agents
 scripts/demo.sh           Live demo script
-tests/agent-vault.ts      Test suite
+tests/agent-vault.ts      SOL vault test suite (29 tests)
+tests/token-vault.ts      SPL token vault test suite
 ```
 
 ## Running the Demo

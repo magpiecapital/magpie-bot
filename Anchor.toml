@@ -7,6 +7,7 @@ skip-lint = false
 [programs.localnet]
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
 agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
+vault_consumer = "4m4NB1tRKvWE6okuvU1Sf7HQLc6VWGrUpwFoc6ZZU4nX"
 
 [programs.devnet]
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"

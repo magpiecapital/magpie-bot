@@ -29,6 +29,11 @@ import {
   SystemProgram,
 } from "@solana/web3.js";
 import { AnchorProvider, BN, Program, Wallet } from "@coral-xyz/anchor";
+import {
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -37,6 +42,7 @@ export const AGENT_VAULT_PROGRAM_ID = new PublicKey(
 );
 
 export const VAULT_SEED = Buffer.from("vault");
+export const TOKEN_VAULT_SEED = Buffer.from("token_vault");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -68,6 +74,36 @@ export interface VaultState {
   availableBalance: number;
 }
 
+export interface TokenVaultPolicy {
+  /** Max tokens (smallest unit) the agent can spend in a single transaction. */
+  spendLimit: number;
+  /** Max tokens (smallest unit) the agent can spend in a rolling 24-hour window. */
+  dailyLimit: number;
+  /** Session duration in seconds. 0 = no expiry. */
+  sessionDuration: number;
+}
+
+export interface TokenVaultState {
+  address: PublicKey;
+  owner: PublicKey;
+  agent: PublicKey;
+  mint: PublicKey;
+  tokenAccount: PublicKey;
+  spendLimit: number;
+  dailyLimit: number;
+  spentToday: number;
+  periodStart: number;
+  sessionExpiry: number;
+  isActive: boolean;
+  totalSpent: number;
+  totalReceived: number;
+  txCount: number;
+  createdAt: number;
+  bump: number;
+  /** Token balance available in the vault. */
+  tokenBalance: number;
+}
+
 // ─── PDA derivation ──────────────────────────────────────────────────────────
 
 /**
@@ -80,6 +116,21 @@ export function deriveVaultPDA(
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [VAULT_SEED, owner.toBuffer(), agent.toBuffer()],
+    programId,
+  );
+}
+
+/**
+ * Derive the token vault PDA for an owner–agent–mint triple.
+ */
+export function deriveTokenVaultPDA(
+  owner: PublicKey,
+  agent: PublicKey,
+  mint: PublicKey,
+  programId: PublicKey = AGENT_VAULT_PROGRAM_ID,
+): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [TOKEN_VAULT_SEED, owner.toBuffer(), agent.toBuffer(), mint.toBuffer()],
     programId,
   );
 }
@@ -247,6 +298,169 @@ export class AgentVaultOwner {
       .accounts({ vault, owner: this.owner.publicKey })
       .rpc({ commitment: "confirmed" });
   }
+
+  // ─── Token Vault Methods ──────────────────────────────────────────────────
+
+  /**
+   * Create a new token vault for an AI agent with a specific SPL mint.
+   * Returns the token vault PDA address.
+   */
+  async createTokenVault(
+    agent: PublicKey,
+    mint: PublicKey,
+    policy: TokenVaultPolicy,
+  ): Promise<PublicKey> {
+    const program = getProgram(this.connection, this.owner);
+    const [tokenVaultPda] = deriveTokenVaultPDA(
+      this.owner.publicKey, agent, mint, this.programId,
+    );
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint, tokenVaultPda, true,
+    );
+
+    await program.methods
+      .createTokenVault(
+        agent,
+        new BN(policy.spendLimit),
+        new BN(policy.dailyLimit),
+        new BN(policy.sessionDuration),
+      )
+      .accounts({
+        tokenVault: tokenVaultPda,
+        vaultTokenAccount,
+        mint,
+        owner: this.owner.publicKey,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .rpc({ commitment: "confirmed" });
+
+    return tokenVaultPda;
+  }
+
+  /**
+   * Deposit SPL tokens into a token vault.
+   */
+  async depositToken(
+    tokenVault: PublicKey,
+    mint: PublicKey,
+    amount: number,
+  ): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint, tokenVault, true,
+    );
+    const depositorTokenAccount = getAssociatedTokenAddressSync(
+      mint, this.owner.publicKey,
+    );
+
+    return program.methods
+      .depositToken(new BN(amount))
+      .accounts({
+        tokenVault,
+        vaultTokenAccount,
+        depositorTokenAccount,
+        mint,
+        depositor: this.owner.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
+   * Update token vault spending policy.
+   */
+  async updateTokenPolicy(
+    tokenVault: PublicKey,
+    spendLimit: number,
+    dailyLimit: number,
+  ): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    return program.methods
+      .updateTokenPolicy(new BN(spendLimit), new BN(dailyLimit))
+      .accounts({ tokenVault, owner: this.owner.publicKey })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
+   * Extend token vault session.
+   */
+  async extendTokenSession(
+    tokenVault: PublicKey,
+    durationSeconds: number,
+  ): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    return program.methods
+      .extendTokenSession(new BN(durationSeconds))
+      .accounts({ tokenVault, owner: this.owner.publicKey })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
+   * Revoke token vault agent.
+   */
+  async revokeTokenAgent(tokenVault: PublicKey): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    return program.methods
+      .revokeTokenAgent()
+      .accounts({ tokenVault, owner: this.owner.publicKey })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
+   * Withdraw SPL tokens from a token vault back to the owner.
+   */
+  async withdrawToken(
+    tokenVault: PublicKey,
+    mint: PublicKey,
+    amount: number,
+  ): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint, tokenVault, true,
+    );
+    const ownerTokenAccount = getAssociatedTokenAddressSync(
+      mint, this.owner.publicKey,
+    );
+
+    return program.methods
+      .ownerWithdrawToken(new BN(amount))
+      .accounts({
+        tokenVault,
+        vaultTokenAccount,
+        ownerTokenAccount,
+        mint,
+        owner: this.owner.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
+   * Close a token vault — drains remaining tokens and reclaims rent.
+   */
+  async closeTokenVault(tokenVault: PublicKey, mint: PublicKey): Promise<string> {
+    const program = getProgram(this.connection, this.owner);
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint, tokenVault, true,
+    );
+    const ownerTokenAccount = getAssociatedTokenAddressSync(
+      mint, this.owner.publicKey,
+    );
+
+    return program.methods
+      .closeTokenVault()
+      .accounts({
+        tokenVault,
+        vaultTokenAccount,
+        ownerTokenAccount,
+        mint,
+        owner: this.owner.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc({ commitment: "confirmed" });
+  }
 }
 
 // ─── Agent SDK ───────────────────────────────────────────────────────────────
@@ -287,10 +501,45 @@ export class AgentVaultAgent {
   }
 
   /**
+   * Spend SPL tokens from a token vault to a destination token account.
+   * The program enforces all policy checks on-chain.
+   */
+  async spendToken(
+    tokenVault: PublicKey,
+    mint: PublicKey,
+    destinationTokenAccount: PublicKey,
+    amount: number,
+  ): Promise<string> {
+    const program = getProgram(this.connection, this.agent);
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint, tokenVault, true,
+    );
+
+    return program.methods
+      .agentSpendToken(new BN(amount))
+      .accounts({
+        tokenVault,
+        vaultTokenAccount,
+        destinationTokenAccount,
+        mint,
+        agent: this.agent.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc({ commitment: "confirmed" });
+  }
+
+  /**
    * Get the vault address for this agent and a given owner.
    */
   getVaultAddress(owner: PublicKey): PublicKey {
     return deriveVaultPDA(owner, this.agent.publicKey, this.programId)[0];
+  }
+
+  /**
+   * Get the token vault address for this agent, owner, and mint.
+   */
+  getTokenVaultAddress(owner: PublicKey, mint: PublicKey): PublicKey {
+    return deriveTokenVaultPDA(owner, this.agent.publicKey, mint, this.programId)[0];
   }
 }
 
@@ -359,6 +608,64 @@ export class AgentVaultReader {
     // If 24h has passed, full daily budget is available
     if (now - vault.periodStart >= 86400) return vault.dailyLimit;
     return Math.max(0, vault.dailyLimit - vault.spentToday);
+  }
+
+  /**
+   * Fetch the full state of a token vault.
+   */
+  async getTokenVault(address: PublicKey): Promise<TokenVaultState | null> {
+    const dummy = Keypair.generate();
+    const program = getProgram(this.connection, dummy);
+
+    try {
+      const info = await this.connection.getAccountInfo(address);
+      if (!info) return null;
+
+      const raw = program.coder.accounts.decode("TokenVault", info.data);
+
+      // Fetch token balance from the vault's ATA
+      let tokenBalance = 0;
+      try {
+        const ataInfo = await this.connection.getTokenAccountBalance(raw.tokenAccount);
+        tokenBalance = Number(ataInfo.value.amount);
+      } catch {
+        // ATA may not exist yet
+      }
+
+      return {
+        address,
+        owner: raw.owner,
+        agent: raw.agent,
+        mint: raw.mint,
+        tokenAccount: raw.tokenAccount,
+        spendLimit: Number(raw.spendLimit),
+        dailyLimit: Number(raw.dailyLimit),
+        spentToday: Number(raw.spentToday),
+        periodStart: Number(raw.periodStart),
+        sessionExpiry: Number(raw.sessionExpiry),
+        isActive: raw.isActive,
+        totalSpent: Number(raw.totalSpent),
+        totalReceived: Number(raw.totalReceived),
+        txCount: Number(raw.txCount),
+        createdAt: Number(raw.createdAt),
+        bump: raw.bump,
+        tokenBalance,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch a token vault for a specific owner–agent–mint triple.
+   */
+  async getTokenVaultByTriple(
+    owner: PublicKey,
+    agent: PublicKey,
+    mint: PublicKey,
+  ): Promise<TokenVaultState | null> {
+    const [pda] = deriveTokenVaultPDA(owner, agent, mint, this.programId);
+    return this.getTokenVault(pda);
   }
 }
 

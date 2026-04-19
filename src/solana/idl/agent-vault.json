@@ -64,6 +64,100 @@
       ]
     },
     {
+      "name": "agent_spend_token",
+      "docs": [
+        "Agent spends SPL tokens from the vault. Same 6-layer policy enforcement."
+      ],
+      "discriminator": [
+        6,
+        15,
+        146,
+        110,
+        48,
+        220,
+        174,
+        17
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "destination_token_account",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "agent",
+          "signer": true,
+          "relations": [
+            "token_vault"
+          ]
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "close_token_vault",
+      "docs": [
+        "Owner closes token vault — drains remaining tokens and reclaims rent."
+      ],
+      "discriminator": [
+        30,
+        14,
+        239,
+        231,
+        79,
+        189,
+        15,
+        252
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "token_vault"
+          ]
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_vault",
       "docs": [
         "Owner closes the vault and reclaims all SOL (including rent)."
@@ -93,6 +187,157 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "create_token_vault",
+      "docs": [
+        "Create a token vault for any SPL mint (USDC, BONK, etc.).",
+        "",
+        "Seeds: [b\"token_vault\", owner, agent, mint]",
+        "One vault per owner–agent–mint triple."
+      ],
+      "discriminator": [
+        161,
+        29,
+        12,
+        45,
+        127,
+        88,
+        61,
+        49
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "arg",
+                "path": "agent"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "token_vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        }
+      ],
+      "args": [
+        {
+          "name": "agent",
+          "type": "pubkey"
+        },
+        {
+          "name": "spend_limit",
+          "type": "u64"
+        },
+        {
+          "name": "daily_limit",
+          "type": "u64"
+        },
+        {
+          "name": "session_duration",
+          "type": "i64"
+        }
+      ]
     },
     {
       "name": "create_vault",
@@ -206,6 +451,53 @@
       ]
     },
     {
+      "name": "deposit_token",
+      "docs": [
+        "Deposit SPL tokens into a token vault. Anyone can deposit."
+      ],
+      "discriminator": [
+        11,
+        156,
+        96,
+        218,
+        39,
+        163,
+        180,
+        19
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "depositor_token_account",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "extend_session",
       "docs": [
         "Owner extends (or sets) the agent's session."
@@ -231,6 +523,42 @@
           "signer": true,
           "relations": [
             "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "duration",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "extend_token_session",
+      "docs": [
+        "Owner extends token vault session."
+      ],
+      "discriminator": [
+        166,
+        44,
+        192,
+        120,
+        50,
+        246,
+        193,
+        205
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "token_vault"
           ]
         }
       ],
@@ -278,6 +606,55 @@
       ]
     },
     {
+      "name": "owner_withdraw_token",
+      "docs": [
+        "Owner withdraws SPL tokens from the vault."
+      ],
+      "discriminator": [
+        113,
+        80,
+        101,
+        84,
+        80,
+        135,
+        215,
+        156
+      ],
+      "accounts": [
+        {
+          "name": "token_vault"
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "owner_token_account",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "token_vault"
+          ]
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "revoke_agent",
       "docs": [
         "Owner immediately revokes the agent's access."
@@ -303,6 +680,37 @@
           "signer": true,
           "relations": [
             "vault"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "revoke_token_agent",
+      "docs": [
+        "Owner revokes token vault agent."
+      ],
+      "discriminator": [
+        53,
+        2,
+        59,
+        219,
+        97,
+        45,
+        120,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "token_vault"
           ]
         }
       ],
@@ -387,9 +795,62 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "update_token_policy",
+      "docs": [
+        "Owner updates token vault spending policy."
+      ],
+      "discriminator": [
+        210,
+        120,
+        122,
+        140,
+        229,
+        176,
+        145,
+        223
+      ],
+      "accounts": [
+        {
+          "name": "token_vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "token_vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "spend_limit",
+          "type": "u64"
+        },
+        {
+          "name": "daily_limit",
+          "type": "u64"
+        }
+      ]
     }
   ],
   "accounts": [
+    {
+      "name": "TokenVault",
+      "discriminator": [
+        121,
+        7,
+        84,
+        254,
+        151,
+        228,
+        43,
+        144
+      ]
+    },
     {
       "name": "Vault",
       "discriminator": [
@@ -497,6 +958,45 @@
       ]
     },
     {
+      "name": "TokenAgentSpent",
+      "discriminator": [
+        246,
+        65,
+        145,
+        120,
+        125,
+        41,
+        240,
+        245
+      ]
+    },
+    {
+      "name": "TokenDeposited",
+      "discriminator": [
+        104,
+        7,
+        18,
+        187,
+        94,
+        141,
+        251,
+        120
+      ]
+    },
+    {
+      "name": "TokenVaultCreated",
+      "discriminator": [
+        215,
+        221,
+        38,
+        95,
+        1,
+        11,
+        17,
+        105
+      ]
+    },
+    {
       "name": "VaultClosed",
       "discriminator": [
         238,
@@ -578,6 +1078,11 @@
       "code": 6010,
       "name": "Overflow",
       "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6011,
+      "name": "MintMismatch",
+      "msg": "Token mint does not match vault mint"
     }
   ],
   "types": [
@@ -764,6 +1269,193 @@
           },
           {
             "name": "new_expiry",
+            "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenAgentSpent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "destination",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "daily_spent",
+            "type": "u64"
+          },
+          {
+            "name": "daily_remaining",
+            "type": "u64"
+          },
+          {
+            "name": "tx_count",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenDeposited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenVault",
+      "docs": [
+        "SPL Token Vault — same policy model, operates on any SPL mint."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "spend_limit",
+            "type": "u64"
+          },
+          {
+            "name": "daily_limit",
+            "type": "u64"
+          },
+          {
+            "name": "spent_today",
+            "type": "u64"
+          },
+          {
+            "name": "period_start",
+            "type": "i64"
+          },
+          {
+            "name": "session_expiry",
+            "type": "i64"
+          },
+          {
+            "name": "is_active",
+            "type": "bool"
+          },
+          {
+            "name": "total_spent",
+            "type": "u64"
+          },
+          {
+            "name": "total_received",
+            "type": "u64"
+          },
+          {
+            "name": "tx_count",
+            "type": "u64"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenVaultCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "spend_limit",
+            "type": "u64"
+          },
+          {
+            "name": "daily_limit",
+            "type": "u64"
+          },
+          {
+            "name": "session_expiry",
             "type": "i64"
           },
           {
