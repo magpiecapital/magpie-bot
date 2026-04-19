@@ -36,6 +36,7 @@ import { startLoanWatcher } from "./services/loan-watcher.js";
 import { startHealthWatcher } from "./services/health-watcher.js";
 import { startRiskEngine } from "./services/risk-engine.js";
 import { startApiServer } from "./api/server.js";
+import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -103,6 +104,7 @@ bot.start({
     startHealthWatcher(bot);
     startRiskEngine(bot);
     startApiServer();
+    startCreditOraclePublisher();
   },
 });
 

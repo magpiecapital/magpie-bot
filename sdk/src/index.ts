@@ -25,7 +25,7 @@ import { Keypair } from "@solana/web3.js";
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 export const CREDIT_ORACLE_PROGRAM_ID = new PublicKey(
-  "MagCrEdScoRe1111111111111111111111111111111",
+  "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E",
 );
 
 export const CREDIT_SCORE_SEED = Buffer.from("credit-score");

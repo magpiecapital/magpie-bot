@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-declare_id!("MagCrEdScoRe1111111111111111111111111111111");
+declare_id!("BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E");
 
 /// Magpie Credit Oracle — On-chain composable credit primitive.
 ///
