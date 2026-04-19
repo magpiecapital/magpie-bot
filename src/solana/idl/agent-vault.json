@@ -1,0 +1,932 @@
+{
+  "address": "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t",
+  "metadata": {
+    "name": "agent_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Programmable wallets for AI agents on Solana — on-chain spending policies, session keys, and audit trails"
+  },
+  "docs": [
+    "Agent Vault Protocol",
+    "",
+    "Programmable wallets for AI agents on Solana.",
+    "Owners create vaults with spending policies — per-transaction limits,",
+    "daily budgets, session expiry, and optional allowlists.",
+    "Agents spend autonomously within those bounds. Every action is logged",
+    "on-chain for full auditability."
+  ],
+  "instructions": [
+    {
+      "name": "agent_spend",
+      "docs": [
+        "Agent spends SOL from the vault to a destination.",
+        "",
+        "Enforces every policy layer:",
+        "1. Vault must be active",
+        "2. Session must not be expired",
+        "3. Caller must be the assigned agent",
+        "4. Amount must be ≤ per-transaction limit",
+        "5. Daily cumulative must be ≤ daily limit",
+        "6. Vault must have sufficient balance (above rent-exempt minimum)"
+      ],
+      "discriminator": [
+        23,
+        170,
+        137,
+        159,
+        219,
+        53,
+        9,
+        61
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "agent",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "destination",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "close_vault",
+      "docs": [
+        "Owner closes the vault and reclaims all SOL (including rent)."
+      ],
+      "discriminator": [
+        141,
+        103,
+        17,
+        126,
+        72,
+        75,
+        29,
+        29
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "create_vault",
+      "docs": [
+        "Create a new vault with an assigned agent and spending policy.",
+        "",
+        "Seeds: [b\"vault\", owner, agent]",
+        "One vault per owner–agent pair."
+      ],
+      "discriminator": [
+        29,
+        237,
+        247,
+        208,
+        193,
+        82,
+        54,
+        135
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "arg",
+                "path": "agent"
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "agent",
+          "type": "pubkey"
+        },
+        {
+          "name": "spend_limit",
+          "type": "u64"
+        },
+        {
+          "name": "daily_limit",
+          "type": "u64"
+        },
+        {
+          "name": "session_duration",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "deposit",
+      "docs": [
+        "Deposit SOL into a vault. Anyone can deposit."
+      ],
+      "discriminator": [
+        242,
+        35,
+        198,
+        137,
+        82,
+        225,
+        242,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "depositor",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "extend_session",
+      "docs": [
+        "Owner extends (or sets) the agent's session."
+      ],
+      "discriminator": [
+        201,
+        215,
+        202,
+        21,
+        222,
+        73,
+        18,
+        96
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "duration",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "owner_withdraw",
+      "docs": [
+        "Owner withdraws SOL from the vault."
+      ],
+      "discriminator": [
+        138,
+        172,
+        103,
+        228,
+        254,
+        96,
+        114,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "revoke_agent",
+      "docs": [
+        "Owner immediately revokes the agent's access."
+      ],
+      "discriminator": [
+        227,
+        60,
+        209,
+        125,
+        240,
+        117,
+        163,
+        73
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_agent",
+      "docs": [
+        "Owner swaps the agent keypair. Resets daily spending and reactivates."
+      ],
+      "discriminator": [
+        154,
+        74,
+        121,
+        91,
+        137,
+        19,
+        101,
+        166
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "new_agent",
+          "type": "pubkey"
+        },
+        {
+          "name": "session_duration",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "update_policy",
+      "docs": [
+        "Owner updates the spending policy."
+      ],
+      "discriminator": [
+        212,
+        245,
+        246,
+        7,
+        163,
+        151,
+        18,
+        57
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "spend_limit",
+          "type": "u64"
+        },
+        {
+          "name": "daily_limit",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Vault",
+      "discriminator": [
+        211,
+        8,
+        232,
+        43,
+        2,
+        152,
+        117,
+        119
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "AgentChanged",
+      "discriminator": [
+        248,
+        6,
+        169,
+        87,
+        197,
+        255,
+        16,
+        191
+      ]
+    },
+    {
+      "name": "AgentRevoked",
+      "discriminator": [
+        12,
+        251,
+        249,
+        166,
+        122,
+        83,
+        162,
+        116
+      ]
+    },
+    {
+      "name": "AgentSpent",
+      "discriminator": [
+        20,
+        48,
+        241,
+        251,
+        238,
+        42,
+        166,
+        163
+      ]
+    },
+    {
+      "name": "Deposited",
+      "discriminator": [
+        111,
+        141,
+        26,
+        45,
+        161,
+        35,
+        100,
+        57
+      ]
+    },
+    {
+      "name": "OwnerWithdrew",
+      "discriminator": [
+        93,
+        227,
+        126,
+        234,
+        132,
+        244,
+        70,
+        195
+      ]
+    },
+    {
+      "name": "PolicyUpdated",
+      "discriminator": [
+        225,
+        112,
+        112,
+        67,
+        95,
+        236,
+        245,
+        161
+      ]
+    },
+    {
+      "name": "SessionExtended",
+      "discriminator": [
+        233,
+        52,
+        6,
+        150,
+        6,
+        177,
+        42,
+        43
+      ]
+    },
+    {
+      "name": "VaultClosed",
+      "discriminator": [
+        238,
+        129,
+        38,
+        228,
+        227,
+        118,
+        249,
+        215
+      ]
+    },
+    {
+      "name": "VaultCreated",
+      "discriminator": [
+        117,
+        25,
+        120,
+        254,
+        75,
+        236,
+        78,
+        115
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Unauthorized",
+      "msg": "Only the vault owner can perform this action"
+    },
+    {
+      "code": 6001,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidSpendLimit",
+      "msg": "Spend limit must be greater than zero"
+    },
+    {
+      "code": 6003,
+      "name": "DailyLimitBelowSpendLimit",
+      "msg": "Daily limit must be ≥ per-transaction spend limit"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidSessionDuration",
+      "msg": "Session duration must be positive"
+    },
+    {
+      "code": 6005,
+      "name": "VaultInactive",
+      "msg": "Vault is not active — agent access has been revoked"
+    },
+    {
+      "code": 6006,
+      "name": "SessionExpired",
+      "msg": "Agent session has expired — owner must extend"
+    },
+    {
+      "code": 6007,
+      "name": "ExceedsTransactionLimit",
+      "msg": "Amount exceeds per-transaction spend limit"
+    },
+    {
+      "code": 6008,
+      "name": "ExceedsDailyLimit",
+      "msg": "Amount would exceed daily spending limit"
+    },
+    {
+      "code": 6009,
+      "name": "InsufficientFunds",
+      "msg": "Insufficient vault balance (rent-exempt minimum preserved)"
+    },
+    {
+      "code": 6010,
+      "name": "Overflow",
+      "msg": "Arithmetic overflow"
+    }
+  ],
+  "types": [
+    {
+      "name": "AgentChanged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "session_expiry",
+            "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AgentRevoked",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AgentSpent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "destination",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "daily_spent",
+            "type": "u64"
+          },
+          {
+            "name": "daily_remaining",
+            "type": "u64"
+          },
+          {
+            "name": "tx_count",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Deposited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "depositor",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "new_balance",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OwnerWithdrew",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PolicyUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "old_spend_limit",
+            "type": "u64"
+          },
+          {
+            "name": "new_spend_limit",
+            "type": "u64"
+          },
+          {
+            "name": "old_daily_limit",
+            "type": "u64"
+          },
+          {
+            "name": "new_daily_limit",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionExtended",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "new_expiry",
+            "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Vault",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "docs": [
+              "Human owner who controls policies and can withdraw."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "docs": [
+              "AI agent keypair authorized to spend within policy bounds."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "spend_limit",
+            "docs": [
+              "Maximum lamports per single transaction."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "daily_limit",
+            "docs": [
+              "Maximum lamports the agent can spend in a rolling 24h window."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "spent_today",
+            "docs": [
+              "Lamports spent so far in the current 24h period."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "period_start",
+            "docs": [
+              "Unix timestamp when the current 24h period started."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "session_expiry",
+            "docs": [
+              "Unix timestamp when the agent's session expires. 0 = no expiry."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "is_active",
+            "docs": [
+              "Whether the agent is currently authorized to spend."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "total_spent",
+            "docs": [
+              "Lifetime lamports spent by agents."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_received",
+            "docs": [
+              "Lifetime lamports deposited."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "tx_count",
+            "docs": [
+              "Total number of agent spend transactions."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "created_at",
+            "docs": [
+              "When this vault was created."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump seed."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "agent",
+            "type": "pubkey"
+          },
+          {
+            "name": "spend_limit",
+            "type": "u64"
+          },
+          {
+            "name": "daily_limit",
+            "type": "u64"
+          },
+          {
+            "name": "session_expiry",
+            "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    }
+  ]
+}

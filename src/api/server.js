@@ -12,6 +12,7 @@
 import http from "node:http";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
+import { handleVaultApi } from "./vault-api.js";
 
 const PORT = parseInt(process.env.API_PORT || "3001", 10);
 
@@ -213,7 +214,7 @@ async function router(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "X-API-Key, Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     return res.end();
@@ -223,6 +224,11 @@ async function router(req, res) {
   if (path === "/api/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ status: "ok", service: "magpie-credit-protocol" }));
+  }
+
+  // Agent Vault routes (public — agents authenticate with their keypair)
+  if (path.startsWith("/api/v1/vault")) {
+    return handleVaultApi(req, res, url, path);
   }
 
   // Auth required for all other routes
