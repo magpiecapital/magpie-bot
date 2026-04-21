@@ -14,11 +14,14 @@
  *   6. Protocol Engagement (5%) — referrals, features used, activity
  *
  * Score range: 300 (min) – 850 (max)
- * Tier mapping:
- *   Bronze:   300-499 → 30% max LTV, 1.5% fee, 7 day max
- *   Silver:   500-649 → 32% max LTV, 1.5% fee, 7 day max
- *   Gold:     650-749 → 35% max LTV, 1.25% fee, 14 day max
- *   Platinum: 750-850 → 38% max LTV, 1.0% fee, 30 day max
+ * Tier mapping (feeRate = minimum fee for Standard tier at this credit level):
+ *   Bronze:   300-499 → 30% max LTV, 1.5–3% fee (tier-dependent), 7 day max
+ *   Silver:   500-649 → 32% max LTV, 1.5–3% fee (tier-dependent), 7 day max
+ *   Gold:     650-749 → 35% max LTV, 1.25–2.75% fee, 14 day max
+ *   Platinum: 750-850 → 38% max LTV, 1.0–2.5% fee, 30 day max
+ *
+ * Loan tier base fees: Express 3%, Quick 2%, Standard 1.5%
+ * Credit score can reduce these (Gold ~17% off, Platinum ~33% off)
  */
 import { query } from "../db/pool.js";
 

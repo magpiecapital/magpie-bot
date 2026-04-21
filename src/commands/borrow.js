@@ -8,9 +8,9 @@ import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 
 const LTV_TIERS = [
-  { option: 0, ltv: 30, days: 2, label: "30% LTV · 2 days (Express)" },
-  { option: 1, ltv: 25, days: 3, label: "25% LTV · 3 days (Quick)" },
-  { option: 2, ltv: 20, days: 7, label: "20% LTV · 7 days (Standard)" },
+  { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
+  { option: 1, ltv: 25, days: 3, feeBps: 200, label: "25% LTV · 3d · 2% fee (Quick)" },
+  { option: 2, ltv: 20, days: 7, feeBps: 150, label: "20% LTV · 7d · 1.5% fee (Standard)" },
 ];
 
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
@@ -141,7 +141,7 @@ export function registerBorrowCallbacks(bot) {
     const kb = new InlineKeyboard();
     for (const t of LTV_TIERS) {
       const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
-      const fee = loanSol * 0.015;
+      const fee = loanSol * (t.feeBps / 10_000);
       const receive = loanSol - fee;
       kb.text(
         `${t.label} → ~${receive.toFixed(4)} SOL`,
@@ -157,7 +157,7 @@ export function registerBorrowCallbacks(bot) {
         `*Value:* ${fmtSol(valueLamports)} SOL`,
         "",
         "*Choose a loan tier:*",
-        "_(amount shown is what you receive after 1.5% fee)_",
+        "_(amount shown is what you receive after tier fee)_",
         "",
         "⏱ _This quote expires in 60 seconds._",
       ].join("\n"),
@@ -239,7 +239,7 @@ export function registerBorrowCallbacks(bot) {
       });
 
       const loanAmountPreFee = Math.floor((currentValueLamports * tier.ltv) / 100);
-      const fee = Math.floor((loanAmountPreFee * 150) / 10_000);
+      const fee = Math.floor((loanAmountPreFee * tier.feeBps) / 10_000);
       const loanAmountAfterFee = loanAmountPreFee - fee;
 
       await recordLoan({

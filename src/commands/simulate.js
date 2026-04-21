@@ -8,9 +8,9 @@ import { query } from "../db/pool.js";
 import { getPriceInSol } from "../services/price.js";
 
 const TIERS = {
-  1: { ltv: 30, days: 2, label: "Express" },
-  2: { ltv: 25, days: 3, label: "Quick" },
-  3: { ltv: 20, days: 7, label: "Standard" },
+  1: { ltv: 30, days: 2, feeBps: 300, label: "Express" },
+  2: { ltv: 25, days: 3, feeBps: 200, label: "Quick" },
+  3: { ltv: 20, days: 7, feeBps: 150, label: "Standard" },
 };
 
 function usage(ctx) {
@@ -65,7 +65,7 @@ export async function handleSimulate(ctx) {
 
   for (const t of tierList) {
     const gross = collateralValueSol * (t.ltv / 100);
-    const fee = gross * 0.015;
+    const fee = gross * (t.feeBps / 10_000);
     const receive = gross - fee;
     const liquidationPriceSol = (gross / 1.1) / amount; // price at which ratio drops to 1.1x
     lines.push(

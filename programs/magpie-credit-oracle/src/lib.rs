@@ -27,7 +27,7 @@ pub mod magpie_credit_oracle {
         score_account.f_liquidation_ratio = 100; // perfect until proven otherwise
         score_account.f_protocol_engagement = 0;
         score_account.max_ltv_bps = 3000; // 30%
-        score_account.fee_rate_bps = 150; // 1.5%
+        score_account.fee_rate_bps = 150; // 1.5% (Standard tier minimum for new users)
         score_account.max_duration_days = 7;
         score_account.loans_scored = 0;
         score_account.last_updated = Clock::get()?.unix_timestamp;
@@ -161,7 +161,7 @@ pub struct CreditScoreAccount {
     pub f_protocol_engagement: u8, // 1
     /// Tier benefits (computed from score).
     pub max_ltv_bps: u16,         // 2 (basis points, e.g. 3500 = 35%)
-    pub fee_rate_bps: u16,        // 2 (basis points, e.g. 150 = 1.5%)
+    pub fee_rate_bps: u16,        // 2 (basis points — min fee for Standard tier, e.g. 150 = 1.5%)
     pub max_duration_days: u8,    // 1
     /// Number of loans that contributed to this score.
     pub loans_scored: u32,        // 4

@@ -110,9 +110,10 @@
     {
       "name": "extend_loan",
       "docs": [
-        "Extend the loan by its original `duration_days`, paying a 1.5% fee on",
-        "the current outstanding balance. If the loan is already past due, the",
-        "new deadline is computed from `now`, otherwise from the prior deadline."
+        "Extend the loan by its original `duration_days`, paying the tier fee",
+        "(Express 3%, Quick 2%, Standard 1.5%) on the current outstanding balance.",
+        "If the loan is already past due, the new deadline is computed from `now`,",
+        "otherwise from the prior deadline."
       ],
       "discriminator": [
         2,
