@@ -7,7 +7,7 @@ import "dotenv/config";
 import { connection } from "./connection.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const idlPath = path.join(__dirname, "idl", "bagbank.json");
+const idlPath = path.join(__dirname, "idl", "magpie.json");
 const idl = JSON.parse(readFileSync(idlPath, "utf8"));
 
 export const PROGRAM_ID = new PublicKey(
