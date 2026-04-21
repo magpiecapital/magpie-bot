@@ -7,6 +7,13 @@ import { executeExtendLoan, recordExtendLoan } from "../services/loans.js";
 
 const pending = new Map();
 
+// Map LTV percentage to tier fee in basis points
+function feeBpsForLtv(ltv) {
+  if (ltv >= 30) return 300n;  // Express
+  if (ltv >= 25) return 200n;  // Quick
+  return 150n;                 // Standard
+}
+
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
@@ -32,7 +39,8 @@ export async function handleExtend(ctx) {
 
   const kb = new InlineKeyboard();
   for (const loan of rows) {
-    const fee = (BigInt(loan.original_loan_amount_lamports) * 150n) / 10_000n;
+    const bps = feeBpsForLtv(loan.ltv_percentage);
+    const fee = (BigInt(loan.original_loan_amount_lamports) * bps) / 10_000n;
     kb.text(
       `#${loan.loan_id} · ${loan.symbol ?? "?"} · fee ${fmtSol(fee)} SOL`,
       `extend:loan:${loan.id}`,
@@ -41,7 +49,7 @@ export async function handleExtend(ctx) {
   kb.text("✕ Cancel", "extend:cancel");
 
   await ctx.reply(
-    "*Extend loan* — adds the original duration for a 1.5% fee.\n\nPick a loan:",
+    "*Extend loan* — adds the original duration for the tier fee.\n\nPick a loan:",
     { parse_mode: "Markdown", reply_markup: kb },
   );
 }
@@ -71,7 +79,8 @@ export function registerExtendCallbacks(bot) {
       return;
     }
 
-    const fee = (BigInt(loan.original_loan_amount_lamports) * 150n) / 10_000n;
+    const bps = feeBpsForLtv(loan.ltv_percentage);
+    const fee = (BigInt(loan.original_loan_amount_lamports) * bps) / 10_000n;
     const sol = await getSolBalance(publicKey);
 
     // Need enough SOL to cover fee + ~0.003 SOL buffer for tx + rent.
@@ -108,7 +117,7 @@ export function registerExtendCallbacks(bot) {
       [
         `*Extend loan #${loan.loan_id}*`,
         `Symbol: ${loan.symbol ?? "?"}`,
-        `Extension fee: *${fmtSol(fee)} SOL* (1.5%)`,
+        `Extension fee: *${fmtSol(fee)} SOL* (${Number(bps) / 100}%)`,
         `New due: ${newDue.toUTCString()}`,
         wasDue ? "_(loan was past due — clock resets from now)_" : "",
         "",

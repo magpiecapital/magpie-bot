@@ -26,9 +26,9 @@ export async function handlePrice(ctx) {
   try {
     const priceSol = await getPriceInSol(token.mint);
     const tiers = [
-      { ltv: 30, days: 2 },
-      { ltv: 25, days: 3 },
-      { ltv: 20, days: 7 },
+      { ltv: 30, days: 2, feeBps: 300, label: "Express" },
+      { ltv: 25, days: 3, feeBps: 200, label: "Quick" },
+      { ltv: 20, days: 7, feeBps: 150, label: "Standard" },
     ];
     const lines = [
       `💰 *${token.symbol}* — ${token.name ?? ""}`,
@@ -39,8 +39,8 @@ export async function handlePrice(ctx) {
       "*Max loan per token:*",
     ];
     for (const t of tiers) {
-      const loanPerToken = priceSol * (t.ltv / 100) * 0.985; // 1.5% fee
-      lines.push(`• ${t.ltv}% LTV / ${t.days}d: ${loanPerToken.toFixed(9)} SOL`);
+      const loanPerToken = priceSol * (t.ltv / 100) * (1 - t.feeBps / 10_000);
+      lines.push(`• ${t.label} (${t.ltv}% / ${t.days}d / ${t.feeBps / 100}% fee): ${loanPerToken.toFixed(9)} SOL`);
     }
 
     await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });

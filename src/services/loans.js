@@ -387,7 +387,8 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
 }
 
 /**
- * Extend the loan by its original duration for a 1.5% fee.
+ * Extend the loan by its original duration for the tier fee
+ * (Express 3%, Quick 2%, Standard 1.5%).
  * If already past due, clock resets from now.
  */
 export async function executeExtendLoan({ userId, loanDbRow }) {
@@ -412,8 +413,11 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     loanTokenProgram,
   );
 
-  // Fee = 1.5% of current original_loan_amount.
-  const feeLamports = (BigInt(loanDbRow.original_loan_amount_lamports) * 150n) / 10_000n;
+  // Fee = tier-dependent % of current original_loan_amount.
+  // Express (30% LTV) = 3%, Quick (25%) = 2%, Standard (20%) = 1.5%
+  const ltv = loanDbRow.ltv_percentage;
+  const feeBps = ltv >= 30 ? 300n : ltv >= 25 ? 200n : 150n;
+  const feeLamports = (BigInt(loanDbRow.original_loan_amount_lamports) * feeBps) / 10_000n;
 
   const preIxs = [
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
