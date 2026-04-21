@@ -1,0 +1,1308 @@
+{
+  "address": "GrMUU2SHayLkNtpcFHu4qt3wxf5y55qchWPESHUZzYGq",
+  "metadata": {
+    "name": "magpie",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Memecoin-collateralized lending protocol"
+  },
+  "instructions": [
+    {
+      "name": "add_collateral",
+      "docs": [
+        "Top up collateral on an active loan. No fee — purely defensive.",
+        "Updates only `collateral_amount`; off-chain components derive current",
+        "value from the mint + price oracle."
+      ],
+      "discriminator": [
+        127,
+        82,
+        121,
+        42,
+        161,
+        176,
+        249,
+        206
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  97,
+                  116,
+                  101,
+                  114,
+                  97,
+                  108,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "borrower_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "extend_loan",
+      "docs": [
+        "Extend the loan by its original `duration_days`, paying the tier fee",
+        "(Express 3%, Quick 2%, Standard 1.5%) on the current outstanding balance.",
+        "If the loan is already past due, the new deadline is computed from `now`,",
+        "otherwise from the prior deadline."
+      ],
+      "discriminator": [
+        2,
+        208,
+        222,
+        190,
+        109,
+        148,
+        247,
+        117
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "fee_wallet_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_lending_pool",
+      "docs": [
+        "Initialize the lending pool (one-time). Only the lender calls this."
+      ],
+      "discriminator": [
+        236,
+        76,
+        136,
+        68,
+        196,
+        14,
+        9,
+        177
+      ],
+      "accounts": [
+        {
+          "name": "lending_pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lender"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "lender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "loan_token_program"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "fee_wallet",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "liquidate_loan",
+      "docs": [
+        "Liquidate an overdue loan. Only the lender can call.",
+        "Collateral is transferred to the lender (backend then swaps via Jupiter)."
+      ],
+      "discriminator": [
+        111,
+        249,
+        185,
+        54,
+        161,
+        147,
+        178,
+        24
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan.borrower",
+                "account": "Loan"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  97,
+                  116,
+                  101,
+                  114,
+                  97,
+                  108,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lender"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "lender_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "lender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "partial_repay",
+      "docs": [
+        "Pay down part of the outstanding balance. Collateral stays locked; a",
+        "subsequent `repay_loan` only requires the reduced balance.",
+        "Must be strictly less than the current `original_loan_amount`; use",
+        "`repay_loan` to close out entirely."
+      ],
+      "discriminator": [
+        142,
+        116,
+        46,
+        250,
+        227,
+        209,
+        60,
+        39
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "repay_loan",
+      "docs": [
+        "Repay loan; collateral is returned to borrower."
+      ],
+      "discriminator": [
+        224,
+        93,
+        144,
+        77,
+        61,
+        17,
+        137,
+        54
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "account",
+                "path": "loan.loan_id",
+                "account": "Loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  97,
+                  116,
+                  101,
+                  114,
+                  97,
+                  108,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "borrower_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "request_and_fund_loan",
+      "docs": [
+        "Request and instantly fund a loan against memecoin collateral.",
+        "Atomically: locks collateral, computes loan amount from LTV, deducts fee,",
+        "sends loan asset to borrower."
+      ],
+      "discriminator": [
+        21,
+        217,
+        199,
+        183,
+        6,
+        96,
+        200,
+        52
+      ],
+      "accounts": [
+        {
+          "name": "loan",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              },
+              {
+                "kind": "arg",
+                "path": "loan_id"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  97,
+                  116,
+                  101,
+                  114,
+                  97,
+                  108,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "loan"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending_pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool.lender",
+                "account": "LendingPool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "borrower_collateral_account",
+          "writable": true
+        },
+        {
+          "name": "borrower_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "fee_wallet_token_account",
+          "writable": true
+        },
+        {
+          "name": "borrower",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "loan_token_program"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "collateral_amount",
+          "type": "u64"
+        },
+        {
+          "name": "loan_option",
+          "type": "u8"
+        },
+        {
+          "name": "collateral_value",
+          "type": "u64"
+        },
+        {
+          "name": "loan_id",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_loan_token",
+      "docs": [
+        "Emergency lender withdrawal from the vault."
+      ],
+      "discriminator": [
+        249,
+        65,
+        158,
+        28,
+        5,
+        54,
+        210,
+        46
+      ],
+      "accounts": [
+        {
+          "name": "lending_pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  101,
+                  110,
+                  100,
+                  105,
+                  110,
+                  103,
+                  45,
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lender"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  97,
+                  110,
+                  45,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  45,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "lending_pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "loan_token_mint"
+        },
+        {
+          "name": "lender_loan_token_account",
+          "writable": true
+        },
+        {
+          "name": "lender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "loan_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "LendingPool",
+      "discriminator": [
+        208,
+        40,
+        242,
+        82,
+        186,
+        18,
+        75,
+        36
+      ]
+    },
+    {
+      "name": "Loan",
+      "discriminator": [
+        20,
+        195,
+        70,
+        117,
+        165,
+        227,
+        182,
+        1
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "InvalidLoanOption",
+      "msg": "Invalid loan option. Must be 0, 1, or 2."
+    },
+    {
+      "code": 6001,
+      "name": "InvalidCollateralAmount",
+      "msg": "Invalid collateral amount. Must be greater than 0."
+    },
+    {
+      "code": 6002,
+      "name": "InvalidCollateralValue",
+      "msg": "Invalid collateral value. Must be greater than 0."
+    },
+    {
+      "code": 6003,
+      "name": "InvalidAmount",
+      "msg": "Invalid amount."
+    },
+    {
+      "code": 6004,
+      "name": "CalculationOverflow",
+      "msg": "Calculation overflow occurred."
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientLenderFunds",
+      "msg": "Insufficient funds in lender's vault."
+    },
+    {
+      "code": 6006,
+      "name": "LoanNotActive",
+      "msg": "Loan is not in Active status."
+    },
+    {
+      "code": 6007,
+      "name": "UnauthorizedBorrower",
+      "msg": "Only the borrower can repay this loan."
+    },
+    {
+      "code": 6008,
+      "name": "UnauthorizedLender",
+      "msg": "Only the lender can liquidate loans."
+    },
+    {
+      "code": 6009,
+      "name": "LoanNotDue",
+      "msg": "Loan is not yet due for liquidation."
+    },
+    {
+      "code": 6010,
+      "name": "InvalidFeeAccount",
+      "msg": "Fee wallet token account does not belong to the configured fee wallet."
+    }
+  ],
+  "types": [
+    {
+      "name": "LendingPool",
+      "docs": [
+        "Global lending pool — single PDA that manages all lending operations.",
+        "In BagBank, loan asset = wSOL; collateral = any SPL memecoin."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lender",
+            "docs": [
+              "The lender's wallet address (pool operator)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "loan_token_vault",
+            "docs": [
+              "PDA token account holding the pool's wSOL for disbursing loans."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_wallet",
+            "docs": [
+              "Wallet where origination fees are collected."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "total_loans_issued",
+            "docs": [
+              "Total number of loans issued (for tracking)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_liquidations",
+            "docs": [
+              "Total number of liquidations executed."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump for verification."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Loan",
+      "docs": [
+        "Individual loan — one PDA per loan."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "loan_id",
+            "docs": [
+              "Unique loan identifier."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "borrower",
+            "docs": [
+              "Borrower's wallet address."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_mint",
+            "docs": [
+              "Mint address of the collateral token (e.g. BONK, WIF)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_vault",
+            "docs": [
+              "PDA token account holding the locked collateral."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_amount",
+            "docs": [
+              "Amount of collateral tokens locked (raw, with decimals)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "loan_amount",
+            "docs": [
+              "Loan asset amount borrower actually receives (after fee). Denominated in the",
+              "loan asset's smallest unit (for wSOL, lamports)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "original_loan_amount",
+            "docs": [
+              "Original loan amount before fee — this is what the borrower must repay."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "transaction_fee",
+            "docs": [
+              "Origination fee collected (loan asset units)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ltv_percentage",
+            "docs": [
+              "Loan-to-value percentage: 20, 25, or 30."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "duration_days",
+            "docs": [
+              "Loan duration in days: 2, 3, or 7."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "start_timestamp",
+            "docs": [
+              "Unix timestamp when the loan became active."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "due_timestamp",
+            "docs": [
+              "Unix timestamp when repayment is due."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "status",
+            "docs": [
+              "Current status of the loan."
+            ],
+            "type": {
+              "defined": {
+                "name": "LoanStatus"
+              }
+            }
+          },
+          {
+            "name": "collateral_value_at_start",
+            "docs": [
+              "Value of collateral at loan creation, expressed in the loan asset's smallest unit."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LoanStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Repaid"
+          },
+          {
+            "name": "Liquidated"
+          }
+        ]
+      }
+    }
+  ]
+}
