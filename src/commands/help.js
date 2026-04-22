@@ -23,6 +23,7 @@ export async function handleHelp(ctx) {
     "/price <symbol|mint> — oracle price + max loan per tier",
     "",
     "*Wallet*",
+    "/import — import your existing Solana wallet",
     "/withdraw — send SOL or tokens out",
     "/export — export your private key (⚠️ custodial)",
     "",

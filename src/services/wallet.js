@@ -69,6 +69,35 @@ export async function loadKeypair(userId) {
 }
 
 /**
+ * Import an existing wallet by base58 private key.
+ * Replaces any existing wallet for this user.
+ * Returns { publicKey: string }.
+ */
+export async function importWallet(userId, base58PrivateKey) {
+  const decoded = bs58.decode(base58PrivateKey);
+  const kp = Keypair.fromSecretKey(decoded);
+  const secretBuf = Buffer.from(kp.secretKey);
+  const { ciphertext, iv, authTag } = encrypt(secretBuf);
+
+  const existing = await query("SELECT id FROM wallets WHERE user_id = $1", [userId]);
+  if (existing.rows.length > 0) {
+    await query(
+      `UPDATE wallets SET public_key = $2, encrypted_secret = $3, nonce = $4, auth_tag = $5
+       WHERE user_id = $1`,
+      [userId, kp.publicKey.toBase58(), ciphertext, iv, authTag],
+    );
+  } else {
+    await query(
+      `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, kp.publicKey.toBase58(), ciphertext, iv, authTag],
+    );
+  }
+
+  return { publicKey: kp.publicKey.toBase58() };
+}
+
+/**
  * Export base58 secret key for user (used by /export command with confirmation).
  */
 export async function exportSecret(userId) {

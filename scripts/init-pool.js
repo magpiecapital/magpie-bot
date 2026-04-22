@@ -31,7 +31,7 @@ import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const idl = JSON.parse(
-  readFileSync(path.join(__dirname, "..", "src", "solana", "idl", "bagbank.json"), "utf8"),
+  readFileSync(path.join(__dirname, "..", "src", "solana", "idl", "magpie.json"), "utf8"),
 );
 
 function parseArgs() {
