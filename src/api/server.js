@@ -14,7 +14,7 @@ import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 import { handleVaultApi } from "./vault-api.js";
 
-const PORT = parseInt(process.env.API_PORT || "3001", 10);
+const PORT = parseInt(process.env.PORT || process.env.API_PORT || "3001", 10);
 
 // ─── Rate limiter ───────────────────────────────────────────────────────────
 const rateLimitStore = new Map();
