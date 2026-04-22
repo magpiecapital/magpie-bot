@@ -59,8 +59,15 @@ export async function handleMe(ctx) {
     `Referred: ${refs.total}`,
   );
 
+  const { InlineKeyboard } = await import("grammy");
+  const kb = new InlineKeyboard()
+    .text("🏠 Home", "start:home")
+    .text("💰 Borrow", "start:borrow")
+    .text("📋 Wallet", "fallback:deposit");
+
   await ctx.reply(lines.join("\n"), {
     parse_mode: "Markdown",
     disable_web_page_preview: true,
+    reply_markup: kb,
   });
 }

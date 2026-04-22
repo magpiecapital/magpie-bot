@@ -29,5 +29,11 @@ export async function handleSupported(ctx) {
   }
   lines.push("", "Use /simulate to preview a loan.");
 
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  const { InlineKeyboard } = await import("grammy");
+  const kb = new InlineKeyboard()
+    .text("🏠 Home", "start:home")
+    .text("💰 Borrow", "start:borrow")
+    .text("📋 Wallet", "fallback:deposit");
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
