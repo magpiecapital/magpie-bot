@@ -1,3 +1,4 @@
+import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 
@@ -9,15 +10,23 @@ export async function handleDeposit(ctx) {
   const { publicKey } = await ensureWallet(user.id);
 
   const msg = [
-    "💰 *Your deposit address*",
+    "💰 *Your Magpie wallet*",
     "",
     `\`${publicKey}\``,
     "",
-    "Send any SPL memecoin here to use as collateral.",
-    "Also send a small amount of SOL (~0.01) to cover transaction fees.",
+    "Tap the address above to copy it, then send tokens from Phantom or Solflare.",
     "",
-    "Once deposited, use /borrow to take out a SOL loan.",
+    "*What to send:*",
+    "• Any supported memecoin (/supported to see the list)",
+    "• ~0.01 SOL for transaction fees",
+    "",
+    "_Tokens arrive in under 30 seconds. Tap Borrow once they land._",
   ].join("\n");
 
-  await ctx.reply(msg, { parse_mode: "Markdown" });
+  const kb = new InlineKeyboard()
+    .text("💰 Borrow now", "start:borrow")
+    .row()
+    .text("📋 Supported tokens", "start:supported");
+
+  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
