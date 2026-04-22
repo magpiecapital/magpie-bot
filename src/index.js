@@ -1,7 +1,7 @@
 import { Bot } from "grammy";
 import "dotenv/config";
 
-import { handleStart } from "./commands/start.js";
+import { handleStart, registerStartCallbacks } from "./commands/start.js";
 import { handleDeposit } from "./commands/deposit.js";
 import { handlePositions } from "./commands/positions.js";
 import { handleBorrow, registerBorrowCallbacks } from "./commands/borrow.js";
@@ -24,6 +24,7 @@ import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleVault } from "./commands/vault.js";
 import { handleImport } from "./commands/import-wallet.js";
+import { handleWallet } from "./commands/wallet.js";
 import {
   handlePause,
   handleResume,
@@ -73,6 +74,7 @@ bot.command("risk", handleRisk);
 bot.command("lend", handleLend);
 bot.command("vault", handleVault);
 bot.command("import", handleImport);
+bot.command("wallet", handleWallet);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)
@@ -93,6 +95,7 @@ registerTopupCallbacks(bot);
 registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
+registerStartCallbacks(bot);
 
 bot.catch((err) => {
   console.error("Bot error:", err);

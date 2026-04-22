@@ -12,14 +12,16 @@ export async function handleImport(ctx) {
   if (!key) {
     return ctx.reply(
       [
-        "Import an existing Solana wallet by sending your private key.",
+        "⚠️ *Advanced: Import an existing wallet*",
         "",
-        "Usage: `/import <base58 private key>`",
+        "Most users don't need this\\. Instead, use /deposit to get your Magpie wallet address and send tokens there\\.",
         "",
-        "Your message will be deleted immediately for security.",
-        "The key is encrypted and stored the same way as generated wallets.",
+        "If you still want to import, send:",
+        "`/import <base58 private key>`",
+        "",
+        "Your message will be deleted immediately for security\\.",
       ].join("\n"),
-      { parse_mode: "Markdown" },
+      { parse_mode: "MarkdownV2" },
     );
   }
 
