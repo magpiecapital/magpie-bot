@@ -25,6 +25,7 @@ import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleVault } from "./commands/vault.js";
 import { handleImport } from "./commands/import-wallet.js";
 import { handleWallet } from "./commands/wallet.js";
+import { handleFallback, registerFallbackCallbacks } from "./commands/fallback.js";
 import {
   handlePause,
   handleResume,
@@ -96,6 +97,10 @@ registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
 registerStartCallbacks(bot);
+registerFallbackCallbacks(bot);
+
+// Fallback: respond to any text message that isn't a command
+bot.on("message:text", handleFallback);
 
 bot.catch((err) => {
   console.error("Bot error:", err);
