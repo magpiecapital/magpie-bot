@@ -25,6 +25,7 @@ const PATTERNS = [
   { match: /\b(risk|safe|dangerous)\b/i, cmd: "risk", label: "Token risk assessment" },
   { match: /\b(stats|protocol|tvl|volume)\b/i, cmd: "stats", label: "Protocol stats" },
   { match: /\b(notify|alert|notification)\b/i, cmd: "notify", label: "Notification settings" },
+  { match: /\b(home|menu|main|start|back)\b/i, cmd: "home", label: "Go home" },
   { match: /\b(hi|hello|hey|yo|sup|gm|good morning|what'?s up)\b/i, cmd: "_greeting", label: null },
 ];
 
@@ -47,6 +48,7 @@ const HANDLER_MAP = {
   risk: () => import("./risk.js").then((m) => m.handleRisk),
   stats: () => import("./stats.js").then((m) => m.handleStats),
   notify: () => import("./notify.js").then((m) => m.handleNotify),
+  home: () => import("./home.js").then((m) => m.handleHome),
 };
 
 // Solana base58 address pattern (32-44 chars of base58 alphabet)

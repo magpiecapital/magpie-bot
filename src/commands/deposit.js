@@ -26,7 +26,8 @@ export async function handleDeposit(ctx) {
   const kb = new InlineKeyboard()
     .text("💰 Borrow now", "start:borrow")
     .row()
-    .text("📋 Supported tokens", "start:supported");
+    .text("📋 Supported tokens", "start:supported")
+    .text("🏠 Home", "start:home");
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }

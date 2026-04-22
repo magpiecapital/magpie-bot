@@ -1,11 +1,15 @@
+import { InlineKeyboard } from "grammy";
 import { isAdmin } from "../services/admin.js";
 
 export async function handleHelp(ctx) {
   const lines = [
     "🏦 *Magpie Help*",
     "",
+    "*Navigation*",
+    "/home — main menu",
+    "/help — this page",
+    "",
     "*Account*",
-    "/start — onboard (accepts referral: `/start CODE`)",
     "/me — wallet, tier, stats, referral code",
     "/deposit — show your deposit address",
     "/notify — manage notifications + auto-repay",
@@ -67,5 +71,10 @@ export async function handleHelp(ctx) {
     );
   }
 
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  const kb = new InlineKeyboard()
+    .text("🏠 Home", "start:home")
+    .text("💰 Borrow", "start:borrow")
+    .text("📋 Wallet", "fallback:deposit");
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }

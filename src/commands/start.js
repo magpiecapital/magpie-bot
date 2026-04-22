@@ -109,4 +109,10 @@ export function registerStartCallbacks(bot) {
     const { handleSupported } = await import("./supported.js");
     await handleSupported(ctx);
   });
+
+  bot.callbackQuery("start:home", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    ctx.match = "";
+    await handleStart(ctx);
+  });
 }

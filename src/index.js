@@ -25,6 +25,7 @@ import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleVault } from "./commands/vault.js";
 import { handleImport } from "./commands/import-wallet.js";
 import { handleWallet } from "./commands/wallet.js";
+import { handleHome } from "./commands/home.js";
 import { handleFallback, registerFallbackCallbacks } from "./commands/fallback.js";
 import {
   handlePause,
@@ -76,6 +77,7 @@ bot.command("lend", handleLend);
 bot.command("vault", handleVault);
 bot.command("import", handleImport);
 bot.command("wallet", handleWallet);
+bot.command("home", handleHome);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)
