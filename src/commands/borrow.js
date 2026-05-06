@@ -49,10 +49,16 @@ export async function handleBorrow(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  const [balances, sol] = await Promise.all([
-    getSupportedBalances(publicKey),
-    getSolBalance(publicKey),
-  ]);
+  let balances, sol;
+  try {
+    [balances, sol] = await Promise.all([
+      getSupportedBalances(publicKey),
+      getSolBalance(publicKey),
+    ]);
+  } catch (err) {
+    console.error("[borrow] RPC error:", err.message);
+    return ctx.reply("⚠️ Couldn't fetch your balances right now. Please try again in a moment.");
+  }
 
   if (sol < 5_000_000) {
     await ctx.reply(
