@@ -76,6 +76,9 @@ export async function handleBorrow(ctx) {
     return;
   }
 
+  // Cache balances so token selection doesn't need another RPC call.
+  pending.set(ctx.chat.id, { userId: user.id, balances });
+
   const kb = new InlineKeyboard();
   for (const b of balances) {
     kb.text(`${b.symbol} (${b.humanAmount.toLocaleString()})`, `borrow:mint:${b.mint}`).row();
@@ -98,9 +101,18 @@ export function registerBorrowCallbacks(bot) {
   bot.callbackQuery(/^borrow:mint:(.+)$/, async (ctx) => {
     const mint = ctx.match[1];
     const user = await upsertUser(ctx.from.id, ctx.from.username);
-    const { publicKey } = await ensureWallet(user.id);
-    const balances = await getSupportedBalances(publicKey);
-    const selected = balances.find((b) => b.mint === mint);
+
+    // Use cached balances from /borrow if available, otherwise re-fetch.
+    const cached = pending.get(ctx.chat.id);
+    let selected;
+    if (cached?.balances) {
+      selected = cached.balances.find((b) => b.mint === mint);
+    }
+    if (!selected) {
+      const { publicKey } = await ensureWallet(user.id);
+      const balances = await getSupportedBalances(publicKey);
+      selected = balances.find((b) => b.mint === mint);
+    }
 
     if (!selected) {
       await ctx.answerCallbackQuery("Balance no longer available");
