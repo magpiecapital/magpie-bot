@@ -12,14 +12,14 @@ export async function handleImport(ctx) {
   if (!key) {
     return ctx.reply(
       [
-        "⚠️ *Advanced: Import an existing wallet*",
+        "🔑 *Import your wallet*",
         "",
-        "Most users don't need this\\. Instead, use /deposit to get your Magpie wallet address and send tokens there\\.",
+        "Already holding approved tokens? Connect your wallet and borrow instantly — no transfers needed\\.",
         "",
-        "If you still want to import, send:",
-        "`/import <base58 private key>`",
+        "Paste your private key after the command:",
+        "`/import yourPrivateKeyHere`",
         "",
-        "Your message will be deleted immediately for security\\.",
+        "🔒 Your message is automatically deleted for security\\.",
       ].join("\n"),
       { parse_mode: "MarkdownV2" },
     );
@@ -32,7 +32,7 @@ export async function handleImport(ctx) {
     const decoded = bs58.default.decode(key);
     Keypair.fromSecretKey(decoded);
   } catch (_) {
-    return ctx.reply("Invalid private key. Please provide a valid base58 Solana private key.");
+    return ctx.reply("That doesn't look right. Make sure you're pasting your full private key from Phantom or Solflare.");
   }
 
   const user = await upsertUser(tgUser.id, tgUser.username);
