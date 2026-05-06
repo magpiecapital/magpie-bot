@@ -21,7 +21,7 @@ import { getPrefs } from "./prefs.js";
 import { maybeAutoRepay } from "./auto-repay.js";
 
 const SOL_SENTINEL = "SOL";
-const POLL_INTERVAL_MS = Number(process.env.DEPOSIT_POLL_MS) || 20_000;
+const POLL_INTERVAL_MS = Number(process.env.DEPOSIT_POLL_MS) || 60_000;
 
 function fmt(raw, decimals) {
   const n = Number(raw) / 10 ** decimals;
@@ -152,11 +152,9 @@ export function startDepositWatcher(bot) {
         getSupportedMintsMap(),
       ]);
       const users = walletsRes.rows;
-      // Process in small batches to avoid hammering the RPC.
-      const BATCH = 5;
-      for (let i = 0; i < users.length; i += BATCH) {
-        const slice = users.slice(i, i + BATCH);
-        await Promise.all(slice.map((u) => processWallet(bot, u, supportedMints)));
+      // Process sequentially to stay within free RPC rate limits.
+      for (const u of users) {
+        await processWallet(bot, u, supportedMints);
       }
     } catch (err) {
       console.error("[deposit-watcher] cycle error:", err.message);
