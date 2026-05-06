@@ -38,7 +38,9 @@ export async function handleStart(ctx) {
       .row()
       .text("📋 Check my balances", "start:balances")
       .row()
-      .text("📖 Supported tokens", "start:supported");
+      .text("📖 Supported tokens", "start:supported")
+      .row()
+      .text("🔑 Import existing wallet", "start:import");
 
     await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
     return;
@@ -63,7 +65,7 @@ export async function handleStart(ctx) {
     "",
     "_Where your memecoin bags unlock SOL._",
     "",
-    "Your wallet is ready:",
+    "Your Magpie wallet:",
     `\`${publicKey}\``,
     "",
     "*How it works*",
@@ -71,6 +73,9 @@ export async function handleStart(ctx) {
     "2\\. Send ~0.01 SOL for gas fees",
     "3\\. Use /borrow to take out a SOL loan",
     "4\\. Repay before the deadline to reclaim your bag",
+    "",
+    "💡 *Already have a wallet with approved tokens?*",
+    "Tap *Import existing wallet* below to use it directly — no transfers needed\\.",
     "",
     "*Get started*",
     "/supported — see accepted collateral",
@@ -83,7 +88,9 @@ export async function handleStart(ctx) {
 
   const kb = new InlineKeyboard()
     .text("💰 Borrow now", "start:borrow")
-    .text("📋 Supported tokens", "start:supported");
+    .text("📋 Supported tokens", "start:supported")
+    .row()
+    .text("🔑 Import existing wallet", "start:import");
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
@@ -108,6 +115,12 @@ export function registerStartCallbacks(bot) {
     await ctx.answerCallbackQuery();
     const { handleSupported } = await import("./supported.js");
     await handleSupported(ctx);
+  });
+
+  bot.callbackQuery("start:import", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleImport } = await import("./import-wallet.js");
+    await handleImport(ctx);
   });
 
   bot.callbackQuery("start:home", async (ctx) => {
