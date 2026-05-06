@@ -112,12 +112,15 @@ bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
+    // Deposit watcher disabled: free public RPC can't handle background polling.
+    // Re-enable when a dedicated RPC endpoint is available.
     startApiServer();
-    startDepositWatcher(bot);
+    // startDepositWatcher(bot);
     setTimeout(() => startLoanWatcher(bot), 5_000);
     setTimeout(() => startHealthWatcher(bot), 10_000);
     setTimeout(() => startRiskEngine(bot), 15_000);
-    setTimeout(() => startCreditOraclePublisher(), 20_000);
+    // Credit oracle publisher disabled: requires funded authority wallet.
+    // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
 });
 
