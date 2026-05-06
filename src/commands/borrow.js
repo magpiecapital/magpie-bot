@@ -107,16 +107,107 @@ export function registerBorrowCallbacks(bot) {
       return;
     }
 
-    pending.set(ctx.chat.id, { userId: user.id, selected });
+    pending.set(ctx.chat.id, { userId: user.id, selected, stage: "amount" });
 
     const kb = new InlineKeyboard()
       .text("25%", "borrow:pct:25").text("50%", "borrow:pct:50")
       .text("75%", "borrow:pct:75").text("100%", "borrow:pct:100")
+      .row()
+      .text("✏️ Custom amount", "borrow:custom")
       .row().text("✕ Cancel", "borrow:cancel");
 
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
-      `Selected: *${selected.symbol}*\nBalance: ${selected.humanAmount.toLocaleString()}\n\n*How much to use as collateral?*`,
+      `Selected: *${selected.symbol}*\nBalance: ${selected.humanAmount.toLocaleString()}\n\n*How much to use as collateral?*\nPick a preset or enter a custom amount.`,
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery("borrow:custom", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) {
+      await ctx.answerCallbackQuery("Session expired, run /borrow again");
+      return;
+    }
+    state.stage = "await_custom";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `Selected: *${state.selected.symbol}*`,
+        `Balance: ${state.selected.humanAmount.toLocaleString()}`,
+        "",
+        `Type the amount of ${state.selected.symbol} you want to use as collateral:`,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  // Middleware to catch custom amount input.
+  bot.on("message:text", async (ctx, next) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || state.stage !== "await_custom") return next();
+
+    const input = ctx.message.text.trim().replace(/,/g, "");
+    const amount = Number(input);
+
+    if (isNaN(amount) || amount <= 0) {
+      return ctx.reply("Please enter a valid number.");
+    }
+
+    if (amount > state.selected.humanAmount) {
+      return ctx.reply(
+        `That's more than your balance of ${state.selected.humanAmount.toLocaleString()} ${state.selected.symbol}. Try a smaller amount.`,
+      );
+    }
+
+    const rawBig = BigInt(Math.floor(amount * 10 ** state.selected.decimals));
+    state.collateralRaw = rawBig;
+    state.humanAmount = amount;
+    state.stage = "tier";
+    delete state.stage;
+    pending.set(ctx.chat.id, state);
+
+    // Fetch value and show tier selection.
+    let valueLamports;
+    try {
+      valueLamports = await collateralValueLamports(
+        state.selected.mint,
+        rawBig,
+        state.selected.decimals,
+      );
+    } catch (err) {
+      console.error("[borrow] price fetch error:", err.message);
+      pending.delete(ctx.chat.id);
+      return ctx.reply("⚠️ Couldn't fetch price right now. Run /borrow to try again.");
+    }
+
+    state.collateralValueLamports = valueLamports;
+    state.quotedAt = Date.now();
+    pending.set(ctx.chat.id, state);
+
+    const kb = new InlineKeyboard();
+    for (const t of LTV_TIERS) {
+      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
+      const fee = loanSol * (t.feeBps / 10_000);
+      const receive = loanSol - fee;
+      kb.text(
+        `${t.label} → ~${receive.toFixed(4)} SOL`,
+        `borrow:tier:${t.option}`,
+      ).row();
+    }
+    kb.text("✕ Cancel", "borrow:cancel");
+
+    await ctx.reply(
+      [
+        `*Collateral:* ${amount.toLocaleString()} ${state.selected.symbol}`,
+        `*Value:* ${fmtSol(valueLamports)} SOL`,
+        "",
+        "*Choose a loan tier:*",
+        "_(amount shown is what you receive after tier fee)_",
+        "",
+        "⏱ _This quote expires in 60 seconds._",
+      ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
   });
