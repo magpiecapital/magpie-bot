@@ -48,16 +48,23 @@ async function doImport(ctx, tgUser, key) {
 
   try {
     const { publicKey } = await importWallet(user.id, key);
+
+    const kb = new InlineKeyboard()
+      .text("💰 Borrow now", "start:borrow")
+      .text("📋 Check my balances", "start:balances")
+      .row()
+      .text("📖 Supported tokens", "start:supported")
+      .text("🏠 Home", "start:home");
+
     await ctx.reply(
       [
         "✅ *Wallet imported*",
         "",
         `Address: \`${publicKey}\``,
         "",
-        "This wallet will now be used for all Magpie operations.",
-        "Your tokens are ready to use as collateral — no transfers needed.",
+        "You're all set. Your tokens are ready to use as collateral — no transfers needed.",
       ].join("\n"),
-      { parse_mode: "Markdown" },
+      { parse_mode: "Markdown", reply_markup: kb },
     );
   } catch (err) {
     console.error("Import wallet error:", err);
