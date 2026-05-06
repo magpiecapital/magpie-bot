@@ -82,6 +82,7 @@ export async function handleStart(ctx) {
     "/simulate — preview a loan with live prices",
     "/borrow — take out a SOL loan",
     "/deposit — show your deposit address",
+    "/import — use your existing wallet",
     "/me — your wallet, tier, and referral code",
     "/help — full command list",
   ].join("\n");
