@@ -22,8 +22,7 @@ import { handleExtend, registerExtendCallbacks } from "./commands/extend.js";
 import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
-import { handleVault } from "./commands/vault.js";
-import { handleImport } from "./commands/import-wallet.js";
+import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleFallback, registerFallbackCallbacks } from "./commands/fallback.js";
@@ -74,7 +73,6 @@ bot.command("extend", handleExtend);
 bot.command("credit", handleCredit);
 bot.command("risk", handleRisk);
 bot.command("lend", handleLend);
-bot.command("vault", handleVault);
 bot.command("import", handleImport);
 bot.command("wallet", handleWallet);
 bot.command("home", handleHome);
@@ -98,6 +96,7 @@ registerTopupCallbacks(bot);
 registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
+registerImportCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
 
@@ -112,13 +111,13 @@ console.log("🏦 Magpie bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
-    // Background watchers — start after bot is online so they can DM users.
-    startDepositWatcher(bot);
-    startLoanWatcher(bot);
-    startHealthWatcher(bot);
-    startRiskEngine(bot);
+    // Background watchers — stagger startup to avoid RPC rate-limit flood.
     startApiServer();
-    startCreditOraclePublisher();
+    startDepositWatcher(bot);
+    setTimeout(() => startLoanWatcher(bot), 5_000);
+    setTimeout(() => startHealthWatcher(bot), 10_000);
+    setTimeout(() => startRiskEngine(bot), 15_000);
+    setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
 });
 
