@@ -174,7 +174,7 @@ export async function handleSubmit(ctx) {
     const q = queued[0];
     if (q.status === "pending") {
       return ctx.reply(
-        `*${q.symbol}* is already under review. You'll be notified when it's decided.`,
+        `*${q.symbol}* is already under review — typically approved within 1 hour. You'll be notified.`,
         { parse_mode: "Markdown" },
       );
     }
@@ -344,7 +344,7 @@ export async function handleSubmit(ctx) {
       `Market Cap: $${Math.floor(market.marketCap).toLocaleString()}`,
       `Age: ${ageHours}h`,
       "",
-      "This token passed basic safety checks but needs a quick manual review before going live. You'll be notified when it's approved.",
+      "This token passed safety checks and is in the review queue. Tokens are typically approved within 1 hour — you'll be notified.",
     ];
 
     await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
