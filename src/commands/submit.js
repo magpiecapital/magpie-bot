@@ -98,16 +98,16 @@ async function resolveSymbol(input) {
 // ── Thresholds (mirrors token-screener.js) ──────────────────────────────────
 
 const AUTO_APPROVE = {
-  minLiquidityUsd: 200_000,
-  minAgeHours: 48,
-  minVolume24h: 100_000,
-  minMarketCap: 500_000,
+  minLiquidityUsd: 75_000,
+  minAgeHours: 24,
+  minVolume24h: 50_000,
+  minMarketCap: 250_000,
 };
 
 const MIN_CONSIDER = {
-  minLiquidityUsd: 50_000,
-  minAgeHours: 24,
-  minVolume24h: 25_000,
+  minLiquidityUsd: 30_000,
+  minAgeHours: 12,
+  minVolume24h: 10_000,
 };
 
 // ── Command handler ─────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 
-const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 900_000; // 15 min
+const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 600_000; // 10 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
 // Known xStock mint prefixes and issuers (tokens.xyz ecosystem)
@@ -63,80 +63,126 @@ function detectCategory(symbol, name) {
 
 // Auto-approve: must pass ALL of these
 const AUTO_APPROVE = {
-  minLiquidityUsd: 200_000,
-  minHolders: 500,
-  minAgeHours: 48,
+  minLiquidityUsd: 75_000,
+  minHolders: 300,
+  minAgeHours: 24,
   maxTop10HolderPct: 40,
   lpBurnedRequired: true,
   noMintAuthority: true,
   noFreezeAuthority: true,
-  minVolume24h: 100_000,
-  minMarketCap: 500_000,
+  minVolume24h: 50_000,
+  minMarketCap: 250_000,
 };
 
 // Minimum to even consider (below this = auto-reject)
 const MIN_CONSIDER = {
-  minLiquidityUsd: 50_000,
-  minHolders: 200,
-  minAgeHours: 24,
-  minVolume24h: 25_000,
+  minLiquidityUsd: 30_000,
+  minHolders: 100,
+  minAgeHours: 12,
+  minVolume24h: 10_000,
 };
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
 
+// Search terms for broad memecoin discovery (rotated across cycles)
+const MEMECOIN_SEARCH_TERMS = [
+  "pump", "bonk", "pepe", "doge", "cat", "bull", "moon", "meme",
+  "inu", "ai", "sol", "chad", "wojak", "frog", "based", "king",
+  "trump", "elon", "giga", "turbo", "bob", "baby", "ape", "coin",
+  "pop", "rich", "cash", "gold", "diamond", "rocket", "fire",
+  "whale", "shark", "bear", "crab", "monkey", "rat", "duck",
+];
+
+// Rotate through search terms — 8 per cycle to avoid rate limits
+let searchTermIndex = 0;
+function getNextSearchBatch() {
+  const batch = [];
+  for (let i = 0; i < 8; i++) {
+    batch.push(MEMECOIN_SEARCH_TERMS[searchTermIndex % MEMECOIN_SEARCH_TERMS.length]);
+    searchTermIndex++;
+  }
+  return batch;
+}
+
 /**
- * Fetch trending/high-volume Solana tokens from DexScreener.
+ * Fetch trending/high-volume Solana tokens from multiple DexScreener sources.
+ *
+ * Sources:
+ *   1. Token boosts (top) — paid promotions / trending
+ *   2. Token boosts (latest) — recently boosted tokens
+ *   3. Latest profiles — new tokens that filled out their profile
+ *   4. Keyword search — rotates through memecoin-related terms
+ *   5. xStock issuer pairs — tokenized stocks
+ *   6. xStock ticker search — "xTSLA", "xNVDA" etc.
  */
 async function discoverTokens() {
   const tokens = new Map();
 
-  // Source 1: DexScreener token boosted (trending)
+  function addSolanaToken(addr, source) {
+    if (addr) tokens.set(addr, { mint: addr, source });
+  }
+
+  // Helper: extract Solana tokens from a boost/profile array
+  function extractFromBoostArray(data, source) {
+    if (!Array.isArray(data)) return;
+    for (const t of data) {
+      if (t.chainId === "solana" && t.tokenAddress) addSolanaToken(t.tokenAddress, source);
+    }
+  }
+
+  // Helper: extract Solana pairs from a search result with min liquidity
+  function extractFromSearchPairs(data, source, minLiq = 10_000) {
+    if (!data?.pairs) return;
+    for (const p of data.pairs) {
+      if (p.chainId !== "solana") continue;
+      const addr = p.baseToken?.address;
+      if (addr && (p.liquidity?.usd ?? 0) >= minLiq) addSolanaToken(addr, source);
+    }
+  }
+
+  // Source 1: DexScreener token boosts (top trending)
   try {
     const res = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        for (const t of data) {
-          if (t.chainId === "solana" && t.tokenAddress) {
-            tokens.set(t.tokenAddress, { mint: t.tokenAddress, source: "trending" });
-          }
-        }
-      }
-    }
+    if (res.ok) extractFromBoostArray(await res.json(), "trending");
   } catch (err) {
     console.error("[screener] trending fetch error:", err.message);
   }
 
-  // Source 2: DexScreener latest profiles (new tokens with filled profiles)
+  // Source 2: DexScreener token boosts (latest — catches tokens trending up)
+  try {
+    const res = await fetch("https://api.dexscreener.com/token-boosts/latest/v1");
+    if (res.ok) extractFromBoostArray(await res.json(), "boost_latest");
+  } catch (err) {
+    console.error("[screener] boost latest fetch error:", err.message);
+  }
+
+  // Source 3: DexScreener latest profiles (new tokens with filled profiles)
   try {
     const res = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        for (const t of data) {
-          if (t.chainId === "solana" && t.tokenAddress) {
-            tokens.set(t.tokenAddress, { mint: t.tokenAddress, source: "new_profile" });
-          }
-        }
-      }
-    }
+    if (res.ok) extractFromBoostArray(await res.json(), "new_profile");
   } catch (err) {
     console.error("[screener] profiles fetch error:", err.message);
   }
 
-  // Source 3: tokens.xyz xStocks — discover new tokenized stocks
+  // Source 4: Keyword search — rotates through memecoin-related terms each cycle
+  const searchBatch = getNextSearchBatch();
+  for (const term of searchBatch) {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(term)}`);
+      if (res.ok) extractFromSearchPairs(await res.json(), `search:${term}`, 20_000);
+    } catch { /* ignore */ }
+  }
+
+  // Source 5: tokens.xyz xStocks — discover new tokenized stocks
   try {
     const res = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + KNOWN_STOCK_ISSUERS.join(","));
     if (res.ok) {
       const pairs = await res.json();
       if (Array.isArray(pairs)) {
-        // Collect all tokens from the issuer's pairs
         for (const p of pairs) {
           const addr = p.baseToken?.address;
           const symbol = p.baseToken?.symbol || "";
-          if (addr && symbol.startsWith("x") && symbol.length >= 2) {
-            tokens.set(addr, { mint: addr, source: "xstock" });
-          }
+          if (addr && symbol.startsWith("x") && symbol.length >= 2) addSolanaToken(addr, "xstock");
         }
       }
     }
@@ -144,10 +190,10 @@ async function discoverTokens() {
     console.error("[screener] xstock fetch error:", err.message);
   }
 
-  // Source 4: Search DexScreener for new "x" prefixed stock tokens on Solana
-  for (const query of STOCK_SEARCH_QUERIES) {
+  // Source 6: Search DexScreener for "x" prefixed stock tokens
+  for (const q of STOCK_SEARCH_QUERIES) {
     try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${query}`);
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${q}`);
       if (res.ok) {
         const data = await res.json();
         if (data?.pairs) {
@@ -156,7 +202,7 @@ async function discoverTokens() {
             const addr = p.baseToken?.address;
             const symbol = p.baseToken?.symbol || "";
             if (addr && symbol.startsWith("x") && (p.liquidity?.usd ?? 0) > 10_000) {
-              tokens.set(addr, { mint: addr, source: "stock_search" });
+              addSolanaToken(addr, "stock_search");
             }
           }
         }
