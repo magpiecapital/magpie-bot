@@ -1,0 +1,680 @@
+/**
+ * Token Screener — automated discovery and vetting of new Solana tokens.
+ *
+ * Pipeline:
+ *   1. Discover: poll DexScreener for trending/high-volume Solana tokens
+ *   2. Filter: skip tokens we've already seen or that are already supported
+ *   3. Safety checks: mint authority, freeze authority, LP, holders, age, liquidity
+ *   4. Auto-approve: tokens passing ALL strict criteria get added to supported_mints
+ *   5. Review queue: borderline tokens get queued for admin review via Telegram
+ *   6. Notify: admin gets a summary of new approvals and pending reviews
+ *
+ * Auto-approved tokens start with conservative loan terms (lowest LTV tier).
+ */
+import { query } from "../db/pool.js";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { connection } from "../solana/connection.js";
+
+const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 900_000; // 15 min
+const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
+
+// Known xStock mint prefixes and issuers (tokens.xyz ecosystem)
+const KNOWN_STOCK_ISSUERS = [
+  "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB", // xTSLA — used as a seed to find issuer pairs
+];
+
+// Real stock tickers to search for tokenized versions
+const STOCK_TICKERS = [
+  "TSLA", "NVDA", "AAPL", "GOOGL", "AMZN", "MSFT", "META", "MSTR", "COIN",
+  "AMD", "PLTR", "NFLX", "INTC", "UBER", "SHOP", "SQ", "PYPL", "DIS",
+  "BA", "JPM", "GS", "V", "MA", "BRK", "WMT", "PFE", "JNJ", "XOM",
+  "SPY", "QQQ", "SOXX", "ARKK",
+];
+
+const STOCK_SEARCH_QUERIES = STOCK_TICKERS.map((t) => `x${t}`);
+
+// Detect if a token is a tokenized stock based on symbol/name patterns
+function detectCategory(symbol, name) {
+  const sym = symbol.toUpperCase();
+  const nm = (name || "").toLowerCase();
+
+  // xStock pattern: "x" prefix + known stock ticker
+  if (sym.startsWith("X") && STOCK_TICKERS.includes(sym.slice(1))) {
+    return "stock";
+  }
+
+  // Name-based detection
+  if (nm.includes("tokenized") || nm.includes("stock") || nm.includes("equity")) {
+    return "stock";
+  }
+
+  // Known company names
+  const companies = ["tesla", "nvidia", "apple", "alphabet", "amazon", "microsoft",
+    "meta platforms", "microstrategy", "coinbase", "netflix", "intel", "uber",
+    "shopify", "block inc", "paypal", "disney", "boeing", "jpmorgan", "goldman"];
+  if (companies.some((c) => nm.includes(c))) {
+    return "stock";
+  }
+
+  return "memecoin";
+}
+
+// ─── Safety thresholds ──────────────────────────────────────────────────────
+
+// Auto-approve: must pass ALL of these
+const AUTO_APPROVE = {
+  minLiquidityUsd: 200_000,
+  minHolders: 500,
+  minAgeHours: 48,
+  maxTop10HolderPct: 40,
+  lpBurnedRequired: true,
+  noMintAuthority: true,
+  noFreezeAuthority: true,
+  minVolume24h: 100_000,
+  minMarketCap: 500_000,
+};
+
+// Minimum to even consider (below this = auto-reject)
+const MIN_CONSIDER = {
+  minLiquidityUsd: 50_000,
+  minHolders: 200,
+  minAgeHours: 24,
+  minVolume24h: 25_000,
+};
+
+// ─── Discovery ──────────────────────────────────────────────────────────────
+
+/**
+ * Fetch trending/high-volume Solana tokens from DexScreener.
+ */
+async function discoverTokens() {
+  const tokens = new Map();
+
+  // Source 1: DexScreener token boosted (trending)
+  try {
+    const res = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        for (const t of data) {
+          if (t.chainId === "solana" && t.tokenAddress) {
+            tokens.set(t.tokenAddress, { mint: t.tokenAddress, source: "trending" });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[screener] trending fetch error:", err.message);
+  }
+
+  // Source 2: DexScreener latest profiles (new tokens with filled profiles)
+  try {
+    const res = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        for (const t of data) {
+          if (t.chainId === "solana" && t.tokenAddress) {
+            tokens.set(t.tokenAddress, { mint: t.tokenAddress, source: "new_profile" });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[screener] profiles fetch error:", err.message);
+  }
+
+  // Source 3: tokens.xyz xStocks — discover new tokenized stocks
+  try {
+    const res = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + KNOWN_STOCK_ISSUERS.join(","));
+    if (res.ok) {
+      const pairs = await res.json();
+      if (Array.isArray(pairs)) {
+        // Collect all tokens from the issuer's pairs
+        for (const p of pairs) {
+          const addr = p.baseToken?.address;
+          const symbol = p.baseToken?.symbol || "";
+          if (addr && symbol.startsWith("x") && symbol.length >= 2) {
+            tokens.set(addr, { mint: addr, source: "xstock" });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[screener] xstock fetch error:", err.message);
+  }
+
+  // Source 4: Search DexScreener for new "x" prefixed stock tokens on Solana
+  for (const query of STOCK_SEARCH_QUERIES) {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${query}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.pairs) {
+          for (const p of data.pairs) {
+            if (p.chainId !== "solana") continue;
+            const addr = p.baseToken?.address;
+            const symbol = p.baseToken?.symbol || "";
+            if (addr && symbol.startsWith("x") && (p.liquidity?.usd ?? 0) > 10_000) {
+              tokens.set(addr, { mint: addr, source: "stock_search" });
+            }
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  return Array.from(tokens.values());
+}
+
+// ─── On-chain safety checks ─────────────────────────────────────────────────
+
+/**
+ * Check mint/freeze authority and basic token info on-chain.
+ */
+async function getOnChainInfo(mintStr) {
+  try {
+    const mintPk = new PublicKey(mintStr);
+    const info = await connection.getAccountInfo(mintPk);
+    if (!info) return null;
+
+    // SPL Token mint layout: first 36 bytes = mintAuthorityOption(4) + mintAuthority(32)
+    // bytes 36-40 = supply (u64)
+    // bytes 44-45 = decimals (u8)
+    // bytes 46-50 = isInitialized(1) + freezeAuthorityOption(4) + freezeAuthority(32)
+    const data = info.data;
+    if (data.length < 82) return null;
+
+    const mintAuthorityOption = data.readUInt32LE(0);
+    const decimals = data.readUInt8(44);
+    const freezeAuthorityOption = data.readUInt32LE(46);
+
+    return {
+      decimals,
+      hasMintAuthority: mintAuthorityOption === 1,
+      hasFreezeAuthority: freezeAuthorityOption === 1,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Market data ────────────────────────────────────────────────────────────
+
+/**
+ * Fetch detailed market data for a batch of mints from DexScreener.
+ */
+async function getMarketData(mints) {
+  const result = new Map();
+  const BATCH = 30;
+
+  for (let i = 0; i < mints.length; i += BATCH) {
+    const batch = mints.slice(i, i + BATCH);
+    try {
+      const res = await fetch(
+        `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
+      );
+      if (!res.ok) continue;
+      const pairs = await res.json();
+      if (!Array.isArray(pairs)) continue;
+
+      for (const p of pairs) {
+        const addr = p.baseToken?.address;
+        if (!addr) continue;
+
+        const liq = p.liquidity?.usd ?? 0;
+        const existing = result.get(addr);
+        if (existing && (existing.liquidity ?? 0) >= liq) continue;
+
+        result.set(addr, {
+          symbol: p.baseToken?.symbol || "???",
+          name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
+          price: p.priceUsd ? parseFloat(p.priceUsd) : null,
+          liquidity: liq,
+          volume24h: p.volume?.h24 ?? 0,
+          marketCap: p.marketCap ?? p.fdv ?? 0,
+          pairCreatedAt: p.pairCreatedAt ?? null,
+          imageUrl: p.info?.imageUrl ?? null,
+        });
+      }
+    } catch (err) {
+      console.error("[screener] market data batch error:", err.message);
+    }
+  }
+  return result;
+}
+
+/**
+ * Estimate holder count from DexScreener or Helius (fallback: use 0).
+ */
+async function getHolderCount(mint) {
+  // Try Helius DAS API if available
+  const heliusKey = process.env.HELIUS_API_KEY;
+  if (heliusKey) {
+    try {
+      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${heliusKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mintAccounts: [mint] }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data[0]?.onChainAccountInfo?.holderCount) {
+          return data[0].onChainAccountInfo.holderCount;
+        }
+      }
+    } catch { /* fallback */ }
+  }
+
+  // Fallback: use Birdeye
+  try {
+    const res = await fetch(
+      `https://public-api.birdeye.so/defi/v3/token/holder?address=${mint}`,
+      { headers: { "X-API-KEY": process.env.BIRDEYE_API_KEY || "" } },
+    );
+    if (res.ok) {
+      const data = await res.json();
+      return data?.data?.total ?? 0;
+    }
+  } catch { /* fallback */ }
+
+  return 0;
+}
+
+// ─── Vetting ────────────────────────────────────────────────────────────────
+
+/**
+ * Run safety checks on a token and return a verdict.
+ * Stocks and memecoins have different criteria.
+ */
+function vetToken(onChain, market, holderCount, category) {
+  const fails = [];
+  let safetyScore = 100;
+  const isStock = category === "stock";
+
+  const ageHours = market.pairCreatedAt
+    ? Math.floor((Date.now() - market.pairCreatedAt) / 3_600_000)
+    : 0;
+
+  // ── Authority checks ──
+  // Stocks: mint/freeze authority is EXPECTED (issuer manages supply to track real price)
+  // Memecoins: mint/freeze authority is a red flag
+  if (!isStock) {
+    if (onChain.hasMintAuthority) {
+      fails.push("Mint authority enabled — supply can be inflated");
+      safetyScore -= 30;
+    }
+    if (onChain.hasFreezeAuthority) {
+      fails.push("Freeze authority enabled — tokens can be frozen");
+      safetyScore -= 30;
+    }
+  }
+
+  // Liquidity
+  if (market.liquidity < MIN_CONSIDER.minLiquidityUsd) {
+    fails.push(`Liquidity $${Math.floor(market.liquidity)} < $${MIN_CONSIDER.minLiquidityUsd} minimum`);
+    safetyScore -= 20;
+  } else if (market.liquidity < AUTO_APPROVE.minLiquidityUsd) {
+    safetyScore -= 10;
+  }
+
+  // Age
+  if (ageHours < MIN_CONSIDER.minAgeHours) {
+    fails.push(`Token age ${ageHours}h < ${MIN_CONSIDER.minAgeHours}h minimum`);
+    safetyScore -= 15;
+  } else if (ageHours < AUTO_APPROVE.minAgeHours) {
+    safetyScore -= 5;
+  }
+
+  // Holders (stocks can have fewer holders and still be legitimate)
+  const minHolders = isStock ? 50 : MIN_CONSIDER.minHolders;
+  const autoHolders = isStock ? 100 : AUTO_APPROVE.minHolders;
+  if (holderCount < minHolders) {
+    fails.push(`${holderCount} holders < ${minHolders} minimum`);
+    safetyScore -= 15;
+  } else if (holderCount < autoHolders) {
+    safetyScore -= 5;
+  }
+
+  // Volume
+  if (market.volume24h < MIN_CONSIDER.minVolume24h) {
+    fails.push(`24h volume $${Math.floor(market.volume24h)} < $${MIN_CONSIDER.minVolume24h} minimum`);
+    safetyScore -= 10;
+  }
+
+  // ── Verdict ──
+  let canAutoApprove, meetsMinimum;
+
+  if (isStock) {
+    // Stocks: don't check mint/freeze authority, lower holder threshold
+    canAutoApprove =
+      market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
+      holderCount >= autoHolders &&
+      ageHours >= AUTO_APPROVE.minAgeHours &&
+      market.volume24h >= AUTO_APPROVE.minVolume24h;
+
+    meetsMinimum =
+      market.liquidity >= MIN_CONSIDER.minLiquidityUsd &&
+      ageHours >= MIN_CONSIDER.minAgeHours &&
+      holderCount >= minHolders;
+  } else {
+    // Memecoins: full safety checks
+    canAutoApprove =
+      !onChain.hasMintAuthority &&
+      !onChain.hasFreezeAuthority &&
+      market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
+      holderCount >= AUTO_APPROVE.minHolders &&
+      ageHours >= AUTO_APPROVE.minAgeHours &&
+      market.volume24h >= AUTO_APPROVE.minVolume24h &&
+      market.marketCap >= AUTO_APPROVE.minMarketCap;
+
+    meetsMinimum =
+      !onChain.hasMintAuthority &&
+      !onChain.hasFreezeAuthority &&
+      market.liquidity >= MIN_CONSIDER.minLiquidityUsd &&
+      ageHours >= MIN_CONSIDER.minAgeHours &&
+      holderCount >= MIN_CONSIDER.minHolders &&
+      market.volume24h >= MIN_CONSIDER.minVolume24h;
+  }
+
+  return {
+    verdict: canAutoApprove ? "auto_approve" : meetsMinimum ? "review" : "reject",
+    safetyScore: Math.max(0, safetyScore),
+    fails,
+    ageHours,
+  };
+}
+
+// ─── Actions ────────────────────────────────────────────────────────────────
+
+async function autoApproveToken(mint, onChain, market, holderCount, ageHours, category) {
+  await query(
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url, liquidity_usd,
+        holder_count, market_cap_usd, has_mint_authority, has_freeze_authority,
+        lp_burned, token_age_hours, auto_approved, screened_at, source, enabled)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,NOW(),'screener',TRUE)
+     ON CONFLICT (mint) DO NOTHING`,
+    [
+      mint,
+      market.symbol.toUpperCase(),
+      market.name,
+      onChain.decimals,
+      category,
+      market.imageUrl,
+      market.liquidity,
+      holderCount,
+      market.marketCap,
+      onChain.hasMintAuthority,
+      onChain.hasFreezeAuthority,
+      false, // lp_burned — can't reliably check, default false
+      ageHours,
+    ],
+  );
+}
+
+async function queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category) {
+  await query(
+    `INSERT INTO token_screen_queue
+       (mint, symbol, name, decimals, category, image_url, liquidity_usd,
+        volume_24h_usd, market_cap_usd, holder_count, has_mint_authority,
+        has_freeze_authority, token_age_hours, safety_score, fail_reasons, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending')
+     ON CONFLICT (mint) DO UPDATE SET
+       liquidity_usd = EXCLUDED.liquidity_usd,
+       volume_24h_usd = EXCLUDED.volume_24h_usd,
+       market_cap_usd = EXCLUDED.market_cap_usd,
+       holder_count = EXCLUDED.holder_count,
+       safety_score = EXCLUDED.safety_score,
+       fail_reasons = EXCLUDED.fail_reasons`,
+    [
+      mint,
+      market.symbol.toUpperCase(),
+      market.name,
+      onChain.decimals,
+      category,
+      market.imageUrl,
+      market.liquidity,
+      market.volume24h,
+      market.marketCap,
+      holderCount,
+      onChain.hasMintAuthority,
+      onChain.hasFreezeAuthority,
+      ageHours,
+      safetyScore,
+      fails,
+    ],
+  );
+}
+
+async function markSeen(mint) {
+  await query(
+    `INSERT INTO token_screen_seen (mint) VALUES ($1) ON CONFLICT DO NOTHING`,
+    [mint],
+  );
+}
+
+// ─── Main loop ──────────────────────────────────────────────────────────────
+
+async function tick(bot) {
+  const discovered = await discoverTokens();
+  if (discovered.length === 0) return;
+
+  // Filter out already-seen and already-supported tokens
+  const mints = discovered.map((t) => t.mint);
+  const { rows: seenRows } = await query(
+    `SELECT mint FROM token_screen_seen WHERE mint = ANY($1)`,
+    [mints],
+  );
+  const { rows: supportedRows } = await query(
+    `SELECT mint FROM supported_mints WHERE mint = ANY($1)`,
+    [mints],
+  );
+  const seenSet = new Set([...seenRows.map((r) => r.mint), ...supportedRows.map((r) => r.mint)]);
+  const newMints = discovered.filter((t) => !seenSet.has(t.mint));
+
+  if (newMints.length === 0) return;
+
+  console.log(`[screener] Screening ${newMints.length} new tokens...`);
+
+  // Fetch market data in bulk
+  const marketData = await getMarketData(newMints.map((t) => t.mint));
+
+  const approved = [];
+  const queued = [];
+
+  for (const { mint } of newMints) {
+    await markSeen(mint);
+
+    const market = marketData.get(mint);
+    if (!market) continue;
+
+    // Quick reject: no meaningful liquidity
+    if (market.liquidity < 10_000) continue;
+
+    const onChain = await getOnChainInfo(mint);
+    if (!onChain) continue;
+
+    const holderCount = await getHolderCount(mint);
+    const category = detectCategory(market.symbol, market.name);
+
+    const { verdict, safetyScore, fails, ageHours } = vetToken(onChain, market, holderCount, category);
+
+    if (verdict === "auto_approve") {
+      await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
+      approved.push({ symbol: market.symbol, mint, liquidity: market.liquidity, marketCap: market.marketCap, category });
+    } else if (verdict === "review") {
+      await queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category);
+      queued.push({ symbol: market.symbol, mint, safetyScore, fails, category });
+    }
+    // verdict === "reject" → silently skip
+  }
+
+  // Notify admin
+  if (bot && ADMIN_TG_ID && (approved.length > 0 || queued.length > 0)) {
+    const lines = ["*Token Screener Report*", ""];
+
+    if (approved.length > 0) {
+      lines.push(`*Auto-approved (${approved.length}):*`);
+      for (const t of approved) {
+        const tag = t.category === "stock" ? " [STOCK]" : "";
+        lines.push(`  + ${t.symbol}${tag} — $${Math.floor(t.liquidity).toLocaleString()} liq, $${Math.floor(t.marketCap).toLocaleString()} mcap`);
+      }
+      lines.push("");
+    }
+
+    if (queued.length > 0) {
+      lines.push(`*Needs review (${queued.length}):*`);
+      for (const t of queued) {
+        const tag = t.category === "stock" ? " [STOCK]" : "";
+        lines.push(`  ? ${t.symbol}${tag} (score: ${t.safetyScore}) — ${t.fails[0] || "borderline"}`);
+      }
+      lines.push("");
+      lines.push("Use /reviewtokens to approve or reject.");
+    }
+
+    try {
+      await bot.api.sendMessage(ADMIN_TG_ID, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("[screener] Failed to notify admin:", err.message);
+    }
+  }
+
+  if (approved.length > 0) {
+    console.log(`[screener] Auto-approved ${approved.length} tokens: ${approved.map((t) => t.symbol).join(", ")}`);
+  }
+  if (queued.length > 0) {
+    console.log(`[screener] Queued ${queued.length} tokens for review`);
+  }
+}
+
+// ─── Admin review command ───────────────────────────────────────────────────
+
+export async function handleReviewTokens(ctx) {
+  const { rows } = await query(
+    `SELECT * FROM token_screen_queue WHERE status = 'pending' ORDER BY safety_score DESC LIMIT 10`,
+  );
+
+  if (rows.length === 0) {
+    return ctx.reply("No tokens pending review.");
+  }
+
+  const { InlineKeyboard } = await import("grammy");
+
+  for (const t of rows) {
+    const lines = [
+      `*${t.symbol}* — ${t.name || "Unknown"}`,
+      `Liquidity: $${Number(t.liquidity_usd).toLocaleString()}`,
+      `Volume 24h: $${Number(t.volume_24h_usd).toLocaleString()}`,
+      `Market Cap: $${Number(t.market_cap_usd).toLocaleString()}`,
+      `Holders: ${t.holder_count}`,
+      `Age: ${t.token_age_hours}h`,
+      `Safety: ${t.safety_score}/100`,
+      `Mint auth: ${t.has_mint_authority ? "YES" : "no"}`,
+      `Freeze auth: ${t.has_freeze_authority ? "YES" : "no"}`,
+    ];
+    if (t.fail_reasons?.length > 0) {
+      lines.push("", "*Issues:*");
+      for (const r of t.fail_reasons) lines.push(`  - ${r}`);
+    }
+    lines.push("", `\`${t.mint}\``);
+
+    const kb = new InlineKeyboard()
+      .text("Approve", `screen:approve:${t.mint}`)
+      .text("Reject", `screen:reject:${t.mint}`);
+
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+  }
+}
+
+export function registerScreenerCallbacks(bot) {
+  bot.callbackQuery(/^screen:approve:(.+)$/, async (ctx) => {
+    const mint = ctx.match[1];
+    const { rows: [t] } = await query(
+      `SELECT * FROM token_screen_queue WHERE mint = $1`, [mint],
+    );
+    if (!t) {
+      return ctx.answerCallbackQuery("Token not found in queue");
+    }
+
+    // Add to supported_mints
+    await query(
+      `INSERT INTO supported_mints
+         (mint, symbol, name, decimals, category, image_url, liquidity_usd,
+          holder_count, market_cap_usd, has_mint_authority, has_freeze_authority,
+          token_age_hours, auto_approved, screened_at, source, enabled)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,NOW(),'review',TRUE)
+       ON CONFLICT (mint) DO UPDATE SET enabled = TRUE`,
+      [
+        t.mint, t.symbol, t.name, t.decimals, t.category, t.image_url,
+        t.liquidity_usd, t.holder_count, t.market_cap_usd,
+        t.has_mint_authority, t.has_freeze_authority, t.token_age_hours,
+      ],
+    );
+
+    await query(
+      `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,
+      [mint],
+    );
+
+    await ctx.answerCallbackQuery(`${t.symbol} approved`);
+    await ctx.editMessageText(`${t.symbol} approved and live for lending.`);
+
+    // Notify the user who submitted this token
+    if (t.submitted_by) {
+      try {
+        await ctx.api.sendMessage(
+          t.submitted_by,
+          `Your submitted token *${t.symbol}* has been approved! You can now use it as collateral.\n\nUse /borrow to get started.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* user may have blocked bot */ }
+    }
+  });
+
+  bot.callbackQuery(/^screen:reject:(.+)$/, async (ctx) => {
+    const mint = ctx.match[1];
+    const { rows: [t] } = await query(
+      `SELECT symbol, submitted_by FROM token_screen_queue WHERE mint = $1`, [mint],
+    );
+    await query(
+      `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
+      [mint],
+    );
+    await ctx.answerCallbackQuery("Rejected");
+    await ctx.editMessageText(`${t?.symbol || "Token"} rejected.`);
+
+    // Notify the submitter
+    if (t?.submitted_by) {
+      try {
+        await ctx.api.sendMessage(
+          t.submitted_by,
+          `Your submitted token *${t.symbol}* was not approved. It did not meet our collateral safety requirements at this time.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* user may have blocked bot */ }
+    }
+  });
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+export function startTokenScreener(bot) {
+  console.log(`🔍 Token screener running (every ${POLL_INTERVAL_MS / 1000}s)`);
+
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await tick(bot);
+    } catch (err) {
+      console.error("[screener] cycle error:", err.message);
+    } finally {
+      running = false;
+    }
+  };
+
+  run();
+  return setInterval(run, POLL_INTERVAL_MS);
+}
