@@ -43,8 +43,8 @@ const WATCHLIST_THRESHOLDS = {
   maxMarketCap: 50_000,
 };
 
-// Strikes before watchlist → delist
-const STRIKES_TO_DELIST = 2;
+// Strikes before watchlist → delist (6 strikes × 15 min = 90 min of degraded data)
+const STRIKES_TO_DELIST = 6;
 
 // ── Market data ─────────────────────────────────────────────────────────────
 
@@ -225,10 +225,14 @@ async function tick(bot) {
     }
 
     // ── Watchlist checks ──
-    const degraded =
+    // Skip watchlist for tokens with >$1M mcap — low liquidity reading is likely
+    // a DexScreener data issue (batch API sometimes returns only one pair)
+    const highMcap = market.marketCap > 1_000_000;
+    const degraded = !highMcap && (
       market.liquidity < WATCHLIST_THRESHOLDS.maxLiquidityUsd ||
       market.volume24h < WATCHLIST_THRESHOLDS.maxVolume24h ||
-      market.marketCap < WATCHLIST_THRESHOLDS.maxMarketCap;
+      market.marketCap < WATCHLIST_THRESHOLDS.maxMarketCap
+    );
 
     if (degraded) {
       const newStrikes = strikes + 1;
