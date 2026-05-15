@@ -18,6 +18,7 @@ export async function handleHelp(ctx) {
     "/supported — accepted collateral with live prices",
     "/simulate <symbol> <amount> [tier] — preview a loan",
     "/borrow — take out a SOL loan",
+    "/reborrow — quick re-borrow (same token + tier as last loan)",
     "/positions — active loans + live health",
     "/repay — repay and reclaim collateral",
     "/partialrepay — pay down part of a loan",
@@ -40,13 +41,8 @@ export async function handleHelp(ctx) {
     "*Marketplace*",
     "/lend — lending marketplace (create pools, deposit, browse)",
     "",
-    "*Agent Vault*",
-    "/vault — view your AI agent vault status",
-    "/vault create — create a programmable agent vault",
-    "/vault fund <SOL> — deposit SOL into vault",
-    "/vault policy <per-tx> <daily> — update spending limits",
-    "/vault revoke — revoke agent access",
-    "/vault withdraw <SOL> — withdraw from vault",
+    "*Tokens*",
+    "/submit <mint|symbol> — submit a token for collateral approval",
     "",
     "*Stats*",
     "/stats — protocol-wide stats",
@@ -68,6 +64,7 @@ export async function handleHelp(ctx) {
       "/enablemint <mint> <symbol> <decimals> [name]",
       "/disablemint <symbol|mint>",
       "/broadcast <message> — DM everyone",
+      "/reviewtokens — review auto-screened tokens",
     );
   }
 

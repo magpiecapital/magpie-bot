@@ -12,7 +12,6 @@
 import http from "node:http";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
-import { handleVaultApi } from "./vault-api.js";
 
 const PORT = parseInt(process.env.PORT || process.env.API_PORT || "3001", 10);
 
@@ -181,6 +180,29 @@ async function handleFlaggedTokens() {
   return { status: 200, body: { flagged: tokens } };
 }
 
+async function handleTokens() {
+  const { rows } = await query(
+    `SELECT mint, symbol, name, decimals, category, image_url, enabled, created_at
+     FROM supported_mints
+     WHERE enabled = TRUE
+     ORDER BY created_at ASC`,
+  );
+  return {
+    status: 200,
+    body: {
+      count: rows.length,
+      tokens: rows.map((t) => ({
+        mint: t.mint,
+        symbol: t.symbol,
+        name: t.name,
+        decimals: t.decimals,
+        category: t.category || "memecoin",
+        image: t.image_url || null,
+      })),
+    },
+  };
+}
+
 async function handleMarketplaceStats() {
   const { getMarketplaceStats } = await import("../services/p2p-marketplace.js");
   const stats = await getMarketplaceStats();
@@ -205,7 +227,7 @@ async function handleLeaderboard() {
 
 // ─── Router ─────────────────────────────────────────────────────────────────
 
-const PUBLIC_ROUTES = new Set(["/api/v1/health"]);
+const PUBLIC_ROUTES = new Set(["/api/v1/health", "/api/v1/tokens"]);
 
 async function router(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -224,11 +246,6 @@ async function router(req, res) {
   if (path === "/api/v1/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ status: "ok", service: "magpie-credit-protocol" }));
-  }
-
-  // Agent Vault routes (public — agents authenticate with their keypair)
-  if (path.startsWith("/api/v1/vault")) {
-    return handleVaultApi(req, res, url, path);
   }
 
   // Auth required for all other routes
@@ -256,6 +273,9 @@ async function router(req, res) {
       case "/api/v1/credit/leaderboard":
         result = await handleLeaderboard();
         break;
+      case "/api/v1/tokens":
+        result = await handleTokens();
+        break;
       case "/api/v1/risk/token":
         result = await handleTokenRisk(req, url);
         break;
@@ -276,6 +296,7 @@ async function router(req, res) {
               "GET /api/v1/credit/score?wallet=<address>": "Query credit score by wallet",
               "GET /api/v1/credit/history?wallet=<address>": "Score history trend",
               "GET /api/v1/credit/leaderboard": "Top credit scores",
+              "GET /api/v1/tokens": "All approved tokens (public, no auth)",
               "GET /api/v1/risk/token?mint=<address>": "Token risk assessment",
               "GET /api/v1/risk/flagged": "Currently flagged tokens",
               "GET /api/v1/marketplace/stats": "P2P marketplace statistics",

@@ -7,6 +7,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { getSolBalance } from "../services/deposits.js";
 import { tierFor, nextTierHint, getUserStats } from "../services/reputation.js";
 import { getOrCreateCode, referralStats } from "../services/referrals.js";
+import { getLoanLimits } from "../services/loan-limits.js";
 import { query } from "../db/pool.js";
 
 function fmtSol(lamports) {
@@ -20,13 +21,14 @@ export async function handleMe(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  const [sol, stats, code, refs, activeRow, botInfo] = await Promise.all([
+  const [sol, stats, code, refs, activeRow, botInfo, limits] = await Promise.all([
     getSolBalance(publicKey),
     getUserStats(user.id),
     getOrCreateCode(user.id),
     referralStats(user.id),
     query(`SELECT COUNT(*)::int AS n FROM loans WHERE user_id = $1 AND status = 'active'`, [user.id]),
     ctx.api.getMe(),
+    getLoanLimits(user.id),
   ]);
 
   const tier = tierFor(stats);
@@ -47,6 +49,12 @@ export async function handleMe(ctx) {
     `\`${publicKey}\``,
     `Balance: ${fmtSol(sol)} SOL`,
     `Active loans: ${activeRow.rows[0].n}`,
+    "",
+    "*Loan limits*",
+    `Tier: *${limits.tier}*`,
+    `Max per loan: ${fmtSol(limits.maxPerLoan)} SOL`,
+    `Max outstanding: ${fmtSol(limits.maxOutstanding)} SOL`,
+    `Available: ${fmtSol(limits.availableToBorrow)} SOL`,
     "",
     "*Lifetime stats*",
     `Loans repaid:      ${stats.repaid_count}`,

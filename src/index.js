@@ -25,6 +25,8 @@ import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
+import { handleSubmit } from "./commands/submit.js";
+import { handleReborrow, registerReborrowCallbacks } from "./commands/reborrow.js";
 import { handleFallback, registerFallbackCallbacks } from "./commands/fallback.js";
 import {
   handlePause,
@@ -39,6 +41,9 @@ import { startDepositWatcher } from "./services/deposit-watcher.js";
 import { startLoanWatcher } from "./services/loan-watcher.js";
 import { startHealthWatcher } from "./services/health-watcher.js";
 import { startRiskEngine } from "./services/risk-engine.js";
+import { startPumpWatcher } from "./services/pump-watcher.js";
+import { startTokenScreener, handleReviewTokens, registerScreenerCallbacks } from "./services/token-screener.js";
+import { startTokenHealth } from "./services/token-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 
@@ -75,7 +80,9 @@ bot.command("risk", handleRisk);
 bot.command("lend", handleLend);
 bot.command("import", handleImport);
 bot.command("wallet", handleWallet);
+bot.command("reborrow", handleReborrow);
 bot.command("home", handleHome);
+bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
 
 // Admin commands (authorization enforced in handlers)
@@ -85,6 +92,7 @@ bot.command("adminstatus", handleAdminStatus);
 bot.command("enablemint", handleEnableMint);
 bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
+bot.command("reviewtokens", handleReviewTokens);
 
 // Inline callback registration
 registerBorrowCallbacks(bot);
@@ -97,6 +105,8 @@ registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
 registerImportCallbacks(bot);
+registerReborrowCallbacks(bot);
+registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
 
@@ -119,6 +129,9 @@ bot.start({
     setTimeout(() => startLoanWatcher(bot), 5_000);
     setTimeout(() => startHealthWatcher(bot), 10_000);
     setTimeout(() => startRiskEngine(bot), 15_000);
+    setTimeout(() => startPumpWatcher(bot), 20_000);
+    setTimeout(() => startTokenScreener(bot), 25_000);
+    setTimeout(() => startTokenHealth(bot), 30_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

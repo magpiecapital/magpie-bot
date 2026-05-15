@@ -6,6 +6,7 @@ import { collateralValueLamports } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
+import { checkLoanLimits } from "../services/loan-limits.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
@@ -336,6 +337,19 @@ export function registerBorrowCallbacks(bot) {
 
     // Use the freshest price for the actual loan execution
     state.collateralValueLamports = currentValueLamports;
+
+    // ── Loan limit check ──
+    const loanAmountCheck = Math.floor((currentValueLamports * tier.ltv) / 100);
+    const limitCheck = await checkLoanLimits(state.userId, loanAmountCheck);
+    if (!limitCheck.allowed) {
+      pending.delete(ctx.chat.id);
+      await ctx.editMessageText(
+        `⚠️ *Loan limit reached*\n\n${limitCheck.reason}\n\nTier: *${limitCheck.tier}*\nRun /borrow to try a smaller amount.`,
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
     await ctx.editMessageText("⏳ Submitting on-chain...");
 
     try {
