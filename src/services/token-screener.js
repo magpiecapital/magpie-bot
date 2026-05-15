@@ -18,6 +18,14 @@ import { connection } from "../solana/connection.js";
 const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 600_000; // 10 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
+// Symbols to never approve — wrapped/bridged L1 tokens that aren't real memecoins
+const BLOCKED_SYMBOLS = new Set([
+  "SOL", "WSOL", "ETH", "WETH", "BTC", "WBTC", "BNB", "WBNB",
+  "USDC", "USDT", "BUSD", "DAI", "USDD", "TUSD", "FRAX",
+  "DOGE", "SHIB", "PEPE", "FLOKI", "BONK20", "LINK", "UNI",
+  "AVAX", "MATIC", "DOT", "ADA", "XRP", "LTC", "ATOM",
+]);
+
 // Known xStock mint prefixes and issuers (tokens.xyz ecosystem)
 const KNOWN_STOCK_ISSUERS = [
   "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB", // xTSLA — used as a seed to find issuer pairs
@@ -535,8 +543,9 @@ async function tick(bot) {
     const market = marketData.get(mint);
     if (!market) continue;
 
-    // Quick reject: no meaningful liquidity
+    // Quick reject: no meaningful liquidity or blocked symbol (wrapped L1s)
     if (market.liquidity < 10_000) continue;
+    if (BLOCKED_SYMBOLS.has(market.symbol.toUpperCase())) continue;
 
     const onChain = await getOnChainInfo(mint);
     if (!onChain) continue;
