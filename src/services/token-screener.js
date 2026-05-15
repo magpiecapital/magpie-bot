@@ -714,6 +714,90 @@ export function registerScreenerCallbacks(bot) {
   });
 }
 
+// ─── Auto-approve aged review queue tokens ──────────────────────────────────
+
+const REVIEW_AUTO_APPROVE_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Tokens that have been in the review queue for 1+ hour and still pass safety
+ * checks get auto-approved. This ensures users get a timely response.
+ */
+async function processReviewQueue(bot) {
+  const { rows } = await query(
+    `SELECT * FROM token_screen_queue
+     WHERE status = 'pending'
+       AND created_at <= NOW() - INTERVAL '1 hour'`,
+  );
+
+  if (rows.length === 0) return;
+
+  for (const t of rows) {
+    // Re-check on-chain safety before approving
+    const onChain = await getOnChainInfo(t.mint);
+    if (!onChain || onChain.hasMintAuthority || onChain.hasFreezeAuthority) {
+      // Token degraded — reject it
+      await query(
+        `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
+        [t.mint],
+      );
+      if (t.submitted_by && bot) {
+        try {
+          await bot.api.sendMessage(
+            t.submitted_by,
+            `Your submitted token *${t.symbol}* was not approved. It did not pass our safety re-check.`,
+            { parse_mode: "Markdown" },
+          );
+        } catch { /* user may have blocked bot */ }
+      }
+      console.log(`[screener] Review auto-rejected ${t.symbol} (failed re-check)`);
+      continue;
+    }
+
+    // Approve it
+    await query(
+      `INSERT INTO supported_mints
+         (mint, symbol, name, decimals, category, image_url, liquidity_usd,
+          holder_count, market_cap_usd, has_mint_authority, has_freeze_authority,
+          token_age_hours, auto_approved, screened_at, source, enabled)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,FALSE,$10,TRUE,NOW(),'review_auto',TRUE)
+       ON CONFLICT (mint) DO UPDATE SET enabled = TRUE`,
+      [
+        t.mint, t.symbol, t.name, t.decimals, t.category, t.image_url,
+        t.liquidity_usd, t.holder_count, t.market_cap_usd, t.token_age_hours,
+      ],
+    );
+
+    await query(
+      `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,
+      [t.mint],
+    );
+
+    console.log(`[screener] Review auto-approved ${t.symbol} (1h elapsed, passed re-check)`);
+
+    // Notify submitter
+    if (t.submitted_by && bot) {
+      try {
+        await bot.api.sendMessage(
+          t.submitted_by,
+          `Your submitted token *${t.symbol}* has been approved! You can now use it as collateral.\n\nUse /borrow to get started.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* user may have blocked bot */ }
+    }
+
+    // Notify admin
+    if (ADMIN_TG_ID && bot) {
+      try {
+        await bot.api.sendMessage(
+          ADMIN_TG_ID,
+          `*Review auto-approved* (1h elapsed)\n\n${t.symbol} — $${Number(t.liquidity_usd).toLocaleString()} liq\n\`${t.mint}\``,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* non-critical */ }
+    }
+  }
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startTokenScreener(bot) {
@@ -725,6 +809,7 @@ export function startTokenScreener(bot) {
     running = true;
     try {
       await tick(bot);
+      await processReviewQueue(bot);
     } catch (err) {
       console.error("[screener] cycle error:", err.message);
     } finally {
