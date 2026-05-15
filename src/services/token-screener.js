@@ -442,12 +442,13 @@ function vetToken(onChain, market, holderCount, category) {
 // ─── Actions ────────────────────────────────────────────────────────────────
 
 async function autoApproveToken(mint, onChain, market, holderCount, ageHours, category) {
+  const isStock = category === "stock";
   await query(
     `INSERT INTO supported_mints
        (mint, symbol, name, decimals, category, image_url, liquidity_usd,
         holder_count, market_cap_usd, has_mint_authority, has_freeze_authority,
-        lp_burned, token_age_hours, auto_approved, screened_at, source, enabled)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,NOW(),'screener',TRUE)
+        lp_burned, token_age_hours, auto_approved, screened_at, source, enabled, protected)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,NOW(),'screener',TRUE,$14)
      ON CONFLICT (mint) DO NOTHING`,
     [
       mint,
@@ -463,6 +464,7 @@ async function autoApproveToken(mint, onChain, market, holderCount, ageHours, ca
       onChain.hasFreezeAuthority,
       false, // lp_burned — can't reliably check, default false
       ageHours,
+      isStock, // stocks are auto-protected from health monitor delisting
     ],
   );
 }
