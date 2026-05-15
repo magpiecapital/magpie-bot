@@ -4,16 +4,24 @@
  * Runs every 15 minutes alongside the token screener. For each enabled token
  * in supported_mints, checks current market data and flags/delists tokens that:
  *
- *   1. INSTANT DELIST (rug detected):
- *      - Liquidity drops below $5K (LP pulled)
+ *   1. INSTANT DELIST (rug detected — still subject to circuit breaker):
+ *      - Liquidity drops below $5K AND market cap below $50K (LP pulled)
  *      - Market cap drops below $10K
  *      - Mint authority appeared (wasn't there at approval)
- *      - No trading pairs found on DexScreener (token dead)
  *
- *   2. WATCHLIST (degraded — 2 consecutive strikes → delist):
+ *   2. WATCHLIST (degraded — 6 consecutive strikes → delist):
  *      - Liquidity drops below $25K
  *      - 24h volume below $5K
  *      - Market cap below $50K
+ *      - Tokens with >$1M mcap are exempt (likely bad API data)
+ *
+ *   3. CIRCUIT BREAKER:
+ *      - Max 3 delistings per cycle — if exceeded, abort and alert admin
+ *      - Prevents mass-delist from bad DexScreener data
+ *
+ *   4. DATA VALIDATION:
+ *      - If >50% of tokens return no market data, treat as API outage and skip
+ *      - Instant delist requires BOTH low liquidity AND low mcap (not just one)
  *
  * When a token is delisted:
  *   - supported_mints.enabled = FALSE (no new loans)
@@ -30,11 +38,14 @@ const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
 
-// Instant delist — clear rug signals
+// Instant delist — clear rug signals (BOTH conditions must be true)
 const RUG_THRESHOLDS = {
   maxLiquidityUsd: 5_000,
-  maxMarketCap: 10_000,
+  maxMarketCap: 50_000, // raised from $10K — must have BOTH low liq AND low mcap
 };
+
+// Market cap floor — below this is instant delist regardless of liquidity
+const MCAP_FLOOR = 10_000;
 
 // Watchlist — degraded but not dead yet
 const WATCHLIST_THRESHOLDS = {
@@ -45,6 +56,12 @@ const WATCHLIST_THRESHOLDS = {
 
 // Strikes before watchlist → delist (6 strikes × 15 min = 90 min of degraded data)
 const STRIKES_TO_DELIST = 6;
+
+// Circuit breaker — max delistings per single cycle
+const MAX_DELISTS_PER_CYCLE = 3;
+
+// If more than this fraction of tokens have no market data, treat as API outage
+const API_OUTAGE_THRESHOLD = 0.5;
 
 // ── Market data ─────────────────────────────────────────────────────────────
 
@@ -161,21 +178,72 @@ async function tick(bot) {
   const mints = tokens.map((t) => t.mint);
   const marketData = await getMarketData(mints);
 
+  // ── API outage detection ──
+  // If more than 50% of tokens have no data, DexScreener is likely down.
+  // Do NOT increment strikes or delist anything — just log and bail.
+  const missingCount = mints.filter((m) => !marketData.has(m)).length;
+  const missingRatio = missingCount / mints.length;
+  if (missingRatio > API_OUTAGE_THRESHOLD) {
+    console.warn(
+      `[token-health] API OUTAGE DETECTED — ${missingCount}/${mints.length} tokens (${(missingRatio * 100).toFixed(0)}%) returned no data. Skipping entire cycle.`,
+    );
+    if (bot && ADMIN_TG_ID) {
+      try {
+        await bot.api.sendMessage(
+          ADMIN_TG_ID,
+          `*Health Monitor: API outage detected*\n\n${missingCount}/${mints.length} tokens returned no market data from DexScreener.\n\nSkipping this cycle to prevent false delistings.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* non-critical */ }
+    }
+    return;
+  }
+
   const delisted = [];
   const watchlisted = [];
   const recovered = [];
+  let delistCount = 0;
 
   for (const token of tokens) {
     const { mint, symbol } = token;
     const market = marketData.get(mint);
     const strikes = token.health_strikes || 0;
 
+    // ── Circuit breaker ──
+    // If we've already delisted MAX_DELISTS_PER_CYCLE tokens this cycle,
+    // stop delisting and alert admin. Something is likely wrong with the data.
+    if (delistCount >= MAX_DELISTS_PER_CYCLE) {
+      if (delistCount === MAX_DELISTS_PER_CYCLE) {
+        console.warn(`[token-health] CIRCUIT BREAKER — already delisted ${delistCount} tokens this cycle, halting further delistings`);
+        if (bot && ADMIN_TG_ID) {
+          try {
+            await bot.api.sendMessage(
+              ADMIN_TG_ID,
+              `*Health Monitor: Circuit breaker tripped*\n\nAlready delisted ${delistCount} tokens this cycle (max ${MAX_DELISTS_PER_CYCLE}). Halting further delistings.\n\nDelisted so far: ${delisted.join(", ")}\n\nPlease review — this may indicate bad API data rather than actual rugs.`,
+              { parse_mode: "Markdown" },
+            );
+          } catch { /* non-critical */ }
+        }
+        delistCount++; // increment past max so this alert only fires once
+      }
+      // Still update market data but don't delist or add strikes
+      if (market) {
+        await query(
+          `UPDATE supported_mints
+           SET liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW()
+           WHERE mint = $1`,
+          [mint, market.liquidity, market.marketCap],
+        );
+      }
+      continue;
+    }
+
     // No market data found — token may be dead
     if (!market) {
-      // Check if it's truly gone or just a DexScreener hiccup
       if (strikes >= STRIKES_TO_DELIST) {
         await delistToken(mint, symbol, "No trading data found (token appears dead)", bot);
         delisted.push(symbol);
+        delistCount++;
       } else {
         await query(
           `UPDATE supported_mints SET health_strikes = COALESCE(health_strikes, 0) + 1 WHERE mint = $1`,
@@ -188,25 +256,28 @@ async function tick(bot) {
 
     // ── Instant delist checks ──
 
-    // Liquidity pulled
-    if (market.liquidity < RUG_THRESHOLDS.maxLiquidityUsd) {
+    // Market cap completely cratered (below $10K floor)
+    if (market.marketCap < MCAP_FLOOR) {
       await delistToken(
         mint, symbol,
-        `Liquidity collapsed to $${Math.floor(market.liquidity).toLocaleString()} (threshold: $${RUG_THRESHOLDS.maxLiquidityUsd.toLocaleString()})`,
+        `Market cap collapsed to $${Math.floor(market.marketCap).toLocaleString()} (floor: $${MCAP_FLOOR.toLocaleString()})`,
         bot,
       );
       delisted.push(symbol);
+      delistCount++;
       continue;
     }
 
-    // Market cap cratered
-    if (market.marketCap < RUG_THRESHOLDS.maxMarketCap) {
+    // Liquidity pulled AND market cap low — both must be true to prevent
+    // false positives from DexScreener returning incomplete pair data
+    if (market.liquidity < RUG_THRESHOLDS.maxLiquidityUsd && market.marketCap < RUG_THRESHOLDS.maxMarketCap) {
       await delistToken(
         mint, symbol,
-        `Market cap collapsed to $${Math.floor(market.marketCap).toLocaleString()} (threshold: $${RUG_THRESHOLDS.maxMarketCap.toLocaleString()})`,
+        `Rug detected — liquidity $${Math.floor(market.liquidity).toLocaleString()} AND mcap $${Math.floor(market.marketCap).toLocaleString()}`,
         bot,
       );
       delisted.push(symbol);
+      delistCount++;
       continue;
     }
 
@@ -220,6 +291,7 @@ async function tick(bot) {
           bot,
         );
         delisted.push(symbol);
+        delistCount++;
         continue;
       }
     }
@@ -247,10 +319,11 @@ async function tick(bot) {
 
         await delistToken(
           mint, symbol,
-          `Degraded for ${newStrikes} consecutive checks: ${reasons.join(", ")}`,
+          `Degraded for ${newStrikes} consecutive checks (${newStrikes * 15} min): ${reasons.join(", ")}`,
           bot,
         );
         delisted.push(symbol);
+        delistCount++;
       } else {
         await query(
           `UPDATE supported_mints SET health_strikes = $2 WHERE mint = $1`,
