@@ -1,0 +1,6 @@
+[deploy]
+startCommand = "node src/index.js"
+
+[service]
+# Expose HTTP API alongside the Telegram bot
+internalPort = 3001
