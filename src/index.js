@@ -44,6 +44,7 @@ import { startRiskEngine } from "./services/risk-engine.js";
 import { startPumpWatcher } from "./services/pump-watcher.js";
 import { startTokenScreener, handleReviewTokens, registerScreenerCallbacks } from "./services/token-screener.js";
 import { startTokenHealth } from "./services/token-health.js";
+import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 
@@ -132,6 +133,7 @@ bot.start({
     setTimeout(() => startPumpWatcher(bot), 20_000);
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
+    startDbHealth(bot); // Start immediately — monitors DB connectivity
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
