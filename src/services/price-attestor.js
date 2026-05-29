@@ -4,7 +4,7 @@ import bs58 from "bs58";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import "dotenv/config";
-import { getPriceInSol } from "./price.js";
+import { getPriceInSol, getPricesInSolBatch } from "./price.js";
 import { getProgramForSigner } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
@@ -61,17 +61,18 @@ export async function initializePriceFeed(mintStr) {
 
 /**
  * Update the on-chain price attestation for a given mint.
- * Fetches current price from Jupiter, writes to the PDA.
+ * If `priceSolOverride` is provided, uses it; otherwise fetches from Jupiter.
+ * Callers attesting many tokens at once should batch-fetch via
+ * getPricesInSolBatch and pass the per-mint price to avoid rate limits.
  */
-export async function attestPrice(mintStr, decimals) {
+export async function attestPrice(mintStr, decimals, priceSolOverride) {
   const lender = loadLenderKeypair();
   const program = getProgramForSigner(lender);
   const mintPk = new PublicKey(mintStr);
   const [pool] = lendingPoolPda(LENDER_PUBKEY);
   const [priceFeed] = priceFeedPda(mintPk, pool);
 
-  // Get price from Jupiter (price = SOL per 1 token)
-  const priceSol = await getPriceInSol(mintStr);
+  const priceSol = priceSolOverride ?? (await getPriceInSol(mintStr));
   // Convert to lamports per 1 full token (10^decimals raw units)
   const priceLamports = Math.floor(priceSol * 1e9);
 
@@ -131,9 +132,20 @@ export function startPriceAttestor(intervalMs = 30_000) {
       return;
     }
 
+    // Single batch Jupiter fetch for all enabled mints (1-2 calls instead of N).
+    let priceMap;
+    try {
+      priceMap = await getPricesInSolBatch(tokens.map((t) => t.mint));
+    } catch (err) {
+      console.error(`[PriceAttestor] Batch price fetch failed: ${err.message}`);
+      return;
+    }
+
     for (const { mint, decimals } of tokens) {
+      const priceSol = priceMap.get(mint);
+      if (!priceSol) continue; // no Jupiter coverage — skip silently
+
       try {
-        const priceSol = await getPriceInSol(mint);
         const priceLamports = Math.floor(priceSol * 1e9);
         const lastPrice = lastPrices.get(mint) || 0;
         const since = Date.now() - (lastAttestAt.get(mint) || 0);
@@ -144,7 +156,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
         if (drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS) continue;
 
         try {
-          const result = await attestPrice(mint, decimals);
+          const result = await attestPrice(mint, decimals, priceSol);
           lastPrices.set(mint, priceLamports);
           lastAttestAt.set(mint, Date.now());
           console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
