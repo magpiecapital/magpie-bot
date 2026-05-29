@@ -122,6 +122,9 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
   // feed timestamp never crosses the contract's 120s staleness limit.
   const MAX_GAP_MS = 60_000;
+  // Cap on-chain inits per tick — drip-feed backfill of missing feeds to
+  // avoid bursting Helius RPC and triggering 429 rate limits.
+  const MAX_INITS_PER_TICK = 5;
 
   async function tick() {
     let tokens;
@@ -133,14 +136,16 @@ export function startPriceAttestor(intervalMs = 30_000) {
     }
 
     // Single batch Jupiter fetch for all enabled mints (1-2 calls instead of N).
+    // On failure (rate limit, transient), skip the whole tick — next one retries.
     let priceMap;
     try {
       priceMap = await getPricesInSolBatch(tokens.map((t) => t.mint));
     } catch (err) {
-      console.error(`[PriceAttestor] Batch price fetch failed: ${err.message}`);
+      console.error(`[PriceAttestor] Batch price fetch failed (will retry next tick): ${err.message}`);
       return;
     }
 
+    let initsThisTick = 0;
     for (const { mint, decimals } of tokens) {
       const priceSol = priceMap.get(mint);
       if (!priceSol) continue; // no Jupiter coverage — skip silently
@@ -162,13 +167,18 @@ export function startPriceAttestor(intervalMs = 30_000) {
           console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
         } catch (attestErr) {
           // Feed PDA may not exist yet for newly-approved tokens —
-          // auto-init it so the next tick succeeds.
+          // auto-init it so the next tick succeeds. Drip-feed inits to
+          // avoid hammering Helius.
           if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+            if (initsThisTick >= MAX_INITS_PER_TICK) {
+              continue; // backfill the rest on subsequent ticks
+            }
             const init = await initializePriceFeed(mint);
             if (init.alreadyExists) {
               throw attestErr; // not the issue we expected — rethrow
             }
-            console.log(`[PriceAttestor] Auto-initialized feed for ${mint.slice(0, 8)}... — attest on next tick`);
+            initsThisTick++;
+            console.log(`[PriceAttestor] Auto-initialized feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
           } else {
             throw attestErr;
           }
