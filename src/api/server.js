@@ -12,6 +12,17 @@
 import http from "node:http";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
+import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
+
+// Staleness thresholds for each periodic service.
+// 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
+const STALE_MS = {
+  screener: 20 * 60 * 1000,     // 20 min (screener runs every 10)
+  "token-health": 30 * 60 * 1000, // 30 min (token-health runs every 15)
+};
+
+// Grace period after startup before stale thresholds apply.
+const STARTUP_GRACE_MS = 30 * 60 * 1000; // 30 min
 
 const PORT = parseInt(process.env.PORT || process.env.API_PORT || "3001", 10);
 
@@ -242,10 +253,61 @@ async function router(req, res) {
     return res.end();
   }
 
-  // Health check (no auth)
+  // Health check (no auth) — real liveness probe
   if (path === "/api/v1/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok", service: "magpie-credit-protocol" }));
+    const checks = { db: "unknown", screener: "unknown", "token-health": "unknown" };
+    const reasons = [];
+    const now = Date.now();
+    const sinceStartup = now - getStartedAt();
+    const inGrace = sinceStartup < STARTUP_GRACE_MS;
+
+    // 1. DB ping
+    try {
+      await query("SELECT 1");
+      checks.db = "ok";
+    } catch (err) {
+      checks.db = "fail";
+      reasons.push(`db: ${err.message}`);
+    }
+
+    // 2. Service heartbeats — stale if no successful cycle in threshold,
+    //    unless we're still in startup grace period.
+    const hb = getHeartbeats();
+    for (const [name, threshold] of Object.entries(STALE_MS)) {
+      const entry = hb.services[name];
+      if (!entry) {
+        if (inGrace) {
+          checks[name] = "warming-up";
+        } else {
+          checks[name] = "fail";
+          reasons.push(`${name}: no cycle since startup`);
+        }
+        continue;
+      }
+      if (!entry.ok) {
+        checks[name] = "fail";
+        reasons.push(`${name}: last cycle errored`);
+        continue;
+      }
+      if (entry.ageMs > threshold) {
+        checks[name] = "stale";
+        reasons.push(`${name}: ${Math.round(entry.ageMs / 60000)}m since last ok cycle`);
+        continue;
+      }
+      checks[name] = "ok";
+    }
+
+    const failing = reasons.length > 0;
+    res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      status: failing ? "degraded" : "ok",
+      service: "magpie-credit-protocol",
+      checks,
+      reasons: failing ? reasons : undefined,
+      uptimeMs: hb.uptimeMs,
+      startedAt: hb.startedAt,
+      heartbeats: hb.services,
+    }));
   }
 
   // Auth required for all other routes

@@ -363,6 +363,8 @@ async function tick(bot) {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+import { markCycle } from "../lib/heartbeat.js";
+
 export function startTokenHealth(bot) {
   console.log(`🩺 Token health monitor running (every ${POLL_INTERVAL_MS / 1000}s)`);
 
@@ -370,12 +372,15 @@ export function startTokenHealth(bot) {
   const run = async () => {
     if (running) return;
     running = true;
+    let ok = true;
     try {
       await tick(bot);
     } catch (err) {
+      ok = false;
       console.error("[token-health] cycle error:", err.message);
     } finally {
       running = false;
+      markCycle("token-health", ok);
     }
   };
 

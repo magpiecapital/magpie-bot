@@ -800,6 +800,8 @@ async function processReviewQueue(bot) {
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
+import { markCycle } from "../lib/heartbeat.js";
+
 export function startTokenScreener(bot) {
   console.log(`🔍 Token screener running (every ${POLL_INTERVAL_MS / 1000}s)`);
 
@@ -807,13 +809,16 @@ export function startTokenScreener(bot) {
   const run = async () => {
     if (running) return;
     running = true;
+    let ok = true;
     try {
       await tick(bot);
       await processReviewQueue(bot);
     } catch (err) {
+      ok = false;
       console.error("[screener] cycle error:", err.message);
     } finally {
       running = false;
+      markCycle("screener", ok);
     }
   };
 
