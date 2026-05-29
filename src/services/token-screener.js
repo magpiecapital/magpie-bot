@@ -91,7 +91,7 @@ const AUTO_APPROVE = {
 const MIN_CONSIDER = {
   minLiquidityUsd: 10_000,
   minHolders: 50,
-  minAgeHours: 6,
+  minAgeHours: 4,
   minVolume24h: 3_000,
 };
 
