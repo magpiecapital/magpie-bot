@@ -1,21 +1,26 @@
 import axios from "axios";
 import "dotenv/config";
 
-const JUPITER_API = process.env.JUPITER_API_URL || "https://api.jup.ag/price/v2";
+// Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
+// prices are derived as token_usd / sol_usd.
+const JUPITER_API = process.env.JUPITER_API_URL || "https://lite-api.jup.ag/price/v3";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 /**
- * Fetch price of `mint` denominated in SOL.
- * Returns the price as a float (tokens per 1 SOL → value-per-token).
+ * Fetch price of `mint` denominated in SOL (token value in SOL).
+ * Returns a float — multiply by token amount (human units) for total SOL value.
  */
 export async function getPriceInSol(mint) {
   const resp = await axios.get(JUPITER_API, {
-    params: { ids: mint, vsToken: SOL_MINT },
+    params: { ids: `${mint},${SOL_MINT}` },
     timeout: 10_000,
   });
-  const data = resp.data?.data?.[mint];
-  if (!data?.price) throw new Error(`No price data for mint ${mint}`);
-  return Number(data.price);
+  const tokenUsd = resp.data?.[mint]?.usdPrice;
+  const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+  if (!tokenUsd || !solUsd) {
+    throw new Error(`No price data for mint ${mint}`);
+  }
+  return tokenUsd / solUsd;
 }
 
 /**
