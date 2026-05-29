@@ -4,7 +4,7 @@ import { PROGRAM_ID } from "./program.js";
 
 export function lendingPoolPda(lenderPubkey) {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from("lending-pool"), lenderPubkey.toBuffer()],
+    [Buffer.from("pool"), lenderPubkey.toBuffer()],
     PROGRAM_ID,
   );
 }
@@ -28,6 +28,13 @@ export function loanPda(borrowerPubkey, loanId) {
 export function collateralVaultPda(loanPubkey) {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("collateral-vault"), loanPubkey.toBuffer()],
+    PROGRAM_ID,
+  );
+}
+
+export function priceFeedPda(mintPubkey, poolPubkey) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("price"), mintPubkey.toBuffer(), poolPubkey.toBuffer()],
     PROGRAM_ID,
   );
 }
