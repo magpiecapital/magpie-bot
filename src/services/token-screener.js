@@ -527,19 +527,29 @@ async function tick(bot) {
 
   const approved = [];
   const queued = [];
+  let rejNoMarket = 0, rejBlocked = 0, rejNoOnChain = 0, rejVerdict = 0;
 
   for (const { mint } of newMints) {
+    const market = marketData.get(mint);
+    if (!market) {
+      // No DexScreener pair yet — don't markSeen so we retry later when it has one.
+      rejNoMarket++;
+      continue;
+    }
+
+    // Only mark seen once we have enough data to make a real decision.
     await markSeen(mint);
 
-    const market = marketData.get(mint);
-    if (!market) continue;
-
-    // Quick reject: no meaningful liquidity or blocked symbol (wrapped L1s)
-    if (market.liquidity < 10_000) continue;
-    if (BLOCKED_SYMBOLS.has(market.symbol.toUpperCase())) continue;
+    if (BLOCKED_SYMBOLS.has(market.symbol.toUpperCase())) {
+      rejBlocked++;
+      continue;
+    }
 
     const onChain = await getOnChainInfo(mint);
-    if (!onChain) continue;
+    if (!onChain) {
+      rejNoOnChain++;
+      continue;
+    }
 
     const holderCount = await getHolderCount(mint);
     const category = detectCategory(market.symbol, market.name);
@@ -552,8 +562,18 @@ async function tick(bot) {
     } else if (verdict === "review") {
       await queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category);
       queued.push({ symbol: market.symbol, mint, safetyScore, fails, category });
+    } else {
+      rejVerdict++;
+      console.log(`[screener] reject ${market.symbol}: ${fails.slice(0, 3).join("; ")}`);
     }
-    // verdict === "reject" → silently skip
+  }
+
+  if (approved.length || queued.length || rejVerdict || rejBlocked || rejNoOnChain) {
+    console.log(
+      `[screener] result: approved=${approved.length} queued=${queued.length} ` +
+      `rej_verdict=${rejVerdict} rej_blocked=${rejBlocked} rej_no_onchain=${rejNoOnChain} ` +
+      `rej_no_market=${rejNoMarket}`,
+    );
   }
 
   // Notify admin
