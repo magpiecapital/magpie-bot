@@ -3,52 +3,75 @@ import { isAdmin } from "../services/admin.js";
 
 export async function handleHelp(ctx) {
   const lines = [
-    "🪶 *Magpie — Command List*",
+    "🏦 *Magpie Help*",
     "",
     "*Navigation*",
     "/home — main menu",
     "/help — this page",
     "",
-    "*Tokens & Discovery*",
-    "/supported — approved tokens with live market data",
-    "/risk `<symbol|mint>` — risk profile, liquidity, holders",
-    "/price `<symbol|mint>` — live price",
-    "/submit `<mint|symbol>` — propose a token for screening",
-    "",
     "*Account*",
-    "/me — your wallet, tier, stats, referral code",
-    "/credit — your 300-850 credit score",
-    "/wallet — show your Magpie wallet address",
-    "/import — import an existing Solana wallet",
+    "/me — wallet, tier, stats, referral code",
+    "/deposit — show your deposit address",
+    "/notify — manage notifications + auto-repay",
+    "",
+    "*Loans*",
+    "/supported — accepted collateral with live prices",
+    "/simulate <symbol> <amount> [tier] — preview a loan",
+    "/borrow — take out a SOL loan",
+    "/reborrow — quick re-borrow (same token + tier as last loan)",
+    "/positions — active loans + live health",
+    "/repay — repay and reclaim collateral",
+    "/partialrepay — pay down part of a loan",
+    "/topup — add collateral (improves health, no fee)",
+    "/extend — extend a loan (tier fee: 3%/2%/1.5%)",
+    "/history — last 10 loans",
+    "/price <symbol|mint> — oracle price + max loan per tier",
+    "",
+    "*Wallet*",
+    "/wallet — show your deposit address",
+    "/deposit — same as /wallet",
+    "/import — import an existing Solana wallet (advanced)",
+    "/withdraw — send SOL or tokens out",
     "/export — export your private key (⚠️ custodial)",
-    "/notify — manage notification preferences",
+    "",
+    "*Credit & Risk*",
+    "/credit — view your 300-850 credit score",
+    "/risk <symbol> — AI risk assessment for a token",
+    "",
+    "*Marketplace*",
+    "/lend — lending marketplace (create pools, deposit, browse)",
+    "",
+    "*Tokens*",
+    "/submit <mint|symbol> — submit a token for collateral approval",
     "",
     "*Stats*",
     "/stats — protocol-wide stats",
-    "/simulate `<symbol> <amount>` — what-if loan calculator (when lending returns)",
     "",
-    "*Lending (currently paused)*",
-    "/deposit, /withdraw, /topup, /borrow, /repay, /partialrepay,",
-    "/extend, /reborrow, /lend, /positions, /history",
-    "_Will be reactivated when the on-chain protocol returns._",
+    "*How it works*",
+    "1. Deposit memecoins to your Magpie wallet",
+    "2. Pick a tier:  30%/2d · 25%/3d · 20%/7d",
+    "3. Receive SOL instantly (Express 3%, Quick 2%, Standard 1.5% fee)",
+    "4. Repay before due to reclaim your bag",
+    "5. Miss the deadline or drop below 1.1x → liquidation",
   ];
 
   if (isAdmin(ctx.from?.id)) {
     lines.push(
       "",
       "*Admin*",
-      "/pause, /resume — toggle features (when lending is back)",
+      "/pause, /resume — toggle new borrows",
       "/adminstatus — system overview",
-      "/enablemint `<mint> <symbol> <decimals> [name]`",
-      "/disablemint `<symbol|mint>`",
-      "/broadcast `<message>` — DM everyone",
-      "/reviewtokens — review auto-screened borderline tokens",
+      "/enablemint <mint> <symbol> <decimals> [name]",
+      "/disablemint <symbol|mint>",
+      "/broadcast <message> — DM everyone",
+      "/reviewtokens — review auto-screened tokens",
     );
   }
 
   const kb = new InlineKeyboard()
     .text("🏠 Home", "start:home")
-    .text("📋 Supported", "start:supported");
+    .text("💰 Borrow", "start:borrow")
+    .text("📋 Wallet", "fallback:deposit");
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
