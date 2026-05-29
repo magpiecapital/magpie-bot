@@ -57,7 +57,6 @@ const BORROWABLE_TOKENS = [
   { symbol: "FARTCOIN", mint: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump", decimals: 6 },
   { symbol: "PENGU",    mint: "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv", decimals: 6 },
   { symbol: "POPCAT",   mint: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", decimals: 9 },
-  { symbol: "CUM",      mint: "oqU4DdYCbdSf9j74vnEgvCn1YzNfYQEPWaC6pu6pump", decimals: 6 },
 ];
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
