@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { collateralValueLamports } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
+import { attestPrice, initializePriceFeed } from "../services/price-attestor.js";
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
@@ -351,6 +352,32 @@ export function registerBorrowCallbacks(bot) {
     }
 
     await ctx.editMessageText("⏳ Submitting on-chain...");
+
+    // Just-in-time price feed refresh — guarantees the on-chain feed is
+    // fresh (<120s) for the user's mint before requestAndFundLoan checks it.
+    // Auto-initializes the feed if missing (first-time borrow against the mint).
+    try {
+      await attestPrice(state.selected.mint, state.selected.decimals);
+    } catch (attestErr) {
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+        try {
+          await initializePriceFeed(state.selected.mint);
+          await attestPrice(state.selected.mint, state.selected.decimals);
+        } catch (initErr) {
+          pending.delete(ctx.chat.id);
+          await ctx.editMessageText(
+            `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
+          );
+          return;
+        }
+      } else {
+        pending.delete(ctx.chat.id);
+        await ctx.editMessageText(
+          `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
+        );
+        return;
+      }
+    }
 
     try {
       const result = await executeBorrow({

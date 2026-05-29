@@ -96,13 +96,20 @@ export async function attestPrice(mintStr, decimals, priceSolOverride) {
 }
 
 /**
- * Fetch the current list of enabled borrowable mints from the DB.
- * The screener and manual /submit approvals write here; this is the
- * single source of truth for "what can be borrowed against."
+ * Mints we need to keep continuously fresh on-chain: those backing
+ * any active loan (so the risk engine / health watcher / repay flow
+ * can rely on a non-stale price). New /borrow calls do their own
+ * just-in-time attestation before submitting the tx, so we don't
+ * need to sweep every enabled mint here — only the ones with skin
+ * in the game right now.
  */
-async function fetchEnabledMints() {
+async function fetchMintsToAttest() {
   const r = await query(
-    `SELECT mint, decimals FROM supported_mints WHERE enabled = TRUE`,
+    `SELECT DISTINCT sm.mint, sm.decimals
+       FROM supported_mints sm
+       JOIN loans l ON l.collateral_mint = sm.mint
+      WHERE sm.enabled = TRUE
+        AND l.status = 'active'`,
   );
   return r.rows.map((row) => ({ mint: row.mint, decimals: row.decimals }));
 }
@@ -129,11 +136,12 @@ export function startPriceAttestor(intervalMs = 30_000) {
   async function tick() {
     let tokens;
     try {
-      tokens = await fetchEnabledMints();
+      tokens = await fetchMintsToAttest();
     } catch (err) {
-      console.error(`[PriceAttestor] Failed to load enabled mints: ${err.message}`);
+      console.error(`[PriceAttestor] Failed to load active-loan mints: ${err.message}`);
       return;
     }
+    if (tokens.length === 0) return; // idle — nothing to keep fresh
 
     // Single batch Jupiter fetch for all enabled mints (1-2 calls instead of N).
     // On failure (rate limit, transient), skip the whole tick — next one retries.
