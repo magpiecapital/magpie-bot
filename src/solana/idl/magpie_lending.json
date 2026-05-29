@@ -489,7 +489,10 @@
           "name": "pool"
         },
         {
-          "name": "mint"
+          "name": "mint",
+          "docs": [
+            "Accept both legacy Token and Token-2022 mints."
+          ]
         },
         {
           "name": "price_feed",
