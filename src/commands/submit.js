@@ -104,12 +104,12 @@ const AUTO_APPROVE = {
   minMarketCap: 250_000,
 };
 
-// Loosened 2026-05-29 (aligns with screener MIN_CONSIDER).
-// Borderline tokens go to /reviewtokens for manual admin approval.
+// Calibrated for pump-style launches: 24h volume bar must be small because
+// a 4h-old token hasn't had 24h to accumulate volume yet.
 const MIN_CONSIDER = {
-  minLiquidityUsd: 10_000,
+  minLiquidityUsd: 5_000,
   minAgeHours: 4,
-  minVolume24h: 3_000,
+  minVolume24h: 500,
 };
 
 // ── Command handler ─────────────────────────────────────────────────────────

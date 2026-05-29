@@ -88,11 +88,13 @@ const AUTO_APPROVE = {
 // Loosened 2026-05-29 — was 30k/100/12h/10k. Sends more tokens to /reviewtokens
 // for manual review. AUTO_APPROVE bar stays strict to keep rug-pulls out of
 // auto-approvals.
+// Calibrated for pump.fun-era tokens: a 4-hour-old token literally hasn't had
+// 24 hours to accumulate volume, so the volume bar is much lower.
 const MIN_CONSIDER = {
-  minLiquidityUsd: 10_000,
-  minHolders: 50,
+  minLiquidityUsd: 5_000,
+  minHolders: 25,
   minAgeHours: 4,
-  minVolume24h: 3_000,
+  minVolume24h: 500,
 };
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
