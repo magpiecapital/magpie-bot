@@ -2,32 +2,24 @@ import { Bot } from "grammy";
 import "dotenv/config";
 
 import { handleStart, registerStartCallbacks } from "./commands/start.js";
-import { handleDeposit } from "./commands/deposit.js";
-import { handlePositions } from "./commands/positions.js";
-import { handleBorrow, registerBorrowCallbacks } from "./commands/borrow.js";
-import { handleRepay, registerRepayCallbacks } from "./commands/repay.js";
 import { handlePrice } from "./commands/price.js";
-import { handleWithdraw, registerWithdrawCallbacks } from "./commands/withdraw.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
 import { handleStats } from "./commands/stats.js";
-import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe } from "./commands/me.js";
 import { handleSupported } from "./commands/supported.js";
 import { handleNotify, registerNotifyCallbacks } from "./commands/notify.js";
-import { handleTopup, registerTopupCallbacks } from "./commands/topup.js";
-import { handlePartialRepay, registerPartialRepayCallbacks } from "./commands/partial-repay.js";
-import { handleExtend, registerExtendCallbacks } from "./commands/extend.js";
 import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
-import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
-import { handleReborrow, registerReborrowCallbacks } from "./commands/reborrow.js";
 import { handleFallback, registerFallbackCallbacks } from "./commands/fallback.js";
+// On-chain lending commands routed to a shared "paused" handler.
+// See _disabled.js for context. Re-route when the protocol returns.
+import { handleDisabledLending } from "./commands/_disabled.js";
 import {
   handlePause,
   handleResume,
@@ -58,33 +50,36 @@ const bot = new Bot(token);
 
 bot.use(rateLimit());
 
-// User commands
+// User commands — active (off-chain)
 bot.command("start", handleStart);
-bot.command("deposit", handleDeposit);
-bot.command("positions", handlePositions);
-bot.command("history", handleHistory);
-bot.command("borrow", handleBorrow);
-bot.command("repay", handleRepay);
-bot.command("price", handlePrice);
-bot.command("simulate", handleSimulate);
-bot.command("supported", handleSupported);
-bot.command("withdraw", handleWithdraw);
-bot.command("export", handleExport);
-bot.command("stats", handleStats);
-bot.command("me", handleMe);
-bot.command("notify", handleNotify);
-bot.command("topup", handleTopup);
-bot.command("partialrepay", handlePartialRepay);
-bot.command("extend", handleExtend);
-bot.command("credit", handleCredit);
-bot.command("risk", handleRisk);
-bot.command("lend", handleLend);
-bot.command("import", handleImport);
-bot.command("wallet", handleWallet);
-bot.command("reborrow", handleReborrow);
 bot.command("home", handleHome);
-bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
+bot.command("me", handleMe);
+bot.command("wallet", handleWallet);
+bot.command("import", handleImport);
+bot.command("export", handleExport);
+bot.command("notify", handleNotify);
+bot.command("supported", handleSupported);
+bot.command("price", handlePrice);
+bot.command("risk", handleRisk);
+bot.command("credit", handleCredit);
+bot.command("submit", handleSubmit);
+bot.command("simulate", handleSimulate);
+bot.command("stats", handleStats);
+
+// On-chain lending commands — paused while protocol is offline.
+// Send a friendly explanation instead of failing on-chain calls.
+bot.command("deposit", handleDisabledLending);
+bot.command("withdraw", handleDisabledLending);
+bot.command("topup", handleDisabledLending);
+bot.command("borrow", handleDisabledLending);
+bot.command("repay", handleDisabledLending);
+bot.command("partialrepay", handleDisabledLending);
+bot.command("extend", handleDisabledLending);
+bot.command("reborrow", handleDisabledLending);
+bot.command("lend", handleDisabledLending);
+bot.command("positions", handleDisabledLending);
+bot.command("history", handleDisabledLending);
 
 // Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
@@ -95,18 +90,10 @@ bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
 
-// Inline callback registration
-registerBorrowCallbacks(bot);
-registerRepayCallbacks(bot);
-registerWithdrawCallbacks(bot);
+// Inline callback registration — only for the active (off-chain) commands.
 registerExportCallbacks(bot);
 registerNotifyCallbacks(bot);
-registerTopupCallbacks(bot);
-registerPartialRepayCallbacks(bot);
-registerExtendCallbacks(bot);
-registerLendCallbacks(bot);
 registerImportCallbacks(bot);
-registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
@@ -126,16 +113,22 @@ bot.start({
     // Deposit watcher disabled: free public RPC can't handle background polling.
     // Re-enable when a dedicated RPC endpoint is available.
     startApiServer();
-    // startDepositWatcher(bot);
-    setTimeout(() => startLoanWatcher(bot), 5_000);
-    setTimeout(() => startHealthWatcher(bot), 10_000);
+    // ── On-chain background loops DISABLED ────────────────────────────────────
+    // The magpie-lending program was closed on 2026-05-07 and the user
+    // decided not to spend SOL to redeploy. Until/unless a new on-chain
+    // protocol ships, these watchers have nothing to watch — they were
+    // logging errors every cycle and eating RPC quota.
+    //   - startDepositWatcher (also previously disabled due to RPC limits)
+    //   - startLoanWatcher
+    //   - startHealthWatcher
+    //   - startCreditOraclePublisher
+    // To revive: uncomment after the new program is live.
+    // ─────────────────────────────────────────────────────────────────────────
     setTimeout(() => startRiskEngine(bot), 15_000);
     setTimeout(() => startPumpWatcher(bot), 20_000);
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
     startDbHealth(bot); // Start immediately — monitors DB connectivity
-    // Credit oracle publisher disabled: requires funded authority wallet.
-    // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
 });
 
