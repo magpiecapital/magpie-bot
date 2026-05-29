@@ -85,11 +85,14 @@ const AUTO_APPROVE = {
 };
 
 // Minimum to even consider (below this = auto-reject)
+// Loosened 2026-05-29 — was 30k/100/12h/10k. Sends more tokens to /reviewtokens
+// for manual review. AUTO_APPROVE bar stays strict to keep rug-pulls out of
+// auto-approvals.
 const MIN_CONSIDER = {
-  minLiquidityUsd: 30_000,
-  minHolders: 100,
-  minAgeHours: 12,
-  minVolume24h: 10_000,
+  minLiquidityUsd: 10_000,
+  minHolders: 50,
+  minAgeHours: 6,
+  minVolume24h: 3_000,
 };
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
