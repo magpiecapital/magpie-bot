@@ -32,6 +32,8 @@
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { PublicKey } from "@solana/web3.js";
+import { cachedJson } from "../lib/http-cache.js";
+import { markCycle } from "../lib/heartbeat.js";
 
 const POLL_INTERVAL_MS = Number(process.env.TOKEN_HEALTH_INTERVAL_MS) || 900_000; // 15 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -71,30 +73,25 @@ async function getMarketData(mints) {
 
   for (let i = 0; i < mints.length; i += BATCH) {
     const batch = mints.slice(i, i + BATCH);
-    try {
-      const res = await fetch(
-        `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
-      );
-      if (!res.ok) continue;
-      const pairs = await res.json();
-      if (!Array.isArray(pairs)) continue;
+    const pairs = await cachedJson(
+      `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
+      { ttlMs: 30_000 },
+    );
+    if (!Array.isArray(pairs)) continue;
 
-      for (const p of pairs) {
-        const addr = p.baseToken?.address;
-        if (!addr) continue;
-        const liq = p.liquidity?.usd ?? 0;
-        const existing = result.get(addr);
-        if (existing && (existing.liquidity ?? 0) >= liq) continue;
+    for (const p of pairs) {
+      const addr = p.baseToken?.address;
+      if (!addr) continue;
+      const liq = p.liquidity?.usd ?? 0;
+      const existing = result.get(addr);
+      if (existing && (existing.liquidity ?? 0) >= liq) continue;
 
-        result.set(addr, {
-          symbol: p.baseToken?.symbol || "???",
-          liquidity: liq,
-          volume24h: p.volume?.h24 ?? 0,
-          marketCap: p.marketCap ?? p.fdv ?? 0,
-        });
-      }
-    } catch (err) {
-      console.error("[token-health] market data error:", err.message);
+      result.set(addr, {
+        symbol: p.baseToken?.symbol || "???",
+        liquidity: liq,
+        volume24h: p.volume?.h24 ?? 0,
+        marketCap: p.marketCap ?? p.fdv ?? 0,
+      });
     }
   }
   return result;
@@ -362,8 +359,6 @@ async function tick(bot) {
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
-
-import { markCycle } from "../lib/heartbeat.js";
 
 export function startTokenHealth(bot) {
   console.log(`🩺 Token health monitor running (every ${POLL_INTERVAL_MS / 1000}s)`);

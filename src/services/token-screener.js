@@ -14,6 +14,8 @@
 import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
+import { cachedJson } from "../lib/http-cache.js";
+import { markCycle } from "../lib/heartbeat.js";
 
 const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 600_000; // 10 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -149,73 +151,59 @@ async function discoverTokens() {
   }
 
   // Source 1: DexScreener token boosts (top trending)
-  try {
-    const res = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
-    if (res.ok) extractFromBoostArray(await res.json(), "trending");
-  } catch (err) {
-    console.error("[screener] trending fetch error:", err.message);
+  {
+    const data = await cachedJson("https://api.dexscreener.com/token-boosts/top/v1");
+    if (data) extractFromBoostArray(data, "trending");
   }
 
   // Source 2: DexScreener token boosts (latest — catches tokens trending up)
-  try {
-    const res = await fetch("https://api.dexscreener.com/token-boosts/latest/v1");
-    if (res.ok) extractFromBoostArray(await res.json(), "boost_latest");
-  } catch (err) {
-    console.error("[screener] boost latest fetch error:", err.message);
+  {
+    const data = await cachedJson("https://api.dexscreener.com/token-boosts/latest/v1");
+    if (data) extractFromBoostArray(data, "boost_latest");
   }
 
   // Source 3: DexScreener latest profiles (new tokens with filled profiles)
-  try {
-    const res = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
-    if (res.ok) extractFromBoostArray(await res.json(), "new_profile");
-  } catch (err) {
-    console.error("[screener] profiles fetch error:", err.message);
+  {
+    const data = await cachedJson("https://api.dexscreener.com/token-profiles/latest/v1");
+    if (data) extractFromBoostArray(data, "new_profile");
   }
 
   // Source 4: Keyword search — rotates through memecoin-related terms each cycle
   const searchBatch = getNextSearchBatch();
   for (const term of searchBatch) {
-    try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(term)}`);
-      if (res.ok) extractFromSearchPairs(await res.json(), `search:${term}`, 20_000);
-    } catch { /* ignore */ }
+    const data = await cachedJson(
+      `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(term)}`,
+    );
+    if (data) extractFromSearchPairs(data, `search:${term}`, 20_000);
   }
 
   // Source 5: tokens.xyz xStocks — discover new tokenized stocks
-  try {
-    const res = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + KNOWN_STOCK_ISSUERS.join(","));
-    if (res.ok) {
-      const pairs = await res.json();
-      if (Array.isArray(pairs)) {
-        for (const p of pairs) {
-          const addr = p.baseToken?.address;
-          const symbol = p.baseToken?.symbol || "";
-          if (addr && symbol.startsWith("x") && symbol.length >= 2) addSolanaToken(addr, "xstock");
-        }
+  {
+    const pairs = await cachedJson(
+      "https://api.dexscreener.com/tokens/v1/solana/" + KNOWN_STOCK_ISSUERS.join(","),
+    );
+    if (Array.isArray(pairs)) {
+      for (const p of pairs) {
+        const addr = p.baseToken?.address;
+        const symbol = p.baseToken?.symbol || "";
+        if (addr && symbol.startsWith("x") && symbol.length >= 2) addSolanaToken(addr, "xstock");
       }
     }
-  } catch (err) {
-    console.error("[screener] xstock fetch error:", err.message);
   }
 
   // Source 6: Search DexScreener for "x" prefixed stock tokens
   for (const q of STOCK_SEARCH_QUERIES) {
-    try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${q}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.pairs) {
-          for (const p of data.pairs) {
-            if (p.chainId !== "solana") continue;
-            const addr = p.baseToken?.address;
-            const symbol = p.baseToken?.symbol || "";
-            if (addr && symbol.startsWith("x") && (p.liquidity?.usd ?? 0) > 10_000) {
-              addSolanaToken(addr, "stock_search");
-            }
-          }
+    const data = await cachedJson(`https://api.dexscreener.com/latest/dex/search?q=${q}`);
+    if (data?.pairs) {
+      for (const p of data.pairs) {
+        if (p.chainId !== "solana") continue;
+        const addr = p.baseToken?.address;
+        const symbol = p.baseToken?.symbol || "";
+        if (addr && symbol.startsWith("x") && (p.liquidity?.usd ?? 0) > 10_000) {
+          addSolanaToken(addr, "stock_search");
         }
       }
-    } catch { /* ignore */ }
+    }
   }
 
   return Array.from(tokens.values());
@@ -264,35 +252,30 @@ async function getMarketData(mints) {
 
   for (let i = 0; i < mints.length; i += BATCH) {
     const batch = mints.slice(i, i + BATCH);
-    try {
-      const res = await fetch(
-        `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
-      );
-      if (!res.ok) continue;
-      const pairs = await res.json();
-      if (!Array.isArray(pairs)) continue;
+    const pairs = await cachedJson(
+      `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
+      { ttlMs: 30_000 },
+    );
+    if (!Array.isArray(pairs)) continue;
 
-      for (const p of pairs) {
-        const addr = p.baseToken?.address;
-        if (!addr) continue;
+    for (const p of pairs) {
+      const addr = p.baseToken?.address;
+      if (!addr) continue;
 
-        const liq = p.liquidity?.usd ?? 0;
-        const existing = result.get(addr);
-        if (existing && (existing.liquidity ?? 0) >= liq) continue;
+      const liq = p.liquidity?.usd ?? 0;
+      const existing = result.get(addr);
+      if (existing && (existing.liquidity ?? 0) >= liq) continue;
 
-        result.set(addr, {
-          symbol: p.baseToken?.symbol || "???",
-          name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
-          price: p.priceUsd ? parseFloat(p.priceUsd) : null,
-          liquidity: liq,
-          volume24h: p.volume?.h24 ?? 0,
-          marketCap: p.marketCap ?? p.fdv ?? 0,
-          pairCreatedAt: p.pairCreatedAt ?? null,
-          imageUrl: p.info?.imageUrl ?? null,
-        });
-      }
-    } catch (err) {
-      console.error("[screener] market data batch error:", err.message);
+      result.set(addr, {
+        symbol: p.baseToken?.symbol || "???",
+        name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
+        price: p.priceUsd ? parseFloat(p.priceUsd) : null,
+        liquidity: liq,
+        volume24h: p.volume?.h24 ?? 0,
+        marketCap: p.marketCap ?? p.fdv ?? 0,
+        pairCreatedAt: p.pairCreatedAt ?? null,
+        imageUrl: p.info?.imageUrl ?? null,
+      });
     }
   }
   return result;
@@ -799,8 +782,6 @@ async function processReviewQueue(bot) {
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
-
-import { markCycle } from "../lib/heartbeat.js";
 
 export function startTokenScreener(bot) {
   console.log(`🔍 Token screener running (every ${POLL_INTERVAL_MS / 1000}s)`);
