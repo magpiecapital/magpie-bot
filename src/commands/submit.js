@@ -104,10 +104,12 @@ const AUTO_APPROVE = {
   minMarketCap: 250_000,
 };
 
+// Loosened 2026-05-29 (aligns with screener MIN_CONSIDER).
+// Borderline tokens go to /reviewtokens for manual admin approval.
 const MIN_CONSIDER = {
-  minLiquidityUsd: 30_000,
-  minAgeHours: 12,
-  minVolume24h: 10_000,
+  minLiquidityUsd: 10_000,
+  minAgeHours: 4,
+  minVolume24h: 3_000,
 };
 
 // ── Command handler ─────────────────────────────────────────────────────────
@@ -215,7 +217,7 @@ export async function handleSubmit(ctx) {
   if (market.liquidity < MIN_CONSIDER.minLiquidityUsd)
     fails.push(`Liquidity ($${Math.floor(market.liquidity).toLocaleString()}) below $50K minimum`);
   if (ageHours < MIN_CONSIDER.minAgeHours)
-    fails.push(`Token is only ${ageHours}h old (minimum 24h)`);
+    fails.push(`Token is only ${ageHours}h old (minimum ${MIN_CONSIDER.minAgeHours}h)`);
   if (market.volume24h < MIN_CONSIDER.minVolume24h)
     fails.push(`24h volume ($${Math.floor(market.volume24h).toLocaleString()}) below $25K minimum`);
 
