@@ -6,6 +6,9 @@ node_modules/
 .DS_Store
 dist/
 .deploy-keypair.json
+# Any file with 'keypair' in the name (catches lender-keypair-v2.json, etc.)
+*keypair*.json
+**/*keypair*.json
 target/
 .next/
 .anchor/
