@@ -408,9 +408,10 @@ function vetToken(onChain, market, holderCount, category) {
       market.volume24h >= AUTO_APPROVE.minVolume24h &&
       market.marketCap >= AUTO_APPROVE.minMarketCap;
 
+    // Don't block from review on authority alone — pump-style launches keep
+    // mint authority until they graduate. Authority status is in `fails` so
+    // admin sees the warning when reviewing.
     meetsMinimum =
-      !onChain.hasMintAuthority &&
-      !onChain.hasFreezeAuthority &&
       market.liquidity >= MIN_CONSIDER.minLiquidityUsd &&
       ageHours >= MIN_CONSIDER.minAgeHours &&
       holderCount >= MIN_CONSIDER.minHolders &&

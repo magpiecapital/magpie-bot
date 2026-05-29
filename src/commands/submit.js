@@ -210,19 +210,22 @@ export async function handleSubmit(ctx) {
     : 0;
 
   // ── Safety checks ──
+  // Size/age/volume failures = hard reject (truly garbage).
+  // Authority flags = warning only — go to /reviewtokens for admin to decide.
   const fails = [];
+  const warnings = [];
 
-  if (onChain.hasMintAuthority) fails.push("Mint authority is enabled — supply can be inflated");
-  if (onChain.hasFreezeAuthority) fails.push("Freeze authority is enabled — tokens can be frozen");
+  if (onChain.hasMintAuthority) warnings.push("Mint authority is enabled — supply can be inflated");
+  if (onChain.hasFreezeAuthority) warnings.push("Freeze authority is enabled — tokens can be frozen");
   if (market.liquidity < MIN_CONSIDER.minLiquidityUsd)
-    fails.push(`Liquidity ($${Math.floor(market.liquidity).toLocaleString()}) below $50K minimum`);
+    fails.push(`Liquidity ($${Math.floor(market.liquidity).toLocaleString()}) below $${MIN_CONSIDER.minLiquidityUsd.toLocaleString()} minimum`);
   if (ageHours < MIN_CONSIDER.minAgeHours)
     fails.push(`Token is only ${ageHours}h old (minimum ${MIN_CONSIDER.minAgeHours}h)`);
   if (market.volume24h < MIN_CONSIDER.minVolume24h)
-    fails.push(`24h volume ($${Math.floor(market.volume24h).toLocaleString()}) below $25K minimum`);
+    fails.push(`24h volume ($${Math.floor(market.volume24h).toLocaleString()}) below $${MIN_CONSIDER.minVolume24h.toLocaleString()} minimum`);
 
-  // Hard reject: mint/freeze authority or below minimums
-  if (onChain.hasMintAuthority || onChain.hasFreezeAuthority || fails.length > 0) {
+  // Hard reject only on real size/age failures.
+  if (fails.length > 0) {
     const lines = [
       `*${market.symbol}* — Not Approved`,
       "",
@@ -235,6 +238,7 @@ export async function handleSubmit(ctx) {
       "",
       "*Issues:*",
       ...fails.map((f) => `  • ${f}`),
+      ...warnings.map((w) => `  • ${w}`),
       "",
       "This token does not meet our safety criteria for collateral.",
     ];
@@ -242,7 +246,10 @@ export async function handleSubmit(ctx) {
   }
 
   // ── Auto-approve vs review ──
+  // Auto-approve still requires authority revoked — warnings block this.
   const canAutoApprove =
+    !onChain.hasMintAuthority &&
+    !onChain.hasFreezeAuthority &&
     market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
     ageHours >= AUTO_APPROVE.minAgeHours &&
     market.volume24h >= AUTO_APPROVE.minVolume24h &&
