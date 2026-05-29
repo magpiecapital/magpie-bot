@@ -21,6 +21,7 @@ const TOKENS = [
   { symbol: "FARTCOIN", mint: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump" },
   { symbol: "PENGU",    mint: "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv" },
   { symbol: "POPCAT",   mint: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr" },
+  { symbol: "CUM",      mint: "oqU4DdYCbdSf9j74vnEgvCn1YzNfYQEPWaC6pu6pump" },
 ];
 
 async function main() {
