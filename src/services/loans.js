@@ -1,8 +1,8 @@
 import {
+  Keypair,
   PublicKey,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
-  Transaction,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
 import {
@@ -16,6 +16,8 @@ import {
   createCloseAccountInstruction,
 } from "@solana/spl-token";
 import BN from "bn.js";
+import fs from "node:fs";
+import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { getProgramForSigner } from "../solana/program.js";
@@ -24,12 +26,20 @@ import {
   loanTokenVaultPda,
   loanPda,
   collateralVaultPda,
+  priceFeedPda,
 } from "../solana/pdas.js";
 import { loadKeypair } from "./wallet.js";
 import { query } from "../db/pool.js";
 import { recordCreditEvent } from "./credit-score.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
+
+/** Load the lender/authority keypair from the JSON file on disk. */
+function loadLenderKeypair() {
+  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+  const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
+  return Keypair.fromSecretKey(new Uint8Array(raw));
+}
 
 // Detect whether a mint uses Token-2022 or classic Token program.
 async function getMintTokenProgram(mint) {
@@ -118,6 +128,9 @@ export async function executeBorrow({
     ),
   ];
 
+  // Authority must co-sign to attest the collateral value
+  const lenderKeypair = loadLenderKeypair();
+
   const sig = await program.methods
     .requestAndFundLoan(
       new BN(collateralAmountRaw.toString()),
@@ -126,21 +139,23 @@ export async function executeBorrow({
       loanId,
     )
     .accounts({
+      pool: lendingPool,
+      loanTokenVault,
       loan: loanAccount,
       collateralVault,
-      lendingPool,
-      loanTokenVault,
-      loanTokenMint: loanTokenMintPk,
       collateralMint: collateralMintPk,
       borrowerCollateralAccount: borrowerCollateralAta,
       borrowerLoanTokenAccount: borrowerWsolAta,
       feeWalletTokenAccount: feeWalletWsolAta,
       borrower: borrower.publicKey,
+      authority: LENDER_PUBKEY,
+      priceFeed: priceFeedPda(collateralMintPk, lendingPool)[0],
       systemProgram: SystemProgram.programId,
-      collateralTokenProgram,
+      tokenProgram: collateralTokenProgram,
       loanTokenProgram,
       rent: SYSVAR_RENT_PUBKEY,
     })
+    .signers([lenderKeypair])
     .preInstructions(preIxs)
     .postInstructions(postIxs)
     .rpc({ commitment: "confirmed" });
@@ -216,16 +231,15 @@ export async function executeRepay({ userId, loanDbRow }) {
   const sig = await program.methods
     .repayLoan()
     .accounts({
-      loan: loanPdaPk,
-      collateralVault,
-      lendingPool,
+      pool: lendingPool,
       loanTokenVault,
-      loanTokenMint: loanTokenMintPk,
+      loan: loanPdaPk,
       collateralMint: collateralMintPk,
+      collateralVault,
       borrowerCollateralAccount: borrowerCollateralAta,
       borrowerLoanTokenAccount: borrowerWsolAta,
       borrower: borrower.publicKey,
-      collateralTokenProgram,
+      tokenProgram: collateralTokenProgram,
       loanTokenProgram,
     })
     .preInstructions(preIxs)
@@ -308,11 +322,11 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
     .addCollateral(new BN(extraRawAmount.toString()))
     .accounts({
       loan: loanPdaPk,
-      collateralVault,
       collateralMint: collateralMintPk,
+      collateralVault,
       borrowerCollateralAccount: borrowerCollateralAta,
       borrower: borrower.publicKey,
-      collateralTokenProgram,
+      tokenProgram: collateralTokenProgram,
     })
     .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })])
     .rpc({ commitment: "confirmed" });
@@ -371,10 +385,9 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
   const sig = await program.methods
     .partialRepay(new BN(repayLamports.toString()))
     .accounts({
-      loan: loanPdaPk,
-      lendingPool,
+      pool: lendingPool,
       loanTokenVault,
-      loanTokenMint: loanTokenMintPk,
+      loan: loanPdaPk,
       borrowerLoanTokenAccount: borrowerWsolAta,
       borrower: borrower.publicKey,
       loanTokenProgram,
@@ -397,6 +410,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
 
   const loanTokenMintPk = NATIVE_MINT;
   const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
   const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
   const loanTokenProgram = TOKEN_PROGRAM_ID;
 
@@ -449,9 +463,9 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   const sig = await program.methods
     .extendLoan()
     .accounts({
+      pool: lendingPool,
+      loanTokenVault,
       loan: loanPdaPk,
-      lendingPool,
-      loanTokenMint: loanTokenMintPk,
       borrowerLoanTokenAccount: borrowerWsolAta,
       feeWalletTokenAccount: feeWalletWsolAta,
       borrower: borrower.publicKey,

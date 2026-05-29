@@ -28,6 +28,15 @@
           "writable": true
         },
         {
+          "name": "collateral_mint",
+          "docs": [
+            "Collateral mint — needed for transfer_checked (Token-2022 compat)."
+          ],
+          "relations": [
+            "loan"
+          ]
+        },
+        {
           "name": "collateral_vault",
           "writable": true,
           "pda": {
@@ -73,8 +82,7 @@
           ]
         },
         {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+          "name": "token_program"
         }
       ],
       "args": [
@@ -555,6 +563,15 @@
           "writable": true
         },
         {
+          "name": "collateral_mint",
+          "docs": [
+            "Collateral mint — needed for transfer_checked (Token-2022 compat)."
+          ],
+          "relations": [
+            "loan"
+          ]
+        },
+        {
           "name": "collateral_vault",
           "writable": true,
           "pda": {
@@ -610,8 +627,7 @@
           "signer": true
         },
         {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+          "name": "token_program"
         }
       ],
       "args": []
@@ -761,6 +777,15 @@
           "writable": true
         },
         {
+          "name": "collateral_mint",
+          "docs": [
+            "Collateral mint — needed for transfer_checked (Token-2022 compat)."
+          ],
+          "relations": [
+            "loan"
+          ]
+        },
+        {
           "name": "collateral_vault",
           "writable": true,
           "pda": {
@@ -810,8 +835,7 @@
           ]
         },
         {
-          "name": "token_program",
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+          "name": "token_program"
         },
         {
           "name": "loan_token_program",
@@ -999,14 +1023,14 @@
         {
           "name": "token_program",
           "docs": [
-            "Used for collateral vault init + collateral transfers"
-          ],
-          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            "Used for collateral vault init + collateral transfers. Accepts both",
+            "legacy SPL Token and Token-2022 mints."
+          ]
         },
         {
           "name": "loan_token_program",
           "docs": [
-            "Used for loan token (wSOL) transfers from pool vault"
+            "Used for loan token (wSOL) transfers from pool vault. Always legacy."
           ],
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
