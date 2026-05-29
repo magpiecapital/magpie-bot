@@ -12,9 +12,12 @@ export async function handleImport(ctx) {
   try { await ctx.deleteMessage(); } catch (_) {}
 
   // Support legacy inline usage: /import <key>
-  const key = typeof ctx.match === "string" ? ctx.match.trim() : "";
-  if (key) {
-    return doImport(ctx, tgUser, key);
+  // Only treat ctx.match as a key if it actually looks like base58 — otherwise
+  // we'd misinterpret callback data like "start:import" as a (broken) key.
+  const raw = typeof ctx.match === "string" ? ctx.match.trim() : "";
+  const looksLikeKey = /^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(raw);
+  if (looksLikeKey) {
+    return doImport(ctx, tgUser, raw);
   }
 
   const kb = new InlineKeyboard()
