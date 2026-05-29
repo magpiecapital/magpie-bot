@@ -6,7 +6,9 @@ import BN from "bn.js";
 import "dotenv/config";
 import { getPriceInSol } from "./price.js";
 import { getProgramForSigner } from "../solana/program.js";
+import { connection } from "../solana/connection.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
+import { query } from "../db/pool.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
@@ -27,8 +29,8 @@ function loadLenderKeypair() {
 }
 
 /**
- * Initialize a price feed PDA for a given mint.
- * Call once per token you want to support for lending.
+ * Initialize a price feed PDA for a given mint. Idempotent — returns
+ * { alreadyExists: true } if the PDA is already on chain.
  */
 export async function initializePriceFeed(mintStr) {
   const lender = loadLenderKeypair();
@@ -36,6 +38,11 @@ export async function initializePriceFeed(mintStr) {
   const mintPk = new PublicKey(mintStr);
   const [pool] = lendingPoolPda(LENDER_PUBKEY);
   const [priceFeed] = priceFeedPda(mintPk, pool);
+
+  const existing = await connection.getAccountInfo(priceFeed);
+  if (existing) {
+    return { alreadyExists: true, priceFeed: priceFeed.toBase58() };
+  }
 
   const sig = await program.methods
     .initializePriceFeed()
@@ -88,14 +95,26 @@ export async function attestPrice(mintStr, decimals) {
 }
 
 /**
- * Start a periodic price attestor loop for a list of mints.
- * Updates prices on-chain every `intervalMs` milliseconds.
+ * Fetch the current list of enabled borrowable mints from the DB.
+ * The screener and manual /submit approvals write here; this is the
+ * single source of truth for "what can be borrowed against."
+ */
+async function fetchEnabledMints() {
+  const r = await query(
+    `SELECT mint, decimals FROM supported_mints WHERE enabled = TRUE`,
+  );
+  return r.rows.map((row) => ({ mint: row.mint, decimals: row.decimals }));
+}
+
+/**
+ * Start a periodic price attestor loop. The token list is refreshed from
+ * the DB on every tick, so newly-approved tokens get attested automatically
+ * without a bot restart.
  *
- * @param {Array<{mint: string, decimals: number}>} tokens
  * @param {number} intervalMs - default 30 seconds
  */
-export function startPriceAttestor(tokens, intervalMs = 30_000) {
-  console.log(`[PriceAttestor] Starting for ${tokens.length} tokens, interval=${intervalMs}ms`);
+export function startPriceAttestor(intervalMs = 30_000) {
+  console.log(`[PriceAttestor] Starting (DB-driven), interval=${intervalMs}ms`);
 
   const lastPrices = new Map();
   const lastAttestAt = new Map();
@@ -104,6 +123,14 @@ export function startPriceAttestor(tokens, intervalMs = 30_000) {
   const MAX_GAP_MS = 60_000;
 
   async function tick() {
+    let tokens;
+    try {
+      tokens = await fetchEnabledMints();
+    } catch (err) {
+      console.error(`[PriceAttestor] Failed to load enabled mints: ${err.message}`);
+      return;
+    }
+
     for (const { mint, decimals } of tokens) {
       try {
         const priceSol = await getPriceInSol(mint);
@@ -116,10 +143,24 @@ export function startPriceAttestor(tokens, intervalMs = 30_000) {
         const drift = lastPrice > 0 ? Math.abs(priceLamports - lastPrice) / lastPrice : 1;
         if (drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS) continue;
 
-        const result = await attestPrice(mint, decimals);
-        lastPrices.set(mint, priceLamports);
-        lastAttestAt.set(mint, Date.now());
-        console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
+        try {
+          const result = await attestPrice(mint, decimals);
+          lastPrices.set(mint, priceLamports);
+          lastAttestAt.set(mint, Date.now());
+          console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
+        } catch (attestErr) {
+          // Feed PDA may not exist yet for newly-approved tokens —
+          // auto-init it so the next tick succeeds.
+          if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+            const init = await initializePriceFeed(mint);
+            if (init.alreadyExists) {
+              throw attestErr; // not the issue we expected — rethrow
+            }
+            console.log(`[PriceAttestor] Auto-initialized feed for ${mint.slice(0, 8)}... — attest on next tick`);
+          } else {
+            throw attestErr;
+          }
+        }
       } catch (err) {
         console.error(`[PriceAttestor] Failed for ${mint.slice(0, 8)}...: ${err.message}`);
       }

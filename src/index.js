@@ -49,16 +49,6 @@ import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
 
-// Tokens with initialized price feeds — these can be borrowed against.
-// Add to this list AND run `node scripts/init-price-feeds.js` for new ones.
-const BORROWABLE_TOKENS = [
-  { symbol: "BONK",     mint: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", decimals: 5 },
-  { symbol: "WIF",      mint: "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", decimals: 6 },
-  { symbol: "FARTCOIN", mint: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump", decimals: 6 },
-  { symbol: "PENGU",    mint: "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv", decimals: 6 },
-  { symbol: "POPCAT",   mint: "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", decimals: 9 },
-];
-
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
   console.error("TELEGRAM_BOT_TOKEN is not set");
@@ -145,12 +135,12 @@ bot.start({
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
     startDbHealth(bot); // Start immediately — monitors DB connectivity
-    // Push fresh prices to on-chain price feeds every 90s so /borrow
-    // can pass the 2-min staleness check. Drift-gated: only sends a tx
-    // if price moved >0.5%, keeping cost down.
+    // Push fresh prices to on-chain price feeds. DB-driven: the attestor
+    // queries supported_mints (enabled=TRUE) every tick, so newly approved
+    // tokens get attested without a restart. Drift-gated to keep cost low.
     // 45s interval so refresh fires before the 60s force-attest gap.
     // Keeps on-chain feed timestamp comfortably under 120s contract limit.
-    setTimeout(() => startPriceAttestor(BORROWABLE_TOKENS, 45_000), 35_000);
+    setTimeout(() => startPriceAttestor(45_000), 35_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
