@@ -38,19 +38,42 @@ export async function handleImport(ctx) {
 }
 
 async function doImport(ctx, tgUser, key) {
+  // Phantom exports base58 (88 chars). Solflare exports a JSON byte array
+  // ([12,34,56,...]). Support both.
+  let normalizedKey = key;
   try {
     const { Keypair } = await import("@solana/web3.js");
     const bs58 = await import("bs58");
-    const decoded = bs58.default.decode(key);
-    Keypair.fromSecretKey(decoded);
-  } catch (_) {
-    return ctx.reply("That doesn't look right. Make sure you're pasting your full private key from Phantom or Solflare.");
+    let secretKey;
+    if (key.startsWith("[")) {
+      // Solflare JSON array format
+      const arr = JSON.parse(key);
+      secretKey = Uint8Array.from(arr);
+      // Re-encode to base58 so wallet service sees consistent format downstream
+      normalizedKey = bs58.default.encode(secretKey);
+    } else {
+      secretKey = bs58.default.decode(key);
+    }
+    Keypair.fromSecretKey(secretKey);
+  } catch (err) {
+    console.error("[import] parse failed:", err?.message);
+    return ctx.reply(
+      [
+        "That doesn't look right. Make sure you're pasting your full private key:",
+        "",
+        "• *Phantom*: Settings → Show Secret Recovery Phrase isn't it — you need *Export Private Key* (a long string of letters and numbers)",
+        "• *Solflare*: Settings → Export Private Key (long string or array of numbers)",
+        "",
+        "Try again — tap *Import existing wallet* once more.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
   try {
-    const { publicKey } = await importWallet(user.id, key);
+    const { publicKey } = await importWallet(user.id, normalizedKey);
 
     const kb = new InlineKeyboard()
       .text("💰 Borrow now", "start:borrow")
