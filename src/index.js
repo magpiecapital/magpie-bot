@@ -148,7 +148,9 @@ bot.start({
     // Push fresh prices to on-chain price feeds every 90s so /borrow
     // can pass the 2-min staleness check. Drift-gated: only sends a tx
     // if price moved >0.5%, keeping cost down.
-    setTimeout(() => startPriceAttestor(BORROWABLE_TOKENS, 90_000), 35_000);
+    // 45s interval so refresh fires before the 60s force-attest gap.
+    // Keeps on-chain feed timestamp comfortably under 120s contract limit.
+    setTimeout(() => startPriceAttestor(BORROWABLE_TOKENS, 45_000), 35_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

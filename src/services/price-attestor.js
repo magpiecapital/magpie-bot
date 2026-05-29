@@ -98,6 +98,10 @@ export function startPriceAttestor(tokens, intervalMs = 30_000) {
   console.log(`[PriceAttestor] Starting for ${tokens.length} tokens, interval=${intervalMs}ms`);
 
   const lastPrices = new Map();
+  const lastAttestAt = new Map();
+  // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
+  // feed timestamp never crosses the contract's 120s staleness limit.
+  const MAX_GAP_MS = 60_000;
 
   async function tick() {
     for (const { mint, decimals } of tokens) {
@@ -105,13 +109,16 @@ export function startPriceAttestor(tokens, intervalMs = 30_000) {
         const priceSol = await getPriceInSol(mint);
         const priceLamports = Math.floor(priceSol * 1e9);
         const lastPrice = lastPrices.get(mint) || 0;
+        const since = Date.now() - (lastAttestAt.get(mint) || 0);
 
-        // Only update if price changed by more than 0.5% (saves tx fees)
+        // Skip ONLY if drift is small AND we attested recently enough
+        // to keep the on-chain feed fresh.
         const drift = lastPrice > 0 ? Math.abs(priceLamports - lastPrice) / lastPrice : 1;
-        if (drift < 0.005 && lastPrice > 0) continue;
+        if (drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS) continue;
 
         const result = await attestPrice(mint, decimals);
         lastPrices.set(mint, priceLamports);
+        lastAttestAt.set(mint, Date.now());
         console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
       } catch (err) {
         console.error(`[PriceAttestor] Failed for ${mint.slice(0, 8)}...: ${err.message}`);
