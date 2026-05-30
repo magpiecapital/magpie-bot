@@ -48,6 +48,7 @@ import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
+import { BTN_HOME, BTN_WALLET, BTN_BORROW, BTN_POSITIONS } from "./lib/main-keyboard.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -111,6 +112,14 @@ registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
+
+// Persistent reply-keyboard buttons. Route exact button labels to their
+// handlers BEFORE the natural-language fallback so taps go straight to
+// the right command instead of getting funneled through keyword matching.
+bot.hears(BTN_HOME, handleHome);
+bot.hears(BTN_WALLET, handleWallet);
+bot.hears(BTN_BORROW, handleBorrow);
+bot.hears(BTN_POSITIONS, handlePositions);
 
 // Fallback: respond to any text message that isn't a command
 bot.on("message:text", handleFallback);

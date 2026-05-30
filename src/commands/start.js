@@ -3,6 +3,7 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { getOrCreateCode, attribute } from "../services/referrals.js";
 import { getPrefs } from "../services/prefs.js";
+import { mainReplyKeyboard } from "../lib/main-keyboard.js";
 
 export async function handleStart(ctx) {
   const tgUser = ctx.from;
@@ -14,6 +15,14 @@ export async function handleStart(ctx) {
   // Ensure prefs row + referral code exist on first /start.
   await getPrefs(user.id);
   await getOrCreateCode(user.id);
+
+  // Attach persistent quick-actions keyboard. Sticks across all future
+  // messages thanks to is_persistent: true — only needs to be sent once
+  // per user, but re-sending is harmless if they /start again.
+  await ctx.reply("📌 *Quick menu enabled* — use the buttons below to jump anywhere.", {
+    parse_mode: "Markdown",
+    reply_markup: mainReplyKeyboard(),
+  });
 
   const startArg = typeof ctx.match === "string" ? ctx.match.trim() : "";
 
