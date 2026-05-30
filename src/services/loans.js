@@ -301,11 +301,38 @@ export async function recordLoan({
   );
 }
 
+/**
+ * Mark a loan as repaid AND record the corresponding credit event.
+ * The event type is derived from when the user repaid relative to the
+ * loan's due_timestamp:
+ *   - repaid >24h before due  → repay_early  (+20)
+ *   - repaid before due       → repay_ontime (+15)
+ *   - repaid after due        → repay_late   (-10)
+ */
 export async function markLoanRepaid(loanDbId, txSignature) {
+  const { rows: [loan] } = await query(
+    `SELECT user_id, due_timestamp FROM loans WHERE id = $1`,
+    [loanDbId],
+  );
+
   await query(
     `UPDATE loans SET status='repaid', tx_signature=$2, updated_at=NOW() WHERE id=$1`,
     [loanDbId, txSignature],
   );
+
+  if (loan) {
+    const now = Date.now();
+    const due = new Date(loan.due_timestamp).getTime();
+    const eventType =
+      now > due ? "repay_late"
+      : (due - now) > 24 * 60 * 60 * 1000 ? "repay_early"
+      : "repay_ontime";
+    try {
+      await recordCreditEvent(loan.user_id, eventType, loanDbId);
+    } catch (err) {
+      console.error("[loans] recordCreditEvent failed on repay:", err.message);
+    }
+  }
 }
 
 /**
