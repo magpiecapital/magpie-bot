@@ -214,6 +214,144 @@ async function handleTokens() {
   };
 }
 
+async function handleLoans(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) {
+    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  }
+
+  const { rows: [w] } = await query(
+    `SELECT user_id FROM wallets WHERE public_key = $1`, [wallet],
+  );
+  if (!w) {
+    // Unknown wallet — return empty (not an error: dashboard may render zero state)
+    return { status: 200, body: { wallet, active: [], history: [] } };
+  }
+
+  const { rows } = await query(
+    `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
+            l.loan_amount_lamports, l.original_loan_amount_lamports,
+            l.ltv_percentage, l.duration_days,
+            l.start_timestamp, l.due_timestamp,
+            l.status, l.tx_signature, l.updated_at,
+            sm.symbol, sm.name, sm.decimals, sm.image_url, sm.category
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      WHERE l.user_id = $1
+      ORDER BY l.start_timestamp DESC
+      LIMIT 100`,
+    [w.user_id],
+  );
+
+  const shape = (l) => ({
+    loan_id: l.loan_id?.toString?.() ?? null,
+    loan_pda: l.loan_pda,
+    status: l.status,
+    collateral: {
+      mint: l.collateral_mint,
+      symbol: l.symbol,
+      name: l.name,
+      decimals: l.decimals,
+      image: l.image_url || null,
+      category: l.category || "memecoin",
+      amount: l.collateral_amount?.toString?.() ?? null,
+    },
+    loan: {
+      amount_lamports: l.loan_amount_lamports?.toString?.() ?? null,
+      original_amount_lamports: l.original_loan_amount_lamports?.toString?.() ?? null,
+      ltv_percentage: l.ltv_percentage,
+      duration_days: l.duration_days,
+    },
+    timestamps: {
+      started_at: l.start_timestamp,
+      due_at: l.due_timestamp,
+      updated_at: l.updated_at,
+    },
+    tx_signature: l.tx_signature,
+  });
+
+  return {
+    status: 200,
+    body: {
+      wallet,
+      active: rows.filter((r) => r.status === "active").map(shape),
+      history: rows.filter((r) => r.status !== "active").map(shape),
+    },
+  };
+}
+
+async function handleWalletBalance(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) {
+    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  }
+
+  const { PublicKey } = await import("@solana/web3.js");
+  const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+  const { connection } = await import("../solana/connection.js");
+
+  let walletPk;
+  try {
+    walletPk = new PublicKey(wallet);
+  } catch {
+    return { status: 400, body: { error: "Invalid wallet address" } };
+  }
+
+  // SOL balance + supported-token balances (both legacy SPL and Token-2022).
+  const [solLamports, legacyAccounts, t22Accounts] = await Promise.all([
+    connection.getBalance(walletPk).catch(() => 0),
+    connection.getParsedTokenAccountsByOwner(walletPk, { programId: TOKEN_PROGRAM_ID }).catch(() => ({ value: [] })),
+    connection.getParsedTokenAccountsByOwner(walletPk, { programId: TOKEN_2022_PROGRAM_ID }).catch(() => ({ value: [] })),
+  ]);
+
+  const allAccts = [...legacyAccounts.value, ...t22Accounts.value];
+  const byMint = new Map();
+  for (const acc of allAccts) {
+    const info = acc.account.data?.parsed?.info;
+    if (!info?.mint || !info?.tokenAmount) continue;
+    const amount = info.tokenAmount.uiAmount;
+    if (!amount || amount <= 0) continue;
+    byMint.set(info.mint, {
+      mint: info.mint,
+      raw_amount: info.tokenAmount.amount,
+      decimals: info.tokenAmount.decimals,
+      amount: amount,
+    });
+  }
+
+  // Enrich with symbol/name/category from supported_mints for tokens we recognize.
+  const mints = [...byMint.keys()];
+  if (mints.length > 0) {
+    const { rows } = await query(
+      `SELECT mint, symbol, name, image_url, category
+         FROM supported_mints
+        WHERE mint = ANY($1)`,
+      [mints],
+    );
+    for (const r of rows) {
+      const t = byMint.get(r.mint);
+      if (!t) continue;
+      t.symbol = r.symbol;
+      t.name = r.name;
+      t.image = r.image_url || null;
+      t.category = r.category || "memecoin";
+      t.borrowable = true;
+    }
+  }
+
+  return {
+    status: 200,
+    body: {
+      wallet,
+      sol: {
+        lamports: solLamports.toString(),
+        amount: solLamports / 1e9,
+      },
+      tokens: [...byMint.values()],
+    },
+  };
+}
+
 async function handleMarketplaceStats() {
   const { getMarketplaceStats } = await import("../services/p2p-marketplace.js");
   const stats = await getMarketplaceStats();
@@ -238,7 +376,13 @@ async function handleLeaderboard() {
 
 // ─── Router ─────────────────────────────────────────────────────────────────
 
-const PUBLIC_ROUTES = new Set(["/api/v1/health", "/api/v1/tokens"]);
+const PUBLIC_ROUTES = new Set([
+  "/api/v1/health",
+  "/api/v1/tokens",
+  "/api/v1/loans",
+  "/api/v1/wallet/balance",
+  "/api/v1/credit/score",
+]);
 
 async function router(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -338,6 +482,12 @@ async function router(req, res) {
       case "/api/v1/tokens":
         result = await handleTokens();
         break;
+      case "/api/v1/loans":
+        result = await handleLoans(req, url);
+        break;
+      case "/api/v1/wallet/balance":
+        result = await handleWalletBalance(req, url);
+        break;
       case "/api/v1/risk/token":
         result = await handleTokenRisk(req, url);
         break;
@@ -359,6 +509,8 @@ async function router(req, res) {
               "GET /api/v1/credit/history?wallet=<address>": "Score history trend",
               "GET /api/v1/credit/leaderboard": "Top credit scores",
               "GET /api/v1/tokens": "All approved tokens (public, no auth)",
+              "GET /api/v1/loans?wallet=<address>": "Active + historical loans for a wallet",
+              "GET /api/v1/wallet/balance?wallet=<address>": "SOL + token balances for a wallet",
               "GET /api/v1/risk/token?mint=<address>": "Token risk assessment",
               "GET /api/v1/risk/flagged": "Currently flagged tokens",
               "GET /api/v1/marketplace/stats": "P2P marketplace statistics",
