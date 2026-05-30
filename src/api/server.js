@@ -394,6 +394,100 @@ async function handleWalletBalance(req, url) {
   };
 }
 
+async function handlePublicPoolStats() {
+  // Public LP-relevant pool stats: TVL, utilization, fee periods, recent
+  // fee events. No auth required — everything here is derivable from
+  // on-chain state anyway. Used by the /earn page to show APR estimates
+  // and recent yield activity.
+  const { PublicKey } = await import("@solana/web3.js");
+  const { getReadOnlyProgram } = await import("../solana/program.js");
+  const { lendingPoolPda } = await import("../solana/pdas.js");
+
+  let poolState = null;
+  try {
+    const [poolPda] = lendingPoolPda(new PublicKey(process.env.LENDER_PUBKEY));
+    const p = await getReadOnlyProgram().account.lendingPool.fetch(poolPda);
+    const totalDeposits = Number(p.totalDeposits);
+    const totalBorrowed = Number(p.totalBorrowed);
+    poolState = {
+      pool_pda: poolPda.toBase58(),
+      protocol_fee_bps: Number(p.protocolFeeBps),
+      lp_fee_share_bps: 10_000 - Number(p.protocolFeeBps),
+      total_deposits_sol: totalDeposits / 1e9,
+      total_borrowed_sol: totalBorrowed / 1e9,
+      total_shares: p.totalShares.toString(),
+      available_liquidity_sol: Math.max(0, totalDeposits - totalBorrowed) / 1e9,
+      utilization: totalDeposits > 0 ? totalBorrowed / totalDeposits : 0,
+      total_fees_earned_sol: Number(p.totalFeesEarned) / 1e9,
+      total_loans_issued: p.totalLoansIssued.toString(),
+      paused: p.paused,
+    };
+  } catch { /* fall through */ }
+
+  // Period-fee buckets (gross, before 80/20 split). LP receives lp_fee_share
+  // of these. SUM(numeric × bps / 10000) gives the originated fee.
+  const { rows: [periods] } = await query(
+    `SELECT
+       SUM(CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                ELSE original_loan_amount_lamports::numeric * 150 / 10000 END)::text AS lifetime,
+       SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '24 hours' THEN
+            CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                 WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                 ELSE original_loan_amount_lamports::numeric * 150 / 10000 END
+          ELSE 0 END)::text AS d24h,
+       SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '7 days' THEN
+            CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                 WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                 ELSE original_loan_amount_lamports::numeric * 150 / 10000 END
+          ELSE 0 END)::text AS d7d,
+       SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '30 days' THEN
+            CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                 WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                 ELSE original_loan_amount_lamports::numeric * 150 / 10000 END
+          ELSE 0 END)::text AS d30d
+       FROM loans`,
+  );
+
+  // Recent loans by start time — used for the "recent yield activity" stream.
+  const { rows: recentLoans } = await query(
+    `SELECT l.id, l.status,
+            l.original_loan_amount_lamports::text AS amount_lamports,
+            l.ltv_percentage, l.start_timestamp, l.updated_at,
+            sm.symbol
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      ORDER BY GREATEST(l.start_timestamp, l.updated_at) DESC
+      LIMIT 8`,
+  );
+
+  return {
+    status: 200,
+    body: {
+      pool: poolState,
+      fees: {
+        lifetime_lamports: periods?.lifetime || "0",
+        last_24h_lamports: periods?.d24h || "0",
+        last_7d_lamports: periods?.d7d || "0",
+        last_30d_lamports: periods?.d30d || "0",
+      },
+      recent_loans: recentLoans.map((r) => {
+        const feeBps = r.ltv_percentage >= 30 ? 300 : r.ltv_percentage >= 25 ? 200 : 150;
+        const feeLamports = Math.floor(Number(r.amount_lamports) * feeBps / 10_000);
+        return {
+          symbol: r.symbol,
+          status: r.status,
+          loan_amount_lamports: r.amount_lamports,
+          fee_lamports: feeLamports.toString(),
+          timestamp: r.status === "active" ? r.start_timestamp : r.updated_at,
+          event: r.status === "active" ? "borrow" : r.status === "repaid" ? "repay" : "liquidation",
+        };
+      }),
+      generated_at: new Date().toISOString(),
+    },
+  };
+}
+
 async function handleAdminPoolStats(req, url) {
   const wallet = url.searchParams.get("wallet");
   if (!wallet) {
@@ -593,6 +687,7 @@ const PUBLIC_ROUTES = new Set([
   // Admin route is "public" at the HTTP layer but gates internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
+  "/api/v1/pool/stats",
 ]);
 
 async function router(req, res) {
@@ -701,6 +796,9 @@ async function router(req, res) {
         break;
       case "/api/v1/admin/pool-stats":
         result = await handleAdminPoolStats(req, url);
+        break;
+      case "/api/v1/pool/stats":
+        result = await handlePublicPoolStats();
         break;
       case "/api/v1/risk/token":
         result = await handleTokenRisk(req, url);
