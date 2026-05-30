@@ -48,6 +48,7 @@ import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
+import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -164,6 +165,7 @@ bot.start({
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
     startDbHealth(bot); // Start immediately — monitors DB connectivity
+    setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
     // queries supported_mints (enabled=TRUE) every tick, so newly approved
     // tokens get attested without a restart. Drift-gated to keep cost low.
