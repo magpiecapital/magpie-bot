@@ -17,8 +17,8 @@ import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
 const STALE_MS = {
-  screener: 20 * 60 * 1000,     // 20 min (screener runs every 10)
-  "token-health": 30 * 60 * 1000, // 30 min (token-health runs every 15)
+  screener: 20 * 60 * 1000,        // 20 min (screener runs every 10)
+  "token-health": 2 * 60 * 60 * 1000, // 2h (token-health runs every 1h)
 };
 
 // Grace period after startup before stale thresholds apply.
