@@ -63,18 +63,15 @@ export async function incrementBorrowed(userId, lamports, loanDbId = null) {
   }
 }
 
-export async function incrementRepaid(userId, loanDbId = null, wasEarly = false) {
+export async function incrementRepaid(userId) {
   await query(
     `UPDATE users SET repaid_count = repaid_count + 1, updated_at = NOW()
      WHERE id = $1`,
     [userId],
   );
-  try {
-    const eventType = wasEarly ? "repay_early" : "repay_ontime";
-    await recordCreditEvent(userId, eventType, loanDbId);
-  } catch (err) {
-    console.error("[reputation] credit event error:", err.message);
-  }
+  // Credit event is recorded by markLoanRepaid in loans.js (authoritative
+  // path — it has the due_timestamp to classify early/ontime/late and
+  // links the event to loan_id). Recording here too produced duplicates.
 }
 
 export async function incrementLiquidated(userId, loanDbId = null) {
