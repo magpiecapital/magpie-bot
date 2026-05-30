@@ -35,7 +35,7 @@ import { PublicKey } from "@solana/web3.js";
 import { cachedJson } from "../lib/http-cache.js";
 import { markCycle } from "../lib/heartbeat.js";
 
-const POLL_INTERVAL_MS = Number(process.env.TOKEN_HEALTH_INTERVAL_MS) || 900_000; // 15 min
+const POLL_INTERVAL_MS = Number(process.env.TOKEN_HEALTH_INTERVAL_MS) || 3_600_000; // 1 hour
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
