@@ -323,6 +323,46 @@ async function getHolderCount(mint) {
   return 0;
 }
 
+// ─── Honeypot test ──────────────────────────────────────────────────────────
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const JUP_QUOTE_API = process.env.JUPITER_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
+
+/**
+ * Verify the token is sellable by asking Jupiter to quote a tiny <token> → SOL
+ * swap. If Jupiter can't route the trade (transfer hook blocks, frozen mint,
+ * 100% transfer fee, default-frozen accounts, no DEX liquidity), the token is
+ * effectively a honeypot and must be rejected.
+ *
+ * Returns { sellable: true } on success, or { sellable: false, reason } on
+ * any failure. Catches the classic "approve it, dump on us, can't liquidate"
+ * attack that pure threshold checks miss.
+ */
+export async function checkSellable(mint, decimals) {
+  // Quote a sell of 1 whole token (10^decimals raw units). Small enough to
+  // not require huge depth; large enough that fee/precision rounding doesn't
+  // zero it out.
+  const amount = Math.pow(10, Math.max(0, decimals ?? 6));
+  const url = `${JUP_QUOTE_API}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (!res.ok) {
+      // Jupiter explicitly fails when the token cannot be routed.
+      return { sellable: false, reason: `Jupiter quote ${res.status}` };
+    }
+    const data = await res.json();
+    if (!data?.outAmount || data.outAmount === "0") {
+      return { sellable: false, reason: "Jupiter returned no sell route" };
+    }
+    return { sellable: true };
+  } catch (err) {
+    // Network errors don't necessarily mean honeypot, but we err on the
+    // side of caution and require a successful sellability check before
+    // approving anything.
+    return { sellable: false, reason: `quote check failed: ${err.message}` };
+  }
+}
+
 // ─── Vetting ────────────────────────────────────────────────────────────────
 
 /**
@@ -555,6 +595,20 @@ async function tick(bot) {
 
     const { verdict, safetyScore, fails, ageHours } = vetToken(onChain, market, holderCount, category);
 
+    // Honeypot guard: before promoting a token to approved OR review,
+    // verify Jupiter can route a tiny sell. Tokens that pass thresholds
+    // but block transfers (transfer hooks, 100% fees, frozen accounts,
+    // no DEX liquidity) get rejected here. Skips stocks since they
+    // route through their own issuer flow, not DEXes.
+    if (category !== "stock" && (verdict === "auto_approve" || verdict === "review")) {
+      const sell = await checkSellable(mint, onChain.decimals);
+      if (!sell.sellable) {
+        await markSeen(mint); // permanent reject — won't recover
+        console.log(`[screener] reject ${market.symbol} (honeypot): ${sell.reason}`);
+        continue;
+      }
+    }
+
     if (verdict === "auto_approve") {
       await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
       await markSeen(mint);
@@ -673,6 +727,21 @@ export function registerScreenerCallbacks(bot) {
       return ctx.answerCallbackQuery("Token not found in queue");
     }
 
+    // Honeypot re-check at approval time — token state may have changed
+    // between submission and admin review. Skip the check for stocks.
+    if (t.category !== "stock") {
+      const sell = await checkSellable(t.mint, t.decimals);
+      if (!sell.sellable) {
+        await ctx.answerCallbackQuery(`Blocked: ${sell.reason}`);
+        await ctx.editMessageText(`${t.symbol} blocked: token failed sellability check (${sell.reason}).`);
+        await query(
+          `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
+          [mint],
+        );
+        return;
+      }
+    }
+
     // Add to supported_mints
     await query(
       `INSERT INTO supported_mints
@@ -770,6 +839,28 @@ async function processReviewQueue(bot) {
       }
       console.log(`[screener] Review auto-rejected ${t.symbol} (failed re-check)`);
       continue;
+    }
+
+    // Sellability re-check — most important gate before lending against it.
+    if (t.category !== "stock") {
+      const sell = await checkSellable(t.mint, onChain.decimals);
+      if (!sell.sellable) {
+        await query(
+          `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
+          [t.mint],
+        );
+        if (t.submitted_by && bot) {
+          try {
+            await bot.api.sendMessage(
+              t.submitted_by,
+              `Your submitted token *${t.symbol}* failed the sellability check (honeypot risk) and was not approved.`,
+              { parse_mode: "Markdown" },
+            );
+          } catch { /* user may have blocked bot */ }
+        }
+        console.log(`[screener] Review auto-rejected ${t.symbol} (honeypot: ${sell.reason})`);
+        continue;
+      }
     }
 
     // Approve it
