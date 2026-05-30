@@ -339,6 +339,48 @@ async function handleWalletBalance(req, url) {
     }
   }
 
+  // For mints we still don't know (not in supported_mints), look up the
+  // real ticker/name via DexScreener so the dashboard doesn't display a
+  // 4-char prefix of the mint pubkey. Batched (up to 30 mints per call).
+  const unknownMints = [...byMint.values()].filter((t) => !t.symbol).map((t) => t.mint);
+  if (unknownMints.length > 0) {
+    try {
+      const BATCH = 30;
+      for (let i = 0; i < unknownMints.length; i += BATCH) {
+        const batch = unknownMints.slice(i, i + BATCH);
+        const res = await fetch(
+          `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
+          { signal: AbortSignal.timeout(8_000) },
+        );
+        if (!res.ok) continue;
+        const pairs = await res.json();
+        if (!Array.isArray(pairs)) continue;
+
+        // Multiple pairs per token possible — keep the one with the highest liquidity.
+        const bestByMint = new Map();
+        for (const p of pairs) {
+          const addr = p?.baseToken?.address;
+          if (!addr || !byMint.has(addr)) continue;
+          const liq = p?.liquidity?.usd ?? 0;
+          const existing = bestByMint.get(addr);
+          if (!existing || liq > (existing.liquidity?.usd ?? 0)) {
+            bestByMint.set(addr, p);
+          }
+        }
+        for (const [addr, p] of bestByMint) {
+          const t = byMint.get(addr);
+          if (!t) continue;
+          t.symbol = p.baseToken?.symbol || t.symbol;
+          t.name = p.baseToken?.name || p.baseToken?.symbol || t.name;
+          t.image = p.info?.imageUrl || t.image || null;
+          t.borrowable = false; // not in supported_mints
+        }
+      }
+    } catch (err) {
+      console.warn("[api] DexScreener lookup failed:", err.message);
+    }
+  }
+
   return {
     status: 200,
     body: {
