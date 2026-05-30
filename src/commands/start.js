@@ -3,7 +3,6 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { getOrCreateCode, attribute } from "../services/referrals.js";
 import { getPrefs } from "../services/prefs.js";
-import { mainReplyKeyboard } from "../lib/main-keyboard.js";
 
 export async function handleStart(ctx) {
   const tgUser = ctx.from;
@@ -16,13 +15,15 @@ export async function handleStart(ctx) {
   await getPrefs(user.id);
   await getOrCreateCode(user.id);
 
-  // Attach persistent quick-actions keyboard. Sticks across all future
-  // messages thanks to is_persistent: true — only needs to be sent once
-  // per user, but re-sending is harmless if they /start again.
-  await ctx.reply("📌 *Quick menu enabled* — use the buttons below to jump anywhere.", {
-    parse_mode: "Markdown",
-    reply_markup: mainReplyKeyboard(),
-  });
+  // Dismiss any legacy reply keyboard sitting under the chat bar.
+  // Navigation is now via the menu button (set globally via setMyCommands)
+  // and inline keyboards attached to specific messages — both live ABOVE
+  // the chat input where users expect them.
+  try {
+    await ctx.api.sendMessage(ctx.chat.id, "👋", {
+      reply_markup: { remove_keyboard: true },
+    }).then((m) => ctx.api.deleteMessage(ctx.chat.id, m.message_id).catch(() => {}));
+  } catch { /* non-critical */ }
 
   const startArg = typeof ctx.match === "string" ? ctx.match.trim() : "";
 

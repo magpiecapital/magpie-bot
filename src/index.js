@@ -48,7 +48,6 @@ import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
-import { BTN_HOME, BTN_WALLET, BTN_BORROW, BTN_POSITIONS } from "./lib/main-keyboard.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -113,14 +112,6 @@ registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
 
-// Persistent reply-keyboard buttons. Route exact button labels to their
-// handlers BEFORE the natural-language fallback so taps go straight to
-// the right command instead of getting funneled through keyword matching.
-bot.hears(BTN_HOME, handleHome);
-bot.hears(BTN_WALLET, handleWallet);
-bot.hears(BTN_BORROW, handleBorrow);
-bot.hears(BTN_POSITIONS, handlePositions);
-
 // Fallback: respond to any text message that isn't a command
 bot.on("message:text", handleFallback);
 
@@ -128,10 +119,39 @@ bot.catch((err) => {
   console.error("Bot error:", err);
 });
 
+// Register the primary nav commands so they appear in Telegram's menu
+// button (the icon next to the chat input). This is the Telegram-native
+// way to make navigation "always available" — sits above the chat bar,
+// always visible, no awkward reply-keyboard slot.
+async function registerBotCommands() {
+  try {
+    await bot.api.setMyCommands([
+      { command: "home", description: "🏠 Home / main menu" },
+      { command: "wallet", description: "💼 Your wallet + SOL balance" },
+      { command: "borrow", description: "💰 Take a loan" },
+      { command: "positions", description: "📊 Active loans" },
+      { command: "repay", description: "✅ Repay a loan" },
+      { command: "deposit", description: "📥 Show deposit address" },
+      { command: "withdraw", description: "📤 Withdraw SOL" },
+      { command: "supported", description: "🪙 Approved collateral tokens" },
+      { command: "credit", description: "⭐ Your credit score + points" },
+      { command: "history", description: "📜 Loan history" },
+      { command: "submit", description: "➕ Submit a new token" },
+      { command: "help", description: "ℹ️ Full command list" },
+    ]);
+    await bot.api.setChatMenuButton({
+      menu_button: { type: "commands" },
+    });
+  } catch (err) {
+    console.warn("[bot] setMyCommands failed:", err.message);
+  }
+}
+
 console.log("🏦 Magpie bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
+    registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.
     // Re-enable when a dedicated RPC endpoint is available.
