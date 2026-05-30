@@ -466,9 +466,11 @@ function cachePut(map, key, result) {
  * Catches the modern "approve it, then activate trap later" attack that
  * the legacy mint/freeze-authority check is blind to.
  */
-export async function auditTokenExtensions(mintStr) {
-  const cached = cacheGet(_extensionCache, mintStr);
-  if (cached) return cached;
+export async function auditTokenExtensions(mintStr, { fresh = false } = {}) {
+  if (!fresh) {
+    const cached = cacheGet(_extensionCache, mintStr);
+    if (cached) return cached;
+  }
   const result = await _auditTokenExtensionsUncached(mintStr);
   cachePut(_extensionCache, mintStr, result);
   return result;
@@ -608,8 +610,10 @@ async function _auditTokenExtensionsUncached(mintStr) {
  */
 export async function checkHolderConcentration(mintStr, opts = {}) {
   const cacheKey = `${mintStr}::${opts.maxTop10Pct ?? 40}::${opts.maxTop20Pct ?? 60}`;
-  const cached = cacheGet(_concentrationCache, cacheKey);
-  if (cached) return cached;
+  if (!opts.fresh) {
+    const cached = cacheGet(_concentrationCache, cacheKey);
+    if (cached) return cached;
+  }
   const result = await _checkHolderConcentrationUncached(mintStr, opts);
   cachePut(_concentrationCache, cacheKey, result);
   return result;
@@ -665,9 +669,11 @@ async function _checkHolderConcentrationUncached(mintStr, opts = {}) {
  * Treats RugCheck failures as "skip" rather than "reject" so a third-party
  * outage doesn't block legitimate submissions. The other audit gates remain.
  */
-export async function rugcheckRisk(mintStr) {
-  const cached = cacheGet(_rugcheckCache, mintStr);
-  if (cached) return cached;
+export async function rugcheckRisk(mintStr, { fresh = false } = {}) {
+  if (!fresh) {
+    const cached = cacheGet(_rugcheckCache, mintStr);
+    if (cached) return cached;
+  }
   const result = await _rugcheckRiskUncached(mintStr);
   cachePut(_rugcheckCache, mintStr, result);
   return result;
@@ -1203,11 +1209,13 @@ export function registerScreenerCallbacks(bot) {
         await query(`UPDATE token_screen_queue SET status='rejected', reviewed_at=NOW() WHERE mint=$1`, [mint]);
         return;
       }
+      // Admin approval is a real-money decision — bypass the audit cache
+      // so token state we surface is current, not minutes-stale.
       const [sell, ext, conc, rug] = await Promise.all([
         checkSellable(t.mint, t.decimals),
-        auditTokenExtensions(t.mint),
-        checkHolderConcentration(t.mint),
-        rugcheckRisk(t.mint),
+        auditTokenExtensions(t.mint, { fresh: true }),
+        checkHolderConcentration(t.mint, { fresh: true }),
+        rugcheckRisk(t.mint, { fresh: true }),
       ]);
       const scamReason =
         !sell.sellable ? `honeypot — ${sell.reason}`
@@ -1330,11 +1338,13 @@ async function processReviewQueue(bot) {
       const imp = checkImpersonation(t.mint, t.symbol, t.name);
       let scamReason = imp.ok ? null : `impersonation — ${imp.reason}`;
       if (!scamReason) {
+        // 30-min auto-approve is also a real-money promotion — bypass
+        // cache so we re-audit fresh state rather than trust cached.
         const [sell, ext, conc, rug] = await Promise.all([
           checkSellable(t.mint, onChain.decimals),
-          auditTokenExtensions(t.mint),
-          checkHolderConcentration(t.mint),
-          rugcheckRisk(t.mint),
+          auditTokenExtensions(t.mint, { fresh: true }),
+          checkHolderConcentration(t.mint, { fresh: true }),
+          rugcheckRisk(t.mint, { fresh: true }),
         ]);
         scamReason =
           !sell.sellable ? `honeypot — ${sell.reason}`

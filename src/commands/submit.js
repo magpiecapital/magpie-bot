@@ -263,11 +263,13 @@ export async function handleSubmit(ctx) {
   // Full scam-token audit. Runs sellability, extension audit, holder
   // concentration, and RugCheck in parallel. Reject on the first
   // failure with a specific reason.
+  // /submit is a user-facing decision point — always run fresh audits,
+  // never serve a cached verdict for this path.
   const [sell, ext, conc, rug] = await Promise.all([
     checkSellable(mint, onChain.decimals),
-    auditTokenExtensions(mint),
-    checkHolderConcentration(mint),
-    rugcheckRisk(mint),
+    auditTokenExtensions(mint, { fresh: true }),
+    checkHolderConcentration(mint, { fresh: true }),
+    rugcheckRisk(mint, { fresh: true }),
   ]);
   const scamReason =
     !sell.sellable ? `honeypot — ${sell.reason}`
