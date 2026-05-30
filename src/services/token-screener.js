@@ -252,7 +252,47 @@ async function discoverTokens() {
     }
   }
 
-  // Source 6: Search DexScreener for "x" prefixed stock tokens
+  // Source 6: pump.fun graduates — tokens that completed the bonding curve
+  // and migrated to Raydium with locked LP. These have stronger baseline
+  // safety than pre-graduation pump tokens but still go through our full
+  // scam audit before approval (we never skip the audit just because the
+  // launchpad has standardized contracts).
+  {
+    const urls = [
+      "https://frontend-api-v3.pump.fun/coins?limit=50&sort=market_cap&order=DESC&complete=true&includeNsfw=false",
+      "https://frontend-api-v3.pump.fun/coins?limit=50&sort=last_trade_timestamp&order=DESC&complete=true&includeNsfw=false",
+    ];
+    for (const url of urls) {
+      const data = await cachedJson(url);
+      if (Array.isArray(data)) {
+        for (const t of data) {
+          if (t?.mint) addSolanaToken(t.mint, "pumpfun_graduate");
+        }
+      }
+    }
+  }
+
+  // Source 7: letsbonk.fun / Bonk launchpad graduates. The API surface is
+  // less stable than pump.fun's; we hit their public coin list and fall
+  // through silently if the endpoint shape shifts.
+  {
+    const urls = [
+      "https://api.letsbonk.fun/coins?sort=market_cap&order=desc&limit=50&complete=true",
+      "https://api.letsbonk.fun/v1/coins?sort=market_cap_desc&limit=50",
+    ];
+    for (const url of urls) {
+      const data = await cachedJson(url);
+      const list = Array.isArray(data) ? data : Array.isArray(data?.coins) ? data.coins : Array.isArray(data?.data) ? data.data : null;
+      if (list) {
+        for (const t of list) {
+          const addr = t?.mint || t?.address || t?.token_address;
+          if (addr) addSolanaToken(addr, "letsbonk_graduate");
+        }
+      }
+    }
+  }
+
+  // Source 8: Search DexScreener for "x" prefixed stock tokens
   for (const q of STOCK_SEARCH_QUERIES) {
     const data = await cachedJson(`https://api.dexscreener.com/latest/dex/search?q=${q}`);
     if (data?.pairs) {
