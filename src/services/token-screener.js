@@ -383,11 +383,23 @@ async function getMarketData(mints) {
 }
 
 /**
- * Estimate holder count from DexScreener or Helius (fallback: use 0).
+ * Estimate holder count. Tries in order:
+ *   1. Helius token-metadata endpoint using the key embedded in SOLANA_RPC_URL
+ *      (so we don't need a separate HELIUS_API_KEY env var).
+ *   2. Birdeye public API (only useful if BIRDEYE_API_KEY is set).
+ *   3. Returns -1 ("unknown") rather than 0 so the screener doesn't treat
+ *      a lookup failure as "this token has zero holders". The vetting
+ *      function checks for -1 and skips the holder gate when so.
  */
 async function getHolderCount(mint) {
-  // Try Helius DAS API if available
-  const heliusKey = process.env.HELIUS_API_KEY;
+  // Extract api-key from SOLANA_RPC_URL — saves needing a separate env var.
+  // SOLANA_RPC_URL looks like: https://mainnet.helius-rpc.com/?api-key=<key>
+  const rpcUrl = process.env.SOLANA_RPC_URL || "";
+  const heliusKey =
+    process.env.HELIUS_API_KEY ||
+    rpcUrl.match(/[?&]api-key=([a-f0-9-]+)/i)?.[1] ||
+    null;
+
   if (heliusKey) {
     try {
       const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${heliusKey}`, {
@@ -397,26 +409,29 @@ async function getHolderCount(mint) {
       });
       if (res.ok) {
         const data = await res.json();
-        if (data[0]?.onChainAccountInfo?.holderCount) {
-          return data[0].onChainAccountInfo.holderCount;
-        }
+        const count = data[0]?.onChainAccountInfo?.holderCount;
+        if (typeof count === "number") return count;
       }
     } catch { /* fallback */ }
   }
 
-  // Fallback: use Birdeye
-  try {
-    const res = await fetch(
-      `https://public-api.birdeye.so/defi/v3/token/holder?address=${mint}`,
-      { headers: { "X-API-KEY": process.env.BIRDEYE_API_KEY || "" } },
-    );
-    if (res.ok) {
-      const data = await res.json();
-      return data?.data?.total ?? 0;
-    }
-  } catch { /* fallback */ }
+  // Fallback: Birdeye (only works with key).
+  if (process.env.BIRDEYE_API_KEY) {
+    try {
+      const res = await fetch(
+        `https://public-api.birdeye.so/defi/v3/token/holder?address=${mint}`,
+        { headers: { "X-API-KEY": process.env.BIRDEYE_API_KEY } },
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data?.data?.total === "number") return data.data.total;
+      }
+    } catch { /* fallback */ }
+  }
 
-  return 0;
+  // Unknown — caller treats this as "skip the holder gate" rather than
+  // blocking on a lookup failure.
+  return -1;
 }
 
 // ─── Token-2022 extension audit ─────────────────────────────────────────────
@@ -776,13 +791,16 @@ function vetToken(onChain, market, holderCount, category) {
     safetyScore -= 5;
   }
 
-  // Holders (stocks can have fewer holders and still be legitimate)
+  // Holders (stocks can have fewer holders and still be legitimate).
+  // holderCount == -1 means "unknown" (lookup failed) — skip the gate
+  // rather than incorrectly treating a failed lookup as zero holders.
   const minHolders = isStock ? 50 : MIN_CONSIDER.minHolders;
   const autoHolders = isStock ? 100 : AUTO_APPROVE.minHolders;
-  if (holderCount < minHolders) {
+  const holdersKnown = holderCount >= 0;
+  if (holdersKnown && holderCount < minHolders) {
     fails.push(`${holderCount} holders < ${minHolders} minimum`);
     safetyScore -= 15;
-  } else if (holderCount < autoHolders) {
+  } else if (holdersKnown && holderCount < autoHolders) {
     safetyScore -= 5;
   }
 
@@ -795,25 +813,30 @@ function vetToken(onChain, market, holderCount, category) {
   // ── Verdict ──
   let canAutoApprove, meetsMinimum;
 
+  // When holder count is unknown (-1), it's not a fail signal — treat
+  // those gates as "pass" so other criteria (liquidity, age, volume,
+  // authority audit) make the decision.
+  const holderOk = (threshold) => !holdersKnown || holderCount >= threshold;
+
   if (isStock) {
     // Stocks: don't check mint/freeze authority, lower holder threshold
     canAutoApprove =
       market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
-      holderCount >= autoHolders &&
+      holderOk(autoHolders) &&
       ageHours >= AUTO_APPROVE.minAgeHours &&
       market.volume24h >= AUTO_APPROVE.minVolume24h;
 
     meetsMinimum =
       market.liquidity >= MIN_CONSIDER.minLiquidityUsd &&
       ageHours >= MIN_CONSIDER.minAgeHours &&
-      holderCount >= minHolders;
+      holderOk(minHolders);
   } else {
     // Memecoins: full safety checks
     canAutoApprove =
       !onChain.hasMintAuthority &&
       !onChain.hasFreezeAuthority &&
       market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
-      holderCount >= AUTO_APPROVE.minHolders &&
+      holderOk(AUTO_APPROVE.minHolders) &&
       ageHours >= AUTO_APPROVE.minAgeHours &&
       market.volume24h >= AUTO_APPROVE.minVolume24h &&
       market.marketCap >= AUTO_APPROVE.minMarketCap;
@@ -824,7 +847,7 @@ function vetToken(onChain, market, holderCount, category) {
     meetsMinimum =
       market.liquidity >= MIN_CONSIDER.minLiquidityUsd &&
       ageHours >= MIN_CONSIDER.minAgeHours &&
-      holderCount >= MIN_CONSIDER.minHolders &&
+      holderOk(MIN_CONSIDER.minHolders) &&
       market.volume24h >= MIN_CONSIDER.minVolume24h;
   }
 
