@@ -4,9 +4,10 @@
  * Runs a SELECT 1 every 2 minutes. After 3 consecutive failures (6 min),
  * sends a Telegram alert. Sends a recovery alert when DB comes back.
  */
-import { query } from "../db/pool.js";
+import { query, pingSecondary } from "../db/pool.js";
 
 const CHECK_INTERVAL_MS = 120_000; // 2 min
+const SECONDARY_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const FAILURES_TO_ALERT = 3;
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
@@ -62,6 +63,33 @@ async function tick(bot) {
   }
 }
 
+/**
+ * Verify the configured secondary DB (Neon standby) is reachable so we
+ * know the failover path actually works before we need it. Runs weekly.
+ * Failures DM admin so a quietly-broken standby gets caught proactively.
+ */
+async function probeSecondary(bot) {
+  const result = await pingSecondary();
+  if (!result.configured) {
+    console.warn("[db-health] No secondary DB configured (DATABASE_URL_SECONDARY)");
+    return;
+  }
+  if (result.ok) {
+    console.log(`[db-health] Standby DB OK (${result.latency_ms}ms)`);
+    return;
+  }
+  console.error(`[db-health] STANDBY DB UNREACHABLE: ${result.error}`);
+  if (bot && ADMIN_TG_ID) {
+    try {
+      await bot.api.sendMessage(
+        ADMIN_TG_ID,
+        `⚠️ *DR standby DB unreachable*\n\nThe failover database (Neon) is not responding to a weekly probe. If primary Railway DB goes down right now, the bot won't be able to fail over.\n\nError: \`${result.error}\``,
+        { parse_mode: "Markdown" },
+      );
+    } catch { /* non-critical */ }
+  }
+}
+
 export function startDbHealth(bot) {
   console.log(`[db-health] Database health monitor running (every ${CHECK_INTERVAL_MS / 1000}s)`);
 
@@ -78,7 +106,15 @@ export function startDbHealth(bot) {
     }
   };
 
-  // Run immediately
+  // Run primary check immediately
   run();
-  return setInterval(run, CHECK_INTERVAL_MS);
+  const primaryInterval = setInterval(run, CHECK_INTERVAL_MS);
+
+  // Weekly standby probe (first run delayed 5 min to avoid startup-flood)
+  setTimeout(() => {
+    probeSecondary(bot);
+    setInterval(() => probeSecondary(bot), SECONDARY_CHECK_INTERVAL_MS);
+  }, 5 * 60 * 1000);
+
+  return primaryInterval;
 }
