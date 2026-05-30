@@ -337,38 +337,72 @@ async function getHolderCount(mint) {
 export async function auditTokenExtensions(mintStr) {
   try {
     const { PublicKey } = await import("@solana/web3.js");
-    const { TOKEN_2022_PROGRAM_ID, getMint, getTransferFeeConfig, getTransferHook, getPermanentDelegate } =
-      await import("@solana/spl-token");
+    const spl = await import("@solana/spl-token");
+    const {
+      TOKEN_2022_PROGRAM_ID, ExtensionType,
+      getMint, getTransferFeeConfig, getTransferHook, getPermanentDelegate,
+      getMintCloseAuthority, getInterestBearingMintConfigState, getDefaultAccountState,
+      getExtensionTypes,
+    } = spl;
     const { connection } = await import("../solana/connection.js");
 
     const mintPk = new PublicKey(mintStr);
     const info = await connection.getAccountInfo(mintPk);
     if (!info) return { safe: false, reason: "mint account not found" };
 
-    // Legacy SPL Token mints don't have extensions; they're audited via
-    // the existing has_mint_authority / has_freeze_authority check.
-    if (!info.owner.equals(TOKEN_2022_PROGRAM_ID)) return { safe: true };
+    // Legacy SPL Token mints can't have extensions; they're already audited
+    // via has_mint_authority / has_freeze_authority. Belt-and-suspenders:
+    // also reject legacy tokens whose freeze_authority is set, since that
+    // authority can freeze accounts at any time.
+    if (!info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      const legacy = await getMint(connection, mintPk).catch(() => null);
+      if (legacy?.freezeAuthority && !legacy.freezeAuthority.equals(PublicKey.default)) {
+        return { safe: false, reason: "Freeze authority active — can freeze tokens later" };
+      }
+      if (legacy?.mintAuthority && !legacy.mintAuthority.equals(PublicKey.default)) {
+        return { safe: false, reason: "Mint authority active — supply can be inflated later" };
+      }
+      return { safe: true };
+    }
 
     const mint = await getMint(connection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const isSet = (pk) => pk && !pk.equals(PublicKey.default);
 
-    // PermanentDelegate: a fixed address can move anyone's tokens at any
-    // time. Hard block — equivalent to the dev being able to seize collateral.
+    // Same legacy fields exist on Token-2022 mints — must also be renounced.
+    if (isSet(mint.freezeAuthority)) {
+      return { safe: false, reason: "Freeze authority active — can freeze tokens later" };
+    }
+    if (isSet(mint.mintAuthority)) {
+      return { safe: false, reason: "Mint authority active — supply can be inflated later" };
+    }
+
+    // NonTransferable extension: tokens can never be moved at all. Reject outright.
+    const extTypes = mint.tlvData?.length ? getExtensionTypes(mint.tlvData) : [];
+    if (ExtensionType?.NonTransferable !== undefined && extTypes.includes(ExtensionType.NonTransferable)) {
+      return { safe: false, reason: "NonTransferable extension — token literally cannot be sold" };
+    }
+
+    // PermanentDelegate: a fixed address can move anyone's tokens at any time.
     const delegate = getPermanentDelegate(mint);
-    if (delegate?.delegate && !delegate.delegate.equals(PublicKey.default)) {
+    if (delegate && isSet(delegate.delegate)) {
       return { safe: false, reason: `PermanentDelegate set (${delegate.delegate.toBase58().slice(0, 8)}…)` };
     }
 
     // TransferHook: external program runs on every transfer and can reject.
-    // Block any non-empty hook.
+    // BOTH a configured program AND a set authority are red flags — authority
+    // means the hook can be ADDED later even if currently null.
     const hook = getTransferHook(mint);
-    if (hook?.programId && !hook.programId.equals(PublicKey.default)) {
-      return { safe: false, reason: `TransferHook program set (${hook.programId.toBase58().slice(0, 8)}…)` };
+    if (hook) {
+      if (isSet(hook.programId)) {
+        return { safe: false, reason: `TransferHook program set (${hook.programId.toBase58().slice(0, 8)}…)` };
+      }
+      if (isSet(hook.authority)) {
+        return { safe: false, reason: "TransferHook authority active — hook can be added later" };
+      }
     }
 
-    // TransferFee: a per-transfer fee can be raised by the config authority
-    // up to 100% (10000 bps). Block any token with the extension where the
-    // fee is currently >5% or the authority is still controlled (so it
-    // could be raised later).
+    // TransferFee: rejection on EITHER a high current fee OR an active
+    // authority (which could raise the fee post-approval).
     const fee = getTransferFeeConfig(mint);
     if (fee) {
       const newerBps = fee.newerTransferFee?.transferFeeBasisPoints ?? 0;
@@ -377,10 +411,39 @@ export async function auditTokenExtensions(mintStr) {
       if (maxBps > 500) {
         return { safe: false, reason: `TransferFee ${(maxBps / 100).toFixed(2)}% exceeds 5% limit` };
       }
-      const authority = fee.transferFeeConfigAuthority;
-      if (authority && !authority.equals(PublicKey.default)) {
-        return { safe: false, reason: "TransferFee authority still set — fee can be raised" };
+      if (isSet(fee.transferFeeConfigAuthority)) {
+        return { safe: false, reason: "TransferFee authority active — fee can be raised later" };
       }
+    }
+
+    // MintCloseAuthority: a holder of this authority can close the mint,
+    // stranding every account holding the token. Reject if active.
+    const mintClose = getMintCloseAuthority?.(mint);
+    if (mintClose && isSet(mintClose.closeAuthority)) {
+      return { safe: false, reason: "MintCloseAuthority active — mint can be closed and tokens stranded" };
+    }
+
+    // InterestBearingConfig: the rate authority can change the interest
+    // rate at any time (positive or negative, no cap). Reject if active.
+    const interest = getInterestBearingMintConfigState?.(mint);
+    if (interest && isSet(interest.rateAuthority)) {
+      return { safe: false, reason: "InterestBearing rate authority active — rate can be changed" };
+    }
+
+    // DefaultAccountState: if this extension exists and the freeze_authority
+    // is renounced (we already check that above), the state can't be changed.
+    // But if the state is currently set to Frozen, every new account starts frozen.
+    const defaultState = getDefaultAccountState?.(mint);
+    if (defaultState?.state === 2 /* Frozen */) {
+      return { safe: false, reason: "DefaultAccountState=Frozen — new accounts created frozen" };
+    }
+
+    // PausableConfig (newer extension): if exists with an active authority,
+    // every transfer can be paused on demand. Reject. Extension may not be
+    // exported in older spl-token; check by ExtensionType enum if available.
+    const PAUSABLE = ExtensionType?.PausableConfig;
+    if (PAUSABLE !== undefined && extTypes.includes(PAUSABLE)) {
+      return { safe: false, reason: "PausableConfig extension present — transfers can be paused" };
     }
 
     return { safe: true };
