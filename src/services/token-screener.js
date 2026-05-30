@@ -434,6 +434,27 @@ async function getHolderCount(mint) {
   return -1;
 }
 
+// ─── Audit-result caches (in-memory, per process) ─────────────────────────
+// Token-2022 extensions / holder concentration / rugcheck data change very
+// slowly. Cache audit results so repeated tick passes don't re-hit RPC for
+// the same mint. Cache lifetime ~30 min — long enough to slash Helius
+// burn, short enough that authority flips still get caught (and the
+// hourly token-health watcher independently re-audits every approved mint).
+const _extensionCache = new Map(); // mint -> { result, expiresAt }
+const _concentrationCache = new Map();
+const _rugcheckCache = new Map();
+const AUDIT_CACHE_MS = 30 * 60 * 1000;
+
+function cacheGet(map, key) {
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { map.delete(key); return null; }
+  return entry.result;
+}
+function cachePut(map, key, result) {
+  map.set(key, { result, expiresAt: Date.now() + AUDIT_CACHE_MS });
+}
+
 // ─── Token-2022 extension audit ─────────────────────────────────────────────
 
 /**
@@ -446,6 +467,14 @@ async function getHolderCount(mint) {
  * the legacy mint/freeze-authority check is blind to.
  */
 export async function auditTokenExtensions(mintStr) {
+  const cached = cacheGet(_extensionCache, mintStr);
+  if (cached) return cached;
+  const result = await _auditTokenExtensionsUncached(mintStr);
+  cachePut(_extensionCache, mintStr, result);
+  return result;
+}
+
+async function _auditTokenExtensionsUncached(mintStr) {
   try {
     const { PublicKey } = await import("@solana/web3.js");
     const spl = await import("@solana/spl-token");
@@ -578,6 +607,15 @@ export async function auditTokenExtensions(mintStr) {
  * known LP programs.
  */
 export async function checkHolderConcentration(mintStr, opts = {}) {
+  const cacheKey = `${mintStr}::${opts.maxTop10Pct ?? 40}::${opts.maxTop20Pct ?? 60}`;
+  const cached = cacheGet(_concentrationCache, cacheKey);
+  if (cached) return cached;
+  const result = await _checkHolderConcentrationUncached(mintStr, opts);
+  cachePut(_concentrationCache, cacheKey, result);
+  return result;
+}
+
+async function _checkHolderConcentrationUncached(mintStr, opts = {}) {
   const maxTop10Pct = opts.maxTop10Pct ?? 40;
   const maxTop20Pct = opts.maxTop20Pct ?? 60;
   try {
@@ -628,6 +666,14 @@ export async function checkHolderConcentration(mintStr, opts = {}) {
  * outage doesn't block legitimate submissions. The other audit gates remain.
  */
 export async function rugcheckRisk(mintStr) {
+  const cached = cacheGet(_rugcheckCache, mintStr);
+  if (cached) return cached;
+  const result = await _rugcheckRiskUncached(mintStr);
+  cachePut(_rugcheckCache, mintStr, result);
+  return result;
+}
+
+async function _rugcheckRiskUncached(mintStr) {
   try {
     const res = await fetch(
       `https://api.rugcheck.xyz/v1/tokens/${mintStr}/report/summary`,
