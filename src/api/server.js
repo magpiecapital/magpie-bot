@@ -394,6 +394,172 @@ async function handleWalletBalance(req, url) {
   };
 }
 
+async function handleAdminPoolStats(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) {
+    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  }
+
+  // Gate: only the configured creator/lender wallet can see this view.
+  // Anyone querying with a different wallet gets a 403, not a 404, so we
+  // don't leak existence of the endpoint.
+  const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
+  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+  }
+
+  const { PublicKey } = await import("@solana/web3.js");
+  const { getReadOnlyProgram } = await import("../solana/program.js");
+  const { lendingPoolPda } = await import("../solana/pdas.js");
+
+  // ── 1. On-chain pool state ──
+  let poolState = null;
+  let poolPda = null;
+  try {
+    const lender = new PublicKey(LENDER_PUBKEY);
+    [poolPda] = lendingPoolPda(lender);
+    const program = getReadOnlyProgram();
+    const p = await program.account.lendingPool.fetch(poolPda);
+    const totalFeesEarnedLamports = Number(p.totalFeesEarned);
+    const protocolBps = Number(p.protocolFeeBps);
+    poolState = {
+      pool_pda: poolPda.toBase58(),
+      authority: p.authority.toBase58(),
+      loan_token_mint: p.loanTokenMint.toBase58(),
+      protocol_fee_bps: protocolBps,
+      keeper_reward_bps: Number(p.keeperRewardBps),
+      total_deposits_lamports: p.totalDeposits?.toString?.() ?? "0",
+      total_deposits_sol: Number(p.totalDeposits) / 1e9,
+      total_borrowed_lamports: p.totalBorrowed?.toString?.() ?? "0",
+      total_borrowed_sol: Number(p.totalBorrowed) / 1e9,
+      total_fees_earned_lamports: totalFeesEarnedLamports.toString(),
+      total_fees_earned_sol: totalFeesEarnedLamports / 1e9,
+      // Split into protocol cut (sent to fee wallet) vs LP cut (stays in pool)
+      protocol_fee_share_sol: (totalFeesEarnedLamports * protocolBps) / 10_000 / 1e9,
+      lp_fee_share_sol: (totalFeesEarnedLamports * (10_000 - protocolBps)) / 10_000 / 1e9,
+      total_loans_issued: p.totalLoansIssued?.toString?.() ?? "0",
+      total_liquidations: p.totalLiquidations?.toString?.() ?? "0",
+      total_shares: p.totalShares?.toString?.() ?? "0",
+      paused: p.paused,
+    };
+  } catch (err) {
+    console.error("[admin] pool fetch failed:", err.message);
+  }
+
+  // ── 2. Loan aggregates from DB ──
+  const { rows: byStatus } = await query(
+    `SELECT status,
+            COUNT(*)::int AS n,
+            COALESCE(SUM(original_loan_amount_lamports::numeric), 0)::text AS total_lamports
+       FROM loans
+      GROUP BY status`,
+  );
+  const loanCounts = { active: 0, repaid: 0, liquidated: 0 };
+  const loanVolume = { active: "0", repaid: "0", liquidated: "0" };
+  for (const r of byStatus) {
+    loanCounts[r.status] = r.n;
+    loanVolume[r.status] = r.total_lamports;
+  }
+  const totalIssued = loanCounts.active + loanCounts.repaid + loanCounts.liquidated;
+  const defaultRate = totalIssued > 0 ? loanCounts.liquidated / totalIssued : 0;
+
+  // ── 3. Fee earnings by time window (from credit_events / DB) ──
+  // Approximation: each repaid loan contributed its original_loan_amount × tier_fee_bps
+  // to fees. Easier: use the on-chain total_fees_earned, then derive by-period
+  // from loans repaid in that window weighted by tier.
+  const { rows: feesByPeriod } = await query(
+    `SELECT
+       SUM(CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                ELSE original_loan_amount_lamports::numeric * 150 / 10000 END)::text AS lifetime,
+       SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '24 hours' THEN
+            CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                 WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                 ELSE original_loan_amount_lamports::numeric * 150 / 10000 END
+          ELSE 0 END)::text AS last_24h,
+       SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '7 days' THEN
+            CASE WHEN ltv_percentage >= 30 THEN original_loan_amount_lamports::numeric * 300 / 10000
+                 WHEN ltv_percentage >= 25 THEN original_loan_amount_lamports::numeric * 200 / 10000
+                 ELSE original_loan_amount_lamports::numeric * 150 / 10000 END
+          ELSE 0 END)::text AS last_7d
+       FROM loans`,
+  );
+  const fees = feesByPeriod[0] || { lifetime: "0", last_24h: "0", last_7d: "0" };
+
+  // ── 4. Top collateral mints by loan count ──
+  const { rows: topMints } = await query(
+    `SELECT l.collateral_mint, sm.symbol, sm.name,
+            COUNT(*)::int AS loans,
+            COALESCE(SUM(l.original_loan_amount_lamports::numeric), 0)::text AS volume_lamports
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      GROUP BY l.collateral_mint, sm.symbol, sm.name
+      ORDER BY loans DESC
+      LIMIT 10`,
+  );
+
+  // ── 5. User counts ──
+  const { rows: [userStats] } = await query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM users) AS total_users,
+       (SELECT COUNT(DISTINCT user_id)::int FROM loans) AS borrowers,
+       (SELECT COUNT(DISTINCT user_id)::int FROM loans WHERE status = 'active') AS active_borrowers`,
+  );
+
+  // ── 6. Supported tokens count ──
+  const { rows: [tokenStats] } = await query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM supported_mints WHERE enabled = TRUE) AS enabled_mints,
+       (SELECT COUNT(*)::int FROM token_screen_queue WHERE status = 'pending') AS pending_review`,
+  );
+
+  // ── 7. Recent loans (last 10) ──
+  const { rows: recentLoans } = await query(
+    `SELECT l.id, l.status,
+            l.collateral_mint, sm.symbol,
+            l.original_loan_amount_lamports::text AS amount,
+            l.ltv_percentage, l.duration_days,
+            l.start_timestamp, l.updated_at, l.tx_signature
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      ORDER BY l.start_timestamp DESC
+      LIMIT 10`,
+  );
+
+  // Pool utilization = borrowed / deposited
+  const utilization = poolState && poolState.total_deposits_sol > 0
+    ? poolState.total_borrowed_sol / poolState.total_deposits_sol
+    : 0;
+
+  return {
+    status: 200,
+    body: {
+      pool: poolState,
+      loans: {
+        counts: loanCounts,
+        volume_lamports: loanVolume,
+        total_issued: totalIssued,
+        default_rate: defaultRate,
+        recent: recentLoans,
+      },
+      fees: {
+        // gross fees (before 80/20 split)
+        lifetime_lamports: fees.lifetime || "0",
+        last_24h_lamports: fees.last_24h || "0",
+        last_7d_lamports: fees.last_7d || "0",
+        // protocol cut (what's in the fee wallet, sent to authority's wSOL ATA)
+        protocol_share_bps: poolState?.protocol_fee_bps ?? 2000,
+        lp_share_bps: 10000 - (poolState?.protocol_fee_bps ?? 2000),
+      },
+      top_collateral_mints: topMints,
+      users: userStats,
+      tokens: tokenStats,
+      pool_utilization: utilization,
+      generated_at: new Date().toISOString(),
+    },
+  };
+}
+
 async function handleMarketplaceStats() {
   const { getMarketplaceStats } = await import("../services/p2p-marketplace.js");
   const stats = await getMarketplaceStats();
@@ -424,6 +590,9 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/loans",
   "/api/v1/wallet/balance",
   "/api/v1/credit/score",
+  // Admin route is "public" at the HTTP layer but gates internally on
+  // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
+  "/api/v1/admin/pool-stats",
 ]);
 
 async function router(req, res) {
@@ -529,6 +698,9 @@ async function router(req, res) {
         break;
       case "/api/v1/wallet/balance":
         result = await handleWalletBalance(req, url);
+        break;
+      case "/api/v1/admin/pool-stats":
+        result = await handleAdminPoolStats(req, url);
         break;
       case "/api/v1/risk/token":
         result = await handleTokenRisk(req, url);
