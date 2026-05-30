@@ -137,7 +137,7 @@ const AUTO_APPROVE = {
   noMintAuthority: true,
   noFreezeAuthority: true,
   minVolume24h: 50_000,
-  minMarketCap: 250_000,
+  minMarketCap: 100_000,
 };
 
 // Minimum to even consider (below this = auto-reject)
@@ -1089,12 +1089,25 @@ async function tick(bot) {
 
 export async function handleReviewTokens(ctx) {
   const { rows } = await query(
-    `SELECT * FROM token_screen_queue WHERE status = 'pending' ORDER BY safety_score DESC LIMIT 10`,
+    `SELECT * FROM token_screen_queue WHERE status = 'pending' ORDER BY safety_score DESC LIMIT 25`,
   );
 
   if (rows.length === 0) {
-    return ctx.reply("No tokens pending review.");
+    return ctx.reply("No tokens pending review. The screener auto-approves anything that aged 30 min in the queue without degrading.");
   }
+
+  // Summary header so admin sees scale before scrolling
+  const { rows: [totals] } = await query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+       COUNT(*) FILTER (WHERE status = 'approved' AND reviewed_at > NOW() - INTERVAL '24 hours')::int AS approved24h,
+       COUNT(*) FILTER (WHERE status = 'rejected' AND reviewed_at > NOW() - INTERVAL '24 hours')::int AS rejected24h
+     FROM token_screen_queue`,
+  );
+  await ctx.reply(
+    `📋 *Review queue*\n\nPending: *${totals.pending}* · Approved (24h): *${totals.approved24h}* · Rejected (24h): *${totals.rejected24h}*\n\nShowing top ${rows.length} by safety score.`,
+    { parse_mode: "Markdown" },
+  );
 
   const { InlineKeyboard } = await import("grammy");
 
@@ -1229,7 +1242,7 @@ export function registerScreenerCallbacks(bot) {
 
 // ─── Auto-approve aged review queue tokens ──────────────────────────────────
 
-const REVIEW_AUTO_APPROVE_MS = 60 * 60 * 1000; // 1 hour
+const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min
 
 /**
  * Tokens that have been in the review queue for 1+ hour and still pass safety
