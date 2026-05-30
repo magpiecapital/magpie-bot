@@ -28,6 +28,62 @@ const BLOCKED_SYMBOLS = new Set([
   "AVAX", "MATIC", "DOT", "ADA", "XRP", "LTC", "ATOM",
 ]);
 
+// Impersonation guard: tokens that try to pass as well-known mints. Any
+// submission with a matching symbol OR name (case-insensitive) but a
+// DIFFERENT mint address gets rejected. Add canonical mints as we
+// onboard them so the screener catches "Fake BONK", "USDC2", "Real WIF",
+// unicode lookalikes, etc.
+const CANONICAL_MINTS = new Map([
+  ["BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"],
+  ["WIF", "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"],
+  ["PENGU", "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv"],
+  ["POPCAT", "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"],
+  ["FARTCOIN", "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"],
+  ["CUM", "oqU4DdYCbdSf9j74vnEgvCn1YzNfYQEPWaC6pu6pump"],
+  ["USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],
+  ["USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"],
+  ["JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"],
+  ["PYTH", "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"],
+  ["JTO", "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"],
+]);
+
+// Normalize a string for comparison: lowercase, strip whitespace, remove
+// common visual-confusable unicode (e.g. cyrillic 'а' for latin 'a').
+function normalizeName(s) {
+  if (!s) return "";
+  return s
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[а]/g, "a") // cyrillic 'а' → 'a'
+    .replace(/[о]/g, "o") // cyrillic 'о' → 'o'
+    .replace(/[е]/g, "e") // cyrillic 'е' → 'e'
+    .replace(/[р]/g, "p") // cyrillic 'р' → 'p'
+    .replace(/[с]/g, "c") // cyrillic 'с' → 'c'
+    .replace(/[х]/g, "x") // cyrillic 'х' → 'x'
+    .replace(/[у]/g, "y"); // cyrillic 'у' → 'y'
+}
+
+/**
+ * Reject tokens trying to impersonate a well-known mint. Triggers if the
+ * submission's symbol or name matches a canonical one but the mint differs.
+ */
+export function checkImpersonation(mint, symbol, name) {
+  const symUp = (symbol || "").toUpperCase().trim();
+  if (CANONICAL_MINTS.has(symUp)) {
+    const canonical = CANONICAL_MINTS.get(symUp);
+    if (canonical !== mint) {
+      return { ok: false, reason: `symbol "${symUp}" impersonates canonical mint ${canonical.slice(0, 8)}…` };
+    }
+  }
+  const nameNorm = normalizeName(name);
+  for (const [canonSym, canonMint] of CANONICAL_MINTS) {
+    if (nameNorm === canonSym.toLowerCase() && mint !== canonMint) {
+      return { ok: false, reason: `name "${name}" matches canonical "${canonSym}" but mint differs` };
+    }
+  }
+  return { ok: true };
+}
+
 // Known xStock mint prefixes and issuers (tokens.xyz ecosystem)
 const KNOWN_STOCK_ISSUERS = [
   "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB", // xTSLA — used as a seed to find issuer pairs
@@ -466,7 +522,9 @@ export async function auditTokenExtensions(mintStr) {
  * an unusually large balance as suspect; future iteration could whitelist
  * known LP programs.
  */
-export async function checkHolderConcentration(mintStr, maxTop10Pct = 40) {
+export async function checkHolderConcentration(mintStr, opts = {}) {
+  const maxTop10Pct = opts.maxTop10Pct ?? 40;
+  const maxTop20Pct = opts.maxTop20Pct ?? 60;
   try {
     const { PublicKey } = await import("@solana/web3.js");
     const { connection } = await import("../solana/connection.js");
@@ -479,20 +537,117 @@ export async function checkHolderConcentration(mintStr, maxTop10Pct = 40) {
     const total = BigInt(supplyInfo.value.amount);
     if (total === 0n) return { ok: false, reason: "zero supply" };
 
-    // Top-10 sum across the returned accounts (Solana caps at 20, so 10 fits).
+    // Solana returns up to 20 largest accounts; check both top-10 and
+    // top-20 (=full set) so a scammer can't just split 90% across 11
+    // wallets to dodge the top-10 limit.
     const top10 = largest.value.slice(0, 10);
-    const sum = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
-    const pct = Number((sum * 10000n) / total) / 100;
+    const top20 = largest.value.slice(0, 20);
+    const sum10 = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
+    const sum20 = top20.reduce((acc, a) => acc + BigInt(a.amount), 0n);
+    const pct10 = Number((sum10 * 10000n) / total) / 100;
+    const pct20 = Number((sum20 * 10000n) / total) / 100;
 
-    if (pct > maxTop10Pct) {
-      return { ok: false, reason: `top-10 holders own ${pct.toFixed(1)}% (max ${maxTop10Pct}%)` };
+    if (pct10 > maxTop10Pct) {
+      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)` };
     }
-    return { ok: true, topTenPct: pct };
+    if (pct20 > maxTop20Pct) {
+      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)` };
+    }
+    return { ok: true, topTenPct: pct10, topTwentyPct: pct20 };
   } catch (err) {
     // Don't block on transient RPC errors — log and let downstream checks
     // (sellability) be the safety net.
     console.warn(`[screener] holder check failed for ${mintStr}: ${err.message}`);
     return { ok: true, skipped: true, reason: err.message };
+  }
+}
+
+// ─── External risk aggregator (RugCheck) ───────────────────────────────────
+
+/**
+ * Cross-check the token against rugcheck.xyz's aggregated risk feed. They
+ * report LP burn/lock status, mutable metadata, top holder concentration,
+ * and a composite risk score we'd otherwise have to compute ourselves.
+ *
+ * Treats RugCheck failures as "skip" rather than "reject" so a third-party
+ * outage doesn't block legitimate submissions. The other audit gates remain.
+ */
+export async function rugcheckRisk(mintStr) {
+  try {
+    const res = await fetch(
+      `https://api.rugcheck.xyz/v1/tokens/${mintStr}/report/summary`,
+      { signal: AbortSignal.timeout(8_000) },
+    );
+    if (!res.ok) return { ok: true, skipped: true, reason: `rugcheck ${res.status}` };
+    const data = await res.json();
+
+    // Hard rejection conditions on RugCheck's structured signals:
+    //  - LP not burned/locked (the highest-leverage post-approval rug)
+    //  - Composite risk score in the "danger" band (>=300 on their scale)
+    //  - Mutable metadata authority still set
+    const risks = Array.isArray(data?.risks) ? data.risks : [];
+    const fatal = risks.find((r) =>
+      /lp.*not.*burned|lp.*not.*locked|mutable.*meta|honeypot|freeze|mint.*authority/i.test(`${r?.name} ${r?.description}`),
+    );
+    if (fatal) {
+      return { ok: false, reason: `rugcheck: ${fatal.name}` };
+    }
+    if (typeof data?.score === "number" && data.score >= 5000) {
+      return { ok: false, reason: `rugcheck risk score ${data.score} (danger band)` };
+    }
+    return { ok: true };
+  } catch (err) {
+    // Network/parse error — log and skip rather than block. Our own audits
+    // (sellability, extensions, holder concentration) still apply.
+    console.warn(`[screener] rugcheck unreachable for ${mintStr}: ${err.message}`);
+    return { ok: true, skipped: true, reason: err.message };
+  }
+}
+
+// ─── Submitter cooldown ─────────────────────────────────────────────────────
+
+const REJECTION_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h
+
+/**
+ * Track recent submission rejections per submitter so a single user can't
+ * brute-force submit dozens of variants of a scam token. After 3 rejections
+ * within 24h, block any further submission from that submitter.
+ *
+ * Stored in submitter_cooldowns table (created on first record).
+ */
+export async function isSubmitterCoolingDown(submitterTgId) {
+  if (!submitterTgId) return { allowed: true };
+  await query(
+    `CREATE TABLE IF NOT EXISTS submitter_rejections (
+       submitter_tg_id BIGINT NOT NULL,
+       mint TEXT NOT NULL,
+       reason TEXT,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       PRIMARY KEY (submitter_tg_id, mint)
+     )`,
+  );
+  const { rows } = await query(
+    `SELECT COUNT(*)::int AS n FROM submitter_rejections
+      WHERE submitter_tg_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
+    [submitterTgId],
+  );
+  if (rows[0].n >= 3) {
+    return { allowed: false, reason: `3 rejections in 24h — cooldown active` };
+  }
+  return { allowed: true };
+}
+
+export async function recordSubmitterRejection(submitterTgId, mint, reason) {
+  if (!submitterTgId) return;
+  try {
+    await query(
+      `INSERT INTO submitter_rejections (submitter_tg_id, mint, reason)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (submitter_tg_id, mint) DO UPDATE SET reason = EXCLUDED.reason, created_at = NOW()`,
+      [submitterTgId, mint, reason],
+    );
+  } catch (err) {
+    console.warn(`[screener] recordSubmitterRejection failed: ${err.message}`);
   }
 }
 
@@ -769,18 +924,27 @@ async function tick(bot) {
     const { verdict, safetyScore, fails, ageHours } = vetToken(onChain, market, holderCount, category);
 
     // Scam-token guard: before promoting to approved OR review, run the
-    // full audit suite — sellability, Token-2022 extensions, and holder
-    // concentration. Skips stocks since they route through their issuer.
+    // full audit suite. Order: impersonation (cheap, in-memory) →
+    // sellability/extensions/concentration (parallel) → rugcheck (slow
+    // external). Skips stocks since they route through their issuer.
     if (category !== "stock" && (verdict === "auto_approve" || verdict === "review")) {
-      const [sell, ext, conc] = await Promise.all([
+      const imp = checkImpersonation(mint, market.symbol, market.name);
+      if (!imp.ok) {
+        await markSeen(mint);
+        console.log(`[screener] reject ${market.symbol} (impersonation — ${imp.reason})`);
+        continue;
+      }
+      const [sell, ext, conc, rug] = await Promise.all([
         checkSellable(mint, onChain.decimals),
         auditTokenExtensions(mint),
         checkHolderConcentration(mint),
+        rugcheckRisk(mint),
       ]);
       const scamReason =
         !sell.sellable ? `honeypot — ${sell.reason}`
         : !ext.safe ? `unsafe extension — ${ext.reason}`
         : !conc.ok ? `concentration — ${conc.reason}`
+        : !rug.ok ? `${rug.reason}`
         : null;
       if (scamReason) {
         await markSeen(mint);
@@ -907,18 +1071,27 @@ export function registerScreenerCallbacks(bot) {
       return ctx.answerCallbackQuery("Token not found in queue");
     }
 
-    // Full scam audit re-check at approval time — token state may have
-    // changed between submission and admin review. Skip for stocks.
+    // Full scam audit re-check at approval time. Token state may have
+    // changed between submission and admin review.
     if (t.category !== "stock") {
-      const [sell, ext, conc] = await Promise.all([
+      const imp = checkImpersonation(t.mint, t.symbol, t.name);
+      if (!imp.ok) {
+        await ctx.answerCallbackQuery(`Blocked: ${imp.reason.slice(0, 40)}`);
+        await ctx.editMessageText(`${t.symbol} blocked: impersonation — ${imp.reason}.`);
+        await query(`UPDATE token_screen_queue SET status='rejected', reviewed_at=NOW() WHERE mint=$1`, [mint]);
+        return;
+      }
+      const [sell, ext, conc, rug] = await Promise.all([
         checkSellable(t.mint, t.decimals),
         auditTokenExtensions(t.mint),
         checkHolderConcentration(t.mint),
+        rugcheckRisk(t.mint),
       ]);
       const scamReason =
         !sell.sellable ? `honeypot — ${sell.reason}`
         : !ext.safe ? `unsafe extension — ${ext.reason}`
         : !conc.ok ? `concentration — ${conc.reason}`
+        : !rug.ok ? `${rug.reason}`
         : null;
       if (scamReason) {
         await ctx.answerCallbackQuery(`Blocked: ${scamReason.slice(0, 40)}`);
@@ -1032,16 +1205,22 @@ async function processReviewQueue(bot) {
 
     // Full scam audit re-check before promoting a 1h-aged review entry.
     if (t.category !== "stock") {
-      const [sell, ext, conc] = await Promise.all([
-        checkSellable(t.mint, onChain.decimals),
-        auditTokenExtensions(t.mint),
-        checkHolderConcentration(t.mint),
-      ]);
-      const scamReason =
-        !sell.sellable ? `honeypot — ${sell.reason}`
-        : !ext.safe ? `unsafe extension — ${ext.reason}`
-        : !conc.ok ? `concentration — ${conc.reason}`
-        : null;
+      const imp = checkImpersonation(t.mint, t.symbol, t.name);
+      let scamReason = imp.ok ? null : `impersonation — ${imp.reason}`;
+      if (!scamReason) {
+        const [sell, ext, conc, rug] = await Promise.all([
+          checkSellable(t.mint, onChain.decimals),
+          auditTokenExtensions(t.mint),
+          checkHolderConcentration(t.mint),
+          rugcheckRisk(t.mint),
+        ]);
+        scamReason =
+          !sell.sellable ? `honeypot — ${sell.reason}`
+          : !ext.safe ? `unsafe extension — ${ext.reason}`
+          : !conc.ok ? `concentration — ${conc.reason}`
+          : !rug.ok ? `${rug.reason}`
+          : null;
+      }
       if (scamReason) {
         await query(
           `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,

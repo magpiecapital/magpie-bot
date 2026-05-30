@@ -13,7 +13,15 @@ import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 import { InlineKeyboard } from "grammy";
-import { checkSellable, auditTokenExtensions, checkHolderConcentration } from "../services/token-screener.js";
+import {
+  checkSellable,
+  auditTokenExtensions,
+  checkHolderConcentration,
+  checkImpersonation,
+  rugcheckRisk,
+  isSubmitterCoolingDown,
+  recordSubmitterRejection,
+} from "../services/token-screener.js";
 
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
@@ -225,22 +233,50 @@ export async function handleSubmit(ctx) {
   if (market.volume24h < MIN_CONSIDER.minVolume24h)
     fails.push(`24h volume ($${Math.floor(market.volume24h).toLocaleString()}) below $${MIN_CONSIDER.minVolume24h.toLocaleString()} minimum`);
 
-  // Full scam-token audit before anything else — sellability (honeypot),
-  // Token-2022 extension audit (PermanentDelegate, TransferHook, TransferFee
-  // >5% or with active authority), and top-10 holder concentration (>40%).
-  // Submitter gets a specific reason so they understand why their token
-  // can't serve as collateral.
-  const [sell, ext, conc] = await Promise.all([
+  // Submitter cooldown: 3 rejections in 24h blocks further submissions.
+  // Stops a single bad actor from brute-forcing the screener.
+  const cooldown = await isSubmitterCoolingDown(userId);
+  if (!cooldown.allowed) {
+    return ctx.reply(
+      `*Cooldown active* — ${cooldown.reason}. Try again later.`,
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // Impersonation guard: matching symbol/name to a canonical token but
+  // different mint = block. Cheap in-memory check, runs first.
+  const imp = checkImpersonation(mint, market.symbol, market.name);
+  if (!imp.ok) {
+    await recordSubmitterRejection(userId, mint, imp.reason);
+    return ctx.reply(
+      [
+        `*${market.symbol}* — Rejected (impersonation)`,
+        "",
+        `Reason: \`${imp.reason}\``,
+        "",
+        "Use the canonical mint address instead.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // Full scam-token audit. Runs sellability, extension audit, holder
+  // concentration, and RugCheck in parallel. Reject on the first
+  // failure with a specific reason.
+  const [sell, ext, conc, rug] = await Promise.all([
     checkSellable(mint, onChain.decimals),
     auditTokenExtensions(mint),
     checkHolderConcentration(mint),
+    rugcheckRisk(mint),
   ]);
   const scamReason =
     !sell.sellable ? `honeypot — ${sell.reason}`
     : !ext.safe ? `unsafe Token-2022 extension — ${ext.reason}`
     : !conc.ok ? `holder concentration — ${conc.reason}`
+    : !rug.ok ? `${rug.reason}`
     : null;
   if (scamReason) {
+    await recordSubmitterRejection(userId, mint, scamReason);
     return ctx.reply(
       [
         `*${market.symbol}* — Rejected (scam-token guard)`,
