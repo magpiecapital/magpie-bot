@@ -13,7 +13,7 @@ import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 import { InlineKeyboard } from "grammy";
-import { checkSellable } from "../services/token-screener.js";
+import { checkSellable, auditTokenExtensions, checkHolderConcentration } from "../services/token-screener.js";
 
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
@@ -225,18 +225,29 @@ export async function handleSubmit(ctx) {
   if (market.volume24h < MIN_CONSIDER.minVolume24h)
     fails.push(`24h volume ($${Math.floor(market.volume24h).toLocaleString()}) below $${MIN_CONSIDER.minVolume24h.toLocaleString()} minimum`);
 
-  // Honeypot / sellability gate — runs BEFORE the threshold rejects so the
-  // submitter gets a clear honeypot message when applicable. A token that
-  // can't be sold via Jupiter (transfer hook, frozen accounts, 100% fee,
-  // no DEX route) can never serve as collateral.
-  const sell = await checkSellable(mint, onChain.decimals);
-  if (!sell.sellable) {
+  // Full scam-token audit before anything else — sellability (honeypot),
+  // Token-2022 extension audit (PermanentDelegate, TransferHook, TransferFee
+  // >5% or with active authority), and top-10 holder concentration (>40%).
+  // Submitter gets a specific reason so they understand why their token
+  // can't serve as collateral.
+  const [sell, ext, conc] = await Promise.all([
+    checkSellable(mint, onChain.decimals),
+    auditTokenExtensions(mint),
+    checkHolderConcentration(mint),
+  ]);
+  const scamReason =
+    !sell.sellable ? `honeypot — ${sell.reason}`
+    : !ext.safe ? `unsafe Token-2022 extension — ${ext.reason}`
+    : !conc.ok ? `holder concentration — ${conc.reason}`
+    : null;
+  if (scamReason) {
     return ctx.reply(
       [
-        `*${market.symbol}* — Rejected (honeypot risk)`,
+        `*${market.symbol}* — Rejected (scam-token guard)`,
         "",
-        `This token failed our sellability check (\`${sell.reason}\`).`,
-        "Magpie can't accept collateral that can't be liquidated on-chain.",
+        `Reason: \`${scamReason}\``,
+        "",
+        "Magpie can't accept collateral that fails our safety audit.",
       ].join("\n"),
       { parse_mode: "Markdown" },
     );

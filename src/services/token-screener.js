@@ -323,6 +323,116 @@ async function getHolderCount(mint) {
   return 0;
 }
 
+// ─── Token-2022 extension audit ─────────────────────────────────────────────
+
+/**
+ * Inspect a Token-2022 mint's extensions for ones that let an issuer block,
+ * pause, freeze, drain, or tax transfers after we've already approved the
+ * token. Returns { safe: true } for legacy tokens or Token-2022 tokens with
+ * benign extensions only; otherwise { safe: false, reason }.
+ *
+ * Catches the modern "approve it, then activate trap later" attack that
+ * the legacy mint/freeze-authority check is blind to.
+ */
+export async function auditTokenExtensions(mintStr) {
+  try {
+    const { PublicKey } = await import("@solana/web3.js");
+    const { TOKEN_2022_PROGRAM_ID, getMint, getTransferFeeConfig, getTransferHook, getPermanentDelegate } =
+      await import("@solana/spl-token");
+    const { connection } = await import("../solana/connection.js");
+
+    const mintPk = new PublicKey(mintStr);
+    const info = await connection.getAccountInfo(mintPk);
+    if (!info) return { safe: false, reason: "mint account not found" };
+
+    // Legacy SPL Token mints don't have extensions; they're audited via
+    // the existing has_mint_authority / has_freeze_authority check.
+    if (!info.owner.equals(TOKEN_2022_PROGRAM_ID)) return { safe: true };
+
+    const mint = await getMint(connection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
+
+    // PermanentDelegate: a fixed address can move anyone's tokens at any
+    // time. Hard block — equivalent to the dev being able to seize collateral.
+    const delegate = getPermanentDelegate(mint);
+    if (delegate?.delegate && !delegate.delegate.equals(PublicKey.default)) {
+      return { safe: false, reason: `PermanentDelegate set (${delegate.delegate.toBase58().slice(0, 8)}…)` };
+    }
+
+    // TransferHook: external program runs on every transfer and can reject.
+    // Block any non-empty hook.
+    const hook = getTransferHook(mint);
+    if (hook?.programId && !hook.programId.equals(PublicKey.default)) {
+      return { safe: false, reason: `TransferHook program set (${hook.programId.toBase58().slice(0, 8)}…)` };
+    }
+
+    // TransferFee: a per-transfer fee can be raised by the config authority
+    // up to 100% (10000 bps). Block any token with the extension where the
+    // fee is currently >5% or the authority is still controlled (so it
+    // could be raised later).
+    const fee = getTransferFeeConfig(mint);
+    if (fee) {
+      const newerBps = fee.newerTransferFee?.transferFeeBasisPoints ?? 0;
+      const olderBps = fee.olderTransferFee?.transferFeeBasisPoints ?? 0;
+      const maxBps = Math.max(newerBps, olderBps);
+      if (maxBps > 500) {
+        return { safe: false, reason: `TransferFee ${(maxBps / 100).toFixed(2)}% exceeds 5% limit` };
+      }
+      const authority = fee.transferFeeConfigAuthority;
+      if (authority && !authority.equals(PublicKey.default)) {
+        return { safe: false, reason: "TransferFee authority still set — fee can be raised" };
+      }
+    }
+
+    return { safe: true };
+  } catch (err) {
+    // Conservative: if we can't audit, reject (rather than silently approve
+    // a potentially-malicious extension we couldn't read).
+    return { safe: false, reason: `extension audit failed: ${err.message}` };
+  }
+}
+
+// ─── Holder concentration ───────────────────────────────────────────────────
+
+/**
+ * Reject tokens where the top 10 holders control >40% of supply — this is
+ * the classic dev-dump risk: a tiny group of wallets can crash the price
+ * right after we accept the token as collateral.
+ *
+ * Skips tokens whose top holders are clearly pool addresses (DEX LPs are
+ * expected to hold significant supply). For now we treat any holder with
+ * an unusually large balance as suspect; future iteration could whitelist
+ * known LP programs.
+ */
+export async function checkHolderConcentration(mintStr, maxTop10Pct = 40) {
+  try {
+    const { PublicKey } = await import("@solana/web3.js");
+    const { connection } = await import("../solana/connection.js");
+
+    const mintPk = new PublicKey(mintStr);
+    const [largest, supplyInfo] = await Promise.all([
+      connection.getTokenLargestAccounts(mintPk, "confirmed"),
+      connection.getTokenSupply(mintPk, "confirmed"),
+    ]);
+    const total = BigInt(supplyInfo.value.amount);
+    if (total === 0n) return { ok: false, reason: "zero supply" };
+
+    // Top-10 sum across the returned accounts (Solana caps at 20, so 10 fits).
+    const top10 = largest.value.slice(0, 10);
+    const sum = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
+    const pct = Number((sum * 10000n) / total) / 100;
+
+    if (pct > maxTop10Pct) {
+      return { ok: false, reason: `top-10 holders own ${pct.toFixed(1)}% (max ${maxTop10Pct}%)` };
+    }
+    return { ok: true, topTenPct: pct };
+  } catch (err) {
+    // Don't block on transient RPC errors — log and let downstream checks
+    // (sellability) be the safety net.
+    console.warn(`[screener] holder check failed for ${mintStr}: ${err.message}`);
+    return { ok: true, skipped: true, reason: err.message };
+  }
+}
+
 // ─── Honeypot test ──────────────────────────────────────────────────────────
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -595,16 +705,23 @@ async function tick(bot) {
 
     const { verdict, safetyScore, fails, ageHours } = vetToken(onChain, market, holderCount, category);
 
-    // Honeypot guard: before promoting a token to approved OR review,
-    // verify Jupiter can route a tiny sell. Tokens that pass thresholds
-    // but block transfers (transfer hooks, 100% fees, frozen accounts,
-    // no DEX liquidity) get rejected here. Skips stocks since they
-    // route through their own issuer flow, not DEXes.
+    // Scam-token guard: before promoting to approved OR review, run the
+    // full audit suite — sellability, Token-2022 extensions, and holder
+    // concentration. Skips stocks since they route through their issuer.
     if (category !== "stock" && (verdict === "auto_approve" || verdict === "review")) {
-      const sell = await checkSellable(mint, onChain.decimals);
-      if (!sell.sellable) {
-        await markSeen(mint); // permanent reject — won't recover
-        console.log(`[screener] reject ${market.symbol} (honeypot): ${sell.reason}`);
+      const [sell, ext, conc] = await Promise.all([
+        checkSellable(mint, onChain.decimals),
+        auditTokenExtensions(mint),
+        checkHolderConcentration(mint),
+      ]);
+      const scamReason =
+        !sell.sellable ? `honeypot — ${sell.reason}`
+        : !ext.safe ? `unsafe extension — ${ext.reason}`
+        : !conc.ok ? `concentration — ${conc.reason}`
+        : null;
+      if (scamReason) {
+        await markSeen(mint);
+        console.log(`[screener] reject ${market.symbol} (${scamReason})`);
         continue;
       }
     }
@@ -727,13 +844,22 @@ export function registerScreenerCallbacks(bot) {
       return ctx.answerCallbackQuery("Token not found in queue");
     }
 
-    // Honeypot re-check at approval time — token state may have changed
-    // between submission and admin review. Skip the check for stocks.
+    // Full scam audit re-check at approval time — token state may have
+    // changed between submission and admin review. Skip for stocks.
     if (t.category !== "stock") {
-      const sell = await checkSellable(t.mint, t.decimals);
-      if (!sell.sellable) {
-        await ctx.answerCallbackQuery(`Blocked: ${sell.reason}`);
-        await ctx.editMessageText(`${t.symbol} blocked: token failed sellability check (${sell.reason}).`);
+      const [sell, ext, conc] = await Promise.all([
+        checkSellable(t.mint, t.decimals),
+        auditTokenExtensions(t.mint),
+        checkHolderConcentration(t.mint),
+      ]);
+      const scamReason =
+        !sell.sellable ? `honeypot — ${sell.reason}`
+        : !ext.safe ? `unsafe extension — ${ext.reason}`
+        : !conc.ok ? `concentration — ${conc.reason}`
+        : null;
+      if (scamReason) {
+        await ctx.answerCallbackQuery(`Blocked: ${scamReason.slice(0, 40)}`);
+        await ctx.editMessageText(`${t.symbol} blocked: ${scamReason}.`);
         await query(
           `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
           [mint],
@@ -841,10 +967,19 @@ async function processReviewQueue(bot) {
       continue;
     }
 
-    // Sellability re-check — most important gate before lending against it.
+    // Full scam audit re-check before promoting a 1h-aged review entry.
     if (t.category !== "stock") {
-      const sell = await checkSellable(t.mint, onChain.decimals);
-      if (!sell.sellable) {
+      const [sell, ext, conc] = await Promise.all([
+        checkSellable(t.mint, onChain.decimals),
+        auditTokenExtensions(t.mint),
+        checkHolderConcentration(t.mint),
+      ]);
+      const scamReason =
+        !sell.sellable ? `honeypot — ${sell.reason}`
+        : !ext.safe ? `unsafe extension — ${ext.reason}`
+        : !conc.ok ? `concentration — ${conc.reason}`
+        : null;
+      if (scamReason) {
         await query(
           `UPDATE token_screen_queue SET status = 'rejected', reviewed_at = NOW() WHERE mint = $1`,
           [t.mint],
@@ -853,12 +988,12 @@ async function processReviewQueue(bot) {
           try {
             await bot.api.sendMessage(
               t.submitted_by,
-              `Your submitted token *${t.symbol}* failed the sellability check (honeypot risk) and was not approved.`,
+              `Your submitted token *${t.symbol}* was not approved (${scamReason}).`,
               { parse_mode: "Markdown" },
             );
           } catch { /* user may have blocked bot */ }
         }
-        console.log(`[screener] Review auto-rejected ${t.symbol} (honeypot: ${sell.reason})`);
+        console.log(`[screener] Review auto-rejected ${t.symbol} (${scamReason})`);
         continue;
       }
     }
