@@ -527,7 +527,7 @@ async function tick(bot) {
 
   const approved = [];
   const queued = [];
-  let rejNoMarket = 0, rejBlocked = 0, rejNoOnChain = 0, rejVerdict = 0;
+  let rejNoMarket = 0, rejBlocked = 0, rejNoOnChain = 0, rejTransient = 0, rejPermanent = 0;
 
   for (const { mint } of newMints) {
     const market = marketData.get(mint);
@@ -537,16 +537,15 @@ async function tick(bot) {
       continue;
     }
 
-    // Only mark seen once we have enough data to make a real decision.
-    await markSeen(mint);
-
     if (BLOCKED_SYMBOLS.has(market.symbol.toUpperCase())) {
+      await markSeen(mint); // permanent — wrapped L1/stablecoin, won't change
       rejBlocked++;
       continue;
     }
 
     const onChain = await getOnChainInfo(mint);
     if (!onChain) {
+      // RPC blip or genuinely unreadable — don't markSeen, retry next tick
       rejNoOnChain++;
       continue;
     }
@@ -558,21 +557,32 @@ async function tick(bot) {
 
     if (verdict === "auto_approve") {
       await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
+      await markSeen(mint);
       approved.push({ symbol: market.symbol, mint, liquidity: market.liquidity, marketCap: market.marketCap, category });
     } else if (verdict === "review") {
       await queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category);
+      await markSeen(mint);
       queued.push({ symbol: market.symbol, mint, safetyScore, fails, category });
     } else {
-      rejVerdict++;
-      console.log(`[screener] reject ${market.symbol}: ${fails.slice(0, 3).join("; ")}`);
+      // Reject: distinguish permanent (authority issues — will never pass)
+      // from transient (too young / low liquidity yet — could mature later).
+      const hasPermanent = fails.some((f) => /authority|honeypot/i.test(f));
+      if (hasPermanent) {
+        await markSeen(mint);
+        rejPermanent++;
+      } else {
+        // Don't markSeen — re-evaluate next tick as the token ages.
+        rejTransient++;
+      }
+      console.log(`[screener] reject ${market.symbol} (${hasPermanent ? "permanent" : "transient"}): ${fails.slice(0, 3).join("; ")}`);
     }
   }
 
-  if (approved.length || queued.length || rejVerdict || rejBlocked || rejNoOnChain) {
+  if (approved.length || queued.length || rejTransient || rejPermanent || rejBlocked || rejNoOnChain) {
     console.log(
       `[screener] result: approved=${approved.length} queued=${queued.length} ` +
-      `rej_verdict=${rejVerdict} rej_blocked=${rejBlocked} rej_no_onchain=${rejNoOnChain} ` +
-      `rej_no_market=${rejNoMarket}`,
+      `rej_permanent=${rejPermanent} rej_transient=${rejTransient} ` +
+      `rej_blocked=${rejBlocked} rej_no_onchain=${rejNoOnChain} rej_no_market=${rejNoMarket}`,
     );
   }
 
