@@ -16,6 +16,7 @@ import {
   createCloseAccountInstruction,
 } from "@solana/spl-token";
 import BN from "bn.js";
+import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
 import "dotenv/config";
@@ -34,8 +35,17 @@ import { recordCreditEvent } from "./credit-score.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
-/** Load the lender/authority keypair from the JSON file on disk. */
+/**
+ * Load the lender keypair. Prefers LENDER_PRIVATE_KEY env var (base58)
+ * for production where there's no keypair file on disk; falls back to
+ * LENDER_KEYPAIR_PATH file for local dev.
+ */
 function loadLenderKeypair() {
+  const b58 = process.env.LENDER_PRIVATE_KEY;
+  if (b58) {
+    const decode = bs58.decode || (bs58.default && bs58.default.decode);
+    return Keypair.fromSecretKey(decode(b58));
+  }
   const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
