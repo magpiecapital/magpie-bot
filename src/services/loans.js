@@ -115,13 +115,25 @@ export async function executeBorrow({
     loanTokenProgram,
   );
 
-  // Pre-instructions: create borrower's wSOL ATA if missing, and ensure fee ATA exists.
+  // Pre-instructions: create borrower's wSOL ATA AND fee wallet's wSOL ATA
+  // if missing. The fee ATA can auto-close once its wSOL balance is drained
+  // (wSOL accounts get closed to reclaim rent); without idempotently creating
+  // it here, subsequent borrows fail with AccountNotInitialized on the
+  // fee_wallet_token_account constraint. Borrower pays the rent (~0.002 SOL,
+  // one-time) — fee ATA persists thereafter as long as it holds wSOL.
   const preIxs = [
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
       borrowerWsolAta,
       borrower.publicKey,
+      loanTokenMintPk,
+      loanTokenProgram,
+    ),
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower.publicKey,
+      feeWalletWsolAta,
+      LENDER_PUBKEY,
       loanTokenMintPk,
       loanTokenProgram,
     ),
@@ -476,6 +488,14 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
       borrower.publicKey,
       borrowerWsolAta,
       borrower.publicKey,
+      loanTokenMintPk,
+      loanTokenProgram,
+    ),
+    // Same safety as executeBorrow: ensure the fee wallet's wSOL ATA exists.
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower.publicKey,
+      feeWalletWsolAta,
+      LENDER_PUBKEY,
       loanTokenMintPk,
       loanTokenProgram,
     ),

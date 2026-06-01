@@ -29,6 +29,37 @@ function loadLenderKeypair() {
 }
 
 /**
+ * Read the on-chain PriceAttestation account and return its age in seconds
+ * (or null if the account doesn't exist / can't be parsed).
+ *
+ * PriceAttestation layout (from the Anchor IDL):
+ *   8     account discriminator
+ *   32    mint
+ *   32    pool
+ *   32    authority
+ *   8     price_lamports (u64)
+ *   8     timestamp (i64)
+ *   2     confidence_bps (u16)
+ *   1     bump
+ *
+ * timestamp is at offset 8+32+32+32+8 = 112, length 8 bytes, little-endian.
+ */
+export async function getPriceFeedAgeSeconds(mintStr) {
+  try {
+    const mintPk = new PublicKey(mintStr);
+    const [pool] = lendingPoolPda(LENDER_PUBKEY);
+    const [priceFeed] = priceFeedPda(mintPk, pool);
+    const info = await connection.getAccountInfo(priceFeed);
+    if (!info || info.data.length < 120) return null;
+    const ts = info.data.readBigInt64LE(112);
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    return Number(now - ts);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Initialize a price feed PDA for a given mint. Idempotent — returns
  * { alreadyExists: true } if the PDA is already on chain.
  */

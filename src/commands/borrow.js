@@ -4,7 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { collateralValueLamports } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
-import { attestPrice, initializePriceFeed } from "../services/price-attestor.js";
+import { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } from "../services/price-attestor.js";
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
@@ -353,29 +353,50 @@ export function registerBorrowCallbacks(bot) {
 
     await ctx.editMessageText("⏳ Submitting on-chain...");
 
-    // Just-in-time price feed refresh — guarantees the on-chain feed is
-    // fresh (<120s) for the user's mint before requestAndFundLoan checks it.
-    // Auto-initializes the feed if missing (first-time borrow against the mint).
-    try {
-      await attestPrice(state.selected.mint, state.selected.decimals);
-    } catch (attestErr) {
-      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-        try {
-          await initializePriceFeed(state.selected.mint);
-          await attestPrice(state.selected.mint, state.selected.decimals);
-        } catch (initErr) {
+    // Just-in-time price feed refresh — but only if the on-chain feed is
+    // actually stale. Contract requires <120s; we use a 60s threshold to
+    // leave headroom for the borrow tx to land before the contract clock
+    // rejects it. Most repeat-borrows skip the attestation entirely.
+    const FRESH_THRESHOLD_SEC = 60;
+    const feedAge = await getPriceFeedAgeSeconds(state.selected.mint);
+    const needsAttest = feedAge === null || feedAge > FRESH_THRESHOLD_SEC;
+
+    if (needsAttest) {
+      try {
+        await attestPrice(state.selected.mint, state.selected.decimals);
+      } catch (attestErr) {
+        if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+          try {
+            await initializePriceFeed(state.selected.mint);
+            await attestPrice(state.selected.mint, state.selected.decimals);
+          } catch (initErr) {
+            pending.delete(ctx.chat.id);
+            await ctx.editMessageText(
+              `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
+            );
+            return;
+          }
+        } else if (/not confirmed in \d+|timed out|TransactionExpired/i.test(attestErr.message)) {
+          // Solana congestion ate the attestation tx. Re-check the feed
+          // age — if a previous attest got close enough to land, we may
+          // already be within the contract's 120s window.
+          const recheckAge = await getPriceFeedAgeSeconds(state.selected.mint);
+          if (recheckAge !== null && recheckAge < 110) {
+            // Close enough — proceed with the borrow anyway.
+          } else {
+            pending.delete(ctx.chat.id);
+            await ctx.editMessageText(
+              `⚠️ Solana network is congested right now and our price refresh tx didn't confirm.\n\nGive it a minute and try /borrow again — it usually clears quickly.`,
+            );
+            return;
+          }
+        } else {
           pending.delete(ctx.chat.id);
           await ctx.editMessageText(
-            `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
+            `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
           );
           return;
         }
-      } else {
-        pending.delete(ctx.chat.id);
-        await ctx.editMessageText(
-          `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
-        );
-        return;
       }
     }
 
