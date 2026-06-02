@@ -73,10 +73,38 @@ export async function query(text, params) {
  *     can be imported under multiple Telegram accounts (common when
  *     users share a wallet across devices / accounts). This was the
  *     hidden cause of repeated "Failed to import wallet" errors.
+ *   - Inserts/refreshes the official $MAGPIE token as an approved,
+ *     protected collateral mint. protected=TRUE exempts it from the
+ *     hourly token-health watcher's auto-disable logic. Liquidity/
+ *     market-cap fields are refreshed by the screener/health sweeps.
  */
 export async function applyStartupPatches() {
   const patches = [
     `ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_public_key_key`,
+
+    // $MAGPIE — protocol token, always approved, exempt from auto-disqualification.
+    // Decimals=6 verified on-chain. ON CONFLICT keeps the row idempotent across boots.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected)
+     VALUES ('9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump',
+             'MAGPIE', 'Magpie', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'protocol_token',
+             TRUE, TRUE)
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       source = 'protocol_token'`,
+
+    // Make sure the screener doesn't re-process $MAGPIE through the audit pipeline.
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump')
+     ON CONFLICT DO NOTHING`,
   ];
   for (const sql of patches) {
     try {
