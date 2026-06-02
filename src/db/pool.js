@@ -64,6 +64,31 @@ export async function query(text, params) {
 }
 
 /**
+ * One-shot schema patches run on bot startup. Each statement must be
+ * idempotent — safe to re-run on every boot. Use sparingly; prefer
+ * proper migration files for non-urgent changes.
+ *
+ * Currently applies:
+ *   - Drops UNIQUE constraint on wallets.public_key so the same wallet
+ *     can be imported under multiple Telegram accounts (common when
+ *     users share a wallet across devices / accounts). This was the
+ *     hidden cause of repeated "Failed to import wallet" errors.
+ */
+export async function applyStartupPatches() {
+  const patches = [
+    `ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_public_key_key`,
+  ];
+  for (const sql of patches) {
+    try {
+      await query(sql);
+      console.log("[db] startup patch applied:", sql.slice(0, 80));
+    } catch (err) {
+      console.warn("[db] startup patch failed (continuing):", err.message);
+    }
+  }
+}
+
+/**
  * Probe the secondary DB directly. Used by the weekly health check to
  * verify the failover path actually works before we need it.
  */

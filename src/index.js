@@ -168,6 +168,10 @@ bot.start({
     setTimeout(() => startPumpWatcher(bot), 20_000);
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
+    // Apply idempotent schema patches before anything that touches DB writes.
+    import("./db/pool.js").then((m) => m.applyStartupPatches()).catch((err) => {
+      console.warn("[bot] applyStartupPatches failed (continuing):", err.message);
+    });
     startDbHealth(bot); // Start immediately — monitors DB connectivity
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
