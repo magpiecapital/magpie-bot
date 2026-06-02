@@ -125,17 +125,23 @@ export async function accrueToHolderPool(feeLamports) {
  * timing their entry/exit around predictable distribution events.
  */
 export async function getHolderPoolState() {
-  const { rows } = await query(
-    `SELECT accrued_lamports, last_distribution_at, next_distribution_at
-       FROM magpie_holder_pool WHERE id = 1`,
-  );
+  // Defensive: SELECT * survives schema patches that may not have applied
+  // yet on first boot of a new deploy. Then pick out the columns we care
+  // about with optional chaining.
+  let rows;
+  try {
+    const r = await query(`SELECT * FROM magpie_holder_pool WHERE id = 1`);
+    rows = r.rows;
+  } catch {
+    rows = [];
+  }
   if (rows.length === 0) {
     return { accrued_lamports: 0n, last_distribution_at: null, next_distribution_at: null };
   }
   return {
-    accrued_lamports: BigInt(rows[0].accrued_lamports),
-    last_distribution_at: rows[0].last_distribution_at,
-    next_distribution_at: rows[0].next_distribution_at,
+    accrued_lamports: BigInt(rows[0].accrued_lamports ?? "0"),
+    last_distribution_at: rows[0].last_distribution_at ?? null,
+    next_distribution_at: rows[0].next_distribution_at ?? null,
   };
 }
 
