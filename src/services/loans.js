@@ -288,6 +288,10 @@ export async function executeRepay({ userId, loanDbRow }) {
 
 /**
  * Persist a new loan record after on-chain success.
+ *
+ * Also credits the borrower's referrer (if any) with their share of the
+ * loan fee. The fee is the difference between original (debt) and net
+ * (received) — already known from the on-chain math.
  */
 export async function recordLoan({
   userId,
@@ -304,13 +308,14 @@ export async function recordLoan({
   const startTs = new Date();
   const dueTs = new Date(startTs.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
-  await query(
+  const { rows } = await query(
     `INSERT INTO loans (
        user_id, loan_id, loan_pda, collateral_mint, collateral_amount,
        loan_amount_lamports, original_loan_amount_lamports,
        ltv_percentage, duration_days,
        start_timestamp, due_timestamp, status, tx_signature
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)`,
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)
+     RETURNING id`,
     [
       userId,
       loanId,
@@ -326,6 +331,22 @@ export async function recordLoan({
       txSignature,
     ],
   );
+
+  // Referral fee-share accrual. fee = debt − received.
+  try {
+    const { accrueFromLoan } = await import("./referral-rewards.js");
+    const feeLamports = BigInt(originalLoanAmountLamports) - BigInt(loanAmountLamports);
+    if (feeLamports > 0n) {
+      await accrueFromLoan({
+        refereeUserId: userId,
+        loanDbId: rows[0].id,
+        feeLamports,
+        eventType: "borrow",
+      });
+    }
+  } catch (err) {
+    console.error("[loans] referral accrual on borrow failed (continuing):", err.message);
+  }
 }
 
 /**
@@ -546,6 +567,21 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     .preInstructions(preIxs)
     .postInstructions(postIxs)
     .rpc({ commitment: "confirmed" });
+
+  // Referral fee-share accrual on the extend fee.
+  try {
+    const { accrueFromLoan } = await import("./referral-rewards.js");
+    if (feeLamports > 0n) {
+      await accrueFromLoan({
+        refereeUserId: userId,
+        loanDbId: loanDbRow.id,
+        feeLamports,
+        eventType: "extend",
+      });
+    }
+  } catch (err) {
+    console.error("[loans] referral accrual on extend failed (continuing):", err.message);
+  }
 
   return { signature: sig, feeLamports: feeLamports.toString() };
 }

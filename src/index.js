@@ -24,6 +24,7 @@ import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
+import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -90,6 +91,9 @@ bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
 bot.command("magpie", handleMagpie);
 bot.command("token", handleMagpie); // alias — users might guess this
+bot.command("refer", handleRefer);
+bot.command("referral", handleRefer); // alias
+bot.command("invite", handleRefer); // alias — common term users guess
 
 // Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
@@ -111,6 +115,7 @@ registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
 registerImportCallbacks(bot);
+registerReferCallbacks(bot);
 registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
@@ -140,6 +145,7 @@ async function registerBotCommands() {
       { command: "supported", description: "🪙 Approved collateral tokens" },
       { command: "credit", description: "⭐ Your credit score + points" },
       { command: "history", description: "📜 Loan history" },
+      { command: "refer", description: "🎁 Earn 5% of friends' loan fees" },
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "help", description: "ℹ️ Full command list" },

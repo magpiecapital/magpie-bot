@@ -105,6 +105,28 @@ export async function applyStartupPatches() {
     `INSERT INTO token_screen_seen (mint)
      VALUES ('9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump')
      ON CONFLICT DO NOTHING`,
+
+    // Referral rewards ledger. One row per fee-bearing event (borrow, extend)
+    // produced by a referred user. Sum of unpaid rows = claimable balance.
+    `CREATE TABLE IF NOT EXISTS referral_earnings (
+       id BIGSERIAL PRIMARY KEY,
+       referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       referee_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       loan_db_id BIGINT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+       event_type TEXT NOT NULL,
+       fee_lamports NUMERIC(30,0) NOT NULL,
+       reward_lamports NUMERIC(30,0) NOT NULL,
+       reward_bps INT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'accrued',
+       paid_tx_signature TEXT,
+       paid_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (loan_db_id, event_type)
+     )`,
+    `CREATE INDEX IF NOT EXISTS referral_earnings_referrer_status_idx
+       ON referral_earnings(referrer_user_id, status)`,
+    `CREATE INDEX IF NOT EXISTS referral_earnings_referee_idx
+       ON referral_earnings(referee_user_id)`,
   ];
   for (const sql of patches) {
     try {
