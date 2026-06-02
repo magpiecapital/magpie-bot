@@ -221,9 +221,24 @@ export async function executeRepay({ userId, loanDbRow }) {
 
   const repayLamports = BigInt(loanDbRow.original_loan_amount_lamports);
 
-  // Wrap SOL → wSOL: create ATA, transfer lamports to it, sync_native.
+  // Pre-instructions:
+  //   1. Idempotent create of borrower's COLLATERAL ATA. The program returns
+  //      collateral here on repay; if the user closed the ATA between borrow
+  //      and repay (Phantom/Solflare let users close empty token accounts
+  //      to reclaim rent), the tx fails with AccountNotInitialized on
+  //      borrower_collateral_account. Cheap to recreate (~0.002 SOL rent,
+  //      recoverable later).
+  //   2. Wrap SOL → wSOL in borrower's loan-token ATA so they can pay back
+  //      the principal: create ATA, fund it, sync_native.
   const preIxs = [
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower.publicKey,
+      borrowerCollateralAta,
+      borrower.publicKey,
+      collateralMintPk,
+      collateralTokenProgram,
+    ),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
       borrowerWsolAta,
