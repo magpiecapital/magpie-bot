@@ -38,8 +38,9 @@ export async function handleImport(ctx) {
 }
 
 async function doImport(ctx, tgUser, key) {
-  // Phantom exports base58 (88 chars). Solflare exports a JSON byte array
-  // ([12,34,56,...]). Support both.
+  // Phantom exports base58 (87-88 chars). Solflare exports a JSON byte
+  // array ([12,34,56,...]). Some wallets export 32-byte SEEDS instead of
+  // 64-byte secret keys — we detect and reject those with a clear message.
   let normalizedKey = key;
   try {
     const { Keypair } = await import("@solana/web3.js");
@@ -49,20 +50,47 @@ async function doImport(ctx, tgUser, key) {
       // Solflare JSON array format
       const arr = JSON.parse(key);
       secretKey = Uint8Array.from(arr);
+      if (secretKey.length === 32) {
+        return ctx.reply(
+          [
+            "That looks like a 32-byte SEED, not a full 64-byte secret key.",
+            "",
+            "Magpie needs the full secret key (the 64-byte version) to sign transactions.",
+            "",
+            "In Solflare: Settings → *Show Private Key* (not 'Show Seed Phrase').",
+          ].join("\n"),
+          { parse_mode: "Markdown" },
+        );
+      }
       // Re-encode to base58 so wallet service sees consistent format downstream
       normalizedKey = bs58.default.encode(secretKey);
     } else {
       secretKey = bs58.default.decode(key);
+      if (secretKey.length === 32) {
+        return ctx.reply(
+          [
+            "That looks like a 32-byte SEED, not a full 64-byte secret key.",
+            "",
+            "Magpie needs the full secret key to sign transactions.",
+            "",
+            "In Phantom: Settings → *Export Private Key* (long string starting with no brackets, ~88 characters).",
+          ].join("\n"),
+          { parse_mode: "Markdown" },
+        );
+      }
     }
     Keypair.fromSecretKey(secretKey);
+    console.log(`[import] parse OK · format=${key.startsWith("[") ? "json" : "base58"} · bytes=${secretKey.length}`);
   } catch (err) {
-    console.error("[import] parse failed:", err?.message);
+    console.error(`[import] parse failed · len=${key.length} · prefix=${key.slice(0, 3)} · err=${err?.message}`);
     return ctx.reply(
       [
-        "That doesn't look right. Make sure you're pasting your full private key:",
+        "That doesn't look right. Make sure you're pasting your full *private key*, not your seed phrase:",
         "",
-        "• *Phantom*: Settings → Show Secret Recovery Phrase isn't it — you need *Export Private Key* (a long string of letters and numbers)",
-        "• *Solflare*: Settings → Export Private Key (long string or array of numbers)",
+        "• *Phantom*: Settings → Security & Privacy → *Export Private Key* (a long string of letters/numbers, ~88 chars)",
+        "• *Solflare*: Settings → *Show Private Key* (long string OR array of numbers)",
+        "",
+        "Don't paste your 12/24-word seed phrase — that's a different thing.",
         "",
         "Try again — tap *Import existing wallet* once more.",
       ].join("\n"),
@@ -93,8 +121,17 @@ async function doImport(ctx, tgUser, key) {
       { parse_mode: "Markdown", reply_markup: kb },
     );
   } catch (err) {
-    console.error("Import wallet error:", err);
-    await ctx.reply("Failed to import wallet. Please try again.");
+    // Surface the actual reason instead of a generic message so we can debug
+    // and so users get something more useful than "Please try again."
+    console.error("[import] DB/encrypt error:", err?.message, err?.stack?.split("\n")[1]);
+    const hint = /WALLET_ENCRYPTION_KEY/i.test(err?.message || "")
+      ? "(server config issue — admin notified)"
+      : /duplicate|unique/i.test(err?.message || "")
+      ? "(this key is already linked to another account)"
+      : /connection|ECONNRESET|ETIMEDOUT/i.test(err?.message || "")
+      ? "(database connection blip — please retry)"
+      : `(${err?.message?.slice(0, 80) || "unknown"})`;
+    await ctx.reply(`Failed to import wallet. ${hint}\n\nTry again with /import.`);
   }
 }
 
