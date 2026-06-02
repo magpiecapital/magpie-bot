@@ -127,20 +127,23 @@ export async function attestPrice(mintStr, decimals, priceSolOverride) {
 }
 
 /**
- * Mints we need to keep continuously fresh on-chain: those backing
- * any active loan (so the risk engine / health watcher / repay flow
- * can rely on a non-stale price). New /borrow calls do their own
- * just-in-time attestation before submitting the tx, so we don't
- * need to sweep every enabled mint here — only the ones with skin
- * in the game right now.
+ * Mints we need to keep continuously fresh on-chain:
+ *   1. Those backing any active loan (risk engine / health watcher / repay
+ *      flow rely on a non-stale price).
+ *   2. Protected mints (protocol's own tokens like $MAGPIE) — keeping these
+ *      always-fresh means /borrow against them is instant with no JIT delay.
+ *
+ * Everything else relies on /borrow's just-in-time attestation, which
+ * keeps RPC cost in check.
  */
 async function fetchMintsToAttest() {
   const r = await query(
     `SELECT DISTINCT sm.mint, sm.decimals
        FROM supported_mints sm
-       JOIN loans l ON l.collateral_mint = sm.mint
+       LEFT JOIN loans l
+              ON l.collateral_mint = sm.mint AND l.status = 'active'
       WHERE sm.enabled = TRUE
-        AND l.status = 'active'`,
+        AND (l.id IS NOT NULL OR sm.protected = TRUE)`,
   );
   return r.rows.map((row) => ({ mint: row.mint, decimals: row.decimals }));
 }
