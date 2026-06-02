@@ -49,18 +49,27 @@ const RUG_THRESHOLDS = {
 // Market cap floor — below this is instant delist regardless of liquidity
 const MCAP_FLOOR = 10_000;
 
-// Watchlist — degraded but not dead yet
+// Liquidity floor — tokens whose liquidity drops below this no longer meet
+// the criteria we used to approve them in the first place. Instant delist
+// regardless of mcap. This is the strongest signal a token has stopped
+// being a viable collateral asset.
+const LIQUIDITY_FLOOR = 5_000;
+
+// Watchlist — degraded but not dead yet. Tighter now so we cull faster.
 const WATCHLIST_THRESHOLDS = {
-  maxLiquidityUsd: 25_000,
-  maxVolume24h: 5_000,
+  maxLiquidityUsd: 15_000,
+  maxVolume24h: 1_000,
   maxMarketCap: 50_000,
 };
 
-// Strikes before watchlist → delist (6 strikes × 15 min = 90 min of degraded data)
-const STRIKES_TO_DELIST = 6;
+// Strikes before watchlist → delist. At a 4h interval, 3 strikes = 12h of
+// sustained degraded data. Down from 6 (which was 24h) — keeping the
+// /tokens page free of decayed memecoins faster.
+const STRIKES_TO_DELIST = 3;
 
-// Circuit breaker — max delistings per single cycle
-const MAX_DELISTS_PER_CYCLE = 3;
+// Circuit breaker — max delistings per single cycle. Bumped to 10 to allow
+// catching up after the tightened thresholds without aborting the cycle.
+const MAX_DELISTS_PER_CYCLE = 10;
 
 // If more than this fraction of tokens have no market data, treat as API outage
 const API_OUTAGE_THRESHOLD = 0.5;
@@ -271,6 +280,22 @@ async function tick(bot) {
       await delistToken(
         mint, symbol,
         `Rug detected — liquidity $${Math.floor(market.liquidity).toLocaleString()} AND mcap $${Math.floor(market.marketCap).toLocaleString()}`,
+        bot,
+      );
+      delisted.push(symbol);
+      delistCount++;
+      continue;
+    }
+
+    // Liquidity dropped below the approval floor. Even if mcap looks fine
+    // (could be inflated/wash-traded), liquidity below the floor means we
+    // can't liquidate this collateral cleanly — no longer meets criteria.
+    // Skip large-cap tokens (>$1M mcap) where low liquidity reading is
+    // likely a DexScreener batch-API quirk, not real degradation.
+    if (market.liquidity < LIQUIDITY_FLOOR && market.marketCap < 1_000_000) {
+      await delistToken(
+        mint, symbol,
+        `Liquidity below floor — $${Math.floor(market.liquidity).toLocaleString()} (min: $${LIQUIDITY_FLOOR.toLocaleString()})`,
         bot,
       );
       delisted.push(symbol);
