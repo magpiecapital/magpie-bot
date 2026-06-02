@@ -150,16 +150,25 @@ export async function getHolderPoolState() {
 export async function getHolderInfoByWallet(walletAddress) {
   if (!walletAddress) return null;
 
-  // 1. On-chain balance (the source of truth — DB doesn't track every wallet)
+  // 1. On-chain balance (source of truth — DB doesn't track every wallet).
+  //    Sum across ALL token accounts owned by this wallet for $MAGPIE,
+  //    not just the ATA — some users hold via non-ATA accounts (legacy
+  //    from before ATAs were standard, or multi-account positions).
+  //    Matches the snapshot logic exactly.
   let balanceRaw = 0n;
   let exists = false;
   try {
-    const ataPubkey = getMagpieAtaForOwner(new PublicKey(walletAddress));
-    const info = await connection.getTokenAccountBalance(ataPubkey).catch(() => null);
-    if (info?.value) {
-      balanceRaw = BigInt(info.value.amount ?? "0");
-      exists = true;
+    const accounts = await connection.getTokenAccountsByOwner(
+      new PublicKey(walletAddress),
+      { mint: MAGPIE_MINT, programId: MAGPIE_TOKEN_PROGRAM },
+      { commitment: "confirmed" },
+    );
+    for (const a of accounts.value) {
+      const data = a.account.data;
+      if (data.length < 72) continue;
+      balanceRaw += data.readBigUInt64LE(64);
     }
+    exists = accounts.value.length > 0;
   } catch {
     /* malformed wallet → return zero state */
   }
