@@ -79,6 +79,44 @@ async function authenticateRequest(req) {
 
 // ─── Route handlers ─────────────────────────────────────────────────────────
 
+async function handleReferrals(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) {
+    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  }
+  const { getReferralSummaryByWallet, REFERRAL_REWARD_BPS, MIN_CLAIM_LAMPORTS } =
+    await import("../services/referral-rewards.js");
+  const summary = await getReferralSummaryByWallet(wallet);
+  if (!summary) {
+    return {
+      status: 404,
+      body: {
+        error: "Wallet not linked to a Magpie account. Start the Telegram bot first.",
+        bot_url: "https://t.me/magpie_capital_bot",
+      },
+    };
+  }
+  const botUsername = process.env.BOT_USERNAME || "magpie_capital_bot";
+  const shareLink = summary.code
+    ? `https://t.me/${botUsername}?start=${summary.code}`
+    : null;
+  return {
+    status: 200,
+    body: {
+      code: summary.code,
+      share_link: shareLink,
+      reward_bps: REFERRAL_REWARD_BPS,
+      reward_pct: REFERRAL_REWARD_BPS / 100,
+      min_claim_lamports: MIN_CLAIM_LAMPORTS.toString(),
+      referred_count: summary.referred_count,
+      borrowed_count: summary.borrowed_count,
+      lifetime_lamports: summary.lifetime_lamports.toString(),
+      paid_lamports: summary.paid_lamports.toString(),
+      claimable_lamports: summary.claimable_lamports.toString(),
+    },
+  };
+}
+
 async function handleCreditScore(req, url) {
   const wallet = url.searchParams.get("wallet");
   const userId = url.searchParams.get("user_id");
@@ -688,6 +726,7 @@ const PUBLIC_ROUTES = new Set([
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
   "/api/v1/pool/stats",
+  "/api/v1/referrals",
 ]);
 
 async function router(req, res) {
@@ -809,6 +848,9 @@ async function router(req, res) {
       case "/api/v1/marketplace/stats":
         result = await handleMarketplaceStats();
         break;
+      case "/api/v1/referrals":
+        result = await handleReferrals(req, url);
+        break;
       default:
         result = {
           status: 200,
@@ -822,6 +864,7 @@ async function router(req, res) {
               "GET /api/v1/credit/leaderboard": "Top credit scores",
               "GET /api/v1/tokens": "All approved tokens (public, no auth)",
               "GET /api/v1/loans?wallet=<address>": "Active + historical loans for a wallet",
+              "GET /api/v1/referrals?wallet=<address>": "Referral code + earnings for a wallet",
               "GET /api/v1/wallet/balance?wallet=<address>": "SOL + token balances for a wallet",
               "GET /api/v1/risk/token?mint=<address>": "Token risk assessment",
               "GET /api/v1/risk/flagged": "Currently flagged tokens",

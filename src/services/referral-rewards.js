@@ -125,6 +125,22 @@ export async function getReferralSummary(userId) {
 }
 
 /**
+ * Same as getReferralSummary, but looked up by wallet pubkey. Used by the
+ * site dashboard to display referral stats next to a connected wallet.
+ *
+ * Returns null if the wallet isn't tied to any bot user.
+ */
+export async function getReferralSummaryByWallet(walletAddress) {
+  if (!walletAddress) return null;
+  const r = await query(
+    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+    [walletAddress],
+  );
+  if (r.rows.length === 0) return null;
+  return getReferralSummary(r.rows[0].user_id);
+}
+
+/**
  * Atomically claim accrued referral earnings. Locks the rows, sends SOL
  * from lender wallet → recipient, marks rows paid with the tx signature.
  *
