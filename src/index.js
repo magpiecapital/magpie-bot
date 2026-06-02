@@ -25,6 +25,7 @@ import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
+import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -51,6 +52,7 @@ import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
+import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -94,6 +96,8 @@ bot.command("token", handleMagpie); // alias — users might guess this
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
+bot.command("holders", handleHolders);
+bot.command("holder", handleHolders); // alias
 
 // Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
@@ -116,6 +120,7 @@ registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
 registerImportCallbacks(bot);
 registerReferCallbacks(bot);
+registerHoldersCallbacks(bot);
 registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
@@ -146,6 +151,7 @@ async function registerBotCommands() {
       { command: "credit", description: "⭐ Your credit score + points" },
       { command: "history", description: "📜 Loan history" },
       { command: "refer", description: "🎁 Earn 5% of friends' loan fees" },
+      { command: "holders", description: "💎 $MAGPIE holder rewards" },
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "help", description: "ℹ️ Full command list" },
@@ -186,6 +192,10 @@ bot.start({
     // 45s interval so refresh fires before the 60s force-attest gap.
     // Keeps on-chain feed timestamp comfortably under 120s contract limit.
     setTimeout(() => startPriceAttestor(45_000), 35_000);
+    // $MAGPIE holder reward distributions (weekly snapshot + pro-rata payout).
+    // Idempotent — only runs when the pool has accrued AND 7+ days have
+    // passed since the last distribution.
+    setTimeout(() => startHolderDistributor(), 90_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

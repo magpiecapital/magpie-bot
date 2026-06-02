@@ -79,6 +79,58 @@ async function authenticateRequest(req) {
 
 // ─── Route handlers ─────────────────────────────────────────────────────────
 
+async function handleHolders(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) {
+    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  }
+  const {
+    getHolderInfoByWallet,
+    HOLDER_REWARD_BPS,
+    MIN_HOLDER_CLAIM_LAMPORTS,
+    MAGPIE_MINT,
+  } = await import("../services/magpie-holder-rewards.js");
+  const info = await getHolderInfoByWallet(wallet);
+  if (!info) {
+    return { status: 400, body: { error: "Invalid wallet address" } };
+  }
+  return {
+    status: 200,
+    body: {
+      wallet: info.wallet,
+      magpie_mint: MAGPIE_MINT.toBase58(),
+      magpie_balance_raw: info.balance_raw,
+      magpie_balance: Number(info.balance_raw) / 1e6, // $MAGPIE has 6 decimals
+      has_balance: info.has_balance,
+      reward_bps: HOLDER_REWARD_BPS,
+      reward_pct: HOLDER_REWARD_BPS / 100,
+      min_claim_lamports: MIN_HOLDER_CLAIM_LAMPORTS.toString(),
+      lifetime_lamports: info.lifetime_lamports.toString(),
+      paid_lamports: info.paid_lamports.toString(),
+      claimable_lamports: info.claimable_lamports.toString(),
+      distributions_count: info.distributions_count,
+    },
+  };
+}
+
+async function handleHolderPool() {
+  const { getHolderPoolState, HOLDER_REWARD_BPS } = await import(
+    "../services/magpie-holder-rewards.js"
+  );
+  const state = await getHolderPoolState();
+  return {
+    status: 200,
+    body: {
+      pool_lamports: state.accrued_lamports.toString(),
+      pool_sol: Number(state.accrued_lamports) / 1e9,
+      last_distribution_at: state.last_distribution_at,
+      reward_bps: HOLDER_REWARD_BPS,
+      reward_pct: HOLDER_REWARD_BPS / 100,
+      distribution_interval_days: 7,
+    },
+  };
+}
+
 async function handleReferrals(req, url) {
   const wallet = url.searchParams.get("wallet");
   if (!wallet) {
@@ -727,6 +779,8 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/admin/pool-stats",
   "/api/v1/pool/stats",
   "/api/v1/referrals",
+  "/api/v1/holders",
+  "/api/v1/holders/pool",
 ]);
 
 async function router(req, res) {
@@ -851,6 +905,12 @@ async function router(req, res) {
       case "/api/v1/referrals":
         result = await handleReferrals(req, url);
         break;
+      case "/api/v1/holders":
+        result = await handleHolders(req, url);
+        break;
+      case "/api/v1/holders/pool":
+        result = await handleHolderPool();
+        break;
       default:
         result = {
           status: 200,
@@ -865,6 +925,8 @@ async function router(req, res) {
               "GET /api/v1/tokens": "All approved tokens (public, no auth)",
               "GET /api/v1/loans?wallet=<address>": "Active + historical loans for a wallet",
               "GET /api/v1/referrals?wallet=<address>": "Referral code + earnings for a wallet",
+              "GET /api/v1/holders?wallet=<address>": "$MAGPIE holder balance + reward stats",
+              "GET /api/v1/holders/pool": "Current $MAGPIE holder reward pool size",
               "GET /api/v1/wallet/balance?wallet=<address>": "SOL + token balances for a wallet",
               "GET /api/v1/risk/token?mint=<address>": "Token risk assessment",
               "GET /api/v1/risk/flagged": "Currently flagged tokens",

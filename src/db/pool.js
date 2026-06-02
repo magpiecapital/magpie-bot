@@ -127,6 +127,44 @@ export async function applyStartupPatches() {
        ON referral_earnings(referrer_user_id, status)`,
     `CREATE INDEX IF NOT EXISTS referral_earnings_referee_idx
        ON referral_earnings(referee_user_id)`,
+
+    // $MAGPIE holder rewards — accrual pool. Singleton row (id=1).
+    `CREATE TABLE IF NOT EXISTS magpie_holder_pool (
+       id INTEGER PRIMARY KEY,
+       accrued_lamports NUMERIC(30,0) NOT NULL DEFAULT 0,
+       last_distribution_at TIMESTAMPTZ,
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `INSERT INTO magpie_holder_pool (id, accrued_lamports) VALUES (1, 0)
+       ON CONFLICT (id) DO NOTHING`,
+
+    // Each weekly snapshot+distribution becomes one row here.
+    `CREATE TABLE IF NOT EXISTS magpie_holder_distributions (
+       id BIGSERIAL PRIMARY KEY,
+       snapshot_at TIMESTAMPTZ NOT NULL,
+       pool_lamports NUMERIC(30,0) NOT NULL,
+       total_balance NUMERIC(40,0) NOT NULL,
+       holder_count INTEGER NOT NULL,
+       eligible_count INTEGER NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+
+    // Per-holder allocations from each distribution. Wallet is the
+    // on-chain $MAGPIE holder address — does NOT need to be a bot user.
+    `CREATE TABLE IF NOT EXISTS magpie_holder_rewards (
+       id BIGSERIAL PRIMARY KEY,
+       distribution_id BIGINT NOT NULL REFERENCES magpie_holder_distributions(id) ON DELETE CASCADE,
+       wallet_address TEXT NOT NULL,
+       balance_at_snapshot NUMERIC(40,0) NOT NULL,
+       reward_lamports NUMERIC(30,0) NOT NULL,
+       status TEXT NOT NULL DEFAULT 'accrued',
+       paid_tx_signature TEXT,
+       paid_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (distribution_id, wallet_address)
+     )`,
+    `CREATE INDEX IF NOT EXISTS magpie_holder_rewards_wallet_status_idx
+       ON magpie_holder_rewards(wallet_address, status)`,
   ];
   for (const sql of patches) {
     try {

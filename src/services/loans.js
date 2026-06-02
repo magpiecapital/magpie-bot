@@ -332,10 +332,13 @@ export async function recordLoan({
     ],
   );
 
-  // Referral fee-share accrual. fee = debt − received.
+  // Compute the on-chain fee once and feed it to all the off-chain accrual hooks
+  // (referrals + $MAGPIE holder pool). fee = debt − received.
+  const feeLamports = BigInt(originalLoanAmountLamports) - BigInt(loanAmountLamports);
+
+  // Referral fee-share accrual
   try {
     const { accrueFromLoan } = await import("./referral-rewards.js");
-    const feeLamports = BigInt(originalLoanAmountLamports) - BigInt(loanAmountLamports);
     if (feeLamports > 0n) {
       await accrueFromLoan({
         refereeUserId: userId,
@@ -346,6 +349,16 @@ export async function recordLoan({
     }
   } catch (err) {
     console.error("[loans] referral accrual on borrow failed (continuing):", err.message);
+  }
+
+  // $MAGPIE holder pool accrual (10% of fee)
+  try {
+    const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
+    if (feeLamports > 0n) {
+      await accrueToHolderPool(feeLamports);
+    }
+  } catch (err) {
+    console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
   }
 }
 
@@ -581,6 +594,16 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     }
   } catch (err) {
     console.error("[loans] referral accrual on extend failed (continuing):", err.message);
+  }
+
+  // $MAGPIE holder pool accrual on the extend fee.
+  try {
+    const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
+    if (feeLamports > 0n) {
+      await accrueToHolderPool(feeLamports);
+    }
+  } catch (err) {
+    console.error("[loans] holder pool accrual on extend failed (continuing):", err.message);
   }
 
   return { signature: sig, feeLamports: feeLamports.toString() };
