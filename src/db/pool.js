@@ -171,6 +171,20 @@ export async function applyStartupPatches() {
     // without leaking it publicly via the per-wallet APIs.
     `ALTER TABLE magpie_holder_pool
        ADD COLUMN IF NOT EXISTS next_distribution_at TIMESTAMPTZ`,
+
+    // Pin the FIRST distribution to a specific moment chosen by the
+    // operator. Only takes effect if no distribution has happened yet —
+    // once the first snapshot fires, the random-window logic takes over
+    // for subsequent runs. Idempotent across boots.
+    //
+    // The exact timestamp must remain operator-private: do not echo it
+    // to logs that ship to public dashboards, do not surface it in any
+    // API response, do not put it in commit messages that are user-facing.
+    `UPDATE magpie_holder_pool
+        SET next_distribution_at = '2026-06-08 17:00:00+00'::timestamptz,
+            updated_at = NOW()
+      WHERE id = 1
+        AND last_distribution_at IS NULL`,
   ];
   for (const sql of patches) {
     try {
