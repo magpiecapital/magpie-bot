@@ -108,7 +108,9 @@ async function handleHolders(req, url) {
       pending_lamports: info.pending_lamports.toString(),
       distributions_count: info.distributions_count,
       estimated_next_payout_lamports: info.estimated_next_payout_lamports.toString(),
-      seconds_until_next_distribution: info.seconds_until_next_distribution,
+      // INTENTIONALLY NOT EXPOSED: snapshot timing. The window is random
+      // (5-10 days) and internal-only — prevents mercenary holders from
+      // timing buy-just-before / dump-just-after distributions.
       auto_distribute: true,
     },
   };
@@ -124,10 +126,10 @@ async function handleHolderPool() {
     body: {
       pool_lamports: state.accrued_lamports.toString(),
       pool_sol: Number(state.accrued_lamports) / 1e9,
-      last_distribution_at: state.last_distribution_at,
       reward_bps: HOLDER_REWARD_BPS,
       reward_pct: HOLDER_REWARD_BPS / 100,
-      distribution_interval_days: 7,
+      // Timing intentionally omitted — snapshots fire at random within
+      // a hidden 5-10 day window after each distribution.
     },
   };
 }

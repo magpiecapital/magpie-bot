@@ -165,6 +165,12 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS magpie_holder_rewards_wallet_status_idx
        ON magpie_holder_rewards(wallet_address, status)`,
+
+    // Anti-dump: snapshot timing is randomized within a window and KEPT
+    // PRIVATE. Storing the target as a column lets the cron compare cheaply
+    // without leaking it publicly via the per-wallet APIs.
+    `ALTER TABLE magpie_holder_pool
+       ADD COLUMN IF NOT EXISTS next_distribution_at TIMESTAMPTZ`,
   ];
   for (const sql of patches) {
     try {

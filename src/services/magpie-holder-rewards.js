@@ -48,6 +48,16 @@ export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL safety floor
 // Avoids spending more in tx fees than the rewards themselves.
 export const MIN_DISTRIBUTION_LAMPORTS = 10_000_000n; // 0.01 SOL
 
+// Anti-dump window: snapshots fire at a random moment within this range,
+// measured from the previous distribution. Internal-only — never exposed
+// via public APIs. The exact next-snapshot time is also kept private.
+const DIST_WINDOW_MIN_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
+const DIST_WINDOW_MAX_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
+
+function pickNextDistributionDelay() {
+  return DIST_WINDOW_MIN_MS + Math.random() * (DIST_WINDOW_MAX_MS - DIST_WINDOW_MIN_MS);
+}
+
 /**
  * Wallets that should NEVER receive holder rewards even if they show up
  * holding $MAGPIE. Pump.fun bonding curve, well-known DEX pools, CEX
@@ -107,19 +117,25 @@ export async function accrueToHolderPool(feeLamports) {
 }
 
 /**
- * Get current accrued pool size (lamports earmarked for the next
- * distribution).
+ * Get current accrued pool size + internal scheduling state.
+ *
+ * NOTE: next_distribution_at and last_distribution_at are INTERNAL-ONLY.
+ * They must never be exposed in public API responses or UIs — the whole
+ * point of the random window is to prevent mercenary holders from
+ * timing their entry/exit around predictable distribution events.
  */
 export async function getHolderPoolState() {
   const { rows } = await query(
-    `SELECT accrued_lamports, last_distribution_at FROM magpie_holder_pool WHERE id = 1`,
+    `SELECT accrued_lamports, last_distribution_at, next_distribution_at
+       FROM magpie_holder_pool WHERE id = 1`,
   );
   if (rows.length === 0) {
-    return { accrued_lamports: 0n, last_distribution_at: null };
+    return { accrued_lamports: 0n, last_distribution_at: null, next_distribution_at: null };
   }
   return {
     accrued_lamports: BigInt(rows[0].accrued_lamports),
     last_distribution_at: rows[0].last_distribution_at,
+    next_distribution_at: rows[0].next_distribution_at,
   };
 }
 
@@ -160,16 +176,18 @@ export async function getHolderInfoByWallet(walletAddress) {
     [walletAddress],
   );
 
-  // 3. Estimated next payout — pool × (this wallet's balance / total eligible)
+  // 3. Estimated next payout — pool × (this wallet's balance / total eligible).
   //    "Total eligible" comes from the last snapshot if we have one,
   //    otherwise from on-chain circulating supply.
+  //    We DO expose the estimate (size of slice) but NOT when the slice
+  //    will be paid — that timing stays private to prevent dump-after-snapshot
+  //    behavior.
   let estimatedNextPayout = 0n;
-  let secondsUntilNext = null;
   try {
     const [poolState, lastSnap] = await Promise.all([
       getHolderPoolState(),
       query(
-        `SELECT total_balance, snapshot_at FROM magpie_holder_distributions
+        `SELECT total_balance FROM magpie_holder_distributions
           ORDER BY snapshot_at DESC LIMIT 1`,
       ),
     ]);
@@ -182,13 +200,6 @@ export async function getHolderInfoByWallet(walletAddress) {
         estimatedNextPayout = (pool * balanceRaw) / totalBalance;
       }
     }
-    // Time to next distribution: 7 days minus time since last
-    if (poolState.last_distribution_at) {
-      const since = Math.floor(
-        (Date.now() - new Date(poolState.last_distribution_at).getTime()) / 1000,
-      );
-      secondsUntilNext = Math.max(0, 7 * 24 * 60 * 60 - since);
-    }
   } catch {
     /* best-effort estimate — fall through with 0 */
   }
@@ -199,10 +210,9 @@ export async function getHolderInfoByWallet(walletAddress) {
     has_balance: exists && balanceRaw > 0n,
     lifetime_lamports: BigInt(totals[0]?.lifetime ?? "0"),
     paid_lamports: BigInt(totals[0]?.paid ?? "0"),
-    pending_lamports: BigInt(totals[0]?.pending ?? "0"), // unpaid (retry pending)
+    pending_lamports: BigInt(totals[0]?.pending ?? "0"),
     distributions_count: totals[0]?.distributions_count ?? 0,
     estimated_next_payout_lamports: estimatedNextPayout,
-    seconds_until_next_distribution: secondsUntilNext,
   };
 }
 
@@ -395,15 +405,18 @@ export async function snapshotAndDistribute() {
 
     // Atomically decrement the pool by what we ALLOCATED — never overwrite
     // to a fixed value. If a concurrent accrueToHolderPool call slips in
-    // during this transaction, its increment is preserved (decrement
-    // applies to the current value, which already includes the new accrual).
+    // during this transaction, its increment is preserved.
+    // Also set the next snapshot time to a random moment 5-10 days from
+    // now — internal only, never exposed via any public API.
+    const nextDelayMs = pickNextDistributionDelay();
     await client.query(
       `UPDATE magpie_holder_pool
           SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
               last_distribution_at = NOW(),
+              next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
               updated_at = NOW()
         WHERE id = 1`,
-      [allocatedSum.toString()],
+      [allocatedSum.toString(), Math.floor(nextDelayMs).toString()],
     );
 
     await client.query("COMMIT");
@@ -593,27 +606,51 @@ export async function claimHolderRewards({ walletAddress }) {
 }
 
 /**
- * Background scheduler: run a distribution every 7 days (configurable).
- * Skips if nothing has accrued or last run was too recent.
+ * Background scheduler: every 6h, retry any leftover unpaid rewards and
+ * check whether the (randomized, internal-only) next-distribution moment
+ * has arrived. If so, snapshot + auto-pay.
+ *
+ * Snapshot timing is INTENTIONALLY UNPREDICTABLE — randomized between
+ * 5-10 days after each distribution. This stops mercenary holders from
+ * timing a buy-just-before / dump-just-after pattern.
  */
-export function startHolderDistributor(intervalMs = 7 * 24 * 60 * 60 * 1000) {
-  console.log(`[holder-rewards] Distributor starting (interval=${intervalMs}ms)`);
+export function startHolderDistributor() {
+  console.log("[holder-rewards] Distributor starting (random 5-10d window, hidden timing)");
 
   async function tick() {
     try {
-      // First: clean up any payouts that failed mid-batch last cycle.
+      // 1. Clean up payouts that failed mid-batch last cycle.
       const retry = await retryAccruedPayouts();
       if (retry.paid > 0) {
         console.log(`[holder-rewards] Retried payouts: ${retry.paid} paid (of ${retry.retried})`);
       }
 
-      // Then: check if a new distribution is due.
+      // 2. Check if a new distribution is due.
       const state = await getHolderPoolState();
-      if (state.last_distribution_at) {
-        const since = Date.now() - new Date(state.last_distribution_at).getTime();
-        if (since < intervalMs) return; // too soon
+      if (state.accrued_lamports <= 0n) return; // nothing to do yet
+
+      // First-ever run: pick a random target and store it (no distribution today).
+      if (!state.next_distribution_at && !state.last_distribution_at) {
+        const delay = pickNextDistributionDelay();
+        await query(
+          `UPDATE magpie_holder_pool
+              SET next_distribution_at = NOW() + ($1 || ' milliseconds')::interval,
+                  updated_at = NOW()
+            WHERE id = 1`,
+          [Math.floor(delay).toString()],
+        );
+        console.log(
+          `[holder-rewards] First distribution scheduled in ~${Math.round(delay / 86_400_000)}d (internal only)`,
+        );
+        return;
       }
-      if (state.accrued_lamports <= 0n) return; // nothing to do
+
+      // If next time hasn't arrived, wait.
+      if (state.next_distribution_at && new Date(state.next_distribution_at) > new Date()) {
+        return;
+      }
+
+      // 3. Snapshot + auto-pay.
       const result = await snapshotAndDistribute();
       if (result) {
         console.log(
@@ -626,9 +663,6 @@ export function startHolderDistributor(intervalMs = 7 * 24 * 60 * 60 * 1000) {
     }
   }
 
-  // Run once on startup (with a small delay) so the first distribution happens
-  // the first time the bot boots after the pool starts accruing.
-  setTimeout(tick, 60 * 60 * 1000); // 1h after boot
-  // Then every 6h check whether a 7d distribution is due.
-  setInterval(tick, 6 * 60 * 60 * 1000);
+  setTimeout(tick, 60 * 60 * 1000); // first check 1h after boot
+  setInterval(tick, 6 * 60 * 60 * 1000); // then every 6h
 }

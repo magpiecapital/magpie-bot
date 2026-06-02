@@ -27,15 +27,6 @@ function fmtMagpie(rawAmount) {
   return n.toFixed(2);
 }
 
-function fmtCountdown(seconds) {
-  if (seconds == null) return "first distribution pending";
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  if (d > 0) return `~${d}d ${h}h`;
-  const m = Math.floor((seconds % 3600) / 60);
-  return `~${h}h ${m}m`;
-}
-
 export async function handleHolders(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
@@ -52,7 +43,7 @@ export async function handleHolders(ctx) {
   const lines = [
     "💎 *$MAGPIE Holder Rewards*",
     "",
-    `*${pct}% of every loan fee* is automatically distributed to $MAGPIE holders every 7 days. No claim button — SOL hits your wallet on its own.`,
+    `*${pct}% of every loan fee* is auto-distributed to $MAGPIE holders. SOL hits your wallet directly — no claim, no signing.`,
     "",
     "*Your Magpie wallet:*",
     `\`${wallet.publicKey}\``,
@@ -72,7 +63,9 @@ export async function handleHolders(ctx) {
   lines.push(
     "",
     "*Current pool (accruing):*",
-    `\`${fmtSol(pool.accrued_lamports)} SOL\` · next distribution: ${fmtCountdown(info.seconds_until_next_distribution)}`,
+    `\`${fmtSol(pool.accrued_lamports)} SOL\` waiting for the next snapshot.`,
+    "",
+    "_Snapshots happen periodically. Hold $MAGPIE consistently — the longer you're in, the more snapshots you'll catch._",
   );
 
   if (!info.has_balance) {
