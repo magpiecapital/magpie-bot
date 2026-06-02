@@ -10,6 +10,7 @@ import { handlePrice } from "./commands/price.js";
 import { handleWithdraw, registerWithdrawCallbacks } from "./commands/withdraw.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
+import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
@@ -87,6 +88,8 @@ bot.command("reborrow", handleReborrow);
 bot.command("home", handleHome);
 bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
+bot.command("magpie", handleMagpie);
+bot.command("token", handleMagpie); // alias — users might guess this
 
 // Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
@@ -138,6 +141,7 @@ async function registerBotCommands() {
       { command: "credit", description: "⭐ Your credit score + points" },
       { command: "history", description: "📜 Loan history" },
       { command: "submit", description: "➕ Submit a new token" },
+      { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "help", description: "ℹ️ Full command list" },
     ]);
     await bot.api.setChatMenuButton({

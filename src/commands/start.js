@@ -94,6 +94,7 @@ export async function handleStart(ctx) {
     "/deposit — show your deposit address",
     "/import — use your existing wallet",
     "/me — your wallet, tier, and referral code",
+    "/magpie — official $MAGPIE token info",
     "/help — full command list",
   ].join("\n");
 
