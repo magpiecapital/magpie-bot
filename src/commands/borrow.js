@@ -18,6 +18,16 @@ const LTV_TIERS = [
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
 const pending = new Map();
 
+/**
+ * Clear any in-progress borrow state for a chat. Used by sibling commands
+ * (e.g. /import) to defensively reset a stuck flow before starting their
+ * own message:text interception, so the user's paste can't get hijacked
+ * by leftover borrow state.
+ */
+export function clearPending(chatId) {
+  pending.delete(chatId);
+}
+
 const QUOTE_TTL_MS = 60_000; // 60-second quote expiry
 const MAX_SLIPPAGE_PCT = 2; // reject if price moved >2% since quote
 

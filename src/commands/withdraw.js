@@ -20,6 +20,17 @@ import { connection } from "../solana/connection.js";
 
 const pending = new Map();
 
+/**
+ * Clear any in-progress withdraw state for a chat. The withdraw flow's
+ * message:text middleware is the "greediest" of the bot — it claims any
+ * text message as long as a state exists, which can hijack a user's
+ * pasted private key during /import. Sibling commands call this to
+ * defensively reset before starting their own paste-capture flow.
+ */
+export function clearPending(chatId) {
+  pending.delete(chatId);
+}
+
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
@@ -80,9 +91,14 @@ export function registerWithdrawCallbacks(bot) {
   });
 
   // Two-step message listener: destination → amount.
+  // Only claim the message if we're actively expecting input — otherwise
+  // call next() so a leftover state doesn't hijack messages meant for
+  // other flows (e.g. /import paste).
   bot.on("message:text", async (ctx, next) => {
     const state = pending.get(ctx.chat.id);
-    if (!state) return next();
+    if (!state || (state.stage !== "await_destination" && state.stage !== "await_amount")) {
+      return next();
+    }
 
     if (state.stage === "await_destination") {
       try {

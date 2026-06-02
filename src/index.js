@@ -108,7 +108,14 @@ bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
 
-// Inline callback registration
+// Inline callback registration.
+//
+// CRITICAL ORDER: import is registered FIRST because its message:text
+// middleware needs priority over /borrow and /withdraw — both of which
+// also intercept text messages. Without this, a user who abandoned a
+// prior /withdraw or /borrow session and then runs /import has their
+// pasted private key hijacked by the leftover state.
+registerImportCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -118,7 +125,6 @@ registerTopupCallbacks(bot);
 registerPartialRepayCallbacks(bot);
 registerExtendCallbacks(bot);
 registerLendCallbacks(bot);
-registerImportCallbacks(bot);
 registerReferCallbacks(bot);
 registerHoldersCallbacks(bot);
 registerReborrowCallbacks(bot);

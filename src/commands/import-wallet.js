@@ -1,6 +1,8 @@
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { importWallet } from "../services/wallet.js";
+import { clearPending as clearBorrowPending } from "./borrow.js";
+import { clearPending as clearWithdrawPending } from "./withdraw.js";
 
 const awaiting = new Map();
 
@@ -138,6 +140,12 @@ async function doImport(ctx, tgUser, key) {
 export function registerImportCallbacks(bot) {
   bot.callbackQuery("import:ready", async (ctx) => {
     await ctx.answerCallbackQuery();
+    // Defensively clear leftover state from sibling flows (borrow, withdraw)
+    // that also intercept text messages. Without this, an abandoned /withdraw
+    // session can hijack the pasted private key and surface as "Invalid
+    // Solana address" — a confusing failure that looks like /import broken.
+    clearBorrowPending(ctx.chat.id);
+    clearWithdrawPending(ctx.chat.id);
     awaiting.set(ctx.chat.id, true);
     await ctx.reply(
       [
