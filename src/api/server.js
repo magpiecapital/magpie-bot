@@ -87,7 +87,6 @@ async function handleHolders(req, url) {
   const {
     getHolderInfoByWallet,
     HOLDER_REWARD_BPS,
-    MIN_HOLDER_CLAIM_LAMPORTS,
     MAGPIE_MINT,
   } = await import("../services/magpie-holder-rewards.js");
   const info = await getHolderInfoByWallet(wallet);
@@ -104,11 +103,13 @@ async function handleHolders(req, url) {
       has_balance: info.has_balance,
       reward_bps: HOLDER_REWARD_BPS,
       reward_pct: HOLDER_REWARD_BPS / 100,
-      min_claim_lamports: MIN_HOLDER_CLAIM_LAMPORTS.toString(),
       lifetime_lamports: info.lifetime_lamports.toString(),
       paid_lamports: info.paid_lamports.toString(),
-      claimable_lamports: info.claimable_lamports.toString(),
+      pending_lamports: info.pending_lamports.toString(),
       distributions_count: info.distributions_count,
+      estimated_next_payout_lamports: info.estimated_next_payout_lamports.toString(),
+      seconds_until_next_distribution: info.seconds_until_next_distribution,
+      auto_distribute: true,
     },
   };
 }

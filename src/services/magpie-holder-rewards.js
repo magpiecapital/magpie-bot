@@ -120,8 +120,12 @@ export async function getHolderPoolState() {
 }
 
 /**
- * Look up an on-chain wallet's $MAGPIE holdings and any unclaimed
- * reward balance. Used by the site dashboard widget.
+ * Look up an on-chain wallet's $MAGPIE holdings and reward history.
+ * Used by the site dashboard widget + /holders bot command.
+ *
+ * Includes an ESTIMATED next payout based on the user's current
+ * balance share vs the last snapshot's eligible total. For the
+ * first distribution (no history yet), uses circulating supply.
  */
 export async function getHolderInfoByWallet(walletAddress) {
   if (!walletAddress) return null;
@@ -140,17 +144,50 @@ export async function getHolderInfoByWallet(walletAddress) {
     /* malformed wallet → return zero state */
   }
 
-  // 2. Accrued + paid reward totals from the distributions ledger
+  // 2. Reward history (lifetime received + per-distribution count)
   const { rows: totals } = await query(
     `SELECT
        COALESCE(SUM(reward_lamports)::numeric, 0)::text AS lifetime,
        COALESCE(SUM(CASE WHEN status = 'paid' THEN reward_lamports ELSE 0 END)::numeric, 0)::text AS paid,
-       COALESCE(SUM(CASE WHEN status = 'accrued' THEN reward_lamports ELSE 0 END)::numeric, 0)::text AS claimable,
+       COALESCE(SUM(CASE WHEN status = 'accrued' THEN reward_lamports ELSE 0 END)::numeric, 0)::text AS pending,
        COUNT(*)::int AS distributions_count
      FROM magpie_holder_rewards
      WHERE wallet_address = $1`,
     [walletAddress],
   );
+
+  // 3. Estimated next payout — pool × (this wallet's balance / total eligible)
+  //    "Total eligible" comes from the last snapshot if we have one,
+  //    otherwise from on-chain circulating supply.
+  let estimatedNextPayout = 0n;
+  let secondsUntilNext = null;
+  try {
+    const [poolState, lastSnap] = await Promise.all([
+      getHolderPoolState(),
+      query(
+        `SELECT total_balance, snapshot_at FROM magpie_holder_distributions
+          ORDER BY snapshot_at DESC LIMIT 1`,
+      ),
+    ]);
+    const pool = poolState.accrued_lamports;
+    if (pool > 0n && balanceRaw > 0n) {
+      const totalBalance = lastSnap.rows[0]
+        ? BigInt(lastSnap.rows[0].total_balance)
+        : await getMagpieCirculatingSupply().catch(() => 0n);
+      if (totalBalance > 0n) {
+        estimatedNextPayout = (pool * balanceRaw) / totalBalance;
+      }
+    }
+    // Time to next distribution: 7 days minus time since last
+    if (poolState.last_distribution_at) {
+      const since = Math.floor(
+        (Date.now() - new Date(poolState.last_distribution_at).getTime()) / 1000,
+      );
+      secondsUntilNext = Math.max(0, 7 * 24 * 60 * 60 - since);
+    }
+  } catch {
+    /* best-effort estimate — fall through with 0 */
+  }
 
   return {
     wallet: walletAddress,
@@ -158,9 +195,20 @@ export async function getHolderInfoByWallet(walletAddress) {
     has_balance: exists && balanceRaw > 0n,
     lifetime_lamports: BigInt(totals[0]?.lifetime ?? "0"),
     paid_lamports: BigInt(totals[0]?.paid ?? "0"),
-    claimable_lamports: BigInt(totals[0]?.claimable ?? "0"),
+    pending_lamports: BigInt(totals[0]?.pending ?? "0"), // unpaid (retry pending)
     distributions_count: totals[0]?.distributions_count ?? 0,
+    estimated_next_payout_lamports: estimatedNextPayout,
+    seconds_until_next_distribution: secondsUntilNext,
   };
+}
+
+/**
+ * Fetch the on-chain circulating supply of $MAGPIE. Used as a fallback
+ * "total eligible" denominator for the very first distribution's estimate.
+ */
+async function getMagpieCirculatingSupply() {
+  const info = await connection.getTokenSupply(MAGPIE_MINT);
+  return BigInt(info?.value?.amount ?? "0");
 }
 
 function getMagpieAtaForOwner(owner) {
@@ -218,29 +266,54 @@ export async function snapshotMagpieHolders() {
 
 /**
  * Take a snapshot, allocate the current pool pro-rata across eligible
- * holders, mark rewards 'accrued' (claimable), and reset the pool.
+ * holders, and AUTO-PAY each holder in SOL. No claim step required —
+ * SOL hits holders' wallets during the distribution itself.
  *
- * Returns { distribution_id, pool_lamports, holder_count, eligible_count, total_balance }
- * or null if there was nothing to distribute.
+ * Flow:
+ *   1. Pre-flight: verify lender has enough SOL to cover pool + reserve.
+ *      If not, skip and try again next cycle.
+ *   2. Enumerate on-chain holders + compute pro-rata shares.
+ *   3. Insert distribution row + per-holder reward rows (status 'accrued').
+ *   4. Send SOL in batches of 10 transfers per tx. On each successful tx,
+ *      flip those rows to 'paid' with the tx signature. Failed batches
+ *      stay 'accrued' for retry on the next cycle.
+ *   5. Reset pool to remainder (untouched if all transfers succeeded).
+ *
+ * Returns { distribution_id, pool_lamports, holder_count, eligible_count,
+ *           total_balance, paid_count, paid_lamports } or null.
  */
+const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana tx limit)
+
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
   if (pool <= 0n) return null;
 
+  // Pre-flight: lender must cover the entire pool + safety reserve
+  const lender = loadLenderKeypair();
+  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
+  if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn(
+      `[holder-rewards] Distribution skipped: lender ${lenderBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+    );
+    return null;
+  }
+
   const holders = await snapshotMagpieHolders();
   if (holders.length === 0) return null;
 
-  // Sum eligible balance
   const totalBalance = holders.reduce((sum, h) => sum + h.balance_raw, 0n);
   if (totalBalance <= 0n) return null;
 
   const { pool: dbPool } = await import("../db/pool.js");
+
+  // Phase 1: write distribution + reward rows (transactional, no SOL movement yet)
+  let distributionId;
+  let rewardRows = [];
+  let allocatedSum = 0n;
   const client = await dbPool.connect();
   try {
     await client.query("BEGIN");
-
-    // 1. Create distribution row
     const { rows: [distRow] } = await client.query(
       `INSERT INTO magpie_holder_distributions
          (snapshot_at, pool_lamports, total_balance, holder_count, eligible_count)
@@ -248,33 +321,38 @@ export async function snapshotAndDistribute() {
        RETURNING id`,
       [pool.toString(), totalBalance.toString(), holders.length, holders.length],
     );
-    const distributionId = distRow.id;
+    distributionId = distRow.id;
 
-    // 2. Pro-rata allocations — skip rewards below 1 lamport
-    let allocatedSum = 0n;
-    const rows = [];
+    const inserts = [];
     for (const h of holders) {
       const reward = (pool * h.balance_raw) / totalBalance;
       if (reward <= 0n) continue;
-      rows.push([distributionId, h.owner, h.balance_raw.toString(), reward.toString()]);
+      inserts.push([distributionId, h.owner, h.balance_raw.toString(), reward.toString()]);
       allocatedSum += reward;
     }
 
-    // Bulk insert
-    if (rows.length > 0) {
-      const placeholders = rows
+    if (inserts.length > 0) {
+      const placeholders = inserts
         .map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}, 'accrued')`)
         .join(", ");
-      const flat = rows.flat();
       await client.query(
         `INSERT INTO magpie_holder_rewards
            (distribution_id, wallet_address, balance_at_snapshot, reward_lamports, status)
-         VALUES ${placeholders}`,
-        flat,
+         VALUES ${placeholders}
+         RETURNING id, wallet_address, reward_lamports`,
+        inserts.flat(),
       );
+
+      // Fetch them back with IDs for the payout phase
+      const { rows } = await client.query(
+        `SELECT id, wallet_address, reward_lamports FROM magpie_holder_rewards
+          WHERE distribution_id = $1`,
+        [distributionId],
+      );
+      rewardRows = rows;
     }
 
-    // 3. Reset the pool. Leave dust (pool - allocatedSum) for the next round.
+    // Reset the pool. Remainder = dust from integer division.
     const remainder = pool - allocatedSum;
     await client.query(
       `UPDATE magpie_holder_pool
@@ -286,21 +364,113 @@ export async function snapshotAndDistribute() {
     );
 
     await client.query("COMMIT");
-
-    return {
-      distribution_id: distributionId,
-      pool_lamports: pool,
-      holder_count: holders.length,
-      eligible_count: rows.length,
-      total_balance: totalBalance,
-      allocated_lamports: allocatedSum,
-    };
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
-    throw err;
-  } finally {
     client.release();
+    throw err;
   }
+  client.release();
+
+  // Phase 2: send SOL in batches, mark rows paid as each batch confirms
+  let paidCount = 0;
+  let paidLamports = 0n;
+  for (let i = 0; i < rewardRows.length; i += BATCH_SIZE) {
+    const batch = rewardRows.slice(i, i + BATCH_SIZE);
+    const tx = new Transaction();
+    for (const r of batch) {
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: lender.publicKey,
+          toPubkey: new PublicKey(r.wallet_address),
+          lamports: BigInt(r.reward_lamports),
+        }),
+      );
+    }
+    try {
+      const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+        commitment: "confirmed",
+      });
+      await query(
+        `UPDATE magpie_holder_rewards
+            SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
+          WHERE id = ANY($1::bigint[])`,
+        [batch.map((r) => r.id), sig],
+      );
+      paidCount += batch.length;
+      paidLamports += batch.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
+    } catch (err) {
+      console.error(
+        `[holder-rewards] Batch payout failed (rows remain 'accrued' for retry):`,
+        err.message,
+      );
+      // Leave 'accrued' — a manual /payaccrued admin command or next cycle can clean up.
+    }
+  }
+
+  return {
+    distribution_id: distributionId,
+    pool_lamports: pool,
+    holder_count: holders.length,
+    eligible_count: rewardRows.length,
+    total_balance: totalBalance,
+    allocated_lamports: allocatedSum,
+    paid_count: paidCount,
+    paid_lamports: paidLamports,
+  };
+}
+
+/**
+ * Retry any 'accrued' rewards (left over from a previous distribution
+ * where the payout tx failed mid-batch). Same batched-transfer pattern.
+ * Safe to call repeatedly. Called from the distributor cron.
+ */
+export async function retryAccruedPayouts() {
+  const { rows } = await query(
+    `SELECT id, wallet_address, reward_lamports
+       FROM magpie_holder_rewards
+      WHERE status = 'accrued'
+      ORDER BY created_at ASC
+      LIMIT 200`,
+  );
+  if (rows.length === 0) return { retried: 0, paid: 0 };
+
+  const lender = loadLenderKeypair();
+  const totalNeeded = rows.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
+  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
+  if (lenderBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn("[holder-rewards] Retry skipped: lender too low");
+    return { retried: 0, paid: 0, skipped: rows.length };
+  }
+
+  let paid = 0;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const batch = rows.slice(i, i + BATCH_SIZE);
+    const tx = new Transaction();
+    for (const r of batch) {
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: lender.publicKey,
+          toPubkey: new PublicKey(r.wallet_address),
+          lamports: BigInt(r.reward_lamports),
+        }),
+      );
+    }
+    try {
+      const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+        commitment: "confirmed",
+      });
+      await query(
+        `UPDATE magpie_holder_rewards
+            SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
+          WHERE id = ANY($1::bigint[])`,
+        [batch.map((r) => r.id), sig],
+      );
+      paid += batch.length;
+    } catch (err) {
+      console.error("[holder-rewards] retry batch failed:", err.message);
+    }
+  }
+  return { retried: rows.length, paid };
 }
 
 /**
@@ -388,6 +558,13 @@ export function startHolderDistributor(intervalMs = 7 * 24 * 60 * 60 * 1000) {
 
   async function tick() {
     try {
+      // First: clean up any payouts that failed mid-batch last cycle.
+      const retry = await retryAccruedPayouts();
+      if (retry.paid > 0) {
+        console.log(`[holder-rewards] Retried payouts: ${retry.paid} paid (of ${retry.retried})`);
+      }
+
+      // Then: check if a new distribution is due.
       const state = await getHolderPoolState();
       if (state.last_distribution_at) {
         const since = Date.now() - new Date(state.last_distribution_at).getTime();
@@ -397,8 +574,8 @@ export function startHolderDistributor(intervalMs = 7 * 24 * 60 * 60 * 1000) {
       const result = await snapshotAndDistribute();
       if (result) {
         console.log(
-          `[holder-rewards] Distributed ${Number(result.allocated_lamports) / 1e9} SOL ` +
-            `across ${result.eligible_count} holders (snapshot=${result.holder_count})`,
+          `[holder-rewards] Distributed: ${Number(result.paid_lamports) / 1e9} SOL paid ` +
+            `(of ${Number(result.allocated_lamports) / 1e9} allocated) to ${result.paid_count}/${result.eligible_count} holders`,
         );
       }
     } catch (err) {
