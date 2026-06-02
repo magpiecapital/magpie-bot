@@ -49,27 +49,31 @@ const RUG_THRESHOLDS = {
 // Market cap floor — below this is instant delist regardless of liquidity
 const MCAP_FLOOR = 10_000;
 
-// Liquidity floor — tokens whose liquidity drops below this no longer meet
-// the criteria we used to approve them in the first place. Instant delist
-// regardless of mcap. This is the strongest signal a token has stopped
-// being a viable collateral asset.
-const LIQUIDITY_FLOOR = 5_000;
+// Liquidity floor — tokens below this no longer meet our entry criteria
+// and can't realistically be liquidated. Instant delist, no strikes.
+const LIQUIDITY_FLOOR = 10_000;
 
-// Watchlist — degraded but not dead yet. Tighter now so we cull faster.
+// 24h volume floor — a token with effectively no trading activity is
+// dead collateral even if a stale pool still shows liquidity. Instant delist.
+const VOLUME_FLOOR = 500;
+
+// Watchlist — uses OR logic now: any ONE degraded metric earns a strike,
+// not all three. Faster culling of tokens decaying in just one dimension
+// (e.g. liquidity still ok but volume cratered, or vice versa).
 const WATCHLIST_THRESHOLDS = {
-  maxLiquidityUsd: 15_000,
-  maxVolume24h: 1_000,
-  maxMarketCap: 50_000,
+  maxLiquidityUsd: 25_000,
+  maxVolume24h: 5_000,
+  maxMarketCap: 100_000,
 };
 
-// Strikes before watchlist → delist. At a 4h interval, 3 strikes = 12h of
-// sustained degraded data. Down from 6 (which was 24h) — keeping the
-// /tokens page free of decayed memecoins faster.
-const STRIKES_TO_DELIST = 3;
+// Strikes before watchlist → delist. At a 4h interval, 2 strikes = 8h of
+// sustained degraded data. Down from 3 (12h) and 6 originally (24h).
+const STRIKES_TO_DELIST = 2;
 
-// Circuit breaker — max delistings per single cycle. Bumped to 10 to allow
-// catching up after the tightened thresholds without aborting the cycle.
-const MAX_DELISTS_PER_CYCLE = 10;
+// Circuit breaker — max delistings per single cycle. Bumped up after
+// tightening thresholds: first cycles will need to clear an accumulated
+// backlog of decayed tokens, then settle into smaller per-cycle delists.
+const MAX_DELISTS_PER_CYCLE = 25;
 
 // If more than this fraction of tokens have no market data, treat as API outage
 const API_OUTAGE_THRESHOLD = 0.5;
@@ -296,6 +300,20 @@ async function tick(bot) {
       await delistToken(
         mint, symbol,
         `Liquidity below floor — $${Math.floor(market.liquidity).toLocaleString()} (min: $${LIQUIDITY_FLOOR.toLocaleString()})`,
+        bot,
+      );
+      delisted.push(symbol);
+      delistCount++;
+      continue;
+    }
+
+    // 24h volume floor — a token with effectively no trading activity
+    // can't serve as functional collateral even if stale liquidity remains.
+    // Same large-cap escape hatch as above.
+    if (market.volume24h < VOLUME_FLOOR && market.marketCap < 1_000_000) {
+      await delistToken(
+        mint, symbol,
+        `Volume below floor — $${Math.floor(market.volume24h).toLocaleString()} 24h (min: $${VOLUME_FLOOR.toLocaleString()})`,
         bot,
       );
       delisted.push(symbol);
