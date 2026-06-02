@@ -20,7 +20,11 @@ import {
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
@@ -31,12 +35,18 @@ import { query } from "../db/pool.js";
 export const MAGPIE_MINT = new PublicKey(
   "9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump",
 );
+// $MAGPIE is a Token-2022 mint (pump.fun graduated tokens commonly are).
+// Verified: mint owner = TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb.
+// All ATA derivations and program-account scans for $MAGPIE must use
+// TOKEN_2022_PROGRAM_ID, NOT TOKEN_PROGRAM_ID.
+export const MAGPIE_TOKEN_PROGRAM = TOKEN_2022_PROGRAM_ID;
 export const HOLDER_REWARD_BPS = 1_000; // 10% of every loan fee
 export const MIN_HOLDER_CLAIM_LAMPORTS = 5_000_000n; // 0.005 SOL
 export const MIN_HOLDER_BALANCE_RAW = 1n; // require at least 1 raw unit ($MAGPIE has 6 decimals → 0.000001)
 export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL safety floor
-// $MAGPIE token account size is the standard SPL token account size.
-const TOKEN_ACCOUNT_SIZE = 165;
+// Don't run a distribution until the pool is at least this large.
+// Avoids spending more in tx fees than the rewards themselves.
+export const MIN_DISTRIBUTION_LAMPORTS = 10_000_000n; // 0.01 SOL
 
 /**
  * Wallets that should NEVER receive holder rewards even if they show up
@@ -52,21 +62,15 @@ const EXCLUDED_WALLETS = new Set([
   "4JSSSaG3xRomQsrxmdQEsahfyFjBVjvuoBKJUUZgzPAx",
 ]);
 
-/**
- * Owner programs whose token accounts are NEVER eligible. We filter at the
- * owner-program level rather than account address — catches every Raydium
- * pool without needing to track each pubkey.
- */
-const EXCLUDED_OWNER_PROGRAMS = new Set([
-  // Raydium AMM v4
-  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-  // Orca whirlpool
-  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-  // Meteora DLMM
-  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-  // Pump.fun program (bonding curve token accounts)
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-]);
+// NOTE on filtering pools/contracts:
+// We do NOT use a hardcoded list of DEX program IDs as the primary filter
+// — the SPL "owner" field stored in token accounts is a PDA derived from
+// the pool, never the program ID itself. So a hardcoded program-ID list
+// never matched anything.
+// Instead, snapshotMagpieHolders() looks up each holder's account-owner
+// program and excludes anything not owned by System Program (i.e. anything
+// that isn't a real wallet). This catches PumpSwap, Raydium, Orca,
+// Meteora, vaults, Token-2022 protocol accounts, etc. — all in one check.
 
 function loadLenderKeypair() {
   const b58 = process.env.LENDER_PRIVATE_KEY;
@@ -212,7 +216,9 @@ async function getMagpieCirculatingSupply() {
 }
 
 function getMagpieAtaForOwner(owner) {
-  return getAssociatedTokenAddressSync(MAGPIE_MINT, owner, false, TOKEN_PROGRAM_ID);
+  // $MAGPIE is Token-2022 — must use that program for ATA derivation
+  // (the ATA address differs from the legacy-Token derivation).
+  return getAssociatedTokenAddressSync(MAGPIE_MINT, owner, false, MAGPIE_TOKEN_PROGRAM);
 }
 
 /**
@@ -227,35 +233,61 @@ function getMagpieAtaForOwner(owner) {
  *   - Empty balances
  */
 export async function snapshotMagpieHolders() {
-  const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+  // Token-2022 accounts can be longer than 165 bytes when the mint has
+  // extensions enabled, so we DON'T constrain dataSize — just match by
+  // mint at offset 0 (same as legacy Token layout for the first 64 bytes).
+  const accounts = await connection.getProgramAccounts(MAGPIE_TOKEN_PROGRAM, {
     commitment: "confirmed",
-    filters: [
-      { dataSize: TOKEN_ACCOUNT_SIZE },
-      // bytes 0-32 of a token account = mint
-      { memcmp: { offset: 0, bytes: MAGPIE_MINT.toBase58() } },
-    ],
+    filters: [{ memcmp: { offset: 0, bytes: MAGPIE_MINT.toBase58() } }],
   });
 
-  // Aggregate balances per owner — a single wallet can have multiple token
+  // Aggregate balances per owner — one wallet can have multiple token
   // accounts for the same mint, so sum across them.
   const byOwner = new Map();
   for (const a of accounts) {
     const data = a.account.data;
-    // Token account layout:
-    //   0..32  mint
-    //   32..64 owner
-    //   64..72 amount (u64 LE)
+    if (data.length < 72) continue;
     const ownerBytes = data.subarray(32, 64);
     const owner = new PublicKey(ownerBytes).toBase58();
     if (EXCLUDED_WALLETS.has(owner)) continue;
-
-    // Reject if the OWNER pubkey is a known DEX program (token account is a pool, not a real holder)
-    if (EXCLUDED_OWNER_PROGRAMS.has(owner)) continue;
 
     const amount = data.readBigUInt64LE(64);
     if (amount < MIN_HOLDER_BALANCE_RAW) continue;
 
     byOwner.set(owner, (byOwner.get(owner) ?? 0n) + amount);
+  }
+
+  // Critical: filter out PDAs / smart-contract accounts (pools, vaults,
+  // bonding curves). Real Solana wallets are owned by System Program; any
+  // other owner-program means the account is a contract or PDA — these
+  // would otherwise siphon ~14% of every distribution to non-holders
+  // (e.g. PumpSwap AMM, Token-2022 protocol accounts, etc).
+  //
+  // Batch fetch (100 per call) keeps RPC cost minimal even with thousands
+  // of holders.
+  const SystemProgramId = SystemProgram.programId.toBase58();
+  const allOwners = Array.from(byOwner.keys());
+  const BATCH = 100;
+  for (let i = 0; i < allOwners.length; i += BATCH) {
+    const batch = allOwners.slice(i, i + BATCH);
+    const pubkeys = batch.map((o) => new PublicKey(o));
+    let infos;
+    try {
+      infos = await connection.getMultipleAccountsInfo(pubkeys, { commitment: "confirmed" });
+    } catch (err) {
+      console.error("[holder-rewards] account-owner lookup failed (keeping conservatively, excluding all in batch):", err.message);
+      // Conservative: if we can't verify, exclude rather than risk paying to PDAs.
+      for (const o of batch) byOwner.delete(o);
+      continue;
+    }
+    for (let j = 0; j < batch.length; j++) {
+      const info = infos[j];
+      // No account info → owner doesn't exist (could be a PDA never funded);
+      // OR owner is a contract — exclude to be safe.
+      if (!info || info.owner?.toBase58() !== SystemProgramId) {
+        byOwner.delete(batch[j]);
+      }
+    }
   }
 
   return Array.from(byOwner.entries()).map(([owner, balance]) => ({
@@ -288,6 +320,15 @@ export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
   if (pool <= 0n) return null;
+
+  // Don't run a distribution if the pool is too small — tx fees would
+  // eat more than the rewards. Wait for it to build up over more weeks.
+  if (pool < MIN_DISTRIBUTION_LAMPORTS) {
+    console.log(
+      `[holder-rewards] Pool ${Number(pool) / 1e9} SOL below minimum ${Number(MIN_DISTRIBUTION_LAMPORTS) / 1e9} — deferring distribution`,
+    );
+    return null;
+  }
 
   // Pre-flight: lender must cover the entire pool + safety reserve
   const lender = loadLenderKeypair();
@@ -352,15 +393,17 @@ export async function snapshotAndDistribute() {
       rewardRows = rows;
     }
 
-    // Reset the pool. Remainder = dust from integer division.
-    const remainder = pool - allocatedSum;
+    // Atomically decrement the pool by what we ALLOCATED — never overwrite
+    // to a fixed value. If a concurrent accrueToHolderPool call slips in
+    // during this transaction, its increment is preserved (decrement
+    // applies to the current value, which already includes the new accrual).
     await client.query(
       `UPDATE magpie_holder_pool
-          SET accrued_lamports = $1,
+          SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
               last_distribution_at = NOW(),
               updated_at = NOW()
         WHERE id = 1`,
-      [remainder.toString()],
+      [allocatedSum.toString()],
     );
 
     await client.query("COMMIT");
