@@ -15,15 +15,32 @@
  */
 
 const BRAND_HASHTAGS = "#Solana #MAGPIE";
+const SITE = "https://magpie.capital";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
 
+// For TG share-card buttons in-bot we still send users to the bot
+// (it's a Telegram-native flow). For external shares (Twitter), we
+// route through the site so the link unfurls into a nice OG card,
+// AND the site has a CTA back to the bot.
 function refLink(referralCode) {
   return referralCode
     ? `https://t.me/magpie_capital_bot?start=${referralCode}`
     : "https://t.me/magpie_capital_bot";
+}
+
+// Site landing URL for borrow share. Renders branded OG card on
+// Twitter/X + funnels visitors to the bot via the embedded CTA.
+function borrowShareUrl(symbol, receiveSol, refCode, ltvPct, days) {
+  const params = new URLSearchParams();
+  if (refCode) params.set("ref", refCode);
+  if (ltvPct != null) params.set("ltv", String(ltvPct));
+  if (days != null) params.set("days", String(days));
+  const qs = params.toString();
+  const path = `/share/borrow/${encodeURIComponent(symbol)}/${encodeURIComponent(receiveSol)}`;
+  return `${SITE}${path}${qs ? "?" + qs : ""}`;
 }
 
 function twitterIntent(text, url) {
@@ -41,18 +58,22 @@ function telegramShare(text, url) {
  * Share card for "just borrowed".
  */
 export function shareBorrow({ symbol, receiveLamports, ltvPct, durationDays, referralCode }) {
+  const receiveSol = fmtSol(receiveLamports);
   const text = [
-    `Just unlocked ${fmtSol(receiveLamports)} SOL against my $${symbol} bag on @magpie_capital`,
+    `Just unlocked ${receiveSol} SOL against my $${symbol} bag on @magpie_capital`,
     "",
     `Why sell when you can borrow? ${ltvPct}% LTV · ${durationDays}d term`,
     "",
     `Your turn ↓`,
   ].join("\n");
-  const url = refLink(referralCode);
+  // Twitter shares use the site landing URL so the card unfurls nicely.
+  // Telegram forwards use the bot URL (native flow).
+  const siteUrl = borrowShareUrl(symbol, receiveSol, referralCode, ltvPct, durationDays);
+  const botUrl = refLink(referralCode);
   return {
     text,
-    twitterUrl: twitterIntent(text + " " + BRAND_HASHTAGS, url),
-    telegramShareUrl: telegramShare(text, url),
+    twitterUrl: twitterIntent(text + " " + BRAND_HASHTAGS, siteUrl),
+    telegramShareUrl: telegramShare(text, botUrl),
   };
 }
 
