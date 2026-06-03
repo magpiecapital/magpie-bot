@@ -129,8 +129,23 @@ export async function handleSubmit(ctx) {
 
   if (!input) {
     return ctx.reply(
-      "Usage: `/submit <mint address or symbol>`\n\nExample:\n`/submit BONK`\n`/submit DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263`",
-      { parse_mode: "Markdown" },
+      [
+        "🔍 *Submit a token for collateral approval*",
+        "",
+        "Usage: `/submit <mint address or symbol>`",
+        "Examples: `/submit BONK` · `/submit DezXAZ8z…`",
+        "",
+        "*Three possible outcomes:*",
+        "",
+        "✅ *Instant Approval* — token cleared every safety audit AND meets the auto-approve bar (≥$75K liq · ≥$50K 24h vol · ≥$100K mcap · ≥24h old · LP burned · mint/freeze authority revoked · top-10 holders ≤40%). Goes live immediately, you can borrow against it now.",
+        "",
+        "🟡 *Needs Review* — token is safe (passed every audit) but doesn't yet hit the auto-approve bar (usually too young, thin liquidity, or low volume). Queued for the team to evaluate manually within ~1 hour.",
+        "",
+        "❌ *Declined* — failed one of: sellability test (honeypot), active mint/freeze authority, holder concentration >40% on top-10, LP not burned, RugCheck risk score, symbol impersonation, or below minimum thresholds. Fix the underlying issue and resubmit — the screener will re-evaluate.",
+        "",
+        "Full details: magpie.capital/submit",
+      ].join("\n"),
+      { parse_mode: "Markdown", disable_web_page_preview: true },
     );
   }
 
@@ -281,20 +296,22 @@ export async function handleSubmit(ctx) {
     await recordSubmitterRejection(userId, mint, scamReason);
     return ctx.reply(
       [
-        `*${market.symbol}* — Rejected (scam-token guard)`,
+        `❌ *${market.symbol}* — Declined`,
         "",
         `Reason: \`${scamReason}\``,
         "",
-        "Magpie can't accept collateral that fails our safety audit.",
+        "Failed one of our safety audits. We can't accept collateral that's manipulable or unsellable — borrowers would be exposed to rug risk. Fix the underlying issue (e.g. burn the LP, renounce authority) and resubmit.",
+        "",
+        "Full criteria: magpie.capital/submit",
       ].join("\n"),
-      { parse_mode: "Markdown" },
+      { parse_mode: "Markdown", disable_web_page_preview: true },
     );
   }
 
   // Hard reject only on real size/age failures.
   if (fails.length > 0) {
     const lines = [
-      `*${market.symbol}* — Not Approved`,
+      `❌ *${market.symbol}* — Declined`,
       "",
       `Liquidity: $${Math.floor(market.liquidity).toLocaleString()}`,
       `Volume 24h: $${Math.floor(market.volume24h).toLocaleString()}`,
@@ -307,9 +324,11 @@ export async function handleSubmit(ctx) {
       ...fails.map((f) => `  • ${f}`),
       ...warnings.map((w) => `  • ${w}`),
       "",
-      "This token does not meet our safety criteria for collateral.",
+      "Below our minimum thresholds for safe collateral. Build more liquidity / volume / age and resubmit — the screener re-evaluates each time.",
+      "",
+      "Full criteria: magpie.capital/submit",
     ];
-    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown", disable_web_page_preview: true });
   }
 
   // ── Auto-approve vs review ──
@@ -354,14 +373,14 @@ export async function handleSubmit(ctx) {
       .text("📋 Supported", "fallback:supported");
 
     const lines = [
-      `*${market.symbol}* — Approved!`,
+      `✅ *${market.symbol}* — Instant Approval`,
       "",
       `Liquidity: $${Math.floor(market.liquidity).toLocaleString()}`,
       `Volume 24h: $${Math.floor(market.volume24h).toLocaleString()}`,
       `Market Cap: $${Math.floor(market.marketCap).toLocaleString()}`,
       `Age: ${ageHours}h`,
       "",
-      "This token is now live as collateral. You can borrow against it immediately.",
+      "Cleared every safety audit AND hit the auto-approve bar. Live as collateral right now — anyone can borrow against it immediately.",
     ];
 
     await ctx.reply(lines.join("\n"), {
@@ -413,14 +432,14 @@ export async function handleSubmit(ctx) {
     );
 
     const lines = [
-      `*${market.symbol}* — Under Review`,
+      `🟡 *${market.symbol}* — Submission Needs Review`,
       "",
       `Liquidity: $${Math.floor(market.liquidity).toLocaleString()}`,
       `Volume 24h: $${Math.floor(market.volume24h).toLocaleString()}`,
       `Market Cap: $${Math.floor(market.marketCap).toLocaleString()}`,
       `Age: ${ageHours}h`,
       "",
-      "This token passed safety checks and is in the review queue. Tokens are typically approved within 1 hour — you'll be notified.",
+      "Passed every safety audit — but didn't yet clear the auto-approve bar (typically too young, thin liquidity, or low 24h volume). Queued for the team to evaluate manually, usually within an hour. You'll get a DM when it's reviewed.",
     ];
 
     await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
