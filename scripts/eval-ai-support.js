@@ -149,6 +149,37 @@ const CASES = [
     expectInText: ["fee"], // either "tx fees" or "transaction fees" or "rent fee"
   },
   {
+    name: "Loan simulation request triggers simulate_loan",
+    prompt: "What would I get if I borrowed against 1000 MAGPIE?",
+    expectTools: ["simulate_loan"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Token price question triggers get_token_price",
+    prompt: "What's $MAGPIE at right now in SOL?",
+    expectTools: ["get_token_price"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "AI knows how to unlock Trusted tier",
+    prompt: "How do I unlock the Trusted tier?",
+    forbiddenTools: ["open_support_ticket"],
+    expectInText: ["3"], // mentions "3 on-time repays" or similar
+  },
+  {
+    name: "Failed borrow diagnosed via tools, not escalated",
+    prompt: "I tried to /borrow but got an error, what's wrong?",
+    forbiddenTools: ["open_support_ticket"],
+    // AI should ask for specifics or call a diagnostic tool — anything but escalate
+  },
+  {
+    name: "Avoiding liquidation walks user through options",
+    prompt: "My loan health is low, how do I avoid getting liquidated?",
+    forbiddenTools: ["open_support_ticket"],
+    // Should mention topup, partial repay, or repay
+    expectInText: ["topup"],
+  },
+  {
     name: "Vague help asks for clarification, no premature escalation",
     prompt: "help",
     expectTools: [],

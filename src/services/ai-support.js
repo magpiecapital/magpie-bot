@@ -294,6 +294,114 @@ Things users frequently hit that aren't obvious:
   just signed by their own keys. Both work identically; only difference
   is who holds the keys. /export reveals the custodial wallet's key.
 
+═══════════════════════════════════════════════════════════════════
+COMMON WORKFLOWS — KNOW THE STEP-BY-STEP RECIPES
+═══════════════════════════════════════════════════════════════════
+When users ask "how do I X", walk them through it concretely. Don't
+just point at a command — explain what happens at each step.
+
+GETTING STARTED (new user):
+1. /start — creates a Magpie wallet, shows the deposit address
+2. Send memecoins/tokens to that wallet from Phantom/Solflare
+3. Also send ~0.01 SOL for gas + ATA rent
+4. Wait ~30s for the deposits to land
+5. Run /borrow — pick token, amount, and tier; sign in chat
+6. SOL lands in their Magpie wallet — they can /withdraw to anywhere
+
+USING AN EXISTING EXTERNAL WALLET (no transfers needed):
+1. /import — paste their private key once (encrypted server-side)
+2. The bot now signs on their behalf using their key
+3. They can /borrow directly against tokens already in that wallet
+4. /export to get the key back any time
+
+TAKING A LOAN:
+1. /simulate <symbol> <amount> first to preview (or ask the agent)
+2. /borrow — guided flow
+3. Pick collateral token and amount
+4. Pick tier: Express (30%/2d/3%), Quick (25%/3d/2%), Standard (20%/7d/1.5%)
+5. Confirm — bot executes the tx, collateral locks, SOL disburses
+
+REPAYING A LOAN:
+- Full: /repay → pick loan → confirm. Collateral returns.
+- Partial: /partialrepay → reduces owed, lowers liquidation risk
+- Top-up: /topup → adds collateral instead of paying SOL, lowers LTV
+- Extend: /extend → moves the due date out (fee proportional)
+- Atomic refresh: /reborrow → close + reopen in one tx with new terms
+
+GETTING $MAGPIE HOLDER REWARDS:
+- Just hold $MAGPIE in any Solana wallet (Magpie wallet works fine)
+- Distributions are AUTOMATIC — no claim step
+- Snapshots happen on randomized 5-10 day windows
+- SOL lands directly in holder wallets when the next distribution fires
+- /holders to see your lifetime received
+
+REFERRING A FRIEND:
+1. /refer to see your code + share link
+2. Send the link to your friend
+3. They tap it → bot opens → they /start (referral auto-attaches)
+4. You earn 5% of every fee they pay, for life
+5. Claim accrued via /refer when it's worth a tx
+
+UNLOCKING TRUSTED TIER (5 SOL/loan, 10 SOL outstanding):
+1. Take small loans first (within New tier 3 SOL cap)
+2. Repay on time, before /extend or due date
+3. After 3 on-time repays → automatic Trusted promotion on next /borrow
+
+AVOIDING LIQUIDATION ON A SHAKY LOAN:
+- Watch /positions for the health ratio
+- Three options to reduce risk:
+  a) /topup — add more collateral (free besides gas)
+  b) /partialrepay — pay down some of what's owed
+  c) /repay — pay it all off if you can
+- /extend can buy time but doesn't lower the liquidation price
+- /notify → toggle "Progressive health alerts" so the bot warns you
+
+WITHDRAWING LP YIELD (from magpie.capital/earn):
+1. Go to magpie.capital/earn
+2. Connect your wallet
+3. See your share + accrued yield
+4. Click Withdraw — gets you principal + earned share
+5. Withdraw is instant if the pool has liquidity; if utilization is
+   high, you may wait briefly until borrowers repay
+
+═══════════════════════════════════════════════════════════════════
+BORROWING FAILURE MODES — DIAGNOSE FAST
+═══════════════════════════════════════════════════════════════════
+When a user says "/borrow didn't work" or "got an error", the cause
+is almost always one of these. Diagnose, don't escalate.
+
+1. INSUFFICIENT GAS — wallet has tokens but <0.01 SOL.
+   Fix: send ~0.01 SOL to the Magpie wallet for tx fees + ATA rent.
+
+2. TOKEN NOT SUPPORTED — they tried a token not on the approved list.
+   Diagnose: \`check_token_supported\`. Fix: /submit it for review, or
+   pick a different token from /supported.
+
+3. TOKEN DISABLED (health) — token is listed but currently paused
+   because liquidity/holder-count/etc. degraded.
+   Diagnose: \`check_token_supported\` returns enabled=false.
+   Fix: wait for token to recover, or use a different one.
+
+4. PER-WALLET LIMIT EXCEEDED — at New tier (3 SOL outstanding) or
+   Trusted tier (10 SOL outstanding).
+   Diagnose: \`get_my_loan_limits\`. Fix: repay existing first, or
+   request a smaller amount.
+
+5. BORROWING PAUSED — admin pressed /pause (rare).
+   Diagnose: \`get_protocol_stats\` returns paused: true.
+   Fix: wait for resume — the team is handling something.
+
+6. PRICE STALE / SLIPPAGE — on-chain price feed older than 120s.
+   Self-heals; just retry in 10-15s.
+
+7. WALLET HAS NO COLLATERAL — they're trying to borrow against a
+   token they don't actually hold.
+   Diagnose: check_token_supported confirms token exists; suggest
+   the user verify their wallet's balance via /wallet.
+
+8. BLOCKHASH EXPIRED — they sat on the confirm screen >90s.
+   Fix: just retry the /borrow — fresh blockhash on next attempt.
+
 KEY URLS:
 - TG bot:        https://t.me/magpie_capital_bot
 - Home:          https://magpie.capital
@@ -462,6 +570,8 @@ Mandatory tool triggers — pattern → tool:
 - User asks "can I borrow against X token", "is X supported", "do you accept X" → \`check_token_supported\`
 - User asks "what did I do recently", "show my activity", "history" generally → \`get_my_recent_activity\`
 - User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
+- User asks "what would I get if I borrow against X", "simulate a loan", "preview a loan", "rate for Y tokens" → \`simulate_loan\`
+- User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 
 If a user message is ambiguous between two tools (e.g., "what's my status?"),
 call \`list_my_loans\` first — that's the most common intent in support.
@@ -719,6 +829,29 @@ const TOOLS = [
     name: "get_my_loan_limits",
     description: "Get the user's personal lending limits — their current tier (new/trusted), max loan size, max outstanding total, current outstanding balance, and how much MORE they can borrow right now. Use when the user asks 'what's my limit', 'how much can I borrow', 'why did my borrow get rejected', 'how do I unlock more', 'what tier am I', or anything about per-wallet caps.",
     input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "simulate_loan",
+    description: "Preview what a loan would look like — given a collateral token + amount, returns the SOL received, fee, total repay, and liquidation price for each of the three LTV tiers (Express 30%, Quick 25%, Standard 20%). Use whenever the user asks 'what would I get if I borrow against X', 'how much SOL would N tokens give me', 'what's the rate for Y collateral'. No wallet needed — fully read-only.",
+    input_schema: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "Token symbol (e.g. 'WIF', 'BONK', 'MAGPIE') or full mint address" },
+        amount: { type: "number", description: "How many tokens to use as collateral (in whole tokens, not raw units)" },
+      },
+      required: ["token", "amount"],
+    },
+  },
+  {
+    name: "get_token_price",
+    description: "Get the live SOL price of an approved collateral token. Use when the user asks 'what's $X at', 'price of Y', 'how much is Z worth in SOL'. Use also as a sanity check before answering pricing questions.",
+    input_schema: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "Token symbol (e.g. 'WIF') or full mint address" },
+      },
+      required: ["token"],
+    },
   },
   {
     name: "open_support_ticket",
@@ -1150,6 +1283,92 @@ const TOOL_HANDLERS = {
       };
     } catch (err) {
       return toolError("activity_lookup_failed", err.message, HINT_RPC_BLIP);
+    }
+  },
+
+  simulate_loan: async ({ token, amount }) => {
+    if (!token || typeof token !== "string") return toolError("invalid_token", null, "Need a token symbol or mint to simulate.");
+    if (!Number.isFinite(amount) || amount <= 0) return toolError("invalid_amount", null, "Need a positive token amount to simulate.");
+    const trimmed = token.trim().replace(/^\$/, "");
+    try {
+      const { rows } = await query(
+        `SELECT mint, symbol, name, decimals, enabled, max_ltv_pct
+         FROM supported_mints
+         WHERE mint = $1 OR LOWER(symbol) = LOWER($1)
+         LIMIT 1`,
+        [trimmed],
+      );
+      if (rows.length === 0) {
+        return toolError("token_not_supported", null, `Tell the user ${trimmed} isn't an approved collateral token. They can /submit it for review.`);
+      }
+      const t = rows[0];
+      if (!t.enabled) {
+        return toolError("token_disabled", null, `Tell the user ${t.symbol} is listed but currently disabled (health watcher). Borrowing against it is paused.`);
+      }
+      const { getPriceInSol } = await import("./price.js");
+      const priceSol = await getPriceInSol(t.mint);
+      const collateralValueSol = amount * priceSol;
+      const TIERS = [
+        { ltv: 30, days: 2, feeBps: 300, label: "Express" },
+        { ltv: 25, days: 3, feeBps: 200, label: "Quick" },
+        { ltv: 20, days: 7, feeBps: 150, label: "Standard" },
+      ];
+      const tiers = TIERS.map((tier) => {
+        const gross = collateralValueSol * (tier.ltv / 100);
+        const fee = gross * (tier.feeBps / 10_000);
+        const receive = gross - fee;
+        const liquidationPriceSol = (gross / 1.1) / amount;
+        return {
+          tier: tier.label,
+          ltv_pct: tier.ltv,
+          duration_days: tier.days,
+          fee_pct: tier.feeBps / 100,
+          receive_sol: receive.toFixed(6),
+          repay_sol: gross.toFixed(6),
+          fee_sol: fee.toFixed(6),
+          liquidation_price_sol_per_token: liquidationPriceSol.toFixed(9),
+        };
+      });
+      return {
+        token: t.symbol,
+        mint: t.mint,
+        collateral_amount: amount,
+        collateral_value_sol: collateralValueSol.toFixed(6),
+        price_sol_per_token: priceSol.toFixed(9),
+        tiers,
+        user_friendly_hint: "Interpret these results conversationally. Highlight the most relevant tier (usually Standard 20% is the safest pick for first-timers, Express 30% gets the most SOL but with tighter liquidation risk).",
+      };
+    } catch (err) {
+      return toolError("simulate_failed", err.message, "Couldn't compute the simulation — likely a price feed blip. Ask the user to try /simulate directly in a moment.");
+    }
+  },
+
+  get_token_price: async ({ token }) => {
+    if (!token || typeof token !== "string") return toolError("invalid_token", null, "Need a token symbol or mint.");
+    const trimmed = token.trim().replace(/^\$/, "");
+    try {
+      const { rows } = await query(
+        `SELECT mint, symbol, decimals, enabled
+         FROM supported_mints
+         WHERE mint = $1 OR LOWER(symbol) = LOWER($1)
+         LIMIT 1`,
+        [trimmed],
+      );
+      if (rows.length === 0) {
+        return toolError("token_not_supported", null, `Tell the user ${trimmed} isn't an approved collateral token, so we don't track its price here. They could check Birdeye or Jupiter for general pricing.`);
+      }
+      const t = rows[0];
+      const { getPriceInSol } = await import("./price.js");
+      const priceSol = await getPriceInSol(t.mint);
+      return {
+        symbol: t.symbol,
+        mint: t.mint,
+        price_sol: priceSol.toFixed(9),
+        enabled_as_collateral: t.enabled,
+        user_friendly_hint: `Quote the price naturally — e.g., "1 ${t.symbol} = X SOL right now". If they want USD, they can do the math against SOL/USD on their end.`,
+      };
+    } catch (err) {
+      return toolError("price_fetch_failed", err.message, "Price oracle had a hiccup. Ask the user to try again in 30s.");
     }
   },
 
