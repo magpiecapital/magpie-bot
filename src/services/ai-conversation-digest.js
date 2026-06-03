@@ -8,8 +8,9 @@
  * Run once on startup (after 4h grace) then every 24h.
  */
 import { query } from "../db/pool.js";
+import { getAdminId } from "./admin-notify.js";
 
-const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+const ADMIN_TG_ID = getAdminId() || null;
 const DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const FIRST_RUN_DELAY_MS = 4 * 60 * 60 * 1000;  // 4h after boot
 const MAX_MESSAGE_CHARS = 3500;                  // Telegram safe-ish length

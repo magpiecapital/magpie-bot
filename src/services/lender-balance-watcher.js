@@ -18,7 +18,8 @@ import { PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
-const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+import { getAdminId } from "./admin-notify.js";
+const ADMIN_TG_ID = getAdminId() || null;
 const POLL_INTERVAL_MS = Number(process.env.LENDER_WATCH_MS) || 30 * 60 * 1000; // 30 min
 
 // Tiered thresholds — alert once per tier crossing.

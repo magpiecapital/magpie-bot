@@ -10,8 +10,9 @@
  * a threshold, which is fine and arguably desirable.
  */
 import "dotenv/config";
+import { getAdminId, notifyAdmin } from "./admin-notify.js";
 
-const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
+const ADMIN_TG_ID = getAdminId();
 const POLL_MS = Number(process.env.HELIUS_USAGE_POLL_MS) || 60 * 60 * 1000; // 1h
 const THRESHOLDS = [0.5, 0.75, 0.9, 0.95];
 
@@ -38,7 +39,7 @@ export function startHeliusUsageWatcher(bot) {
     return null;
   }
   if (!ADMIN_TG_ID) {
-    console.warn("[helius-usage] ADMIN_TELEGRAM_ID not set — usage alerts disabled");
+    console.warn("[helius-usage] No admin ID resolvable — usage alerts disabled");
     return null;
   }
 
@@ -66,11 +67,7 @@ export function startHeliusUsageWatcher(bot) {
               ? "🚨 Approaching cap. RPC failover to public mainnet will kick in if exhausted, but degraded performance is likely."
               : "Monitor usage. Optimize or upgrade plan before hitting the cap.",
           ].join("\n");
-          try {
-            await bot.api.sendMessage(ADMIN_TG_ID, msg, { parse_mode: "Markdown" });
-          } catch (err) {
-            console.error(`[helius-usage] DM failed: ${err.message}`);
-          }
+          await notifyAdmin(bot, msg, { parse_mode: "Markdown" });
         }
       }
     } catch (err) {

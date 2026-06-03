@@ -15,8 +15,9 @@
 import { InlineKeyboard } from "grammy";
 import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
+import { getAdminId } from "../services/admin-notify.js";
 
-const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+const ADMIN_TG_ID = getAdminId() || null;
 
 // chat.id → { stage: "await_followup", ticketId, userId }
 const pending = new Map();

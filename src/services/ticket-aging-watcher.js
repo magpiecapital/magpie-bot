@@ -11,8 +11,9 @@
  * replied, no longer stale) and by user follow-up (clock resets).
  */
 import { query } from "../db/pool.js";
+import { getAdminId } from "./admin-notify.js";
 
-const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+const ADMIN_TG_ID = getAdminId() || null;
 const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 60 * 60 * 1000; // 1h
 
 // Tier index → minimum age in minutes

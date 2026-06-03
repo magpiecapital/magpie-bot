@@ -24,7 +24,8 @@ import { clearPending as clearBorrowPending } from "./borrow.js";
 import { clearPending as clearWithdrawPending } from "./withdraw.js";
 import { chatWithAgent, isAiSupportEnabled, resetConversation, setBotRef } from "../services/ai-support.js";
 
-const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+import { getAdminId } from "../services/admin-notify.js";
+const ADMIN_TG_ID = getAdminId() || null;
 
 const pending = new Map(); // chatId → { stage: 'await_tx' | 'await_message' }
 

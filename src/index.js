@@ -46,6 +46,7 @@ import {
   handleTickets,
   handleClose,
   handleAiStats,
+  handleHealth,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -66,6 +67,7 @@ import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
+import { startInfraHealth } from "./services/infra-health.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -131,6 +133,7 @@ bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
 bot.command("close", handleClose);
 bot.command("aistats", handleAiStats);
+bot.command("health", handleHealth);
 
 // Inline callback registration.
 //
@@ -244,6 +247,9 @@ bot.start({
     // setTimeout(() => startAiConversationDigest(bot), 75_000);
     // Ticket aging — DMs admin about open tickets that cross 2h/8h/24h
     setTimeout(() => startTicketAgingWatcher(bot), 90_000);
+    // Infra health — probes Anthropic, Helius, public RPC, DB every 5 min
+    // Alerts admin only on SUSTAINED degradation (15+ min) to avoid noise
+    setTimeout(() => startInfraHealth(bot), 100_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

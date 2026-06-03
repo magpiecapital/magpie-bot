@@ -6,6 +6,7 @@ import {
 } from "../services/admin.js";
 import { query } from "../db/pool.js";
 import { estimateCostUsd } from "../services/ai-support.js";
+import { getHealthSnapshot } from "../services/infra-health.js";
 
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx.from?.id)) {
@@ -547,4 +548,40 @@ export async function handleAiStats(ctx) {
     console.error("[aistats] error:", err);
     await ctx.reply(`❌ /aistats failed: ${err.message?.slice(0, 150) || "unknown error"}`);
   }
+}
+
+/**
+ * /health — instant infra status snapshot.
+ *
+ * Shows current status + latency + error rate for each external
+ * dependency (Anthropic, Helius RPC, public RPC fallback, DB).
+ * The infra-health watcher updates these every 5 min in the
+ * background.
+ */
+export async function handleHealth(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const snap = getHealthSnapshot();
+  const lines = ["🏥 *Infra health*", ""];
+  function emoji(s) {
+    return s === "healthy" ? "🟢" : s === "degraded" ? "🟡" : s === "down" ? "🔴" : "⚪️";
+  }
+  for (const key of Object.keys(snap)) {
+    const p = snap[key];
+    const ageMin = p.lastCheckedAt
+      ? Math.max(0, Math.floor((Date.now() - p.lastCheckedAt) / 60_000))
+      : null;
+    const lat = p.lastLatencyMs != null ? `${p.lastLatencyMs}ms` : "n/a";
+    const avg1h = p.avgLatencyMs_1h != null ? ` · 1h avg: ${p.avgLatencyMs_1h}ms` : "";
+    const errPct = (p.errorRate_1h * 100).toFixed(0);
+    const errLine = p.errorRate_1h > 0 ? ` · errors 1h: ${errPct}%` : "";
+    lines.push(`${emoji(p.status)} *${p.name}* · ${p.status}`);
+    lines.push(`  Last: ${lat}${avg1h}${errLine}`);
+    if (ageMin != null) lines.push(`  Checked: ${ageMin}m ago`);
+    if (p.lastError) lines.push(`  Last error: \`${p.lastError.slice(0, 120)}\``);
+    lines.push("");
+  }
+  lines.push("_Probes run every 5 min in background. Alerts fire only after 15+ min sustained issues._");
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {
+    ctx.reply(lines.join("\n").replace(/[*_`]/g, ""));
+  });
 }

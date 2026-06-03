@@ -68,8 +68,8 @@ function recordFailure(type, message) {
 
 async function maybeAlertAdmin(bot) {
   if (!bot) return;
-  const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
-  if (!ADMIN_TG_ID) return;
+  const { notifyAdmin: _notify, getAdminId: _getId } = await import("./admin-notify.js");
+  if (!_getId()) return;
   if (recentFailures.length < FAIL_THRESHOLD) return;
   const now = Date.now();
   if (now - lastAdminAlertAt < ADMIN_ALERT_COOLDOWN_MS) return;
@@ -80,20 +80,18 @@ async function maybeAlertAdmin(bot) {
   }, {});
   const summary = Object.entries(byType).map(([k, v]) => `${k}: ${v}`).join(", ");
   const lastErr = recentFailures[recentFailures.length - 1]?.message || "(none)";
-  try {
-    await bot.api.sendMessage(
-      ADMIN_TG_ID,
-      [
-        "🚨 *AI support degraded*",
-        "",
-        `${recentFailures.length} failures in last 5 min.`,
-        `By type: ${summary}`,
-        "",
-        `Last error: \`${lastErr.slice(0, 200)}\``,
-      ].join("\n"),
-      { parse_mode: "Markdown" },
-    );
-  } catch {}
+  await _notify(
+    bot,
+    [
+      "🚨 *AI support degraded*",
+      "",
+      `${recentFailures.length} failures in last 5 min.`,
+      `By type: ${summary}`,
+      "",
+      `Last error: \`${lastErr.slice(0, 200)}\``,
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
 }
 
 // Bot reference is set by support.js so we can DM admin from here.
@@ -1258,11 +1256,27 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
   let escalatedTicketId = null;
   let escalatedReason = null;
 
-  // Build the per-call extra system block once. Username is the only
-  // dynamic context we pass today. Keep it short so it doesn't dominate.
-  const extraSystem = username
-    ? `User context — Telegram username: @${username}. Use their handle sparingly for warmth (once per conversation max, never in every reply).`
-    : null;
+  // Build the per-call extra system block. Includes:
+  //   - username (for sparing warmth)
+  //   - current UTC time (for greeting awareness — "gm" at 3am UTC vs noon)
+  //   - whether this is the user's first message of a new session
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  const timeOfDay = utcHour >= 4 && utcHour < 12 ? "morning UTC"
+    : utcHour >= 12 && utcHour < 17 ? "afternoon UTC"
+    : utcHour >= 17 && utcHour < 22 ? "evening UTC"
+    : "late night UTC";
+  const contextParts = [
+    `Current time: ${now.toISOString()} (${timeOfDay}).`,
+  ];
+  if (username) {
+    contextParts.push(`User's Telegram handle: @${username}. Use sparingly for warmth — at most once per conversation, never in every reply.`);
+  }
+  contextParts.push(
+    "Match your greeting to the time of day if the user greets you ('gm', 'gn', etc.), and don't say 'good morning' at midnight UTC.",
+    "If this is your first message in the conversation, a warm but brief acknowledgment is welcome. If you're already mid-conversation, skip greetings entirely — jump to substance.",
+  );
+  const extraSystem = contextParts.join(" ");
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
     let response;
