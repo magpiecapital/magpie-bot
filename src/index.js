@@ -54,6 +54,7 @@ import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.j
 import { startPriceAttestor } from "./services/price-attestor.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
+import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -204,6 +205,8 @@ bot.start({
     // Idempotent — only runs when the pool has accrued AND 7+ days have
     // passed since the last distribution.
     setTimeout(() => startHolderDistributor(), 90_000);
+    // LP Loyalty distributor — rewards long-term LPs from 2% of fees
+    setTimeout(() => startLpLoyaltyDistributor(), 120_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

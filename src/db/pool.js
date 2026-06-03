@@ -185,6 +185,61 @@ export async function applyStartupPatches() {
             updated_at = NOW()
       WHERE id = 1
         AND last_distribution_at IS NULL`,
+
+    // ─────── LP LOYALTY BONUS POOL ───────
+    // 2% of every loan fee accrues to this pool, distributed pro-rata to
+    // each LP's share-seconds (shares × time held). Long-term holders
+    // earn meaningfully more than flippers on top of the base 80% LP
+    // yield. Sourced from the protocol's 5% slice (drops to 3%); LPs
+    // keep their full 80%.
+    `CREATE TABLE IF NOT EXISTS lp_loyalty_pool (
+       id INTEGER PRIMARY KEY,
+       accrued_lamports NUMERIC(30,0) NOT NULL DEFAULT 0,
+       last_distribution_at TIMESTAMPTZ,
+       next_distribution_at TIMESTAMPTZ,
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `INSERT INTO lp_loyalty_pool (id, accrued_lamports) VALUES (1, 0)
+       ON CONFLICT (id) DO NOTHING`,
+
+    // Per-LP tracking. weighted_deposit_at moves forward proportionally
+    // when an LP adds shares (preserves time-weighted exposure correctly).
+    // shares is the current on-chain position; updated on every sync.
+    `CREATE TABLE IF NOT EXISTS lp_positions (
+       wallet_address TEXT PRIMARY KEY,
+       shares NUMERIC(40,0) NOT NULL DEFAULT 0,
+       weighted_deposit_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       last_synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS lp_positions_shares_idx ON lp_positions(shares)
+       WHERE shares > 0`,
+
+    // Snapshot + distribution ledger.
+    `CREATE TABLE IF NOT EXISTS lp_loyalty_distributions (
+       id BIGSERIAL PRIMARY KEY,
+       snapshot_at TIMESTAMPTZ NOT NULL,
+       pool_lamports NUMERIC(30,0) NOT NULL,
+       total_weight NUMERIC(40,0) NOT NULL,
+       eligible_count INTEGER NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE TABLE IF NOT EXISTS lp_loyalty_rewards (
+       id BIGSERIAL PRIMARY KEY,
+       distribution_id BIGINT NOT NULL REFERENCES lp_loyalty_distributions(id) ON DELETE CASCADE,
+       wallet_address TEXT NOT NULL,
+       shares_at_snapshot NUMERIC(40,0) NOT NULL,
+       seconds_held NUMERIC(20,0) NOT NULL,
+       weight NUMERIC(40,0) NOT NULL,
+       reward_lamports NUMERIC(30,0) NOT NULL,
+       status TEXT NOT NULL DEFAULT 'accrued',
+       paid_tx_signature TEXT,
+       paid_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (distribution_id, wallet_address)
+     )`,
+    `CREATE INDEX IF NOT EXISTS lp_loyalty_rewards_wallet_idx
+       ON lp_loyalty_rewards(wallet_address, status)`,
   ];
   for (const sql of patches) {
     try {

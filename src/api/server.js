@@ -79,6 +79,34 @@ async function authenticateRequest(req) {
 
 // ─── Route handlers ─────────────────────────────────────────────────────────
 
+async function handleLpLoyalty(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  const { getLpLoyaltyByWallet, LP_LOYALTY_REWARD_BPS } = await import(
+    "../services/lp-loyalty.js"
+  );
+  const info = await getLpLoyaltyByWallet(wallet);
+  if (!info) return { status: 400, body: { error: "Invalid wallet" } };
+  return {
+    status: 200,
+    body: {
+      wallet: info.wallet,
+      has_position: info.has_position,
+      shares: info.shares,
+      seconds_held: info.seconds_held,
+      days_held: info.days_held,
+      lifetime_lamports: info.lifetime_lamports.toString(),
+      paid_lamports: info.paid_lamports.toString(),
+      distributions_received: info.distributions_received,
+      reward_bps: LP_LOYALTY_REWARD_BPS,
+      reward_pct: LP_LOYALTY_REWARD_BPS / 100,
+      // INTENTIONALLY OMITTED: weighted_deposit_at, next snapshot timing.
+      // Same operator-private pattern as $MAGPIE holders.
+      auto_distribute: true,
+    },
+  };
+}
+
 async function handleHolders(req, url) {
   const wallet = url.searchParams.get("wallet");
   if (!wallet) {
@@ -784,6 +812,7 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/referrals",
   "/api/v1/holders",
   "/api/v1/holders/pool",
+  "/api/v1/lp-loyalty",
 ]);
 
 async function router(req, res) {
@@ -913,6 +942,9 @@ async function router(req, res) {
         break;
       case "/api/v1/holders/pool":
         result = await handleHolderPool();
+        break;
+      case "/api/v1/lp-loyalty":
+        result = await handleLpLoyalty(req, url);
         break;
       default:
         result = {

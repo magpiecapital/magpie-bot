@@ -360,6 +360,16 @@ export async function recordLoan({
   } catch (err) {
     console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
   }
+
+  // LP Loyalty Bonus Pool accrual (2% of fee, sourced from protocol slice)
+  try {
+    const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
+    if (feeLamports > 0n) {
+      await accrueToLpLoyaltyPool(feeLamports);
+    }
+  } catch (err) {
+    console.error("[loans] LP loyalty accrual on borrow failed (continuing):", err.message);
+  }
 }
 
 /**
@@ -604,6 +614,16 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     }
   } catch (err) {
     console.error("[loans] holder pool accrual on extend failed (continuing):", err.message);
+  }
+
+  // LP Loyalty Bonus Pool accrual on the extend fee.
+  try {
+    const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
+    if (feeLamports > 0n) {
+      await accrueToLpLoyaltyPool(feeLamports);
+    }
+  } catch (err) {
+    console.error("[loans] LP loyalty accrual on extend failed (continuing):", err.message);
   }
 
   return { signature: sig, feeLamports: feeLamports.toString() };
