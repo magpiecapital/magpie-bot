@@ -3,7 +3,7 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
-import { executePartialRepay, recordPartialRepay } from "../services/loans.js";
+import { executePartialRepay, recordPartialRepay, getLiveOwedLamports } from "../services/loans.js";
 
 const pending = new Map();
 
@@ -30,13 +30,16 @@ export async function handlePartialRepay(ctx) {
     return ctx.reply("📭 No active loans.");
   }
 
+  // Live on-chain owed amount per loan, so display matches reality after partial repays
+  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+
   const kb = new InlineKeyboard();
-  for (const loan of rows) {
+  rows.forEach((loan, i) => {
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · owe ${fmtSol(loan.original_loan_amount_lamports)} SOL`,
+      `#${loan.loan_id} · ${loan.symbol ?? "?"} · owe ${fmtSol(liveAmounts[i])} SOL`,
       `prepay:loan:${loan.id}`,
     ).row();
-  }
+  });
   kb.text("✕ Cancel", "prepay:cancel");
 
   await ctx.reply(
@@ -73,7 +76,8 @@ export function registerPartialRepayCallbacks(bot) {
     const sol = await getSolBalance(publicKey);
     // Reserve ~0.003 SOL for fees + rent.
     const available = Math.max(0, sol - 3_000_000);
-    const owed = BigInt(loan.original_loan_amount_lamports);
+    // Live on-chain amount — DB column may be stale after prior partial repays
+    const owed = await getLiveOwedLamports(loan);
 
     if (available <= 0) {
       await ctx.answerCallbackQuery();

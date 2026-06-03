@@ -1,6 +1,7 @@
 import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
 import { collateralValueLamports } from "../services/price.js";
+import { getLiveOwedLamports } from "../services/loans.js";
 
 function formatSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -22,7 +23,7 @@ function healthEmoji(ratio) {
   return "🔴";
 }
 
-async function enrichWithHealth(loan) {
+async function enrichWithHealth(loan, owedLamports) {
   try {
     const { rows } = await query(
       `SELECT decimals FROM supported_mints WHERE mint = $1`,
@@ -34,7 +35,7 @@ async function enrichWithHealth(loan) {
       loan.collateral_amount,
       rows[0].decimals,
     );
-    const owed = Number(loan.original_loan_amount_lamports);
+    const owed = Number(owedLamports ?? loan.original_loan_amount_lamports);
     const ratio = owed > 0 ? currentLamports / owed : 0;
     return { currentLamports, ratio };
   } catch {
@@ -61,17 +62,22 @@ export async function handlePositions(ctx) {
     return ctx.reply("📭 No active loans.\n\nUse /borrow to take one out.");
   }
 
-  const healthResults = await Promise.all(rows.map(enrichWithHealth));
+  // Fetch live on-chain amount first, then use it for health calc.
+  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+  const healthResults = await Promise.all(
+    rows.map((loan, i) => enrichWithHealth(loan, liveAmounts[i])),
+  );
 
   const lines = ["📊 *Your Active Loans*", ""];
   for (let i = 0; i < rows.length; i++) {
     const loan = rows[i];
     const health = healthResults[i];
+    const owed = liveAmounts[i];
     lines.push(
       `*Loan #${loan.loan_id}* — ${loan.symbol ?? "Unknown"}`,
       `Collateral: ${loan.collateral_amount}`,
       `Borrowed: ${formatSol(loan.loan_amount_lamports)} SOL`,
-      `Repay: ${formatSol(loan.original_loan_amount_lamports)} SOL`,
+      `Repay: ${formatSol(owed)} SOL`,
       `LTV: ${loan.ltv_percentage}% | ${loan.duration_days}d term`,
     );
     if (health) {

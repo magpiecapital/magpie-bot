@@ -60,6 +60,38 @@ async function getMintTokenProgram(mint) {
 }
 
 /**
+ * Get the live on-chain amount owed for a loan. The DB column
+ * `original_loan_amount_lamports` should reflect partial repays (it's
+ * decremented by recordPartialRepay), but those writes can fail silently
+ * — leaving the DB stale while the chain stays correct. Every user-
+ * facing surface (positions, repay, partialrepay, extend) should call
+ * this to display the truth. Opportunistically heals the DB if drift is
+ * detected, so the system self-corrects over time.
+ *
+ * Returns a BigInt of lamports owed. Falls back to the DB value if the
+ * on-chain fetch fails (e.g., RPC blip).
+ */
+export async function getLiveOwedLamports(loan) {
+  try {
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const program = getReadOnlyProgram();
+    const onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
+    const live = BigInt(onChain.repayAmount.toString());
+    const stored = BigInt(loan.original_loan_amount_lamports);
+    if (live !== stored) {
+      // Fire-and-forget DB heal
+      query(
+        `UPDATE loans SET original_loan_amount_lamports = $2, updated_at = NOW() WHERE id = $1`,
+        [loan.id, live.toString()],
+      ).catch(() => {});
+    }
+    return live;
+  } catch {
+    return BigInt(loan.original_loan_amount_lamports);
+  }
+}
+
+/**
  * Borrow flow:
  *   1. Compute collateral value in lamports.
  *   2. Ensure borrower has wSOL ATA (will receive loan here).
@@ -220,7 +252,31 @@ export async function executeRepay({ userId, loanDbRow }) {
     loanTokenProgram,
   );
 
-  const repayLamports = BigInt(loanDbRow.original_loan_amount_lamports);
+  // Read the LIVE on-chain repay_amount instead of trusting the DB column.
+  // After partial repays, the on-chain repay_amount decrements but the DB
+  // sync (recordPartialRepay) can fail silently — leaving the DB stale.
+  // Using on-chain value here makes the repay tx wrap the correct amount
+  // (only what's actually owed), and self-heals the DB row.
+  let repayLamports;
+  try {
+    const liveLoan = await program.account.loan.fetch(loanPdaPk);
+    repayLamports = BigInt(liveLoan.repayAmount.toString());
+    // Opportunistic DB heal — bring the stored amount back in sync.
+    if (BigInt(loanDbRow.original_loan_amount_lamports) !== repayLamports) {
+      try {
+        await query(
+          `UPDATE loans SET original_loan_amount_lamports = $2, updated_at = NOW() WHERE id = $1`,
+          [loanDbRow.id, repayLamports.toString()],
+        );
+        console.log(`[repay] Synced loan ${loanDbRow.id} from DB ${loanDbRow.original_loan_amount_lamports} to on-chain ${repayLamports}`);
+      } catch (err) {
+        console.warn("[repay] DB sync after on-chain read failed (proceeding):", err.message);
+      }
+    }
+  } catch (err) {
+    console.warn("[repay] on-chain fetch failed, falling back to DB:", err.message);
+    repayLamports = BigInt(loanDbRow.original_loan_amount_lamports);
+  }
 
   // Pre-instructions:
   //   1. Idempotent create of borrower's COLLATERAL ATA. The program returns
@@ -541,11 +597,14 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     loanTokenProgram,
   );
 
-  // Fee = tier-dependent % of current original_loan_amount.
+  // Fee = tier-dependent % of current OWED amount.
   // Express (30% LTV) = 3%, Quick (25%) = 2%, Standard (20%) = 1.5%
+  // Read live on-chain owed so the fee math doesn't overcharge users
+  // who've already partially repaid.
   const ltv = loanDbRow.ltv_percentage;
   const feeBps = ltv >= 30 ? 300n : ltv >= 25 ? 200n : 150n;
-  const feeLamports = (BigInt(loanDbRow.original_loan_amount_lamports) * feeBps) / 10_000n;
+  const owedLive = await getLiveOwedLamports(loanDbRow);
+  const feeLamports = (owedLive * feeBps) / 10_000n;
 
   const preIxs = [
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),

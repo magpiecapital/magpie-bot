@@ -3,7 +3,7 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
-import { executeExtendLoan, recordExtendLoan } from "../services/loans.js";
+import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports } from "../services/loans.js";
 
 const pending = new Map();
 
@@ -37,15 +37,19 @@ export async function handleExtend(ctx) {
     return ctx.reply("📭 No active loans.");
   }
 
+  // Live on-chain owed amount per loan — fee = bps × current_owed,
+  // not bps × original. Using stale DB would overcharge after partial repays.
+  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+
   const kb = new InlineKeyboard();
-  for (const loan of rows) {
+  rows.forEach((loan, i) => {
     const bps = feeBpsForLtv(loan.ltv_percentage);
-    const fee = (BigInt(loan.original_loan_amount_lamports) * bps) / 10_000n;
+    const fee = (liveAmounts[i] * bps) / 10_000n;
     kb.text(
       `#${loan.loan_id} · ${loan.symbol ?? "?"} · fee ${fmtSol(fee)} SOL`,
       `extend:loan:${loan.id}`,
     ).row();
-  }
+  });
   kb.text("✕ Cancel", "extend:cancel");
 
   await ctx.reply(
@@ -80,7 +84,8 @@ export function registerExtendCallbacks(bot) {
     }
 
     const bps = feeBpsForLtv(loan.ltv_percentage);
-    const fee = (BigInt(loan.original_loan_amount_lamports) * bps) / 10_000n;
+    const owedLive = await getLiveOwedLamports(loan);
+    const fee = (owedLive * bps) / 10_000n;
     const sol = await getSolBalance(publicKey);
 
     // Need enough SOL to cover fee + ~0.003 SOL buffer for tx + rent.

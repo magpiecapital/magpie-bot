@@ -1,7 +1,7 @@
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
-import { executeRepay, markLoanRepaid } from "../services/loans.js";
+import { executeRepay, markLoanRepaid, getLiveOwedLamports } from "../services/loans.js";
 import { incrementRepaid } from "../services/reputation.js";
 
 function fmtSol(lamports) {
@@ -27,13 +27,16 @@ export async function handleRepay(ctx) {
     return ctx.reply("📭 No active loans to repay.");
   }
 
+  // Read live on-chain amount for each loan in parallel
+  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+
   const kb = new InlineKeyboard();
-  for (const loan of rows) {
+  rows.forEach((loan, i) => {
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${fmtSol(loan.original_loan_amount_lamports)} SOL`,
+      `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${fmtSol(liveAmounts[i])} SOL`,
       `repay:loan:${loan.id}`,
     ).row();
-  }
+  });
   kb.text("✕ Cancel", "repay:cancel");
 
   await ctx.reply("*Pick a loan to repay:*", {
@@ -68,6 +71,10 @@ export function registerRepayCallbacks(bot) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText("⏳ Submitting repayment on-chain...");
 
+    // Capture the live owed amount so the success message reflects what
+    // was actually paid (not whatever stale value happens to be in the DB).
+    const owedNow = await getLiveOwedLamports(loan);
+
     try {
       const result = await executeRepay({ userId: user.id, loanDbRow: loan });
       await markLoanRepaid(loan.id, result.signature);
@@ -78,7 +85,7 @@ export function registerRepayCallbacks(bot) {
           "✅ *Loan repaid*",
           "",
           `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
-          `Repaid: ${fmtSol(loan.original_loan_amount_lamports)} SOL`,
+          `Repaid: ${fmtSol(owedNow)} SOL`,
           "Collateral returned to your wallet.",
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
