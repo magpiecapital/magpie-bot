@@ -558,7 +558,7 @@ export async function handleAiStats(ctx) {
  * The infra-health watcher updates these every 5 min in the
  * background.
  */
-export async function handleHealth(ctx) {
+export async function handleInfraHealth(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const snap = getHealthSnapshot();
   const lines = ["🏥 *Infra health*", ""];

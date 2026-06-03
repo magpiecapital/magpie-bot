@@ -21,7 +21,7 @@ export async function handleMe(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  const [sol, stats, code, refs, activeRow, botInfo, limits] = await Promise.all([
+  const [sol, stats, code, refs, activeRow, botInfo, limits, streakRow] = await Promise.all([
     getSolBalance(publicKey),
     getUserStats(user.id),
     getOrCreateCode(user.id),
@@ -29,7 +29,9 @@ export async function handleMe(ctx) {
     query(`SELECT COUNT(*)::int AS n FROM loans WHERE user_id = $1 AND status = 'active'`, [user.id]),
     ctx.api.getMe(),
     getLoanLimits(user.id),
+    query(`SELECT current_streak, best_streak FROM users WHERE id = $1`, [user.id]),
   ]);
+  const streak = streakRow.rows[0] || { current_streak: 0, best_streak: 0 };
 
   const tier = tierFor(stats);
   const hint = nextTierHint(stats);
@@ -60,6 +62,9 @@ export async function handleMe(ctx) {
     `Loans repaid:      ${stats.repaid_count}`,
     `Loans liquidated:  ${stats.liquidated_count}`,
     `Total borrowed:    ${fmtSol(stats.total_borrowed_lamports)} SOL`,
+    streak.current_streak > 0
+      ? `On-time streak:   🔥 *${streak.current_streak}* (best: ${streak.best_streak})`
+      : (streak.best_streak > 0 ? `Best streak:      ${streak.best_streak}` : null),
     "",
     "*Referrals*",
     `Code: \`${code}\``,
@@ -73,7 +78,7 @@ export async function handleMe(ctx) {
     .text("💰 Borrow", "start:borrow")
     .text("📋 Wallet", "fallback:deposit");
 
-  await ctx.reply(lines.join("\n"), {
+  await ctx.reply(lines.filter((l) => l != null).join("\n"), {
     parse_mode: "Markdown",
     disable_web_page_preview: true,
     reply_markup: kb,

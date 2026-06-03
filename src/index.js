@@ -28,6 +28,9 @@ import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
 import { handleMyTickets, registerMyTicketsCallbacks } from "./commands/my-tickets.js";
+import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/autoprotect.js";
+import { handleCalendar, registerCalendarCallbacks } from "./commands/calendar.js";
+import { handleHealth } from "./commands/health.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -46,7 +49,7 @@ import {
   handleTickets,
   handleClose,
   handleAiStats,
-  handleHealth,
+  handleInfraHealth,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -65,6 +68,7 @@ import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
+import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { startInfraHealth } from "./services/infra-health.js";
@@ -113,6 +117,10 @@ bot.command("help_request", handleSupport); // alias — common term users guess
 bot.command("ticket", handleSupport); // alias
 bot.command("mytickets", handleMyTickets);
 bot.command("tickets_mine", handleMyTickets); // alias
+bot.command("autoprotect", handleAutoProtect);
+bot.command("protect", handleAutoProtect); // alias
+bot.command("calendar", handleCalendar);
+bot.command("health", handleHealth);
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
@@ -133,7 +141,7 @@ bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
 bot.command("close", handleClose);
 bot.command("aistats", handleAiStats);
-bot.command("health", handleHealth);
+bot.command("infrahealth", handleInfraHealth);
 
 // Inline callback registration.
 //
@@ -146,6 +154,8 @@ bot.command("health", handleHealth);
 registerImportCallbacks(bot);
 registerSupportCallbacks(bot);
 registerMyTicketsCallbacks(bot);
+registerAutoProtectCallbacks(bot);
+registerCalendarCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -204,6 +214,9 @@ async function registerBotCommands() {
       { command: "wallet", description: "💼 Your wallet + SOL balance" },
       { command: "borrow", description: "💰 Take a loan" },
       { command: "positions", description: "📊 Active loans" },
+      { command: "calendar", description: "📅 Loans sorted by due date" },
+      { command: "health", description: "🩺 Loan health snapshot" },
+      { command: "autoprotect", description: "🛡 Auto-Protect (anti-liquidation)" },
       { command: "repay", description: "✅ Repay a loan" },
       { command: "deposit", description: "📥 Show deposit address" },
       { command: "withdraw", description: "📤 Withdraw SOL" },
@@ -265,6 +278,8 @@ bot.start({
     setTimeout(() => startLoanReconciler(), 45_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
+    // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
+    setTimeout(() => startAutoProtect(bot), 50_000);
     // Daily AI conversation digest — disabled per admin preference.
     // To re-enable, uncomment the next line. Admin can pull stats on
     // their own schedule via /aistats instead.

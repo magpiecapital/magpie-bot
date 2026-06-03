@@ -425,7 +425,10 @@ export function registerSupportCallbacks(bot) {
       const userMsg = ctx.message.text.trim();
       const thinking = await ctx.reply("💭 _Thinking…_", { parse_mode: "Markdown" });
       try {
-        const result = await chatWithAgent(state.userId, userMsg, { username: ctx.from?.username });
+        const result = await chatWithAgent(state.userId, userMsg, {
+          username: ctx.from?.username,
+          languageCode: ctx.from?.language_code,
+        });
         if (!result) {
           await ctx.api.editMessageText(
             ctx.chat.id,

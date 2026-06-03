@@ -452,14 +452,38 @@ export async function markLoanRepaid(loanDbId, txSignature) {
   if (loan) {
     const now = Date.now();
     const due = new Date(loan.due_timestamp).getTime();
+    const onTime = now <= due;
     const eventType =
-      now > due ? "repay_late"
+      !onTime ? "repay_late"
       : (due - now) > 24 * 60 * 60 * 1000 ? "repay_early"
       : "repay_ontime";
     try {
       await recordCreditEvent(loan.user_id, eventType, loanDbId);
     } catch (err) {
       console.error("[loans] recordCreditEvent failed on repay:", err.message);
+    }
+    // Streak tracking — increment on on-time, reset on late.
+    try {
+      if (onTime) {
+        await query(
+          `UPDATE users
+              SET current_streak = current_streak + 1,
+                  best_streak = GREATEST(best_streak, current_streak + 1),
+                  last_repay_was_on_time = TRUE
+            WHERE id = $1`,
+          [loan.user_id],
+        );
+      } else {
+        await query(
+          `UPDATE users
+              SET current_streak = 0,
+                  last_repay_was_on_time = FALSE
+            WHERE id = $1`,
+          [loan.user_id],
+        );
+      }
+    } catch (err) {
+      console.error("[loans] streak update failed:", err.message);
     }
   }
 }

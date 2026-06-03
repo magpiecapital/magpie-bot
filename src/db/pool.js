@@ -268,6 +268,35 @@ export async function applyStartupPatches() {
     `UPDATE support_tickets SET status = 'awaiting_user'
         WHERE status = 'responded'`,
 
+    // ─────── AUTO-PROTECT ───────
+    // Opt-in anti-liquidation: when a loan's health crosses the danger
+    // threshold, the bot auto-tops-up or auto-partial-repays to bring
+    // it back into safe territory. Defaults to OFF (explicit opt-in).
+    `ALTER TABLE user_prefs ADD COLUMN IF NOT EXISTS auto_protect BOOLEAN NOT NULL DEFAULT FALSE`,
+    // Log every auto-protect action so users (and the team) can audit
+    // exactly what was done on their behalf.
+    `CREATE TABLE IF NOT EXISTS auto_protect_actions (
+       id BIGSERIAL PRIMARY KEY,
+       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       loan_id BIGINT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+       action_type TEXT NOT NULL,
+       amount_lamports NUMERIC(30,0),
+       health_before NUMERIC(10,3),
+       health_after NUMERIC(10,3),
+       signature TEXT,
+       error TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS auto_protect_actions_loan_idx
+       ON auto_protect_actions(loan_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS auto_protect_actions_user_idx
+       ON auto_protect_actions(user_id, created_at DESC)`,
+    // Streak tracking — consecutive on-time repays. Updated on each
+    // /repay tx. Used for milestones + future rate discounts.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_repay_was_on_time BOOLEAN`,
+
     // ─────── AI SUPPORT CONVERSATIONS ───────
     // Multi-turn chat history for the AI support agent. One row per user;
     // history accumulates within an active session and resets after the

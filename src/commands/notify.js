@@ -14,6 +14,7 @@ const PREFS = [
   { key: "notify_health",        label: "Progressive health alerts" },
   { key: "notify_liquidations",  label: "Liquidation receipts" },
   { key: "auto_repay",           label: "Auto-repay on SOL deposit" },
+  { key: "auto_protect",         label: "🛡 Auto-Protect (anti-liquidation)" },
 ];
 
 function render(prefs) {

@@ -178,6 +178,24 @@ LOAN MANAGEMENT MECHANICS:
 - /export — export your Magpie wallet's private key. Use only on a trusted
   device; reveals seed. Don't paste it anywhere.
 
+AUTO-PROTECT (anti-liquidation, opt-in):
+- Users can enable Auto-Protect via /autoprotect or /notify toggle.
+- When enabled: a background watcher monitors their active loans every 90s.
+  If health drops below 1.30x, the bot auto-partial-repays from their
+  IDLE SOL balance to bring health back to 1.50x (safe).
+- Hard safety bounds: max 1 SOL per action, max 3 actions per loan in
+  24h, keeps 0.005 SOL reserve for gas.
+- Every action is logged + DM'd to the user with the tx link.
+- "Never been liquidated" — Magpie's biggest trust claim. Auto-Protect
+  is how users guarantee it for themselves.
+
+STREAK REWARDS:
+- Every on-time repay increments the user's current_streak (visible in /me).
+- Late repay resets the streak to 0.
+- Best streak is tracked separately. Today this is a reputation signal;
+  in future it ties to fee discounts.
+- Encourage users to /repay before due_timestamp to build the streak.
+
 PROTOCOL SAFETY:
 - Token health watcher: automatically disables borrowing against tokens whose
   liquidity, holder count, or LP-burned status degrades. Existing loans stay
@@ -217,6 +235,12 @@ BORROWING / LOANS:
 - /simulate    — PREVIEW a loan with live prices — no commit, no wallet
                  needed. Great for "what would I get?" questions.
 - /positions   — List your active loans with status, owed, due date.
+- /calendar    — Chronological view of all active loans sorted by due date,
+                 with health badges.
+- /health [id] — Quick health snapshot for one loan (or lowest-health if no
+                 id given). Shows ratio, liquidation price, what to do.
+- /autoprotect — Toggle Auto-Protect (anti-liquidation auto-actions).
+                 Off by default; users explicitly opt in.
 - /repay       — Fully repay a loan, reclaim collateral.
 - /partialrepay — Repay PART of a loan; reduces owed balance.
 - /topup       — Add MORE collateral to an existing loan. Lowers LTV,
@@ -597,6 +621,10 @@ Mandatory tool triggers — pattern → tool:
 - User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
 - User asks "what would I get if I borrow against X", "simulate a loan", "preview a loan", "rate for Y tokens" → \`simulate_loan\`
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
+- User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
+- User asks "how do I see all my loans by date", "loan calendar", "when are my loans due" → point at /calendar
+- User asks "is my loan close to liquidation", "what's my health", "am I safe" → call \`list_my_loans\` AND point at /health for the snapshot view
+- User asks about "streak", "consecutive repays", "on time" → check their stats via \`get_my_recent_activity\` and mention streak shows in /me
 
 If a user message is ambiguous between two tools (e.g., "what's my status?"),
 call \`list_my_loans\` first — that's the most common intent in support.
@@ -1621,9 +1649,11 @@ async function callAnthropic(messages, extraSystemText) {
  */
 export async function chatWithAgent(userId, userMessage, opts = {}) {
   if (!isAiSupportEnabled()) return null;
-  // Caller can pass { username } from Telegram so the AI can address
-  // the user by first-name sparingly (warmth). Optional.
+  // Caller can pass { username, languageCode } from Telegram so the AI
+  // can use the handle sparingly for warmth + auto-respond in the user's
+  // language without explicit translation infrastructure.
   const username = opts.username || null;
+  const languageCode = opts.languageCode || null;
 
   // PII scrub: never let an accidentally-pasted seed phrase or private
   // key leave our infra. Refuse with a clear warning instead.
@@ -1694,6 +1724,26 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
   ];
   if (username) {
     contextParts.push(`User's Telegram handle: @${username}. Use sparingly for warmth — at most once per conversation, never in every reply.`);
+  }
+  if (languageCode && languageCode !== "en") {
+    // Map common Telegram language codes to human-readable names so the
+    // model gets crisp instructions. Claude handles translation natively
+    // for all major languages; we just need to TELL it which to use.
+    const LANG_NAMES = {
+      es: "Spanish", pt: "Portuguese", fr: "French", de: "German",
+      it: "Italian", ru: "Russian", uk: "Ukrainian", tr: "Turkish",
+      ar: "Arabic", he: "Hebrew", zh: "Mandarin Chinese", "zh-hans": "Simplified Chinese",
+      "zh-hant": "Traditional Chinese", ja: "Japanese", ko: "Korean",
+      vi: "Vietnamese", th: "Thai", id: "Indonesian", ms: "Malay",
+      hi: "Hindi", bn: "Bengali", fil: "Filipino", pl: "Polish",
+      nl: "Dutch", sv: "Swedish", no: "Norwegian", da: "Danish",
+      fi: "Finnish", cs: "Czech", el: "Greek", hu: "Hungarian",
+      ro: "Romanian",
+    };
+    const langName = LANG_NAMES[languageCode.toLowerCase()] || languageCode;
+    contextParts.push(
+      `User's Telegram client language: ${langName} (${languageCode}). RESPOND IN ${langName.toUpperCase()} unless the user clearly writes to you in English. Translate all explanations, hints, and offers naturally — but keep command names (/borrow, /repay, etc.), token symbols, and numbers in their original form. Don't ask "which language?" — just respond in theirs.`,
+    );
   }
   contextParts.push(
     "Match your greeting to the time of day if the user greets you ('gm', 'gn', etc.), and don't say 'good morning' at midnight UTC.",

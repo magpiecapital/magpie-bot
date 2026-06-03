@@ -12,12 +12,13 @@ const DEFAULTS = {
   notify_liquidations: true,
   notify_health: true,
   auto_repay: false,
+  auto_protect: false,
 };
 
 export async function getPrefs(userId) {
   const { rows } = await query(
     `SELECT notify_deposits, notify_loan_warnings, notify_liquidations,
-            notify_health, auto_repay
+            notify_health, auto_repay, auto_protect
      FROM user_prefs WHERE user_id = $1`,
     [userId],
   );
