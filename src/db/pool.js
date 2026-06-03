@@ -256,6 +256,21 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS support_tickets_status_idx
        ON support_tickets(status, created_at DESC)`,
+
+    // ─────── AI SUPPORT CONVERSATIONS ───────
+    // Multi-turn chat history for the AI support agent. One row per user;
+    // history accumulates within an active session and resets after the
+    // TTL (30 min idle) so each "session" stays focused and cheap.
+    `CREATE TABLE IF NOT EXISTS support_conversations (
+       user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+       messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+       turns INTEGER NOT NULL DEFAULT 0,
+       total_input_tokens INTEGER NOT NULL DEFAULT 0,
+       total_output_tokens INTEGER NOT NULL DEFAULT 0,
+       started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       escalated_to_ticket_id BIGINT
+     )`,
   ];
   for (const sql of patches) {
     try {

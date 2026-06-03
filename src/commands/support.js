@@ -22,6 +22,7 @@ import { getLiveOwedLamports } from "../services/loans.js";
 import { collateralValueLamports } from "../services/price.js";
 import { clearPending as clearBorrowPending } from "./borrow.js";
 import { clearPending as clearWithdrawPending } from "./withdraw.js";
+import { chatWithAgent, isAiSupportEnabled, resetConversation } from "../services/ai-support.js";
 
 const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
 
@@ -56,24 +57,34 @@ export async function handleSupport(ctx) {
   if (!tgUser) return;
   await upsertUser(tgUser.id, tgUser.username);
 
-  const kb = new InlineKeyboard()
-    .text("🔍 Diagnose a loan", "support:loan").row()
+  const aiOn = isAiSupportEnabled();
+  const kb = new InlineKeyboard();
+  if (aiOn) {
+    kb.text("💬 Chat with the agent", "support:chat").row();
+  }
+  kb.text("🔍 Diagnose a loan", "support:loan").row()
     .text("💸 Check a transaction", "support:tx").row()
-    .text("💬 Send a message to the team", "support:msg").row()
+    .text("🎫 Open a ticket (admin reply)", "support:msg").row()
     .text("✕ Cancel", "support:cancel");
 
-  await ctx.reply(
-    [
-      "🛟 *Magpie Support*",
+  const lines = ["🛟 *Magpie Support*", ""];
+  if (aiOn) {
+    lines.push(
+      "What's going on? Pick *Chat with the agent* for anything — I can look up your loans, check transactions, answer protocol questions, and escalate to the team if needed.",
       "",
-      "What can I help with?",
-      "",
-      "• *Diagnose a loan* — pull the live state of any of your active loans (owed, health, due date, suggested next steps)",
-      "• *Check a transaction* — paste a Solana tx signature and I'll tell you if it confirmed",
-      "• *Send a message* — anything else, gets routed to the team",
-    ].join("\n"),
-    { parse_mode: "Markdown", reply_markup: kb },
+      "Or jump straight to a specific tool below:",
+    );
+  } else {
+    lines.push("What can I help with?");
+  }
+  lines.push(
+    "",
+    "• *Diagnose a loan* — pull the live state of any of your loans",
+    "• *Check a transaction* — paste a sig, I tell you if it confirmed",
+    "• *Open a ticket* — leave a message, team replies via this bot",
   );
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
 
 async function diagnoseLoan(ctx, loan) {
@@ -317,13 +328,127 @@ export function registerSupportCallbacks(bot) {
     );
   });
 
+  // ── AI CHAT ──────────────────────────────────────────────────
+  // Multi-turn conversational support. User stays in 'ai_chat'
+  // stage until they explicitly end via the End/Ticket button.
+  bot.callbackQuery("support:chat", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (!isAiSupportEnabled()) {
+      return ctx.editMessageText("AI chat is currently disabled. Use the ticket flow instead.");
+    }
+    clearBorrowPending(ctx.chat.id);
+    clearWithdrawPending(ctx.chat.id);
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+    await resetConversation(user.id); // fresh session
+    pending.set(ctx.chat.id, { stage: "ai_chat", userId: user.id });
+    const kb = new InlineKeyboard()
+      .text("✕ End chat", "support:chat:end")
+      .text("🎫 Escalate to ticket", "support:chat:ticket");
+    await ctx.editMessageText(
+      [
+        "💬 *Magpie support agent · live*",
+        "",
+        "I can look up your loans, check transactions, answer protocol questions, and route anything I can't handle to the team.",
+        "",
+        "What's going on?",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery("support:chat:end", async (ctx) => {
+    await ctx.answerCallbackQuery("Chat ended");
+    const state = pending.get(ctx.chat.id);
+    if (state?.userId) await resetConversation(state.userId);
+    pending.delete(ctx.chat.id);
+    await ctx.editMessageText("Chat ended. Use /support anytime.");
+  });
+
+  bot.callbackQuery("support:chat:ticket", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const state = pending.get(ctx.chat.id);
+    if (state?.userId) await resetConversation(state.userId);
+    pending.set(ctx.chat.id, { stage: "await_message" });
+    await ctx.editMessageText(
+      "Type the message you want sent to the team. Include any details that help.",
+    );
+  });
+
   // Text middleware — only acts when the user is actively in a support
   // input stage. Registered EARLY in src/index.js so it doesn't get
   // hijacked by other flows (same defense as /import).
   bot.on("message:text", async (ctx, next) => {
     const state = pending.get(ctx.chat.id);
     if (!state) return next();
-    if (state.stage !== "await_tx" && state.stage !== "await_message") return next();
+    if (state.stage !== "await_tx" && state.stage !== "await_message" && state.stage !== "ai_chat") {
+      return next();
+    }
+
+    if (state.stage === "ai_chat") {
+      // Multi-turn: don't delete state. Send a thinking indicator that
+      // we edit when the response comes back.
+      const userMsg = ctx.message.text.trim();
+      const thinking = await ctx.reply("💭 _Thinking…_", { parse_mode: "Markdown" });
+      try {
+        const result = await chatWithAgent(state.userId, userMsg);
+        if (!result) {
+          await ctx.api.editMessageText(
+            ctx.chat.id,
+            thinking.message_id,
+            "AI chat isn't configured right now. Tap *Open a ticket* via /support.",
+            { parse_mode: "Markdown" },
+          );
+          return;
+        }
+        const kb = new InlineKeyboard()
+          .text("✕ End chat", "support:chat:end")
+          .text("🎫 Escalate to ticket", "support:chat:ticket");
+        // If the AI escalated to a ticket, DM admin with context
+        if (result.escalated_ticket_id && ADMIN_TG_ID) {
+          try {
+            const fromTag = ctx.from.username ? `@${ctx.from.username}` : `tg://${ctx.from.id}`;
+            await ctx.api.sendMessage(
+              ADMIN_TG_ID,
+              [
+                `🎫 *AI-escalated ticket #${result.escalated_ticket_id}*`,
+                "",
+                `From: ${fromTag}`,
+                "",
+                `Last user message: "${userMsg.slice(0, 300)}"`,
+                "",
+                `Tools the agent used: ${result.used_tools?.join(", ") || "(none)"}`,
+                "",
+                `Reply: \`/reply ${result.escalated_ticket_id} <your message>\``,
+              ].join("\n"),
+              { parse_mode: "Markdown" },
+            );
+          } catch { /* non-critical */ }
+        }
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          thinking.message_id,
+          result.text,
+          { parse_mode: "Markdown", reply_markup: kb, disable_web_page_preview: true },
+        ).catch(async () => {
+          // If Markdown parse fails, retry as plaintext (some AI responses
+          // contain unbalanced characters Telegram chokes on)
+          await ctx.api.editMessageText(
+            ctx.chat.id, thinking.message_id, result.text,
+            { reply_markup: kb, disable_web_page_preview: true },
+          );
+        });
+      } catch (err) {
+        console.error("[support:ai_chat] error:", err);
+        await ctx.api.editMessageText(
+          ctx.chat.id, thinking.message_id,
+          "Something broke in the chat. Try /support again or open a ticket.",
+        );
+        pending.delete(ctx.chat.id);
+      }
+      return;
+    }
+
+    // tx / message stages are single-shot
     pending.delete(ctx.chat.id);
 
     if (state.stage === "await_tx") {
