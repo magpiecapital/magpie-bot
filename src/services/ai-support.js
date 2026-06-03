@@ -365,6 +365,31 @@ WITHDRAWING LP YIELD (from magpie.capital/earn):
    high, you may wait briefly until borrowers repay
 
 ═══════════════════════════════════════════════════════════════════
+REPAY / EXTEND FAILURE MODES — DIAGNOSE FAST
+═══════════════════════════════════════════════════════════════════
+When a user says "/repay failed" or pastes a raw Solana error, the
+most common causes:
+
+1. INSUFFICIENT SOL FOR REPAY — wallet doesn't have enough SOL to
+   cover the owed amount + ~0.003 SOL gas. The raw error looks like
+   "Transfer: insufficient lamports X, need Y" or "custom program
+   error: 0x1" from the System Program (11111...).
+   Diagnose: \`get_my_wallet\` returns balance < amount owed.
+   Fix: Send more SOL via /deposit, OR /partialrepay smaller amount,
+   OR /topup more collateral, OR /extend the due date.
+
+2. BLOCKHASH EXPIRED — user sat on confirm >90 seconds.
+   Fix: Just /repay again. Retry uses a fresh blockhash.
+
+3. RPC HICCUP — transient Solana network issue.
+   Fix: Wait 15-30 seconds, retry.
+
+4. LOAN ALREADY CLOSED — race condition where loan was repaid via
+   another flow (keeper, /partialrepay-to-zero, etc.).
+   Diagnose: \`lookup_loan\` shows status=repaid or liquidated.
+   Fix: It's already settled. Their collateral is back.
+
+═══════════════════════════════════════════════════════════════════
 BORROWING FAILURE MODES — DIAGNOSE FAST
 ═══════════════════════════════════════════════════════════════════
 When a user says "/borrow didn't work" or "got an error", the cause

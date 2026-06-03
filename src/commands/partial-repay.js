@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
 import { executePartialRepay, recordPartialRepay, getLiveOwedLamports } from "../services/loans.js";
+import { translateTxError } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -156,9 +157,8 @@ export function registerPartialRepayCallbacks(bot) {
       );
     } catch (err) {
       console.error("Partial repay failed:", err);
-      await ctx.editMessageText(
-        `❌ Partial repay failed: ${err.message || "unknown error"}`,
-      );
+      const friendly = translateTxError(err, { flow: "partialrepay" });
+      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
     }
   });
 }

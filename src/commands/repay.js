@@ -1,12 +1,20 @@
 import { InlineKeyboard } from "grammy";
+import { PublicKey } from "@solana/web3.js";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { executeRepay, markLoanRepaid, getLiveOwedLamports } from "../services/loans.js";
+import { ensureWallet } from "../services/wallet.js";
+import { connection } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
+import { translateTxError } from "../services/tx-error-translator.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
+
+// Tx fees + ATA rent reserve. Conservative: ~5k lamports/sig × a few sigs,
+// plus 0.002 SOL for any ATA creation that might be needed during repay.
+const REPAY_GAS_BUFFER_LAMPORTS = 3_000_000n; // 0.003 SOL
 
 export async function handleRepay(ctx) {
   const tgUser = ctx.from;
@@ -69,11 +77,50 @@ export function registerRepayCallbacks(bot) {
     }
 
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText("⏳ Submitting repayment on-chain...");
 
     // Capture the live owed amount so the success message reflects what
     // was actually paid (not whatever stale value happens to be in the DB).
     const owedNow = await getLiveOwedLamports(loan);
+
+    // ── Preflight: do they have enough SOL to actually repay? ──
+    // Without this check the user gets a cryptic Solana simulation error
+    // ("Transfer: insufficient lamports X, need Y") instead of a clear,
+    // actionable message. Check BEFORE we even build the tx.
+    try {
+      const { publicKey } = await ensureWallet(user.id);
+      const balanceLamports = BigInt(await connection.getBalance(new PublicKey(publicKey)));
+      const needed = owedNow + REPAY_GAS_BUFFER_LAMPORTS;
+      if (balanceLamports < needed) {
+        const short = needed - balanceLamports;
+        await ctx.editMessageText(
+          [
+            "⚠️ *Not enough SOL to repay*",
+            "",
+            `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
+            `Owed: \`${fmtSol(owedNow)} SOL\` (plus ~0.003 SOL for fees)`,
+            `Your wallet: \`${fmtSol(balanceLamports)} SOL\``,
+            `Short by: *\`${fmtSol(short)} SOL\`*`,
+            "",
+            "*What to do:*",
+            `• Send at least \`${fmtSol(short)} SOL\` to your Magpie wallet, then retry /repay`,
+            "• Your deposit address: /deposit",
+            "",
+            "_Other options:_",
+            "• /partialrepay — pay only part of the loan to reduce risk",
+            "• /topup — add more collateral instead of paying down",
+            "• /extend — push the due date out for a fee",
+          ].join("\n"),
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+    } catch (err) {
+      // Balance check itself failed (RPC blip) — log and continue to the
+      // tx attempt rather than blocking the user.
+      console.warn("[repay] preflight balance check failed:", err.message);
+    }
+
+    await ctx.editMessageText("⏳ Submitting repayment on-chain...");
 
     try {
       const result = await executeRepay({ userId: user.id, loanDbRow: loan });
@@ -94,9 +141,8 @@ export function registerRepayCallbacks(bot) {
       );
     } catch (err) {
       console.error("Repay failed:", err);
-      await ctx.editMessageText(
-        `❌ Repay failed: ${err.message || "unknown error"}\n\nTry /repay again.`,
-      );
+      const friendly = translateTxError(err, { flow: "repay", owedLamports: owedNow });
+      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
     }
   });
 }

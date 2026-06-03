@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
 import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports } from "../services/loans.js";
+import { translateTxError } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -166,9 +167,8 @@ export function registerExtendCallbacks(bot) {
       );
     } catch (err) {
       console.error("Extend failed:", err);
-      await ctx.editMessageText(
-        `❌ Extend failed: ${err.message || "unknown error"}`,
-      );
+      const friendly = translateTxError(err, { flow: "extend" });
+      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
     }
   });
 }
