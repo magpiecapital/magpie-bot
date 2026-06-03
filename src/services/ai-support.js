@@ -194,7 +194,30 @@ STREAK REWARDS:
 - Late repay resets the streak to 0.
 - Best streak is tracked separately. Today this is a reputation signal;
   in future it ties to fee discounts.
+- Milestones at 5, 10, 25, 50, 100, 250 streak. Each milestone shows a
+  celebration message + share button on /repay.
 - Encourage users to /repay before due_timestamp to build the streak.
+
+THE "CHEAPER THAN SELLING" FRAMING (USE THIS):
+Magpie's real competition isn't other lenders — it's the user choosing
+to SELL their tokens instead of borrowing. When users hesitate about
+fees or whether borrowing is "worth it", break out the comparison:
+- Selling triggers ~2% slippage on most memecoins
+- Selling creates a taxable event (jurisdiction-dependent)
+- Selling means you no longer hold the bag — miss any upside
+- Magpie fee is 1.5-3% one-time, you keep the bag, no taxable event
+The cheaper_than_selling object returned by simulate_loan has the
+specific numbers — use them. Frame: "borrowing costs X SOL vs selling's
+~Y SOL slippage alone, before tax." This re-frames their mental model.
+
+SHARING + REFERRALS:
+- /share generates a Twitter/X share card the user can fire in one tap
+- Every share carries their referral code → they earn 5% of any new
+  user's lifetime fees
+- After /borrow and /repay success messages, share buttons are appended
+  automatically
+- Encourage sharing for active users — it's free marketing and they
+  earn from it. Don't shill it constantly, but mention when natural.
 
 PROTOCOL SAFETY:
 - Token health watcher: automatically disables borrowing against tokens whose
@@ -1382,6 +1405,11 @@ const TOOL_HANDLERS = {
           liquidation_price_sol_per_token: liquidationPriceSol.toFixed(9),
         };
       });
+      // "Cheaper than selling" comparison data — give the AI the numbers
+      // to use the framing wedge in its answer.
+      const estimatedSellSlippageSol = collateralValueSol * 0.02; // ~2%
+      const standardTier = tiers.find((t) => t.tier === "Standard");
+      const standardFeeSol = standardTier ? parseFloat(standardTier.fee_sol) : 0;
       return {
         token: t.symbol,
         mint: t.mint,
@@ -1389,7 +1417,14 @@ const TOOL_HANDLERS = {
         collateral_value_sol: collateralValueSol.toFixed(6),
         price_sol_per_token: priceSol.toFixed(9),
         tiers,
-        user_friendly_hint: "Interpret these results conversationally. Highlight the most relevant tier (usually Standard 20% is the safest pick for first-timers, Express 30% gets the most SOL but with tighter liquidation risk).",
+        cheaper_than_selling: {
+          estimated_sell_slippage_sol: estimatedSellSlippageSol.toFixed(4),
+          estimated_sell_slippage_pct: "~2%",
+          standard_loan_fee_sol: standardFeeSol.toFixed(4),
+          savings_vs_selling_sol: (estimatedSellSlippageSol - standardFeeSol).toFixed(4),
+          note: "Selling triggers slippage AND a taxable event AND you lose the bag. Borrowing keeps the bag and is usually cheaper.",
+        },
+        user_friendly_hint: "Interpret conversationally. Highlight the most relevant tier (Standard 20% safest, Express 30% most SOL). Then ALWAYS mention the 'cheaper than selling' framing — most users haven't thought about that comparison. Use the cheaper_than_selling data to make the case.",
       };
     } catch (err) {
       return toolError("simulate_failed", err.message, "Couldn't compute the simulation — likely a price feed blip. Ask the user to try /simulate directly in a moment.");

@@ -31,6 +31,7 @@ import { handleMyTickets, registerMyTicketsCallbacks } from "./commands/my-ticke
 import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/autoprotect.js";
 import { handleCalendar, registerCalendarCallbacks } from "./commands/calendar.js";
 import { handleHealth } from "./commands/health.js";
+import { handleShare } from "./commands/share.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -121,6 +122,8 @@ bot.command("autoprotect", handleAutoProtect);
 bot.command("protect", handleAutoProtect); // alias
 bot.command("calendar", handleCalendar);
 bot.command("health", handleHealth);
+bot.command("share", handleShare);
+bot.command("flex", handleShare); // alias — crypto-native phrasing
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
@@ -224,6 +227,7 @@ async function registerBotCommands() {
       { command: "credit", description: "⭐ Your credit score + points" },
       { command: "history", description: "📜 Loan history" },
       { command: "refer", description: "🎁 Earn 5% of friends' loan fees" },
+      { command: "share", description: "📤 Flex your loan / streak on Twitter" },
       { command: "holders", description: "💎 $MAGPIE holder rewards" },
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },

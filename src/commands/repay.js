@@ -127,6 +127,50 @@ export function registerRepayCallbacks(bot) {
       await markLoanRepaid(loan.id, result.signature);
       await incrementRepaid(user.id);
 
+      // Build share + milestone celebration
+      let shareKb;
+      let milestoneLine = "";
+      try {
+        const { getOrCreateCode } = await import("../services/referrals.js");
+        const { shareRepay, shareStreak, streakMilestone } = await import("../services/share-moments.js");
+        const code = await getOrCreateCode(user.id);
+
+        // Read the freshly-updated streak
+        const { rows: [streakRow] } = await query(
+          `SELECT current_streak, best_streak FROM users WHERE id = $1`,
+          [user.id],
+        );
+        const streak = streakRow?.current_streak || 0;
+        const milestone = streakMilestone(streak);
+
+        const repayCard = shareRepay({
+          symbol: loan.symbol ?? "TOKEN",
+          originalLamports: loan.loan_amount_lamports,
+          repaidLamports: owedNow,
+          referralCode: code,
+        });
+
+        if (milestone) {
+          // Hit a milestone — celebrate + offer streak-specific share
+          milestoneLine = `\n🔥 *${streak} on-time repays in a row — milestone unlocked!*\n`;
+          const streakCard = shareStreak({ streak, referralCode: code });
+          shareKb = new InlineKeyboard()
+            .url(`𝕏 Flex ${streak}-streak`, streakCard.twitterUrl)
+            .row()
+            .url("𝕏 Share repay", repayCard.twitterUrl)
+            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+        } else if (streak > 0) {
+          milestoneLine = `\n🔥 _On-time streak: ${streak}_\n`;
+          shareKb = new InlineKeyboard()
+            .url("𝕏 Share to Twitter", repayCard.twitterUrl)
+            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+        } else {
+          shareKb = new InlineKeyboard()
+            .url("𝕏 Share to Twitter", repayCard.twitterUrl)
+            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+        }
+      } catch { /* non-critical */ }
+
       await ctx.editMessageText(
         [
           "✅ *Loan repaid*",
@@ -134,10 +178,10 @@ export function registerRepayCallbacks(bot) {
           `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
           `Repaid: ${fmtSol(owedNow)} SOL`,
           "Collateral returned to your wallet.",
-          "",
+          milestoneLine,
           `[View tx](https://solscan.io/tx/${result.signature})`,
-        ].join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true },
+        ].filter(Boolean).join("\n"),
+        { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: shareKb },
       );
     } catch (err) {
       console.error("Repay failed:", err);

@@ -265,6 +265,133 @@ async function handleCreditHistory(req, url) {
   };
 }
 
+/**
+ * /api/v1/transparency — public aggregated protocol stats.
+ *
+ * Designed for the transparency page on magpie.capital and any third-party
+ * tracker that wants to verify Magpie's health claims. No PII, no auth.
+ *
+ * Returns:
+ *   - lifetime + 24h + 7d + 30d aggregates for loans, fees, users
+ *   - default rate (liquidated / total) — currently 0, the marketing point
+ *   - pool TVL + utilization
+ *   - holder reward pool current size + last distribution
+ *   - LP loyalty pool current size + last distribution
+ *   - referral payouts (lifetime)
+ */
+async function handleTransparency() {
+  // Loans aggregate
+  const { rows: [loans] } = await query(
+    `SELECT
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+       COUNT(*) FILTER (WHERE status = 'repaid')::int AS repaid,
+       COUNT(*) FILTER (WHERE status = 'liquidated')::int AS liquidated,
+       COUNT(*) FILTER (WHERE start_timestamp > NOW() - INTERVAL '24 hours')::int AS new_24h,
+       COUNT(*) FILTER (WHERE start_timestamp > NOW() - INTERVAL '7 days')::int  AS new_7d,
+       COUNT(*) FILTER (WHERE start_timestamp > NOW() - INTERVAL '30 days')::int AS new_30d,
+       COALESCE(SUM(loan_amount_lamports::numeric), 0)::text AS lifetime_borrowed_lamports,
+       COALESCE(SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '24 hours'
+                         THEN loan_amount_lamports::numeric ELSE 0 END), 0)::text
+         AS borrowed_24h_lamports
+     FROM loans`,
+  );
+  // Users aggregate
+  const { rows: [users] } = await query(
+    `SELECT
+       COUNT(*)::int AS total_users,
+       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS new_users_24h,
+       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int  AS new_users_7d
+     FROM users`,
+  );
+  // Pool snapshot (on-chain)
+  let pool = null;
+  try {
+    const { PublicKey } = await import("@solana/web3.js");
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const { lendingPoolPda } = await import("../solana/pdas.js");
+    const [poolPda] = lendingPoolPda(new PublicKey(process.env.LENDER_PUBKEY));
+    const p = await getReadOnlyProgram().account.lendingPool.fetch(poolPda);
+    const td = Number(p.totalDeposits);
+    const tb = Number(p.totalBorrowed);
+    pool = {
+      tvl_sol: td / 1e9,
+      borrowed_sol: tb / 1e9,
+      available_sol: Math.max(0, td - tb) / 1e9,
+      utilization_pct: td > 0 ? +((tb / td) * 100).toFixed(2) : 0,
+      total_fees_earned_sol: Number(p.totalFeesEarned) / 1e9,
+      paused: p.paused,
+    };
+  } catch { /* fall through */ }
+  // Holder reward pool
+  const { rows: [holders] } = await query(
+    `SELECT
+       (SELECT accrued_lamports::text FROM magpie_holder_pool WHERE id = 1) AS current_pool_lamports,
+       (SELECT COUNT(*)::int FROM magpie_holder_distributions) AS lifetime_distributions,
+       (SELECT total_distributed_lamports::text FROM magpie_holder_distributions
+          ORDER BY id DESC LIMIT 1) AS last_distribution_lamports,
+       (SELECT created_at FROM magpie_holder_distributions ORDER BY id DESC LIMIT 1)
+         AS last_distribution_at`,
+  );
+  // LP loyalty pool
+  const { rows: [lpLoy] } = await query(
+    `SELECT
+       (SELECT accrued_lamports::text FROM lp_loyalty_pool WHERE id = 1) AS current_pool_lamports,
+       (SELECT COUNT(*)::int FROM lp_loyalty_distributions) AS lifetime_distributions`,
+  );
+  // Referral payouts lifetime
+  const { rows: [refs] } = await query(
+    `SELECT
+       COALESCE(SUM(reward_lamports)::text, '0') AS lifetime_accrued,
+       COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports ELSE 0 END)::text, '0')
+         AS lifetime_paid
+     FROM referral_earnings`,
+  );
+  // Default rate — % of finalized loans that were liquidated (NOT active)
+  const finalized = loans.repaid + loans.liquidated;
+  const defaultRatePct = finalized > 0 ? +((loans.liquidated / finalized) * 100).toFixed(3) : 0;
+
+  return {
+    status: 200,
+    body: {
+      // Top-line trust signals
+      headline: {
+        liquidations_lifetime: loans.liquidated,
+        default_rate_pct: defaultRatePct,
+        users: users.total_users,
+        loans_lifetime: loans.total,
+        tvl_sol: pool?.tvl_sol ?? null,
+      },
+      loans: {
+        ...loans,
+        lifetime_borrowed_sol: Number(loans.lifetime_borrowed_lamports) / 1e9,
+        borrowed_24h_sol: Number(loans.borrowed_24h_lamports) / 1e9,
+      },
+      users,
+      pool,
+      holder_rewards: {
+        current_pool_sol: holders.current_pool_lamports
+          ? Number(holders.current_pool_lamports) / 1e9 : 0,
+        lifetime_distributions: holders.lifetime_distributions,
+        last_distribution_sol: holders.last_distribution_lamports
+          ? Number(holders.last_distribution_lamports) / 1e9 : null,
+        last_distribution_at: holders.last_distribution_at,
+      },
+      lp_loyalty: {
+        current_pool_sol: lpLoy.current_pool_lamports
+          ? Number(lpLoy.current_pool_lamports) / 1e9 : 0,
+        lifetime_distributions: lpLoy.lifetime_distributions,
+      },
+      referrals: {
+        lifetime_accrued_sol: Number(refs.lifetime_accrued) / 1e9,
+        lifetime_paid_sol: Number(refs.lifetime_paid) / 1e9,
+      },
+      generated_at: new Date().toISOString(),
+      cache_ttl_seconds: 60,
+    },
+  };
+}
+
 async function handleTokenRisk(req, url) {
   const mint = url.searchParams.get("mint");
   if (!mint) {
@@ -813,6 +940,10 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/holders",
   "/api/v1/holders/pool",
   "/api/v1/lp-loyalty",
+  // Transparency dashboard — aggregated protocol health, no PII.
+  // Designed for public consumption (the transparency page on the site,
+  // third-party trackers, etc.). No auth, cached for 60s upstream.
+  "/api/v1/transparency",
 ]);
 
 async function router(req, res) {
@@ -925,6 +1056,9 @@ async function router(req, res) {
       case "/api/v1/pool/stats":
         result = await handlePublicPoolStats();
         break;
+      case "/api/v1/transparency":
+        result = await handleTransparency();
+        break;
       case "/api/v1/risk/token":
         result = await handleTokenRisk(req, url);
         break;
@@ -966,6 +1100,7 @@ async function router(req, res) {
               "GET /api/v1/risk/token?mint=<address>": "Token risk assessment",
               "GET /api/v1/risk/flagged": "Currently flagged tokens",
               "GET /api/v1/marketplace/stats": "P2P marketplace statistics",
+              "GET /api/v1/transparency": "Aggregated public protocol health stats (no auth, no PII)",
             },
             auth: "Pass API key in X-API-Key header",
           },

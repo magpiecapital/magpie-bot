@@ -9,6 +9,7 @@ import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
 import { translateTxError } from "../services/tx-error-translator.js";
+import { renderRiskBlock } from "../services/token-risk-preview.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
@@ -223,16 +224,19 @@ export function registerBorrowCallbacks(bot) {
     }
     kb.text("✕ Cancel", "borrow:cancel");
 
+    const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
     await ctx.reply(
       [
         `*Collateral:* ${amount.toLocaleString()} ${state.selected.symbol}`,
         `*Value:* ${fmtSol(valueLamports)} SOL`,
+        riskBlock ? "" : null,
+        riskBlock || null,
         "",
         "*Choose a loan tier:*",
         "_(amount shown is what you receive after tier fee)_",
         "",
         "⏱ _This quote expires in 60 seconds._",
-      ].join("\n"),
+      ].filter((l) => l != null).join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
   });
@@ -272,17 +276,20 @@ export function registerBorrowCallbacks(bot) {
     }
     kb.text("✕ Cancel", "borrow:cancel");
 
+    const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
         `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
         `*Value:* ${fmtSol(valueLamports)} SOL`,
+        riskBlock ? "" : null,
+        riskBlock || null,
         "",
         "*Choose a loan tier:*",
         "_(amount shown is what you receive after tier fee)_",
         "",
         "⏱ _This quote expires in 60 seconds._",
-      ].join("\n"),
+      ].filter((l) => l != null).join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
   });
@@ -440,6 +447,24 @@ export function registerBorrowCallbacks(bot) {
 
       pending.delete(ctx.chat.id);
 
+      // Build share button — every funded loan is a marketing moment
+      let shareKb;
+      try {
+        const { getOrCreateCode } = await import("../services/referrals.js");
+        const { shareBorrow } = await import("../services/share-moments.js");
+        const code = await getOrCreateCode(state.userId);
+        const card = shareBorrow({
+          symbol: state.selected.symbol,
+          receiveLamports: loanAmountAfterFee,
+          ltvPct: tier.ltv,
+          durationDays: tier.days,
+          referralCode: code,
+        });
+        shareKb = new InlineKeyboard()
+          .url("𝕏 Share to Twitter", card.twitterUrl)
+          .url("📨 Tell a friend", card.telegramShareUrl);
+      } catch { /* non-critical */ }
+
       await ctx.editMessageText(
         [
           "✅ *Loan funded*",
@@ -450,9 +475,9 @@ export function registerBorrowCallbacks(bot) {
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
           "",
-          "Use /positions to check status.",
+          "/positions to check status · /share to flex on the timeline",
         ].join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true },
+        { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: shareKb },
       );
     } catch (err) {
       console.error("Borrow failed:", err);

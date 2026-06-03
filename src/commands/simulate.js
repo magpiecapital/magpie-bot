@@ -88,5 +88,39 @@ export async function handleSimulate(ctx) {
   }
   lines.push("_Liq. price = collateral price at which health hits 1.1x_");
 
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  // ── "Cheaper than selling" wedge ──
+  // Re-frame the user's mental model: their real alternative isn't another
+  // loan, it's SELLING. Show the cost comparison.
+  // Estimated memecoin sell slippage: assume 2% as a conservative midpoint.
+  // (Long-tail tokens often 5%+, larger ones <1%; 2% is fair averaged.)
+  const ESTIMATED_SELL_SLIPPAGE_PCT = 2.0;
+  // Hardest tier (Standard 20% LTV / 1.5% fee) for the comparison
+  const standardTier = TIERS["3"];
+  const standardGross = collateralValueSol * (standardTier.ltv / 100);
+  const standardFee = standardGross * (standardTier.feeBps / 10_000);
+  const sellSlippageCost = collateralValueSol * (ESTIMATED_SELL_SLIPPAGE_PCT / 100);
+  // Side-by-side: "if you sold" vs "if you Magpie"
+  lines.push(
+    "",
+    "*Why borrow instead of sell?*",
+    `If you sold ${amount.toLocaleString()} $${token.symbol} now:`,
+    `  • ~${ESTIMATED_SELL_SLIPPAGE_PCT}% slippage = *${sellSlippageCost.toFixed(4)} SOL gone*`,
+    `  • Capital gains taxable event (jurisdiction-dependent)`,
+    `  • You no longer hold the bag — miss any upside`,
+    "",
+    `If you borrow on Standard tier (${standardTier.ltv}% LTV):`,
+    `  • Fee: *${standardFee.toFixed(4)} SOL* (${(standardTier.feeBps / 100).toFixed(2)}%)`,
+    `  • You keep the full ${amount.toLocaleString()} $${token.symbol} bag`,
+    `  • No taxable event`,
+    "",
+    `_Borrowing costs *${standardFee.toFixed(4)} SOL* vs selling's ${sellSlippageCost.toFixed(4)} SOL slippage alone (before tax). Keep your bag, take liquidity._`,
+  );
+
+  const { InlineKeyboard } = await import("grammy");
+  const kb = new InlineKeyboard().text("💰 Borrow now", "start:borrow");
+
+  await ctx.reply(lines.join("\n"), {
+    parse_mode: "Markdown",
+    reply_markup: kb,
+  });
 }
