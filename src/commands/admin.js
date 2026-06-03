@@ -111,6 +111,39 @@ export async function handleDisableMint(ctx) {
 }
 
 /**
+ * Manually trigger the loan reconciler. Returns drift-fix count.
+ * Useful when a user reports stale data and you want to force a sweep
+ * without waiting for the next 5-min tick.
+ *
+ * Usage: /reconcile
+ */
+export async function handleReconcile(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  await ctx.reply("⏳ Running loan reconciliation sweep...");
+  try {
+    const { runLoanReconciliation, getReconcilerHeartbeat } = await import(
+      "../services/loan-reconciler.js"
+    );
+    const result = await runLoanReconciliation();
+    const hb = getReconcilerHeartbeat();
+    await ctx.reply(
+      [
+        "✅ *Reconciliation complete*",
+        "",
+        `Loans checked: ${result.checked}`,
+        `Drift fixes applied: ${result.fixed}`,
+        result.error ? `\nError: \`${result.error}\`` : "",
+        "",
+        `Last automatic run: ${hb.lastRunAt ? new Date(hb.lastRunAt).toISOString() : "never"}`,
+      ].filter(Boolean).join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Reconcile failed: ${err.message?.slice(0, 200)}`);
+  }
+}
+
+/**
  * Deposit SOL from the lender wallet directly into the lending pool.
  * Increases pool TVL → enables more loans. Lender wallet retains
  * whatever's left for ops + payouts.

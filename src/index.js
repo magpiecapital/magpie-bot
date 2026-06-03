@@ -39,6 +39,7 @@ import {
   handleDisableMint,
   handleBroadcast,
   handleFundPool,
+  handleReconcile,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -55,6 +56,7 @@ import { startPriceAttestor } from "./services/price-attestor.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
+import { startLoanReconciler } from "./services/loan-reconciler.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -110,6 +112,7 @@ bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
 bot.command("fundpool", handleFundPool);
+bot.command("reconcile", handleReconcile);
 
 // Inline callback registration.
 //
@@ -207,6 +210,9 @@ bot.start({
     setTimeout(() => startHolderDistributor(), 90_000);
     // LP Loyalty distributor — rewards long-term LPs from 2% of fees
     setTimeout(() => startLpLoyaltyDistributor(), 120_000);
+    // Loan reconciler — proactively syncs DB state with on-chain truth
+    // every 5 min. Catches partial-repay/extend/liquidation drift.
+    setTimeout(() => startLoanReconciler(), 45_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
