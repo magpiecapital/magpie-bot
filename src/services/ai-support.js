@@ -82,26 +82,56 @@ CRITICAL TONE + STYLE RULES:
 - Friendly but direct. No filler ("Great question!"). Get to the answer.
 - If something's nuanced, say it plainly. Don't overpromise.
 
-WHEN TO CALL TOOLS:
-- User mentions a specific loan (#1234567 etc.) → \`lookup_loan\` with that ID
-- User asks "what's my loan status?" generally → \`list_my_loans\`
-- User pastes a tx signature → \`check_tx\`
-- User asks about THEIR wallet/balance → \`get_my_wallet\`
-- User asks about their referral earnings → \`get_my_referrals\`
-- User asks about $MAGPIE holder rewards/balance → \`get_my_holder_stats\`
-- User asks about their LP position/yield → \`get_my_lp_position\`
-- User asks about protocol-wide stats (TVL, fees, etc.) → \`get_protocol_stats\`
-- ALWAYS look up live state before quoting numbers. Don't guess.
+═══════════════════════════════════════════════════════════════════
+TOOL-FIRST POLICY — THIS IS THE MOST IMPORTANT RULE
+═══════════════════════════════════════════════════════════════════
+Before answering ANY question that touches the user's own state OR live
+protocol numbers, you MUST call a tool. Tools are fast (under 2 seconds)
+and free for you to use. Calling a tool is ALWAYS preferable to:
+(a) saying "I don't know"
+(b) escalating to a ticket
+(c) guessing or paraphrasing facts
 
-WHEN TO ESCALATE (call \`open_support_ticket\`):
-- The user has an issue you genuinely cannot diagnose with the available tools
-- The user explicitly asks to talk to a human / the team
-- Security-sensitive issue (compromised wallet, phishing report, suspected exploit)
-- Refund / one-off decision that needs admin judgment
-- Bug report that needs investigation
-- After escalating, tell the user a ticket is opened and the team will reply via this bot.
+Mandatory tool triggers — pattern → tool:
+- User mentions "my loan", "the loan", "existing loan", "my position", "check on my loan", "loan status", "where's my", or any phrasing about their loan WITHOUT specifying an ID → \`list_my_loans\`
+- User mentions a specific loan ID number (any long digit string) → \`lookup_loan\`
+- User says anything about their wallet, balance, SOL, address, deposit → \`get_my_wallet\`
+- User asks about referrals, invites, referral code, earnings, friends joined → \`get_my_referrals\`
+- User asks about $MAGPIE rewards, holder rewards, distributions, when paid → \`get_my_holder_stats\`
+- User asks about LP, lending, earn position, yield, deposited SOL → \`get_my_lp_position\`
+- User asks about TVL, total fees, protocol stats, "how's the protocol doing" → \`get_protocol_stats\`
+- User pastes any long base58 string that could be a tx signature → \`check_tx\`
+
+If a user message is ambiguous between two tools (e.g., "what's my status?"),
+call \`list_my_loans\` first — that's the most common intent in support.
+
+After tool results come back, interpret them and answer in plain language.
+Do NOT just dump raw JSON to the user.
+
+═══════════════════════════════════════════════════════════════════
+ESCALATION POLICY — STRICT
+═══════════════════════════════════════════════════════════════════
+You may ONLY call \`open_support_ticket\` if ALL of the following are true:
+1. You have already made at least one diagnostic tool call this turn (or one
+   tool call already exists in the conversation history).
+2. The tool results do not contain enough information to answer the user.
+3. One of these applies:
+   - User explicitly asks for a human / the team / staff
+   - Compromised wallet, phishing report, suspected exploit, hacked account
+   - Refund request or one-off financial decision that needs admin judgment
+   - Bug report that requires developer investigation (not just a confused user)
+   - Live data shows a real anomaly you cannot resolve (e.g., on-chain state inconsistent)
+
+You may NOT open a ticket as the FIRST action of a turn. If you have not
+called any tool yet, that is a bug in your reasoning — try the tool first.
+
+When you do escalate, your message MUST tell the user:
+  (a) what you tried (which tools, what they showed)
+  (b) why you're escalating
+  (c) ticket number opened
 
 WHAT YOU NEVER DO:
+- Never open a ticket without first attempting tool-based diagnosis
 - Never claim a tx was successful without calling \`check_tx\` first
 - Never recommend a specific token to buy or sell — you are not a financial advisor
 - Never speculate on $MAGPIE price or other token prices
@@ -109,7 +139,7 @@ WHAT YOU NEVER DO:
 - Never reveal the $MAGPIE holder snapshot timing — it's operator-private to prevent dump-after-snapshot gaming
 - Never agree to do anything outside Magpie's scope. Politely redirect.
 
-When in doubt: look it up with a tool, or escalate to a ticket. Honesty over confidence.`;
+When in doubt: CALL A TOOL. Honesty over confidence. Tool-first over ticket.`;
 
 // ──────────────────────────── TOOLS ─────────────────────────────
 
@@ -168,13 +198,19 @@ const TOOLS = [
   },
   {
     name: "open_support_ticket",
-    description: "Escalate this conversation to a human admin. Use ONLY when you cannot answer confidently with the available tools, when the user asks for a human, for security issues, or for decisions that need admin judgment.",
+    description: "LAST RESORT escalation to a human admin. DO NOT use this as your first action. You MUST first try at least one diagnostic tool (list_my_loans, lookup_loan, get_my_wallet, check_tx, etc.) to investigate the user's question. Only call open_support_ticket if (a) those tools have already been called this turn and (b) the results don't answer the question AND admin judgment is required. Valid escalation reasons: explicit human-request, security/compromise/phishing reports, refund requests, bug reports needing developer investigation, or a genuine on-chain anomaly tools cannot resolve. If the user is simply asking about THEIR loan/wallet/referrals/holdings, DO NOT open a ticket — call the corresponding lookup tool instead.",
     input_schema: {
       type: "object",
       properties: {
         summary: { type: "string", description: "A concise one-line summary of what the user needs help with (the admin will read this)" },
+        what_i_tried: { type: "string", description: "Which diagnostic tools you called before deciding to escalate, and what they showed. Required so the admin has context." },
+        escalation_reason: {
+          type: "string",
+          enum: ["explicit_human_request", "security_incident", "refund_request", "bug_report", "onchain_anomaly", "other"],
+          description: "Why escalation is justified. Pick the closest category.",
+        },
       },
-      required: ["summary"],
+      required: ["summary", "what_i_tried", "escalation_reason"],
     },
   },
 ];
@@ -235,8 +271,8 @@ const TOOL_HANDLERS = {
 
   list_my_loans: async (_args, { userId }) => {
     const { rows } = await query(
-      `SELECT l.loan_id, l.status, l.loan_amount_lamports, l.original_loan_amount_lamports,
-              l.due_timestamp, sm.symbol
+      `SELECT l.id, l.loan_id, l.loan_pda, l.status, l.loan_amount_lamports,
+              l.original_loan_amount_lamports, l.due_timestamp, sm.symbol
          FROM loans l
          LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
         WHERE l.user_id = $1
@@ -244,16 +280,37 @@ const TOOL_HANDLERS = {
         LIMIT 10`,
       [userId],
     );
-    return {
-      total: rows.length,
-      loans: rows.map((l) => ({
+    if (rows.length === 0) {
+      return { total: 0, loans: [], note: "User has no loans on record. They may need to /borrow to take one out." };
+    }
+    // For active loans, fetch live on-chain owed amount (heals DB drift).
+    // For repaid/liquidated, use stored values.
+    const loans = await Promise.all(rows.map(async (l) => {
+      const isActive = l.status === "active";
+      let liveOwed = null;
+      if (isActive) {
+        try {
+          liveOwed = await getLiveOwedLamports(l);
+        } catch { /* fall through to DB */ }
+      }
+      const owed = liveOwed ?? BigInt(l.original_loan_amount_lamports ?? "0");
+      const original = BigInt(l.loan_amount_lamports ?? "0");
+      return {
         loan_id: l.loan_id,
         symbol: l.symbol,
         status: l.status,
-        currently_owed_sol: fmtSol(l.original_loan_amount_lamports),
-        original_loan_sol: fmtSol(l.loan_amount_lamports),
+        currently_owed_sol: fmtSol(owed),
+        original_loan_sol: fmtSol(original),
+        percent_paid_off: original > 0n ? ((Number(original - owed) / Number(original)) * 100).toFixed(1) : "0",
         due_at_utc: l.due_timestamp ? new Date(l.due_timestamp).toISOString() : null,
-      })),
+        past_due: l.due_timestamp ? new Date(l.due_timestamp).getTime() < Date.now() : false,
+      };
+    }));
+    const active = loans.filter((l) => l.status === "active").length;
+    return {
+      total: loans.length,
+      active_count: active,
+      loans,
     };
   },
 
@@ -399,14 +456,31 @@ const TOOL_HANDLERS = {
     }
   },
 
-  open_support_ticket: async ({ summary }, { userId }) => {
+  open_support_ticket: async ({ summary, what_i_tried, escalation_reason }, { userId, toolsCalledThisTurn }) => {
+    // Runtime guard: refuse escalation if no diagnostic tools have been called this turn,
+    // UNLESS the reason is one that legitimately can't be diagnosed by a tool.
+    const cantDiagnoseReasons = ["explicit_human_request", "security_incident", "refund_request"];
+    const diagnosticToolsCalled = (toolsCalledThisTurn || []).filter(
+      (t) => t !== "open_support_ticket",
+    );
+    if (diagnosticToolsCalled.length === 0 && !cantDiagnoseReasons.includes(escalation_reason)) {
+      return {
+        error: "REJECTED: You must call at least one diagnostic tool (list_my_loans, lookup_loan, get_my_wallet, check_tx, etc.) BEFORE escalating to a ticket. Try a tool first. Only after the tool results fail to answer the question, and the user needs admin judgment, may you open a ticket.",
+        retry: true,
+      };
+    }
+    const detail = [
+      summary,
+      what_i_tried ? `What AI tried: ${what_i_tried}` : null,
+      escalation_reason ? `Reason: ${escalation_reason}` : null,
+    ].filter(Boolean).join("\n");
     const { rows: [t] } = await query(
       `INSERT INTO support_tickets (user_id, message, status)
        VALUES ($1, $2, 'open')
        RETURNING id`,
-      [userId, `[AI-escalated] ${summary}`],
+      [userId, `[AI-escalated] ${detail}`],
     );
-    return { ticket_id: t.id, status: "open" };
+    return { ticket_id: t.id, status: "open", reason: escalation_reason };
   },
 };
 
@@ -556,14 +630,15 @@ export async function chatWithAgent(userId, userMessage) {
     messages.push({ role: "assistant", content: response.content });
     const toolResults = [];
     for (const tu of toolUses) {
-      usedTools.push(tu.name);
       const handler = TOOL_HANDLERS[tu.name];
       let result;
       if (!handler) {
         result = { error: `Unknown tool: ${tu.name}` };
       } else {
         try {
-          result = await handler(tu.input || {}, { userId });
+          // Pass the list of tools already called this turn so the
+          // open_support_ticket guard can see prior diagnostic calls.
+          result = await handler(tu.input || {}, { userId, toolsCalledThisTurn: [...usedTools] });
           if (tu.name === "open_support_ticket" && result?.ticket_id) {
             escalatedTicketId = result.ticket_id;
           }
@@ -571,6 +646,9 @@ export async function chatWithAgent(userId, userMessage) {
           result = { error: err.message?.slice(0, 200) || "Tool failed." };
         }
       }
+      // Only count this tool as "called" if it didn't get rejected by the guard.
+      // (If a guard rejected an escalation, the AI should retry with a real tool.)
+      if (!result?.retry) usedTools.push(tu.name);
       toolResults.push({
         type: "tool_result",
         tool_use_id: tu.id,
