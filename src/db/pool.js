@@ -240,6 +240,22 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS lp_loyalty_rewards_wallet_idx
        ON lp_loyalty_rewards(wallet_address, status)`,
+
+    // ─────── SUPPORT TICKETS ───────
+    // Free-form user messages routed to admin. Bot answers most issues
+    // deterministically inline (/support → loan/tx diagnostic); this
+    // table only stores the messages that need a human reply.
+    `CREATE TABLE IF NOT EXISTS support_tickets (
+       id BIGSERIAL PRIMARY KEY,
+       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       message TEXT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'open',
+       admin_reply TEXT,
+       admin_replied_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS support_tickets_status_idx
+       ON support_tickets(status, created_at DESC)`,
   ];
   for (const sql of patches) {
     try {

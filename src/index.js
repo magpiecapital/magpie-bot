@@ -26,6 +26,7 @@ import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
+import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -40,6 +41,8 @@ import {
   handleBroadcast,
   handleFundPool,
   handleReconcile,
+  handleReply,
+  handleTickets,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -97,6 +100,9 @@ bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
 bot.command("magpie", handleMagpie);
 bot.command("token", handleMagpie); // alias — users might guess this
+bot.command("support", handleSupport);
+bot.command("help_request", handleSupport); // alias — common term users guess
+bot.command("ticket", handleSupport); // alias
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
@@ -113,15 +119,19 @@ bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
 bot.command("fundpool", handleFundPool);
 bot.command("reconcile", handleReconcile);
+bot.command("reply", handleReply);
+bot.command("tickets", handleTickets);
 
 // Inline callback registration.
 //
-// CRITICAL ORDER: import is registered FIRST because its message:text
-// middleware needs priority over /borrow and /withdraw — both of which
-// also intercept text messages. Without this, a user who abandoned a
-// prior /withdraw or /borrow session and then runs /import has their
-// pasted private key hijacked by the leftover state.
+// CRITICAL ORDER: import and support are registered FIRST because
+// their message:text middleware needs priority over /borrow and
+// /withdraw — both of which also intercept text messages. Without
+// this, a user who abandoned a prior /withdraw or /borrow session
+// and then runs /import or /support has their next message hijacked
+// by leftover state.
 registerImportCallbacks(bot);
+registerSupportCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -166,6 +176,7 @@ async function registerBotCommands() {
       { command: "holders", description: "💎 $MAGPIE holder rewards" },
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },
+      { command: "support", description: "🛟 Self-serve help / message the team" },
       { command: "help", description: "ℹ️ Full command list" },
     ]);
     await bot.api.setChatMenuButton({

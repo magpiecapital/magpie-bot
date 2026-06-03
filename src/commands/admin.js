@@ -111,6 +111,87 @@ export async function handleDisableMint(ctx) {
 }
 
 /**
+ * Reply to a user's support ticket. Forwards your message via the bot
+ * and marks the ticket responded.
+ *
+ * Usage: /reply <ticket#> <your message>
+ */
+export async function handleReply(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const text = ctx.message.text || "";
+  const match = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)$/);
+  if (!match) {
+    return ctx.reply("Usage: `/reply <ticket#> <message>`", { parse_mode: "Markdown" });
+  }
+  const [, ticketIdStr, reply] = match;
+  const ticketId = Number(ticketIdStr);
+
+  const { rows } = await query(
+    `SELECT s.*, u.telegram_id
+       FROM support_tickets s
+       JOIN users u ON u.id = s.user_id
+      WHERE s.id = $1`,
+    [ticketId],
+  );
+  if (!rows[0]) {
+    return ctx.reply(`Ticket #${ticketId} not found.`);
+  }
+  const ticket = rows[0];
+
+  try {
+    await ctx.api.sendMessage(
+      ticket.telegram_id,
+      `📩 *Magpie support · Ticket #${ticketId}*\n\n${reply}`,
+      { parse_mode: "Markdown" },
+    );
+  } catch (err) {
+    return ctx.reply(`Failed to DM user: ${err.message?.slice(0, 100)}`);
+  }
+
+  await query(
+    `UPDATE support_tickets
+        SET status = 'responded', admin_reply = $2, admin_replied_at = NOW()
+      WHERE id = $1`,
+    [ticketId, reply],
+  );
+
+  await ctx.reply(`✅ Reply sent. Ticket #${ticketId} marked responded.`);
+}
+
+/**
+ * List open support tickets. Quick admin overview.
+ *
+ * Usage: /tickets
+ */
+export async function handleTickets(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const { rows } = await query(
+    `SELECT s.id, s.message, s.created_at, u.telegram_id, u.telegram_username
+       FROM support_tickets s
+       JOIN users u ON u.id = s.user_id
+      WHERE s.status = 'open'
+      ORDER BY s.created_at DESC
+      LIMIT 20`,
+  );
+  if (rows.length === 0) {
+    return ctx.reply("📭 No open tickets.");
+  }
+  const lines = [`🎫 *Open tickets (${rows.length})*`, ""];
+  for (const t of rows) {
+    const ago = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60_000);
+    const from = t.telegram_username ? `@${t.telegram_username}` : `tg://${t.telegram_id}`;
+    const msg = (t.message || "").slice(0, 200);
+    lines.push(
+      `*#${t.id}* · ${from} · ${ago}m ago`,
+      msg,
+      `Reply: \`/reply ${t.id} <message>\``,
+      "",
+    );
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
+/**
  * Manually trigger the loan reconciler. Returns drift-fix count.
  * Useful when a user reports stale data and you want to force a sweep
  * without waiting for the next 5-min tick.
