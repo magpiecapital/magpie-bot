@@ -12,6 +12,7 @@ import { checkLoanLimits } from "../services/loan-limits.js";
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { query } from "../db/pool.js";
+import { translateTxError } from "../services/tx-error-translator.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, feeBps: 300, label: "Express" },
@@ -192,9 +193,8 @@ export function registerReborrowCallbacks(bot) {
       );
     } catch (err) {
       console.error("Reborrow failed:", err);
-      await ctx.editMessageText(
-        `❌ Re-borrow failed: ${err.message || "unknown error"}\n\nTry /borrow instead.`,
-      );
+      const friendly = translateTxError(err, { flow: "reborrow" });
+      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
     }
   });
 }

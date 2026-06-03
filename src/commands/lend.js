@@ -58,7 +58,22 @@ export async function handleLend(ctx) {
     }
   } catch (err) {
     console.error("[lend] Error:", err);
-    return ctx.reply(`Error: ${err.message}`);
+    // Try the tx translator first (handles common Solana patterns).
+    // Falls back to a generic clean message.
+    try {
+      const { translateTxError } = await import("../services/tx-error-translator.js");
+      const friendly = translateTxError(err, { flow: "lend" });
+      return ctx.reply(friendly, { parse_mode: "Markdown" });
+    } catch {
+      return ctx.reply(
+        [
+          "⚠️ *Lending command failed*",
+          "",
+          "Something went wrong. Try the command again, or /support → Chat with agent.",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    }
   }
 }
 

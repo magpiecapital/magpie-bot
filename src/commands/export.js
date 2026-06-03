@@ -46,7 +46,16 @@ export function registerExportCallbacks(bot) {
       }, 60_000);
     } catch (err) {
       console.error("Export failed:", err);
-      await ctx.editMessageText(`❌ Export failed: ${err.message}`);
+      await ctx.editMessageText(
+        [
+          "⚠️ *Export failed*",
+          "",
+          "Couldn't decrypt your wallet key right now. This is rare — usually a transient DB hiccup.",
+          "",
+          "Try /export again in a moment. If it keeps failing, /support → Chat with agent.",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
     }
   });
 }

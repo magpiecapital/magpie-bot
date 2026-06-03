@@ -45,6 +45,16 @@ export async function handlePrice(ctx) {
 
     await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
   } catch (err) {
-    await ctx.reply(`❌ Could not fetch price: ${err.message}`);
+    console.warn("[price] fetch failed:", err.message);
+    await ctx.reply(
+      [
+        "⚠️ *Price feed briefly unavailable*",
+        "",
+        "Couldn't get a fresh price right now. Usually clears in 15-30 seconds.",
+        "",
+        "Try /price again in a moment.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
 }

@@ -8,6 +8,7 @@ import { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } from "../ser
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
+import { translateTxError } from "../services/tx-error-translator.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
@@ -455,9 +456,8 @@ export function registerBorrowCallbacks(bot) {
       );
     } catch (err) {
       console.error("Borrow failed:", err);
-      await ctx.editMessageText(
-        `❌ Loan failed: ${err.message || "unknown error"}\n\nTry again with /borrow.`,
-      );
+      const friendly = translateTxError(err, { flow: "borrow" });
+      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
     }
   });
 }

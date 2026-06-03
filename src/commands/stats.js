@@ -32,8 +32,12 @@ export async function handleStats(ctx) {
       `Program: \`${PROGRAM_ID.toBase58()}\``,
       "",
       "*On-chain:*",
+      `• Total deposits:    ${(pool.totalDeposits.toNumber() / 1e9).toFixed(4)} SOL`,
+      `• Total borrowed:    ${(pool.totalBorrowed.toNumber() / 1e9).toFixed(4)} SOL`,
+      `• Total shares:      ${pool.totalShares.toString()}`,
       `• Loans issued:      ${pool.totalLoansIssued.toString()}`,
       `• Liquidations:      ${pool.totalLiquidations.toString()}`,
+      `• Fees earned:       ${(pool.totalFeesEarned.toNumber() / 1e9).toFixed(4)} SOL`,
       vault ? `• Vault balance:     ${vault.value.uiAmount} wSOL` : "• Vault balance:     unknown",
       "",
       "*Active book:*",
@@ -46,6 +50,15 @@ export async function handleStats(ctx) {
     await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
   } catch (err) {
     console.error("stats failed:", err);
-    await ctx.reply(`❌ Could not fetch stats: ${err.message}`);
+    await ctx.reply(
+      [
+        "⚠️ *Stats briefly unavailable*",
+        "",
+        "Couldn't fetch live protocol stats right now. Usually clears within a minute.",
+        "",
+        "Try /stats again, or check magpie.capital/dashboard directly.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
 }

@@ -46,7 +46,17 @@ export async function handleSimulate(ctx) {
   try {
     priceSol = await getPriceInSol(token.mint);
   } catch (err) {
-    return ctx.reply(`❌ Could not fetch price: ${err.message}`);
+    console.warn("[simulate] price fetch failed:", err.message);
+    return ctx.reply(
+      [
+        "⚠️ *Price feed briefly unavailable*",
+        "",
+        `Couldn't get a fresh ${token.symbol} price right now. Usually clears in 15-30 seconds.`,
+        "",
+        "Try /simulate again, or check /price for a quick read.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
 
   const collateralValueSol = amount * priceSol;

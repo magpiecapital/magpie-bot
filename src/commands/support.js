@@ -190,7 +190,17 @@ async function diagnoseTx(ctx, sig) {
     const res = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
     status = res?.value?.[0];
   } catch (err) {
-    return ctx.reply(`Couldn't reach Solana RPC right now: ${err.message?.slice(0, 100)}`);
+    console.warn("[support] tx-check RPC failed:", err.message);
+    return ctx.reply(
+      [
+        "⚠️ *Solana RPC briefly unavailable*",
+        "",
+        "Couldn't reach the chain to check that tx. Usually clears in 15-30 seconds.",
+        "",
+        "Try again, or paste the sig into solscan.io for a manual look.",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
 
   const lines = [

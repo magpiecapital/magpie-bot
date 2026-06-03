@@ -84,15 +84,39 @@ export function translateTxError(err, ctx = {}) {
       ].filter(Boolean);
       return lines.join("\n");
     }
-    if (flow === "borrow") {
+    if (flow === "borrow" || flow === "reborrow") {
+      const cmd = flow === "reborrow" ? "/reborrow" : "/borrow";
       return [
         "⚠️ *Not enough SOL for gas + ATA rent*",
         "",
-        "Borrows need ~0.01 SOL in your wallet for transaction fees and ATA rent — even though the loan itself is paid TO you.",
+        `Borrows need ~0.01 SOL in your wallet for transaction fees and ATA rent — even though the loan itself is paid TO you.`,
         "",
         have != null ? `Your wallet has: \`${fmtSol(have)} SOL\`` : null,
         "",
-        "Send ~0.01 SOL to your Magpie wallet via /deposit, then /borrow again.",
+        `Send ~0.01 SOL to your Magpie wallet via /deposit, then ${cmd} again.`,
+      ].filter(Boolean).join("\n");
+    }
+    if (flow === "topup") {
+      return [
+        "⚠️ *Not enough SOL for tx fees*",
+        "",
+        "Top-ups are free besides Solana network fees (~0.001 SOL).",
+        "",
+        have != null ? `Your wallet has: \`${fmtSol(have)} SOL\`` : null,
+        "",
+        "Send a bit of SOL via /deposit, then /topup again.",
+      ].filter(Boolean).join("\n");
+    }
+    if (flow === "withdraw") {
+      return [
+        "⚠️ *Not enough SOL to send that out*",
+        "",
+        "You're trying to withdraw more than the wallet holds (after fees).",
+        "",
+        have != null ? `Your wallet has: \`${fmtSol(have)} SOL\`` : null,
+        need != null ? `Tried to send: \`${fmtSol(need)} SOL\`` : null,
+        "",
+        "Try a smaller amount, or leave ~0.001 SOL behind for fees.",
       ].filter(Boolean).join("\n");
     }
     // Generic insufficient-lamports message
