@@ -122,6 +122,33 @@ const CASES = [
     expectInText: ["3 SOL", "5 SOL"],
   },
   {
+    name: "AI knows what /partialrepay does",
+    prompt: "What does /partialrepay do?",
+    forbiddenTools: ["open_support_ticket"],
+    expectInText: ["part"], // mentions "part" of a loan
+  },
+  {
+    name: "AI knows the /lend vs LP-pool distinction",
+    prompt: "What's the difference between /lend and earning on magpie.capital/earn?",
+    forbiddenTools: ["open_support_ticket"],
+    // Should mention that /lend is P2P pools and earn is the main LP
+    expectInText: ["P2P"],
+  },
+  {
+    name: "AI handles 'I deposited but don't see it'",
+    prompt: "I sent SOL to my wallet but I don't see it yet, what's wrong?",
+    // The right move is to ask for tx sig OR check wallet — both fine
+    expectAnyTool: ["get_my_wallet", "check_tx"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "AI handles 'why need 0.01 SOL extra' question",
+    prompt: "Why do I need extra SOL beyond what I want to borrow against?",
+    forbiddenTools: ["open_support_ticket"],
+    // Should explain gas/ATA rent
+    expectInText: ["fee"], // either "tx fees" or "transaction fees" or "rent fee"
+  },
+  {
     name: "Vague help asks for clarification, no premature escalation",
     prompt: "help",
     expectTools: [],
