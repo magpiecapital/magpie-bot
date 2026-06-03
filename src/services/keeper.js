@@ -114,6 +114,7 @@ async function liquidateLoan(program, keeper, loan, pool) {
       tokenProgram: collateralTokenProgram,
     })
     .preInstructions([
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     ])
     .rpc({ commitment: "confirmed" });

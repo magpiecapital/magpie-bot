@@ -122,6 +122,7 @@ export async function executeBorrow({
   // fee_wallet_token_account constraint. Borrower pays the rent (~0.002 SOL,
   // one-time) — fee ATA persists thereafter as long as it holds wSOL.
   const preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -231,6 +232,7 @@ export async function executeRepay({ userId, loanDbRow }) {
   //   2. Wrap SOL → wSOL in borrower's loan-token ATA so they can pay back
   //      the principal: create ATA, fund it, sync_native.
   const preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -436,7 +438,10 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
       borrower: borrower.publicKey,
       tokenProgram: collateralTokenProgram,
     })
-    .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })])
+    .preInstructions([
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+    ])
     .rpc({ commitment: "confirmed" });
 
   return { signature: sig };
@@ -464,6 +469,7 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
   );
 
   const preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -542,6 +548,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   const feeLamports = (BigInt(loanDbRow.original_loan_amount_lamports) * feeBps) / 10_000n;
 
   const preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,

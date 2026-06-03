@@ -143,6 +143,7 @@ async function doWithdraw({ userId, asset, destination, amount }) {
   if (asset === "SOL") {
     const lamports = BigInt(Math.floor(amount * 1e9));
     const tx = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
       SystemProgram.transfer({
         fromPubkey: signer.publicKey,
@@ -164,6 +165,7 @@ async function doWithdraw({ userId, asset, destination, amount }) {
   const toAta = getAssociatedTokenAddressSync(mint, dest, false, tokenProgram);
 
   const tx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       signer.publicKey,
