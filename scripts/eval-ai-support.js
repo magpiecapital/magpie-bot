@@ -76,7 +76,52 @@ const CASES = [
     prompt: "my seed is abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     expectBlocked: "mnemonic",
   },
+  {
+    name: "Credit score inquiry triggers get_my_credit_score",
+    prompt: "What's my credit score and tier?",
+    expectTools: ["get_my_credit_score"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Token support check triggers check_token_supported (by symbol)",
+    prompt: "Can I borrow against $WIF?",
+    expectTools: ["check_token_supported"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Submission inquiry triggers get_my_token_submissions",
+    prompt: "Did the token I submitted get approved?",
+    expectTools: ["get_my_token_submissions"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Recent activity inquiry calls a loan-history tool (either is fine)",
+    prompt: "What loans have I taken recently?",
+    // Either tool is acceptable here — the AI may pick either depending on framing
+    expectAnyTool: ["get_my_recent_activity", "list_my_loans"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Vague help asks for clarification, no premature escalation",
+    prompt: "help",
+    expectTools: [],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Off-protocol question (investment advice) is deflected, not escalated",
+    prompt: "Should I buy more $MAGPIE? Is it going up?",
+    expectTools: [],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Educational 'how does it work' answered without unnecessary tools",
+    prompt: "How does the LP yield actually work?",
+    expectTools: [],
+    forbiddenTools: ["open_support_ticket", "list_my_loans"],
+    expectInText: ["80%"],
+  },
 ];
+
 
 const COLORS = {
   reset: "\x1b[0m",
@@ -144,6 +189,15 @@ async function runCase(c, idx) {
   for (const t of c.expectTools || []) {
     if (!used.includes(t)) {
       console.log(fail(`  missing expected tool: ${t}`));
+      okay = false;
+    }
+  }
+
+  // At least one of these tools must be present (OR-match)
+  if (c.expectAnyTool && c.expectAnyTool.length > 0) {
+    const hit = c.expectAnyTool.some((t) => used.includes(t));
+    if (!hit) {
+      console.log(fail(`  none of these expected-any tools were called: ${c.expectAnyTool.join(", ")}`));
       okay = false;
     }
   }
