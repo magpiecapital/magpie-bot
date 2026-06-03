@@ -38,6 +38,7 @@ import {
   handleEnableMint,
   handleDisableMint,
   handleBroadcast,
+  handleFundPool,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -107,6 +108,7 @@ bot.command("enablemint", handleEnableMint);
 bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
+bot.command("fundpool", handleFundPool);
 
 // Inline callback registration.
 //
