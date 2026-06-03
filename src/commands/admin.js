@@ -320,6 +320,91 @@ export async function handleClose(ctx) {
 }
 
 /**
+ * /closeall — bulk-close every currently-open ticket with a single
+ * canned message routing users to the AI agent. Useful when admin
+ * has been flooded with tickets and wants to clear the backlog by
+ * routing everyone to the now-capable AI.
+ *
+ * Usage:
+ *   /closeall                  — closes all open + awaiting_user tickets
+ *                                 with the default "try /support agent" reply
+ *   /closeall <custom message> — uses your custom message instead
+ *
+ * Each user gets a DM with the reply. Tickets marked closed in DB.
+ */
+export async function handleCloseAll(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const customMsg = (ctx.message?.text || "")
+    .replace(/^\/closeall(\s+|$)/, "")
+    .trim();
+  const reply = customMsg || [
+    "Thanks for your patience — we've upgraded our support agent and it should now be able to answer most questions instantly.",
+    "",
+    "Please run /support → *Chat with our agent* and re-ask. If anything still isn't resolved after that, your follow-up will reach me directly.",
+  ].join("\n");
+
+  // Confirm before nuking — bulk operations deserve a sanity check.
+  const argv = (ctx.message?.text || "").split(/\s+/);
+  if (argv[1] !== "--confirm" && !customMsg) {
+    const { rows: [c] } = await query(
+      `SELECT COUNT(*)::int AS n FROM support_tickets
+        WHERE status IN ('open', 'awaiting_user')`,
+    );
+    return ctx.reply(
+      [
+        `⚠️ This will close *${c.n}* open + awaiting tickets and DM each user the default "try the agent" message.`,
+        "",
+        "To proceed, run: `/closeall --confirm`",
+        "",
+        "Or pass your own message: `/closeall <your message>`",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  const { rows } = await query(
+    `SELECT s.id, u.telegram_id
+       FROM support_tickets s
+       JOIN users u ON u.id = s.user_id
+      WHERE s.status IN ('open', 'awaiting_user')`,
+  );
+
+  if (rows.length === 0) {
+    return ctx.reply("📭 No open tickets to close.");
+  }
+
+  await ctx.reply(`⏳ Closing ${rows.length} tickets and notifying users…`);
+
+  let ok = 0;
+  let fail = 0;
+  for (const r of rows) {
+    try {
+      await ctx.api.sendMessage(
+        Number(r.telegram_id),
+        `📩 *Ticket #${r.id}*\n\n${reply}`,
+        { parse_mode: "Markdown" },
+      );
+      ok++;
+    } catch {
+      fail++;
+    }
+    // Telegram rate limit ~30 msgs/sec — pace at 50ms
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  await query(
+    `UPDATE support_tickets
+        SET status = 'closed',
+            closed_at = NOW(),
+            admin_reply = $1,
+            admin_replied_at = NOW()
+      WHERE status IN ('open', 'awaiting_user')`,
+    [reply],
+  );
+
+  await ctx.reply(`✅ Closed ${rows.length} tickets. Notified ${ok}, ${fail} failed.`);
+}
+
+/**
  * Manually trigger the loan reconciler. Returns drift-fix count.
  * Useful when a user reports stale data and you want to force a sweep
  * without waiting for the next 5-min tick.

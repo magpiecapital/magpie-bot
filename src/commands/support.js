@@ -60,30 +60,47 @@ export async function handleSupport(ctx) {
 
   const aiOn = isAiSupportEnabled();
   const kb = new InlineKeyboard();
+
   if (aiOn) {
-    kb.text("💬 Chat with the agent", "support:chat").row();
+    // Primary path — the agent handles 95%+ of inquiries. Big, top.
+    kb.text("💬 Chat with our agent", "support:chat").row();
+    // Quick-action helpers (deterministic, don't ping admin)
+    kb.text("🔍 Diagnose a loan", "support:loan")
+      .text("💸 Check a transaction", "support:tx").row();
+    // Manual message path → ALSO routes through the AI agent first
+    // (handler routes to the same code path as chat). Re-labeled so
+    // users don't expect a human to materialize on the other end.
+    kb.text("📝 Send the team a message", "support:msg").row();
+    kb.text("✕ Cancel", "support:cancel");
+  } else {
+    // AI disabled fallback — old menu
+    kb.text("🔍 Diagnose a loan", "support:loan").row()
+      .text("💸 Check a transaction", "support:tx").row()
+      .text("🎫 Open a ticket", "support:msg").row()
+      .text("✕ Cancel", "support:cancel");
   }
-  kb.text("🔍 Diagnose a loan", "support:loan").row()
-    .text("💸 Check a transaction", "support:tx").row()
-    .text("🎫 Open a ticket (admin reply)", "support:msg").row()
-    .text("✕ Cancel", "support:cancel");
 
   const lines = ["🛟 *Magpie Support*", ""];
   if (aiOn) {
     lines.push(
-      "What's going on? Pick *Chat with the agent* for anything — I can look up your loans, check transactions, answer protocol questions, and escalate to the team if needed.",
+      "*Just describe what's going on.* Our agent can look up your loans, check transactions, walk you through any feature, and answer protocol questions in seconds.",
       "",
-      "Or jump straight to a specific tool below:",
+      "Tap *Chat with our agent* — that handles almost everything.",
+      "",
+      "_Quick tools:_",
+      "• *Diagnose a loan* — instant on-chain state for any active loan",
+      "• *Check a transaction* — paste a sig, get its status",
+      "• *Send the team a message* — for follow-up or anything the agent can't resolve",
     );
   } else {
     lines.push("What can I help with?");
+    lines.push(
+      "",
+      "• *Diagnose a loan* — pull the live state of any of your loans",
+      "• *Check a transaction* — paste a sig, I tell you if it confirmed",
+      "• *Open a ticket* — leave a message, team replies via this bot",
+    );
   }
-  lines.push(
-    "",
-    "• *Diagnose a loan* — pull the live state of any of your loans",
-    "• *Check a transaction* — paste a sig, I tell you if it confirmed",
-    "• *Open a ticket* — leave a message, team replies via this bot",
-  );
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
@@ -331,13 +348,19 @@ export function registerSupportCallbacks(bot) {
     clearBorrowPending(ctx.chat.id);
     clearWithdrawPending(ctx.chat.id);
     pending.set(ctx.chat.id, { stage: "await_message" });
+    // The await_message handler routes through the AI agent first
+    // (so admin doesn't get spammed for every "ticket"). Be upfront
+    // with the user about that — our agent answers most things
+    // instantly; truly hard cases get queued for the team.
     await ctx.editMessageText(
       [
-        "✍️ *Send a message to the Magpie team*",
+        "✍️ *Tell us what's going on*",
         "",
-        "Type your question or issue below. Include any context like loan #s, tx signatures, or wallet addresses so we can help fast.",
+        "Type your question or issue below. Our agent will look it up immediately — for most things you'll have an answer in seconds.",
         "",
-        "We'll reply via this bot.",
+        "Include loan #s, tx signatures, or wallet addresses if relevant.",
+        "",
+        "_Anything the agent can't resolve gets routed to the team — you'll get a DM back._",
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
@@ -502,39 +525,78 @@ export function registerSupportCallbacks(bot) {
     }
 
     if (state.stage === "await_message") {
-      const message = ctx.message.text.trim();
+      // PRIMARY PATH: route the user's message through the AI agent
+      // first. The agent handles 95%+ of inquiries directly. Only if
+      // the AI explicitly escalates (security_incident / bug_report)
+      // does a ticket DM admin — and that's handled inside the AI's
+      // own escalation gate.
+      //
+      // This means manual /support → "Message the team" no longer
+      // floods admin. Users get instant answers from the agent;
+      // genuine human-required cases queue silently in /tickets.
+      const userMsg = ctx.message.text.trim();
       const user = await upsertUser(ctx.from.id, ctx.from.username);
-      const { rows: [t] } = await query(
-        `INSERT INTO support_tickets (user_id, message, status)
-         VALUES ($1, $2, 'open')
-         RETURNING id`,
-        [user.id, message],
-      );
 
-      await ctx.reply(
-        `✅ Ticket *#${t.id}* opened. The team will reply via this bot — usually within a few hours.`,
-        { parse_mode: "Markdown" },
-      );
-
-      // DM admin with the ticket + a one-line reply hint
-      if (ADMIN_TG_ID) {
+      if (isAiSupportEnabled()) {
+        // Re-enter AI chat with this as the first message
+        pending.set(ctx.chat.id, { stage: "ai_chat", userId: user.id });
+        const thinking = await ctx.reply("💭 _Thinking…_", { parse_mode: "Markdown" });
         try {
-          const fromTag = ctx.from.username ? `@${ctx.from.username}` : `tg://${ctx.from.id}`;
-          await ctx.api.sendMessage(
-            ADMIN_TG_ID,
-            [
-              `🎫 *Support ticket #${t.id}*`,
-              "",
-              `From: ${fromTag}`,
-              "",
-              message,
-              "",
-              `Reply: \`/reply ${t.id} <your message>\``,
-            ].join("\n"),
-            { parse_mode: "Markdown" },
+          const result = await chatWithAgent(user.id, userMsg, {
+            username: ctx.from?.username,
+            languageCode: ctx.from?.language_code,
+          });
+          if (!result) {
+            // AI disabled (no API key) — fall back to silent ticket
+            await fileSilentTicket(ctx, user.id, userMsg);
+            return;
+          }
+          const kb = new InlineKeyboard()
+            .text("🔄 Reset", "support:chat:reset")
+            .text("✕ End", "support:chat:end")
+            .text("🎫 Ticket", "support:chat:ticket");
+          await ctx.api.editMessageText(
+            ctx.chat.id, thinking.message_id, result.text,
+            { parse_mode: "Markdown", reply_markup: kb, disable_web_page_preview: true },
+          ).catch(async () => {
+            await ctx.api.editMessageText(
+              ctx.chat.id, thinking.message_id, result.text,
+              { reply_markup: kb, disable_web_page_preview: true },
+            );
+          });
+        } catch (err) {
+          console.error("[support:msg→ai] error:", err);
+          await ctx.api.editMessageText(
+            ctx.chat.id, thinking.message_id,
+            "The agent hit a snag. I've logged your message for the team to review.",
           );
-        } catch { /* non-critical */ }
+          await fileSilentTicket(ctx, user.id, userMsg);
+        }
+      } else {
+        // No AI configured — file silent ticket (legacy fallback)
+        await fileSilentTicket(ctx, user.id, userMsg);
       }
     }
   });
+}
+
+// File a ticket silently — admin sees it via /tickets on their schedule,
+// no DM. Used as a fallback when the AI agent isn't available or fails.
+async function fileSilentTicket(ctx, userId, message) {
+  const { rows: [t] } = await query(
+    `INSERT INTO support_tickets (user_id, message, status)
+     VALUES ($1, $2, 'open')
+     RETURNING id`,
+    [userId, message],
+  );
+  await ctx.reply(
+    [
+      `✅ *Got it — logged as ticket #${t.id}*`,
+      "",
+      "I've made a note for the team to review. You don't need to do anything else — if we spot something to follow up on, we'll DM you back via this bot.",
+      "",
+      "_Check status any time with /mytickets._",
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
 }

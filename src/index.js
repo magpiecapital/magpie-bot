@@ -49,6 +49,7 @@ import {
   handleReply,
   handleTickets,
   handleClose,
+  handleCloseAll,
   handleAiStats,
   handleInfraHealth,
 } from "./commands/admin.js";
@@ -143,6 +144,7 @@ bot.command("reconcile", handleReconcile);
 bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
 bot.command("close", handleClose);
+bot.command("closeall", handleCloseAll);
 bot.command("aistats", handleAiStats);
 bot.command("infrahealth", handleInfraHealth);
 
