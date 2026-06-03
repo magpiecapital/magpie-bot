@@ -238,8 +238,10 @@ bot.start({
     setTimeout(() => startLoanReconciler(), 45_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
-    // Daily-ish AI conversation sample sent to admin for QA visibility
-    setTimeout(() => startAiConversationDigest(bot), 75_000);
+    // Daily AI conversation digest — disabled per admin preference.
+    // To re-enable, uncomment the next line. Admin can pull stats on
+    // their own schedule via /aistats instead.
+    // setTimeout(() => startAiConversationDigest(bot), 75_000);
     // Ticket aging — DMs admin about open tickets that cross 2h/8h/24h
     setTimeout(() => startTicketAgingWatcher(bot), 90_000);
     // Credit oracle publisher disabled: requires funded authority wallet.

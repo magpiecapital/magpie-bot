@@ -16,8 +16,11 @@ const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : 
 const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 60 * 60 * 1000; // 1h
 
 // Tier index → minimum age in minutes
+// Note: tier 1 (2h) intentionally removed. The AI handles most tickets
+// autonomously, so a 2h-old ticket is rarely actionable AND the admin
+// wants minimal pings. Only ping at 8h+ and 24h+ — by then the user has
+// followed up or genuinely needs attention.
 const TIERS = [
-  { idx: 1, mins: 2 * 60,  emoji: "🟡", label: "2h+ open" },
   { idx: 2, mins: 8 * 60,  emoji: "🟠", label: "8h+ open" },
   { idx: 3, mins: 24 * 60, emoji: "🔴", label: "24h+ open — getting embarrassing" },
 ];

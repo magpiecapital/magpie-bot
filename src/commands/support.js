@@ -427,14 +427,21 @@ export function registerSupportCallbacks(bot) {
         const kb = new InlineKeyboard()
           .text("✕ End chat", "support:chat:end")
           .text("🎫 Escalate to ticket", "support:chat:ticket");
-        // If the AI escalated to a ticket, DM admin with context
-        if (result.escalated_ticket_id && ADMIN_TG_ID) {
+        // Silent ticket policy: most AI escalations queue silently so admin
+        // isn't pinged. Only CRITICAL reasons DM admin immediately — actual
+        // security incidents and developer-action-required bugs. Everything
+        // else waits to be picked up via /tickets on admin's own schedule.
+        const CRITICAL_REASONS = new Set(["security_incident", "bug_report"]);
+        const shouldDmAdmin = result.escalated_ticket_id
+          && ADMIN_TG_ID
+          && CRITICAL_REASONS.has(result.escalated_reason);
+        if (shouldDmAdmin) {
           try {
             const fromTag = ctx.from.username ? `@${ctx.from.username}` : `tg://${ctx.from.id}`;
             await ctx.api.sendMessage(
               ADMIN_TG_ID,
               [
-                `🎫 *AI-escalated ticket #${result.escalated_ticket_id}*`,
+                `🚨 *Critical ticket #${result.escalated_ticket_id}* (${result.escalated_reason})`,
                 "",
                 `From: ${fromTag}`,
                 "",

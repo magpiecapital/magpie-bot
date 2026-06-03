@@ -160,17 +160,8 @@ export function registerMyTicketsCallbacks(bot) {
       return ctx.reply("Couldn't close — either it's not yours or it was already closed.");
     }
     await ctx.reply(`✅ Ticket #${ticketId} marked resolved. Thanks!`);
-    // DM admin that the user resolved it (so they don't keep wondering)
-    if (ADMIN_TG_ID) {
-      try {
-        const fromTag = ctx.from.username ? `@${ctx.from.username}` : `tg://${ctx.from.id}`;
-        await ctx.api.sendMessage(
-          ADMIN_TG_ID,
-          `✅ Ticket *#${ticketId}* marked resolved by ${fromTag}.`,
-          { parse_mode: "Markdown" },
-        );
-      } catch {}
-    }
+    // Silent — admin will see it as 'closed' next time they run /tickets.
+    // No DM to avoid notification noise on routine self-resolutions.
   });
 
   // Text middleware for the follow-up flow.
