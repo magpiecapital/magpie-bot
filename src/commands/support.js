@@ -351,11 +351,11 @@ export function registerSupportCallbacks(bot) {
       .text("🎫 Ticket", "support:chat:ticket");
     await ctx.editMessageText(
       [
-        "💬 *Magpie support agent · live*",
+        "👋 *Hey — what's up?*",
         "",
-        "I can look up your loans, check transactions, answer protocol questions, and route anything I can't handle to the team.",
+        "I'm the Magpie support agent. I can pull up your loans, check transactions, walk you through how things work, and loop in the team if something needs a human.",
         "",
-        "What's going on?",
+        "Just tell me what's going on in plain English.",
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
