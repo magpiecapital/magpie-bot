@@ -32,9 +32,105 @@ const MAX_TOOL_ITERATIONS = 6;
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 min idle = new session
 const RATE_LIMIT_PER_HOUR = 30;
 const MAX_HISTORY_TURNS = 12; // sliding window of last N user+assistant pairs
+const DAILY_SPEND_CAP_USD = Number(process.env.AI_DAILY_SPEND_USD) || 20;
+
+// Anthropic claude-sonnet-4-6 pricing (USD per million tokens).
+// Input/output base rates; cache-read tokens are 90% off vs base input.
+// Source: https://www.anthropic.com/pricing — update if pricing shifts.
+const PRICE_PER_M_INPUT = 3.00;
+const PRICE_PER_M_OUTPUT = 15.00;
+const PRICE_PER_M_CACHE_READ = 0.30;
+const PRICE_PER_M_CACHE_WRITE = 3.75;
 
 export function isAiSupportEnabled() {
   return !!API_KEY;
+}
+
+// ──────────────────────────── ADMIN ALERT BUFFER ─────────────────
+// Track recent failures so we can DM the admin when something's wrong.
+// In-memory ring buffer (resets on restart, which is fine — restart
+// is itself a noteworthy event).
+const recentFailures = []; // { ts, type, message }
+const FAIL_WINDOW_MS = 5 * 60 * 1000; // 5 min
+const FAIL_THRESHOLD = 3;
+const ADMIN_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+let lastAdminAlertAt = 0;
+
+function recordFailure(type, message) {
+  const now = Date.now();
+  recentFailures.push({ ts: now, type, message });
+  // Trim anything older than the window
+  while (recentFailures.length > 0 && now - recentFailures[0].ts > FAIL_WINDOW_MS) {
+    recentFailures.shift();
+  }
+  return recentFailures.length;
+}
+
+async function maybeAlertAdmin(bot) {
+  if (!bot) return;
+  const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
+  if (!ADMIN_TG_ID) return;
+  if (recentFailures.length < FAIL_THRESHOLD) return;
+  const now = Date.now();
+  if (now - lastAdminAlertAt < ADMIN_ALERT_COOLDOWN_MS) return;
+  lastAdminAlertAt = now;
+  const byType = recentFailures.reduce((acc, f) => {
+    acc[f.type] = (acc[f.type] || 0) + 1;
+    return acc;
+  }, {});
+  const summary = Object.entries(byType).map(([k, v]) => `${k}: ${v}`).join(", ");
+  const lastErr = recentFailures[recentFailures.length - 1]?.message || "(none)";
+  try {
+    await bot.api.sendMessage(
+      ADMIN_TG_ID,
+      [
+        "🚨 *AI support degraded*",
+        "",
+        `${recentFailures.length} failures in last 5 min.`,
+        `By type: ${summary}`,
+        "",
+        `Last error: \`${lastErr.slice(0, 200)}\``,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  } catch {}
+}
+
+// Bot reference is set by support.js so we can DM admin from here.
+let botRef = null;
+export function setBotRef(bot) { botRef = bot; }
+
+// ──────────────────────────── PII SCRUB ──────────────────────────
+// Defense-in-depth: prevent users who accidentally paste secrets from
+// having them sent to Anthropic. We refuse the request and warn.
+
+// Solana keypair JSON array: 64 numbers between brackets.
+const KEYPAIR_JSON_REGEX = /\[\s*\d{1,3}(?:\s*,\s*\d{1,3}){63}\s*\]/;
+// Solana private key in base58 (88 chars in the 1-9A-HJ-NP-Za-km-z alphabet,
+// long enough to be unlikely to occur naturally in user text).
+const BASE58_SECRET_REGEX = /\b[1-9A-HJ-NP-Za-km-z]{86,90}\b/;
+// Bip39 mnemonic: 12+ space-separated lowercase words. We don't validate
+// against the wordlist (would balloon module size); 12+ short lowercase
+// words is a high-confidence proxy for "user pasted a seed phrase".
+const MNEMONIC_REGEX = /\b(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8}\b/;
+
+function containsSecret(text) {
+  if (!text || typeof text !== "string") return null;
+  if (KEYPAIR_JSON_REGEX.test(text)) return "keypair_json";
+  if (BASE58_SECRET_REGEX.test(text)) {
+    // Disambiguate: it could be a tx signature (also base58, similar length).
+    // Tx signatures are 64-88 chars; private keys are 87-88 chars. To avoid
+    // false positives on tx signatures, only flag if it's also >= 87 chars
+    // AND not preceded by "tx" or "signature" context.
+    const m = text.match(BASE58_SECRET_REGEX);
+    if (m && m[0].length >= 87) {
+      const ctx = text.toLowerCase();
+      const looksLikeTx = /tx|signature|sig|solscan|hash/.test(ctx);
+      if (!looksLikeTx) return "base58_secret";
+    }
+  }
+  if (MNEMONIC_REGEX.test(text)) return "mnemonic";
+  return null;
 }
 
 // ──────────────────────────── SYSTEM PROMPT ─────────────────────
@@ -226,6 +322,16 @@ async function getUserWallet(userId) {
   return r.rows[0]?.public_key ?? null;
 }
 
+// Standardised tool error shape. The `user_friendly_hint` is what the
+// AI should relay to the user; the raw `error` is for our logs only.
+function toolError(kind, technical, hint) {
+  return { error: kind, technical: technical?.slice(0, 200), user_friendly_hint: hint };
+}
+
+const HINT_RPC_BLIP = "Solana RPC had a brief hiccup. Ask the user to try again in 10-15 seconds.";
+const HINT_NOT_FOUND = "That record was not found. Confirm the user is signed in and has used /start at least once.";
+const HINT_NO_WALLET = "The user has no Magpie wallet yet. Suggest they run /start first.";
+
 const TOOL_HANDLERS = {
   lookup_loan: async ({ loan_id }, { userId }) => {
     const { rows } = await query(
@@ -236,14 +342,14 @@ const TOOL_HANDLERS = {
         LIMIT 1`,
       [loan_id, userId],
     );
-    if (!rows[0]) return { error: "Loan not found, or it does not belong to this user." };
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID was not found for this user. Tell them to double-check the ID (it's the long number from /positions), or call list_my_loans to see what they have.");
     const loan = rows[0];
     const program = getReadOnlyProgram();
     let onChain;
     try {
       onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
-    } catch {
-      return { error: "Could not read this loan from the chain right now." };
+    } catch (err) {
+      return toolError("rpc_blip", err.message, HINT_RPC_BLIP);
     }
     const status =
       "repaid" in onChain.status ? "repaid"
@@ -316,13 +422,13 @@ const TOOL_HANDLERS = {
 
   check_tx: async ({ signature }) => {
     if (!/^[1-9A-HJ-NP-Za-km-z]{60,100}$/.test(signature || "")) {
-      return { error: "That doesn't look like a valid Solana transaction signature." };
+      return toolError("invalid_signature", null, "That string doesn't look like a Solana transaction signature. Ask the user to paste the full signature — it's a long base58 string (~88 chars).");
     }
     try {
       const res = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
       const s = res?.value?.[0];
-      if (!s) return { signature, status: "not_found", note: "Tx was never submitted, expired (>90s blockhash), or dropped from mempool." };
-      if (s.err) return { signature, status: "failed", error: JSON.stringify(s.err).slice(0, 200) };
+      if (!s) return { signature, status: "not_found", note: "Tx was never submitted, expired (>90s blockhash), or dropped from mempool.", user_friendly_hint: "Tell the user the tx was either never broadcast or expired before landing. They should try the action again." };
+      if (s.err) return { signature, status: "failed", error: JSON.stringify(s.err).slice(0, 200), user_friendly_hint: "The tx failed on-chain. Share the solscan link so the user can see the error reason." };
       return {
         signature,
         status: s.confirmationStatus || "processing",
@@ -330,19 +436,27 @@ const TOOL_HANDLERS = {
         solscan_url: `https://solscan.io/tx/${signature}`,
       };
     } catch (err) {
-      return { error: `Could not reach Solana RPC: ${err.message?.slice(0, 100)}` };
+      return toolError("rpc_blip", err.message, HINT_RPC_BLIP);
     }
   },
 
   get_my_wallet: async (_args, { userId }) => {
     const pubkey = await getUserWallet(userId);
-    if (!pubkey) return { error: "User has no Magpie wallet yet (they need to run /start)." };
+    if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     let balanceSol = 0;
+    let balanceFresh = true;
     try {
       const lamports = await connection.getBalance(new PublicKey(pubkey));
       balanceSol = lamports / 1e9;
-    } catch {}
-    return { address: pubkey, sol_balance: balanceSol.toFixed(6) };
+    } catch {
+      balanceFresh = false;
+    }
+    return {
+      address: pubkey,
+      sol_balance: balanceSol.toFixed(6),
+      balance_fresh: balanceFresh,
+      user_friendly_hint: balanceFresh ? undefined : "Balance reads failed; tell the user the address but note that you couldn't verify the live balance right now.",
+    };
   },
 
   get_my_referrals: async (_args, { userId }) => {
@@ -371,11 +485,11 @@ const TOOL_HANDLERS = {
 
   get_my_holder_stats: async (_args, { userId }) => {
     const pubkey = await getUserWallet(userId);
-    if (!pubkey) return { error: "User has no Magpie wallet yet." };
+    if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     try {
       const { getHolderInfoByWallet } = await import("./magpie-holder-rewards.js");
       const info = await getHolderInfoByWallet(pubkey);
-      if (!info) return { error: "Could not look up holder stats." };
+      if (!info) return toolError("holder_lookup_empty", null, "Tell the user we couldn't find them in the holder ledger right now. If they hold $MAGPIE, the next snapshot will pick them up.");
       return {
         wallet: pubkey,
         magpie_balance: (Number(info.balance_raw) / 1e6).toFixed(2),
@@ -385,16 +499,13 @@ const TOOL_HANDLERS = {
         distributions_received: info.distributions_count,
       };
     } catch (err) {
-      return { error: `Holder stats lookup failed: ${err.message?.slice(0, 100)}` };
+      return toolError("holder_lookup_failed", err.message, HINT_RPC_BLIP);
     }
   },
 
   get_my_lp_position: async (_args, { userId }) => {
     const pubkey = await getUserWallet(userId);
-    if (!pubkey) return { error: "User has no Magpie wallet yet." };
-    try {
-      const { fetchDepositorPosition } = await import("../../node_modules/@solana/web3.js/lib/index.js").catch(() => ({}));
-    } catch {}
+    if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     // Use site helper via a direct on-chain read here
     try {
       const program = getReadOnlyProgram();
@@ -406,7 +517,7 @@ const TOOL_HANDLERS = {
         program.programId,
       );
       const position = await program.account.depositorPosition.fetch(positionPda).catch(() => null);
-      if (!position) return { has_position: false };
+      if (!position) return { has_position: false, user_friendly_hint: "The user has no LP position. Tell them they can deposit on magpie.capital/earn to start earning yield." };
       const poolAcc = await program.account.lendingPool.fetch(pool);
       const shares = Number(position.shares);
       const deposited = Number(position.depositedAmount);
@@ -430,14 +541,14 @@ const TOOL_HANDLERS = {
         shares: shares.toString(),
       };
     } catch (err) {
-      return { error: `LP position lookup failed: ${err.message?.slice(0, 100)}` };
+      return toolError("lp_lookup_failed", err.message, HINT_RPC_BLIP);
     }
   },
 
   get_protocol_stats: async () => {
     try {
       const r = await fetch("https://www.magpie.capital/api/v1/pool/stats", { signal: AbortSignal.timeout(5000) });
-      if (!r.ok) return { error: "Pool stats API unavailable." };
+      if (!r.ok) return toolError("stats_api_unavailable", `HTTP ${r.status}`, "The stats API is briefly unavailable. Tell the user to try again in a minute, or check magpie.capital/dashboard directly.");
       const j = await r.json();
       const p = j.pool;
       const f = j.fees;
@@ -452,7 +563,7 @@ const TOOL_HANDLERS = {
         paused: p.paused,
       };
     } catch (err) {
-      return { error: `Stats fetch failed: ${err.message?.slice(0, 100)}` };
+      return toolError("stats_fetch_failed", err.message, "Stats fetch failed. Tell the user to try /stats in the bot or check magpie.capital directly.");
     }
   },
 
@@ -533,36 +644,97 @@ async function checkRateLimit(userId) {
   return true;
 }
 
+// ──────────────────────────── COST + SPEND ──────────────────────
+
+// Cost estimate (USD) given a usage object from the Anthropic response.
+export function estimateCostUsd(usage) {
+  if (!usage) return 0;
+  const inputTok = usage.input_tokens || 0;
+  const outputTok = usage.output_tokens || 0;
+  const cacheReadTok = usage.cache_read_input_tokens || 0;
+  const cacheWriteTok = usage.cache_creation_input_tokens || 0;
+  return (
+    (inputTok * PRICE_PER_M_INPUT
+      + outputTok * PRICE_PER_M_OUTPUT
+      + cacheReadTok * PRICE_PER_M_CACHE_READ
+      + cacheWriteTok * PRICE_PER_M_CACHE_WRITE) / 1_000_000
+  );
+}
+
+// Today's total cost (USD) from support_conversations.last_active_at >= midnight UTC.
+// Note: support_conversations stores cumulative tokens across the whole convo,
+// not per-day, but conversations are short-lived (30 min TTL) so daily mapping
+// via last_active_at is a close-enough proxy.
+async function getTodaySpendUsd() {
+  try {
+    const { rows: [r] } = await query(
+      `SELECT
+         COALESCE(SUM(total_input_tokens), 0)::bigint  AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint AS output_tok
+       FROM support_conversations
+       WHERE last_active_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
+    );
+    // We don't track cache hits separately yet — assume worst-case base rates.
+    // This over-estimates by ~70%, which is fine for a safety cap.
+    return (
+      (Number(r.input_tok) * PRICE_PER_M_INPUT
+        + Number(r.output_tok) * PRICE_PER_M_OUTPUT) / 1_000_000
+    );
+  } catch {
+    return 0; // If DB blip, don't block the agent on metering
+  }
+}
+
 // ──────────────────────────── ANTHROPIC API ─────────────────────
 
+const TRANSIENT_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
+const RETRY_DELAYS_MS = [250, 1000, 4000];
+
 async function callAnthropic(messages) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: MAX_OUTPUT_TOKENS,
-      system: [
-        {
-          type: "text",
-          text: SYSTEM_PROMPT,
-          cache_control: { type: "ephemeral" },
+  let lastErr;
+  for (let attempt = 0; attempt < RETRY_DELAYS_MS.length + 1; attempt++) {
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
         },
-      ],
-      tools: TOOLS,
-      messages,
-    }),
-    signal: AbortSignal.timeout(45_000),
-  });
-  if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Anthropic API ${res.status}: ${errBody.slice(0, 200)}`);
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: MAX_OUTPUT_TOKENS,
+          system: [
+            {
+              type: "text",
+              text: SYSTEM_PROMPT,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+          tools: TOOLS,
+          messages,
+        }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (res.ok) return res.json();
+      const errBody = await res.text();
+      const err = new Error(`Anthropic API ${res.status}: ${errBody.slice(0, 200)}`);
+      err.status = res.status;
+      err.transient = TRANSIENT_STATUSES.has(res.status);
+      // Non-transient (auth, malformed request) → fail fast
+      if (!err.transient) throw err;
+      lastErr = err;
+    } catch (err) {
+      // Network/timeout/abort errors are transient by default
+      if (err.status && !err.transient) throw err;
+      lastErr = err;
+    }
+    // Sleep before next attempt (if any retries remain)
+    if (attempt < RETRY_DELAYS_MS.length) {
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    }
   }
-  return res.json();
+  throw lastErr;
 }
 
 // ──────────────────────────── MAIN ENTRY ────────────────────────
@@ -576,6 +748,41 @@ async function callAnthropic(messages) {
  */
 export async function chatWithAgent(userId, userMessage) {
   if (!isAiSupportEnabled()) return null;
+
+  // PII scrub: never let an accidentally-pasted seed phrase or private
+  // key leave our infra. Refuse with a clear warning instead.
+  const secretType = containsSecret(userMessage);
+  if (secretType) {
+    return {
+      text: [
+        "⚠️ *I detected what looks like a private key or seed phrase in your message.*",
+        "",
+        "*I refused to send it to the AI and discarded it.* For your safety:",
+        "• Never paste private keys or seed phrases into ANY chat",
+        "• Move any funds in that wallet to a fresh wallet IMMEDIATELY — assume the original is compromised",
+        "• Magpie staff will NEVER ask for your seed phrase",
+        "",
+        "Want help with something else? Just ask without the secret.",
+      ].join("\n"),
+      blocked_reason: secretType,
+      used_tools: [],
+    };
+  }
+
+  // Daily spend cap — degrade to ticket-only if today's spend exceeds limit
+  const todaySpend = await getTodaySpendUsd();
+  if (todaySpend >= DAILY_SPEND_CAP_USD) {
+    return {
+      text: [
+        "The AI agent has hit today's spending cap and is paused until midnight UTC.",
+        "",
+        "Tap *Open a ticket* and the team will reply via this bot.",
+      ].join("\n"),
+      spend_capped: true,
+      today_spend_usd: todaySpend,
+      used_tools: [],
+    };
+  }
 
   // Rate limit check
   const allowed = await checkRateLimit(userId);
@@ -601,9 +808,24 @@ export async function chatWithAgent(userId, userMessage) {
       response = await callAnthropic(messages);
     } catch (err) {
       console.error("[ai-support] API error:", err.message);
+      const failType = err.status === 429 ? "rate_limit"
+        : err.status >= 500 ? "anthropic_5xx"
+        : err.status === 401 ? "auth"
+        : err.name === "TimeoutError" || err.name === "AbortError" ? "timeout"
+        : "other";
+      recordFailure(failType, err.message);
+      maybeAlertAdmin(botRef).catch(() => {});
+      const userMsg = failType === "rate_limit"
+        ? "Anthropic is rate limiting us right now. Try again in 30 seconds, or tap *Open a ticket*."
+        : failType === "auth"
+        ? "The AI agent is misconfigured (auth). The team has been notified. Tap *Open a ticket* in the meantime."
+        : failType === "timeout"
+        ? "The AI agent timed out. Try a shorter question, or tap *Open a ticket*."
+        : "The support agent hit an issue talking to its brain. Tap *Open a ticket* and the team will follow up.";
       return {
-        text: "The support agent hit an issue talking to its brain. Tap *Open a ticket* and the team will follow up.",
+        text: userMsg,
         error: err.message,
+        error_type: failType,
         used_tools: usedTools,
       };
     }

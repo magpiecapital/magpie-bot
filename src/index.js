@@ -43,6 +43,7 @@ import {
   handleReconcile,
   handleReply,
   handleTickets,
+  handleAiStats,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -61,6 +62,7 @@ import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
+import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -122,6 +124,7 @@ bot.command("fundpool", handleFundPool);
 bot.command("reconcile", handleReconcile);
 bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
+bot.command("aistats", handleAiStats);
 
 // Inline callback registration.
 //
@@ -227,6 +230,8 @@ bot.start({
     setTimeout(() => startLoanReconciler(), 45_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
+    // Daily-ish AI conversation sample sent to admin for QA visibility
+    setTimeout(() => startAiConversationDigest(bot), 75_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

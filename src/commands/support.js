@@ -22,7 +22,7 @@ import { getLiveOwedLamports } from "../services/loans.js";
 import { collateralValueLamports } from "../services/price.js";
 import { clearPending as clearBorrowPending } from "./borrow.js";
 import { clearPending as clearWithdrawPending } from "./withdraw.js";
-import { chatWithAgent, isAiSupportEnabled, resetConversation } from "../services/ai-support.js";
+import { chatWithAgent, isAiSupportEnabled, resetConversation, setBotRef } from "../services/ai-support.js";
 
 const ADMIN_TG_ID = process.env.ADMIN_TG_ID ? Number(process.env.ADMIN_TG_ID) : null;
 
@@ -234,6 +234,10 @@ async function diagnoseTx(ctx, sig) {
 }
 
 export function registerSupportCallbacks(bot) {
+  // Give ai-support a handle to the bot so it can DM admin on
+  // repeated failures (rate-limit alerts, auth errors, etc.).
+  setBotRef(bot);
+
   bot.callbackQuery("support:cancel", async (ctx) => {
     pending.delete(ctx.chat.id);
     await ctx.answerCallbackQuery();
@@ -342,8 +346,9 @@ export function registerSupportCallbacks(bot) {
     await resetConversation(user.id); // fresh session
     pending.set(ctx.chat.id, { stage: "ai_chat", userId: user.id });
     const kb = new InlineKeyboard()
-      .text("✕ End chat", "support:chat:end")
-      .text("🎫 Escalate to ticket", "support:chat:ticket");
+      .text("🔄 Reset", "support:chat:reset")
+      .text("✕ End", "support:chat:end")
+      .text("🎫 Ticket", "support:chat:ticket");
     await ctx.editMessageText(
       [
         "💬 *Magpie support agent · live*",
@@ -362,6 +367,25 @@ export function registerSupportCallbacks(bot) {
     if (state?.userId) await resetConversation(state.userId);
     pending.delete(ctx.chat.id);
     await ctx.editMessageText("Chat ended. Use /support anytime.");
+  });
+
+  bot.callbackQuery("support:chat:reset", async (ctx) => {
+    await ctx.answerCallbackQuery("Memory cleared");
+    const state = pending.get(ctx.chat.id);
+    if (state?.userId) await resetConversation(state.userId);
+    // Stay in ai_chat stage — user wants a fresh conversation, not exit
+    const kb = new InlineKeyboard()
+      .text("🔄 Reset", "support:chat:reset")
+      .text("✕ End", "support:chat:end")
+      .text("🎫 Ticket", "support:chat:ticket");
+    await ctx.editMessageText(
+      [
+        "💬 *Magpie support agent · fresh session*",
+        "",
+        "Memory cleared. What can I help with?",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
   });
 
   bot.callbackQuery("support:chat:ticket", async (ctx) => {

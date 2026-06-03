@@ -9,7 +9,8 @@
     "db:migrate": "node scripts/migrate.js",
     "init-pool": "node scripts/init-pool.js",
     "backend": "node backend/src/index.js",
-    "backend:dev": "node --watch backend/src/index.js"
+    "backend:dev": "node --watch backend/src/index.js",
+    "eval-ai": "node scripts/eval-ai-support.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",

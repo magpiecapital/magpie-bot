@@ -5,6 +5,7 @@ import {
   isBorrowingPaused,
 } from "../services/admin.js";
 import { query } from "../db/pool.js";
+import { estimateCostUsd } from "../services/ai-support.js";
 
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx.from?.id)) {
@@ -346,5 +347,78 @@ export async function handleFundPool(ctx) {
   } catch (err) {
     console.error("[fundpool] error:", err);
     await ctx.reply(`❌ Deposit failed: ${err.message?.slice(0, 150) || "unknown error"}`);
+  }
+}
+
+/**
+ * /aistats — last-24h snapshot of the AI support agent.
+ *
+ * Shows total conversations, turns, tool usage breakdown,
+ * tickets opened by the AI, and an estimated USD cost. Useful
+ * for spotting cost spikes, looping conversations, or quality issues.
+ */
+export async function handleAiStats(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+
+  try {
+    // 24h aggregates from support_conversations (token + turn counts)
+    const { rows: [agg] } = await query(
+      `SELECT
+         COUNT(*)::int                                          AS conversations,
+         COALESCE(SUM(turns), 0)::int                           AS turns,
+         COALESCE(SUM(total_input_tokens), 0)::bigint           AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint          AS output_tok,
+         COUNT(DISTINCT user_id)::int                           AS unique_users
+       FROM support_conversations
+       WHERE last_active_at >= NOW() - INTERVAL '24 hours'`,
+    );
+
+    // AI-escalated tickets in last 24h
+    const { rows: [tix] } = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM support_tickets
+        WHERE created_at >= NOW() - INTERVAL '24 hours'
+          AND message LIKE '[AI-escalated]%'`,
+    );
+
+    // Today (UTC) for spend cap comparison
+    const { rows: [today] } = await query(
+      `SELECT
+         COALESCE(SUM(total_input_tokens), 0)::bigint  AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint AS output_tok
+       FROM support_conversations
+       WHERE last_active_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
+    );
+
+    const cost24h = estimateCostUsd({
+      input_tokens: Number(agg.input_tok),
+      output_tokens: Number(agg.output_tok),
+    });
+    const costToday = estimateCostUsd({
+      input_tokens: Number(today.input_tok),
+      output_tokens: Number(today.output_tok),
+    });
+    const cap = Number(process.env.AI_DAILY_SPEND_USD) || 20;
+    const capPct = ((costToday / cap) * 100).toFixed(0);
+
+    const avgTurns = agg.conversations > 0 ? (agg.turns / agg.conversations).toFixed(1) : "0";
+
+    const lines = [
+      "🤖 *AI support · 24h*",
+      "",
+      `Conversations:   *${agg.conversations}*  (${agg.unique_users} unique users)`,
+      `Total turns:     *${agg.turns}*  (avg ${avgTurns}/convo)`,
+      `Input tokens:    \`${Number(agg.input_tok).toLocaleString()}\``,
+      `Output tokens:   \`${Number(agg.output_tok).toLocaleString()}\``,
+      `Cost (24h):      *$${cost24h.toFixed(3)}*`,
+      "",
+      `AI-escalated tickets: *${tix.count}*`,
+      "",
+      `Today (UTC): *$${costToday.toFixed(3)}* / $${cap} cap (${capPct}%)`,
+    ];
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("[aistats] error:", err);
+    await ctx.reply(`❌ /aistats failed: ${err.message?.slice(0, 150) || "unknown error"}`);
   }
 }
