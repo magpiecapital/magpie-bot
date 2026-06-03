@@ -102,6 +102,26 @@ const CASES = [
     forbiddenTools: ["open_support_ticket"],
   },
   {
+    name: "Lending limit question triggers get_my_loan_limits",
+    prompt: "What are the lending limits per wallet?",
+    // AI might call get_my_loan_limits (personalized) or answer from facts. Both fine.
+    expectAnyTool: ["get_my_loan_limits"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "How much can I borrow → triggers get_my_loan_limits",
+    prompt: "How much SOL can I borrow right now?",
+    expectAnyTool: ["get_my_loan_limits"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Loan limit fact-question — AI knows the tier numbers",
+    prompt: "What's the max loan size on Magpie? Walk me through the tiers.",
+    forbiddenTools: ["open_support_ticket"],
+    // Should mention both tier caps when explicitly asked about all tiers
+    expectInText: ["3 SOL", "5 SOL"],
+  },
+  {
     name: "Vague help asks for clarification, no premature escalation",
     prompt: "help",
     expectTools: [],

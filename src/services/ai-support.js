@@ -156,6 +156,38 @@ CORE PROTOCOL FACTS:
 - LP Loyalty: 2% pool, time-weighted (shares × seconds held). Auto-paid in SOL on random 5-10d window
 - Liquidations: 0 ever, by design (short terms + low LTV + token-health watcher)
 
+LENDING LIMITS PER WALLET (enforced at /borrow):
+- New tier (default):     max 3 SOL per loan, max 3 SOL outstanding total
+- Trusted tier (3+ on-time repays): max 5 SOL per loan, max 10 SOL outstanding total
+- Limits are tied to USER, not wallet — same Telegram account across multiple imports
+  shares the same limit
+- Tier promotion is automatic — as soon as the user hits 3 successful on-time repays
+  they unlock the Trusted tier on their next /borrow
+- For the user's CURRENT limit + how much they can borrow right now, call
+  the \`get_my_loan_limits\` tool
+
+LOAN MANAGEMENT MECHANICS:
+- /partialrepay — repay PART of a loan, keeping the rest. Reduces owed amount
+  proportionally. Useful to lower liquidation risk without closing out fully.
+- /extend — extend the loan term. Costs a fee proportional to extension length.
+  Resets the due date. Cannot extend past-due loans.
+- /topup — add MORE collateral to an existing loan. Lowers your effective LTV,
+  reduces liquidation risk. Free (just transaction fees).
+- /reborrow — instantly close + reopen a loan with fresh terms. Useful when
+  you want to extend AND change LTV in one move.
+- /export — export your Magpie wallet's private key. Use only on a trusted
+  device; reveals seed. Don't paste it anywhere.
+
+PROTOCOL SAFETY:
+- Token health watcher: automatically disables borrowing against tokens whose
+  liquidity, holder count, or LP-burned status degrades. Existing loans stay
+  active; new borrows blocked until token recovers.
+- Borrowing pause: admin can /pause new borrows in an emergency. Existing
+  loans continue normally. If user reports "borrow isn't working", check if
+  protocol is paused before assuming user error.
+- Anti-dump: holder reward snapshots happen on a randomized 5-10 day window
+  to prevent dump-after-snapshot gaming. Don't reveal the exact timing.
+
 KEY URLS:
 - TG bot:        https://t.me/magpie_capital_bot
 - Home:          https://magpie.capital
@@ -323,6 +355,7 @@ Mandatory tool triggers — pattern → tool:
 - User asks about a token they submitted, "is my token approved", "did my submission go through" → \`get_my_token_submissions\`
 - User asks "can I borrow against X token", "is X supported", "do you accept X" → \`check_token_supported\`
 - User asks "what did I do recently", "show my activity", "history" generally → \`get_my_recent_activity\`
+- User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
 
 If a user message is ambiguous between two tools (e.g., "what's my status?"),
 call \`list_my_loans\` first — that's the most common intent in support.
@@ -574,6 +607,11 @@ const TOOLS = [
   {
     name: "get_my_recent_activity",
     description: "Get a chronological summary of the user's recent protocol activity: borrows, repays, partial repays, extensions, liquidations. Use for general 'what did I do recently', 'show my history', 'what happened with my account' questions.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_my_loan_limits",
+    description: "Get the user's personal lending limits — their current tier (new/trusted), max loan size, max outstanding total, current outstanding balance, and how much MORE they can borrow right now. Use when the user asks 'what's my limit', 'how much can I borrow', 'why did my borrow get rejected', 'how do I unlock more', 'what tier am I', or anything about per-wallet caps.",
     input_schema: { type: "object", properties: {} },
   },
   {
@@ -1006,6 +1044,41 @@ const TOOL_HANDLERS = {
       };
     } catch (err) {
       return toolError("activity_lookup_failed", err.message, HINT_RPC_BLIP);
+    }
+  },
+
+  get_my_loan_limits: async (_args, { userId }) => {
+    try {
+      const { getLoanLimits } = await import("./loan-limits.js");
+      const limits = await getLoanLimits(userId);
+      // Convert bigints to formatted SOL strings for the AI to interpret
+      const fmt = (lamports) => (Number(lamports) / 1e9).toFixed(4);
+      // Distance to trusted tier (if currently new)
+      let onTimeRepays = 0;
+      let repaysToTrusted = null;
+      if (limits.tier === "new") {
+        const { rows: [r] } = await query(
+          `SELECT COUNT(*)::int AS n FROM loans
+            WHERE user_id = $1 AND status = 'repaid' AND updated_at <= due_timestamp`,
+          [userId],
+        );
+        onTimeRepays = r?.n || 0;
+        repaysToTrusted = Math.max(0, 3 - onTimeRepays);
+      }
+      return {
+        tier: limits.tier,
+        max_loan_size_sol: fmt(limits.maxPerLoan),
+        max_outstanding_sol: fmt(limits.maxOutstanding),
+        currently_outstanding_sol: fmt(limits.currentOutstanding),
+        available_to_borrow_sol: fmt(limits.availableToBorrow),
+        on_time_repays: onTimeRepays,
+        repays_to_unlock_trusted: repaysToTrusted,
+        user_friendly_hint: limits.tier === "new"
+          ? `User is on NEW tier. They can take ONE loan up to ${fmt(limits.maxPerLoan)} SOL, max ${fmt(limits.maxOutstanding)} SOL outstanding. They unlock TRUSTED tier (5 SOL/loan, 10 SOL outstanding) after ${repaysToTrusted} more on-time repays.`
+          : `User is on TRUSTED tier — up to ${fmt(limits.maxPerLoan)} SOL per loan, ${fmt(limits.maxOutstanding)} SOL outstanding total. They currently have ${fmt(limits.currentOutstanding)} SOL out, so they can borrow ${fmt(limits.availableToBorrow)} SOL more right now.`,
+      };
+    } catch (err) {
+      return toolError("limits_lookup_failed", err.message, HINT_RPC_BLIP);
     }
   },
 
