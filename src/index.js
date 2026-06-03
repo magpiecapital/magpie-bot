@@ -165,8 +165,32 @@ registerFallbackCallbacks(bot);
 // Fallback: respond to any text message that isn't a command
 bot.on("message:text", handleFallback);
 
-bot.catch((err) => {
-  console.error("Bot error:", err);
+// Global safety net — if ANY handler throws an uncaught exception,
+// the user gets a clean fallback message instead of silence + dropped
+// state. This is the last line of defense after each command's own
+// try/catch and the tx-error translator.
+bot.catch(async (err) => {
+  console.error("[bot] Unhandled error:", err);
+  try {
+    const ctx = err?.ctx;
+    if (ctx && ctx.chat?.id) {
+      await ctx.api.sendMessage(
+        ctx.chat.id,
+        [
+          "⚠️ *Something unexpected happened*",
+          "",
+          "We hit a snag handling that. The team has been logged.",
+          "",
+          "*What to do:*",
+          "• Try the command again",
+          "• Or /support → Chat with agent and describe what you were doing",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    }
+  } catch {
+    // If even the fallback fails, we've exhausted options — just log
+  }
 });
 
 // Register the primary nav commands so they appear in Telegram's menu
