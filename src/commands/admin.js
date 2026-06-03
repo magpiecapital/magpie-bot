@@ -139,57 +139,183 @@ export async function handleReply(ctx) {
   }
   const ticket = rows[0];
 
+  const { InlineKeyboard } = await import("grammy");
+  const kb = new InlineKeyboard()
+    .text("💬 Follow up", `myt:followup:${ticketId}`)
+    .text("✅ Resolved", `myt:close:${ticketId}`);
+
   try {
     await ctx.api.sendMessage(
       ticket.telegram_id,
-      `📩 *Magpie support · Ticket #${ticketId}*\n\n${reply}`,
-      { parse_mode: "Markdown" },
+      [
+        `📩 *Magpie support · Ticket #${ticketId}*`,
+        "",
+        reply,
+        "",
+        "_Reply via the buttons below — or run /mytickets any time to see all your tickets._",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
     );
   } catch (err) {
     return ctx.reply(`Failed to DM user: ${err.message?.slice(0, 100)}`);
   }
 
+  // status='awaiting_user' = admin replied, ball in user's court.
+  // Clearing last_alerted_tier so a NEW user follow-up can re-alert from tier 0.
   await query(
     `UPDATE support_tickets
-        SET status = 'responded', admin_reply = $2, admin_replied_at = NOW()
+        SET status = 'awaiting_user',
+            admin_reply = $2,
+            admin_replied_at = NOW(),
+            last_alerted_tier = NULL
       WHERE id = $1`,
     [ticketId, reply],
   );
 
-  await ctx.reply(`✅ Reply sent. Ticket #${ticketId} marked responded.`);
+  await ctx.reply(`✅ Reply sent. Ticket #${ticketId} now awaits user response.`);
 }
 
 /**
- * List open support tickets. Quick admin overview.
+ * List support tickets with aging + filter.
  *
- * Usage: /tickets
+ * Usage:
+ *   /tickets          — open tickets (oldest first, urgency-sorted)
+ *   /tickets open     — same as above
+ *   /tickets awaiting — tickets awaiting user response
+ *   /tickets all      — open + awaiting (everything not closed)
+ *   /tickets closed   — recently closed
  */
 export async function handleTickets(ctx) {
   if (!(await requireAdmin(ctx))) return;
+  const arg = (ctx.message?.text || "").split(/\s+/)[1]?.toLowerCase() || "open";
+
+  let statusFilter, label;
+  if (arg === "open") {
+    statusFilter = `status = 'open'`;
+    label = "Open · awaiting team reply";
+  } else if (arg === "awaiting" || arg === "user") {
+    statusFilter = `status = 'awaiting_user'`;
+    label = "Awaiting user response";
+  } else if (arg === "all") {
+    statusFilter = `status IN ('open', 'awaiting_user')`;
+    label = "All active tickets";
+  } else if (arg === "closed") {
+    statusFilter = `status = 'closed'`;
+    label = "Recently closed";
+  } else {
+    return ctx.reply("Usage: `/tickets [open|awaiting|all|closed]`", { parse_mode: "Markdown" });
+  }
+
+  // Always: top-line counts so admin knows the full state
+  const { rows: [counts] } = await query(
+    `SELECT
+       SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)::int           AS open,
+       SUM(CASE WHEN status = 'awaiting_user' THEN 1 ELSE 0 END)::int  AS awaiting,
+       SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END)::int         AS closed
+     FROM support_tickets`,
+  );
+
+  const orderBy = arg === "closed"
+    ? "ORDER BY closed_at DESC NULLS LAST"
+    // For active tickets, oldest open first (most urgent)
+    : "ORDER BY GREATEST(created_at, COALESCE(last_user_followup_at, created_at)) ASC";
+
   const { rows } = await query(
-    `SELECT s.id, s.message, s.created_at, u.telegram_id, u.telegram_username
+    `SELECT s.id, s.message, s.status, s.created_at, s.admin_replied_at,
+            s.last_user_followup_at, s.followup_count, s.closed_at,
+            u.telegram_id, u.telegram_username
        FROM support_tickets s
        JOIN users u ON u.id = s.user_id
-      WHERE s.status = 'open'
-      ORDER BY s.created_at DESC
-      LIMIT 20`,
+      WHERE ${statusFilter}
+      ${orderBy}
+      LIMIT 25`,
   );
+
+  const header = [
+    `🎫 *${label} (${rows.length})*`,
+    `Counts → open: *${counts.open}* · awaiting user: *${counts.awaiting}* · closed: *${counts.closed}*`,
+    "",
+  ];
+
   if (rows.length === 0) {
-    return ctx.reply("📭 No open tickets.");
+    return ctx.reply(header.concat(["📭 None."]).join("\n"), { parse_mode: "Markdown" });
   }
-  const lines = [`🎫 *Open tickets (${rows.length})*`, ""];
+
+  function ageBadge(date) {
+    const mins = Math.max(0, Math.floor((Date.now() - new Date(date).getTime()) / 60_000));
+    if (mins < 60) return { e: "🟢", txt: `${mins}m` };
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 12) return { e: "🟢", txt: `${hrs}h` };
+    if (hrs < 24) return { e: "🟡", txt: `${hrs}h` };
+    if (hrs < 48) return { e: "🟠", txt: `${hrs}h` };
+    return { e: "🔴", txt: `${Math.floor(hrs / 24)}d` };
+  }
+
+  const lines = [...header];
   for (const t of rows) {
-    const ago = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60_000);
+    // Reference time = last_user_followup_at if newer, else created_at
+    const refTime = t.last_user_followup_at && new Date(t.last_user_followup_at) > new Date(t.created_at)
+      ? t.last_user_followup_at
+      : t.created_at;
+    const a = ageBadge(refTime);
     const from = t.telegram_username ? `@${t.telegram_username}` : `tg://${t.telegram_id}`;
-    const msg = (t.message || "").slice(0, 200);
+    const msg = (t.message || "").slice(0, 250);
+    const fu = t.followup_count > 0 ? ` · ${t.followup_count} follow-up${t.followup_count > 1 ? "s" : ""}` : "";
     lines.push(
-      `*#${t.id}* · ${from} · ${ago}m ago`,
+      `${a.e} *#${t.id}* · ${from} · ${a.txt}${fu}`,
       msg,
-      `Reply: \`/reply ${t.id} <message>\``,
-      "",
     );
+    if (t.status === "open") {
+      lines.push(`Reply: \`/reply ${t.id} <message>\` · Close: \`/close ${t.id}\``);
+    } else if (t.status === "awaiting_user") {
+      lines.push(`Last reply: ${Math.floor((Date.now() - new Date(t.admin_replied_at).getTime()) / 60_000)}m ago · \`/close ${t.id}\``);
+    }
+    lines.push("");
   }
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {
+    // Markdown fallback — user messages can contain unbalanced chars
+    return ctx.reply(lines.join("\n").replace(/[*_`]/g, ""));
+  });
+}
+
+/**
+ * Close a ticket as admin (resolved, fixed externally, won't-fix, etc.).
+ *
+ * Usage: /close <ticket#>
+ */
+export async function handleClose(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const arg = (ctx.message?.text || "").split(/\s+/)[1];
+  const ticketId = Number(arg);
+  if (!arg || !Number.isFinite(ticketId)) {
+    return ctx.reply("Usage: `/close <ticket#>`", { parse_mode: "Markdown" });
+  }
+  const { rows: [t], rowCount } = await query(
+    `UPDATE support_tickets
+        SET status = 'closed', closed_at = NOW()
+      WHERE id = $1 AND status != 'closed'
+      RETURNING id, user_id`,
+    [ticketId],
+  );
+  if (rowCount === 0) {
+    return ctx.reply(`Ticket #${ticketId} not found or already closed.`);
+  }
+  // Notify the user
+  const { rows: [user] } = await query(
+    `SELECT telegram_id FROM users WHERE id = $1`,
+    [t.user_id],
+  );
+  if (user?.telegram_id) {
+    try {
+      await ctx.api.sendMessage(
+        Number(user.telegram_id),
+        `✅ *Ticket #${ticketId} closed by the team.*\n\nIf you need more help, just /support or /mytickets.`,
+        { parse_mode: "Markdown" },
+      );
+    } catch {}
+  }
+  await ctx.reply(`✅ Ticket #${ticketId} closed.`);
 }
 
 /**

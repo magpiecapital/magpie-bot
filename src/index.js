@@ -27,6 +27,7 @@ import { handleImport, registerImportCallbacks } from "./commands/import-wallet.
 import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
+import { handleMyTickets, registerMyTicketsCallbacks } from "./commands/my-tickets.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -43,6 +44,7 @@ import {
   handleReconcile,
   handleReply,
   handleTickets,
+  handleClose,
   handleAiStats,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
@@ -63,6 +65,7 @@ import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
+import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -106,6 +109,8 @@ bot.command("token", handleMagpie); // alias — users might guess this
 bot.command("support", handleSupport);
 bot.command("help_request", handleSupport); // alias — common term users guess
 bot.command("ticket", handleSupport); // alias
+bot.command("mytickets", handleMyTickets);
+bot.command("tickets_mine", handleMyTickets); // alias
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
@@ -124,6 +129,7 @@ bot.command("fundpool", handleFundPool);
 bot.command("reconcile", handleReconcile);
 bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
+bot.command("close", handleClose);
 bot.command("aistats", handleAiStats);
 
 // Inline callback registration.
@@ -136,6 +142,7 @@ bot.command("aistats", handleAiStats);
 // by leftover state.
 registerImportCallbacks(bot);
 registerSupportCallbacks(bot);
+registerMyTicketsCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -181,6 +188,7 @@ async function registerBotCommands() {
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "support", description: "🛟 Self-serve help / message the team" },
+      { command: "mytickets", description: "🎫 Your support tickets + status" },
       { command: "help", description: "ℹ️ Full command list" },
     ]);
     await bot.api.setChatMenuButton({
@@ -232,6 +240,8 @@ bot.start({
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
     // Daily-ish AI conversation sample sent to admin for QA visibility
     setTimeout(() => startAiConversationDigest(bot), 75_000);
+    // Ticket aging — DMs admin about open tickets that cross 2h/8h/24h
+    setTimeout(() => startTicketAgingWatcher(bot), 90_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

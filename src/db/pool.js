@@ -257,6 +257,17 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS support_tickets_status_idx
        ON support_tickets(status, created_at DESC)`,
 
+    // Ticket lifecycle columns added 2026-06.
+    // status states: 'open' (waiting on admin), 'awaiting_user' (admin replied,
+    // ball in user's court), 'closed' (resolved by admin or user).
+    `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`,
+    `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS last_user_followup_at TIMESTAMPTZ`,
+    `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS followup_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS last_alerted_tier INTEGER`,
+    // Migrate legacy 'responded' status to new 'awaiting_user' state.
+    `UPDATE support_tickets SET status = 'awaiting_user'
+        WHERE status = 'responded'`,
+
     // ─────── AI SUPPORT CONVERSATIONS ───────
     // Multi-turn chat history for the AI support agent. One row per user;
     // history accumulates within an active session and resets after the
