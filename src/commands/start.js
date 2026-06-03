@@ -50,7 +50,9 @@ export async function handleStart(ctx) {
       .row()
       .text("📖 Supported tokens", "start:supported")
       .row()
-      .text("🔑 Import existing wallet", "start:import");
+      .text("🔑 Import existing wallet", "start:import")
+      .row()
+      .text("🛟 Get help", "start:support");
 
     await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
     return;
@@ -95,6 +97,7 @@ export async function handleStart(ctx) {
     "/import — use your existing wallet",
     "/me — your wallet, tier, and referral code",
     "/magpie — official $MAGPIE token info",
+    "/support — chat with our AI agent or open a ticket",
     "/help — full command list",
   ].join("\n");
 
@@ -102,7 +105,9 @@ export async function handleStart(ctx) {
     .text("💰 Borrow now", "start:borrow")
     .text("📋 Supported tokens", "start:supported")
     .row()
-    .text("🔑 Import existing wallet", "start:import");
+    .text("🔑 Import existing wallet", "start:import")
+    .row()
+    .text("🛟 Get help", "start:support");
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
@@ -133,6 +138,12 @@ export function registerStartCallbacks(bot) {
     await ctx.answerCallbackQuery();
     const { handleImport } = await import("./import-wallet.js");
     await handleImport(ctx);
+  });
+
+  bot.callbackQuery("start:support", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleSupport } = await import("./support.js");
+    await handleSupport(ctx);
   });
 
   bot.callbackQuery("start:home", async (ctx) => {
