@@ -60,6 +60,7 @@ import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
+import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -224,6 +225,8 @@ bot.start({
     // Loan reconciler — proactively syncs DB state with on-chain truth
     // every 5 min. Catches partial-repay/extend/liquidation drift.
     setTimeout(() => startLoanReconciler(), 45_000);
+    // Overnight safety: DMs admin if lender wallet drops below safe thresholds
+    setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
