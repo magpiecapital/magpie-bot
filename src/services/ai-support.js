@@ -991,6 +991,62 @@ ask this end up just /extend-ing for a bit of breathing room
 ─────────────────────────────────────────
 
 ═══════════════════════════════════════════════════════════════════
+"WHAT DO I QUALIFY FOR" — THE QUALIFICATION CONVERSATION
+═══════════════════════════════════════════════════════════════════
+Your snapshot now ALWAYS includes the user's credit score, credit
+tier, lending tier (new/trusted), max-per-loan, max-outstanding, and
+available-to-borrow-right-now. Use these directly — most of these
+conversations don't need a tool call.
+
+When a user asks any of:
+  • "How much can I borrow?"
+  • "What's my limit?"
+  • "What tier am I on?"
+  • "What do I qualify for?"
+  • "How do I get better rates / unlock more?"
+  • "When do I hit Gold / Platinum?"
+
+…lead with the SPECIFIC number from the snapshot, then the path to
+the next unlock.
+
+Example responses (use the snapshot, don't invent):
+
+— "How much can I borrow?"
+  "Right now you can borrow up to *X SOL* on your next loan
+   (you're on the *new* lending tier — 3 SOL max per loan, with
+   one loan at a time). 2 more on-time repays unlocks the *trusted*
+   tier, which jumps you to 5 SOL per loan and 10 SOL outstanding
+   total."
+
+— "What's my credit score?"
+  "*Score X / 850* — *bronze tier*. That's the starting floor for
+   everyone; your score moves up automatically on on-time repays
+   (heaviest factor) plus account age and engagement. A single
+   liquidation costs ~50 points so the move is mostly: keep repaying
+   on time."
+
+— "How do I unlock Gold tier?"
+  Walk them through: repayment history (heaviest weight), loan
+  volume, account age, collateral diversity, low liquidation ratio,
+  protocol engagement (LP, referrals, $MAGPIE holdings). Mention
+  that today the credit-score TIERS (bronze/silver/gold/platinum)
+  are reputation signals — fee discounts based on credit tier are
+  spec'd but not yet on-chain. The LENDING limits (new vs trusted)
+  ARE deployed and gate borrow size.
+
+— "I have 3 wallets — does each one have its own credit?"
+  No, score is per account (Telegram user). Every wallet's loans
+  count toward the SAME score, and the same score is published to
+  every wallet's on-chain PDA. See "CREDIT SCORE ACROSS MULTIPLE
+  WALLETS" below.
+
+CRITICAL: tier-fee-discount is SPEC'd but NOT live. Don't promise
+"you'll get cheaper fees at Gold" — be honest: "Today, hitting
+Gold is a reputation flex. The fee-discount system is designed but
+hasn't shipped on-chain yet." LENDING tier (new vs trusted) IS
+deployed and DOES affect borrow size.
+
+═══════════════════════════════════════════════════════════════════
 CREDIT SCORE ACROSS MULTIPLE WALLETS — IT'S ONE SCORE PER ACCOUNT
 ═══════════════════════════════════════════════════════════════════
 A user's credit score is tracked at the Telegram-account level, NOT
@@ -2331,6 +2387,43 @@ async function buildUserSnapshot(userId) {
 
     if (t.open_tix > 0 || t.awaiting_tix > 0) {
       lines.push(`Has ${t.open_tix} open + ${t.awaiting_tix} awaiting tickets. If they ask about an issue, it might be linked to one of those.`);
+    }
+
+    // ─── Credit + loan limits — agent should always know what they qualify for ───
+    try {
+      const [{ rows: [credit] }, { getLoanLimits }] = await Promise.all([
+        query(`SELECT score, tier, loans_scored FROM credit_scores WHERE user_id = $1`, [userId]),
+        import("./loan-limits.js"),
+      ]);
+      const limits = await getLoanLimits(userId);
+      const fmtSol = (l) => (Number(l) / 1e9).toFixed(2);
+      const tierLabel = credit?.tier
+        ? credit.tier.charAt(0).toUpperCase() + credit.tier.slice(1)
+        : "Bronze (default)";
+      const scoreStr = credit?.score ?? 300;
+      lines.push("");
+      lines.push(
+        `Credit & limits — Score ${scoreStr} (${tierLabel} tier · ${credit?.loans_scored ?? 0} loans scored) · ` +
+        `Lending tier: ${limits.tier} · Max/loan ${fmtSol(limits.maxPerLoan)} SOL · ` +
+        `Max outstanding ${fmtSol(limits.maxOutstanding)} SOL · ` +
+        `Available to borrow right now: ${fmtSol(limits.availableToBorrow)} SOL.`,
+      );
+      // Distance to next tier upgrade — helps agent give an answer to
+      // "how do I unlock more" without needing another tool call
+      if (limits.tier === "new") {
+        const { rows: [r] } = await query(
+          `SELECT COUNT(*)::int AS n FROM loans
+            WHERE user_id = $1 AND status = 'repaid' AND updated_at <= due_timestamp`,
+          [userId],
+        );
+        const repays = r?.n || 0;
+        const left = Math.max(0, 3 - repays);
+        if (left > 0) {
+          lines.push(`  → ${left} more on-time repay(s) to unlock TRUSTED tier (5 SOL/loan, 10 SOL outstanding).`);
+        }
+      }
+    } catch (err) {
+      console.warn("[ai-support] snapshot credit/limits fetch failed:", err.message);
     }
 
     // ─── Wallets — the agent should ALWAYS know which wallets the user has ───
