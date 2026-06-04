@@ -15,3 +15,11 @@ target/
 telegram-avatar.svg
 telegram-avatar.svg.png
 lender-keypair.json
+
+# Operational runbooks and incident docs — local only. The magpie-bot
+# repo is public; nothing referencing specific user wallets, incident
+# timestamps, or internal recovery procedures should ever ship to it.
+RECOVERY_RUNBOOK.md
+RAILWAY_SUPPORT_TICKET.md
+NEON_FAILOVER.md
+scripts/incident-timeline.js
