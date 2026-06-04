@@ -32,6 +32,7 @@ import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/auto
 import { handleCalendar, registerCalendarCallbacks } from "./commands/calendar.js";
 import { handleHealth } from "./commands/health.js";
 import { handleShare } from "./commands/share.js";
+import { handleWallets, registerWalletsCallbacks } from "./commands/wallets.js";
 import { handleUnlock, registerUnlockCallbacks } from "./commands/unlock.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
@@ -116,6 +117,8 @@ bot.command("risk", handleRisk);
 bot.command("lend", handleLend);
 bot.command("import", handleImport);
 bot.command("wallet", handleWallet);
+bot.command("wallets", handleWallets);
+bot.command("switchwallet", handleWallets); // alias
 bot.command("reborrow", handleReborrow);
 bot.command("home", handleHome);
 bot.command("submit", handleSubmit);
@@ -174,6 +177,7 @@ registerMyTicketsCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
+registerWalletsCallbacks(bot);
 registerTxErrorCallbacks(bot);
 registerDormantCallbacks(bot);
 registerWinbackCallbacks(bot);
@@ -233,6 +237,7 @@ async function registerBotCommands() {
     await bot.api.setMyCommands([
       { command: "home", description: "🏠 Home / main menu" },
       { command: "wallet", description: "💼 Your wallet + SOL balance" },
+      { command: "wallets", description: "🔀 Switch between your wallets" },
       { command: "unlock", description: "🔓 See your borrow potential" },
       { command: "borrow", description: "💰 Take a loan" },
       { command: "positions", description: "📊 Active loans" },

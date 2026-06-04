@@ -1,3 +1,16 @@
+/**
+ * Wallet service — supports multiple wallets per user with one
+ * active wallet at a time.
+ *
+ * Schema invariant: at most one wallet per user has is_active=TRUE
+ * (enforced by partial unique index `wallets_one_active_per_user_idx`).
+ * Every loan/repay/etc tx signs with the ACTIVE wallet.
+ *
+ * Users can:
+ *   • /import — adds a new wallet, makes it active (siblings deactivated)
+ *   • /wallets — lists their wallets + switches active
+ *   • /export — exports the active wallet's secret
+ */
 import crypto from "node:crypto";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -32,75 +45,207 @@ function decrypt(ciphertext, iv, authTag) {
 }
 
 /**
- * Get or create a custodial Solana wallet for a Telegram user.
- * Returns { publicKey: string } — secret is never returned here.
+ * Get or create the ACTIVE wallet for a user. If they have no wallets
+ * yet, generate a custodial one and mark it active.
+ *
+ * Returns { publicKey, walletId, source, label } — secret never returned.
  */
 export async function ensureWallet(userId) {
-  const existing = await query("SELECT public_key FROM wallets WHERE user_id = $1", [userId]);
+  // Look for the active wallet first
+  const existing = await query(
+    `SELECT id, public_key, source, label
+       FROM wallets
+      WHERE user_id = $1 AND is_active = TRUE
+      LIMIT 1`,
+    [userId],
+  );
   if (existing.rows.length > 0) {
-    return { publicKey: existing.rows[0].public_key };
+    const r = existing.rows[0];
+    return {
+      publicKey: r.public_key,
+      walletId: r.id,
+      source: r.source,
+      label: r.label,
+    };
   }
 
+  // No active wallet. Are there any inactive ones? If so, activate
+  // the oldest custodial one (this can happen if data was migrated).
+  const any = await query(
+    `SELECT id, public_key, source, label FROM wallets
+      WHERE user_id = $1 ORDER BY created_at ASC LIMIT 1`,
+    [userId],
+  );
+  if (any.rows.length > 0) {
+    const r = any.rows[0];
+    await query(`UPDATE wallets SET is_active = TRUE WHERE id = $1`, [r.id]);
+    return {
+      publicKey: r.public_key,
+      walletId: r.id,
+      source: r.source,
+      label: r.label,
+    };
+  }
+
+  // No wallets at all — generate a new custodial one.
   const kp = Keypair.generate();
   const secretBuf = Buffer.from(kp.secretKey);
   const { ciphertext, iv, authTag } = encrypt(secretBuf);
 
-  await query(
-    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag)
-     VALUES ($1, $2, $3, $4, $5)`,
+  const { rows: [inserted] } = await query(
+    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag,
+                          source, label, is_active)
+     VALUES ($1, $2, $3, $4, $5, 'custodial', 'Magpie wallet', TRUE)
+     RETURNING id`,
     [userId, kp.publicKey.toBase58(), ciphertext, iv, authTag],
   );
 
-  return { publicKey: kp.publicKey.toBase58() };
+  return {
+    publicKey: kp.publicKey.toBase58(),
+    walletId: inserted.id,
+    source: "custodial",
+    label: "Magpie wallet",
+  };
 }
 
 /**
- * Load the full Keypair for a user. Use sparingly — keep in memory only as long as needed.
+ * Load the full Keypair for the user's ACTIVE wallet.
+ * Use sparingly — keep in memory only as long as needed.
  */
 export async function loadKeypair(userId) {
   const { rows } = await query(
-    "SELECT encrypted_secret, nonce, auth_tag FROM wallets WHERE user_id = $1",
+    `SELECT encrypted_secret, nonce, auth_tag
+       FROM wallets
+      WHERE user_id = $1 AND is_active = TRUE
+      LIMIT 1`,
     [userId],
   );
-  if (rows.length === 0) throw new Error("Wallet not found");
+  if (rows.length === 0) throw new Error("No active wallet found");
   const row = rows[0];
   const secret = decrypt(row.encrypted_secret, row.nonce, row.auth_tag);
   return Keypair.fromSecretKey(new Uint8Array(secret));
 }
 
 /**
- * Import an existing wallet by base58 private key.
- * Replaces any existing wallet for this user.
- * Returns { publicKey: string }.
+ * List ALL wallets for a user (active + inactive). Used by the
+ * /wallets command for display + switching.
+ *
+ * Returns array of { id, publicKey, source, label, isActive, createdAt }.
+ * Secrets are never returned.
+ */
+export async function listWallets(userId) {
+  const { rows } = await query(
+    `SELECT id, public_key, source, label, is_active, created_at
+       FROM wallets
+      WHERE user_id = $1
+      ORDER BY is_active DESC, created_at ASC`,
+    [userId],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    publicKey: r.public_key,
+    source: r.source,
+    label: r.label || (r.source === "custodial" ? "Magpie wallet" : "Imported"),
+    isActive: r.is_active,
+    createdAt: r.created_at,
+  }));
+}
+
+/**
+ * Switch the active wallet for a user. Deactivates all the user's
+ * other wallets and activates the specified one — atomic via a
+ * transaction so we never have zero or two actives.
+ */
+export async function setActiveWallet(userId, walletId) {
+  // Verify ownership before flipping anything
+  const { rows } = await query(
+    `SELECT id FROM wallets WHERE id = $1 AND user_id = $2`,
+    [walletId, userId],
+  );
+  if (rows.length === 0) {
+    throw new Error("Wallet not found or not yours");
+  }
+  // Atomic flip: deactivate all of this user's wallets, then activate one.
+  // The partial unique index would reject the second UPDATE if we set
+  // before unsetting, so order matters.
+  await query(`UPDATE wallets SET is_active = FALSE WHERE user_id = $1 AND is_active = TRUE`, [userId]);
+  await query(`UPDATE wallets SET is_active = TRUE WHERE id = $1`, [walletId]);
+}
+
+/**
+ * Import an existing wallet. ADDS a new wallet (or activates an
+ * existing one with the same public key), and makes it active.
+ *
+ * NEVER overwrites or destroys an existing wallet's secret —
+ * the user's other wallets are preserved and they can switch
+ * back via /wallets any time.
+ *
+ * Returns { publicKey, walletId, alreadyExisted }.
  */
 export async function importWallet(userId, base58PrivateKey) {
   const decoded = bs58.decode(base58PrivateKey);
   const kp = Keypair.fromSecretKey(decoded);
-  const secretBuf = Buffer.from(kp.secretKey);
-  const { ciphertext, iv, authTag } = encrypt(secretBuf);
+  const publicKey = kp.publicKey.toBase58();
 
-  const existing = await query("SELECT id FROM wallets WHERE user_id = $1", [userId]);
+  // Already have this wallet? Just activate it.
+  const existing = await query(
+    `SELECT id FROM wallets WHERE user_id = $1 AND public_key = $2 LIMIT 1`,
+    [userId, publicKey],
+  );
   if (existing.rows.length > 0) {
-    await query(
-      `UPDATE wallets SET public_key = $2, encrypted_secret = $3, nonce = $4, auth_tag = $5
-       WHERE user_id = $1`,
-      [userId, kp.publicKey.toBase58(), ciphertext, iv, authTag],
-    );
-  } else {
-    await query(
-      `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [userId, kp.publicKey.toBase58(), ciphertext, iv, authTag],
-    );
+    await setActiveWallet(userId, existing.rows[0].id);
+    return { publicKey, walletId: existing.rows[0].id, alreadyExisted: true };
   }
 
-  return { publicKey: kp.publicKey.toBase58() };
+  // New wallet — insert it. Deactivate all current actives first so
+  // the partial unique index doesn't reject the new one.
+  await query(`UPDATE wallets SET is_active = FALSE WHERE user_id = $1 AND is_active = TRUE`, [userId]);
+
+  const secretBuf = Buffer.from(kp.secretKey);
+  const { ciphertext, iv, authTag } = encrypt(secretBuf);
+  const { rows: [inserted] } = await query(
+    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag,
+                          source, label, is_active)
+     VALUES ($1, $2, $3, $4, $5, 'imported', 'Imported wallet', TRUE)
+     RETURNING id`,
+    [userId, publicKey, ciphertext, iv, authTag],
+  );
+
+  return { publicKey, walletId: inserted.id, alreadyExisted: false };
 }
 
 /**
- * Export base58 secret key for user (used by /export command with confirmation).
+ * Export base58 secret key for the ACTIVE wallet only.
  */
 export async function exportSecret(userId) {
   const kp = await loadKeypair(userId);
   return bs58.encode(kp.secretKey);
+}
+
+/**
+ * Export base58 secret for a SPECIFIC wallet (by wallet id). Used
+ * when the user wants to export an inactive wallet without first
+ * having to switch to it.
+ */
+export async function exportSecretByWalletId(userId, walletId) {
+  const { rows } = await query(
+    `SELECT encrypted_secret, nonce, auth_tag
+       FROM wallets WHERE id = $1 AND user_id = $2 LIMIT 1`,
+    [walletId, userId],
+  );
+  if (rows.length === 0) throw new Error("Wallet not found or not yours");
+  const row = rows[0];
+  const secret = decrypt(row.encrypted_secret, row.nonce, row.auth_tag);
+  return bs58.encode(secret);
+}
+
+/**
+ * Rename a wallet's label.
+ */
+export async function renameWallet(userId, walletId, label) {
+  const clean = (label || "").trim().slice(0, 40);
+  await query(
+    `UPDATE wallets SET label = $1 WHERE id = $2 AND user_id = $3`,
+    [clean || null, walletId, userId],
+  );
 }

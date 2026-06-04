@@ -82,6 +82,28 @@ export async function applyStartupPatches() {
   const patches = [
     `ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_public_key_key`,
 
+    // ── MULTI-WALLET SUPPORT ──
+    // Previously, /import REPLACED the user's Magpie-generated wallet's
+    // encrypted_secret with the imported wallet's secret. That destroyed
+    // the original key permanently and locked users out of any loans
+    // opened on the original wallet. This migration lifts the
+    // one-wallet-per-user constraint and adds active-wallet tracking
+    // so users can hold N wallets and toggle between them.
+    `ALTER TABLE wallets DROP CONSTRAINT IF EXISTS wallets_user_id_key`,
+    `ALTER TABLE wallets ADD COLUMN IF NOT EXISTS label TEXT`,
+    `ALTER TABLE wallets ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'custodial'`,
+    `ALTER TABLE wallets ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`,
+    // Mark every existing wallet as active (they're the only one per user
+    // right now, so this is correct). New /import calls will deactivate
+    // siblings and activate the new wallet atomically.
+    `UPDATE wallets SET is_active = TRUE WHERE is_active IS NULL`,
+    // Partial unique index — at most one active wallet per user.
+    // This is the integrity constraint that makes the active-wallet
+    // model unambiguous.
+    `CREATE UNIQUE INDEX IF NOT EXISTS wallets_one_active_per_user_idx
+       ON wallets (user_id) WHERE is_active = TRUE`,
+    `CREATE INDEX IF NOT EXISTS wallets_user_id_lookup_idx ON wallets (user_id)`,
+
     // $MAGPIE — protocol token, always approved, exempt from auto-disqualification.
     // Decimals=6 verified on-chain. ON CONFLICT keeps the row idempotent across boots.
     `INSERT INTO supported_mints

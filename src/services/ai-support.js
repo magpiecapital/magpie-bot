@@ -309,7 +309,11 @@ without guessing. Direct them to the right command.
 ONBOARDING / WALLET:
 - /start    — Onboarding. Creates Magpie wallet, shows deposit address.
 - /home     — Main menu (alias for /start without referral handling).
-- /wallet   — Show your Magpie wallet pubkey + SOL balance.
+- /wallet   — Show your ACTIVE wallet's pubkey + SOL balance.
+- /wallets  — List ALL of the user's wallets (custodial + imported)
+              and toggle which one is active. KEY COMMAND for users
+              who've imported and need to switch back to repay a loan
+              opened on a different wallet.
 - /deposit  — Show your Magpie wallet deposit address (with QR).
 - /withdraw — Withdraw SOL from your Magpie wallet to any address.
 - /import   — Import an EXISTING external wallet (Phantom/Solflare etc.)
@@ -620,20 +624,21 @@ most common causes:
 
 5. CONSTRAINT_HAS_ONE — Anchor error meaning the signing wallet
    ISN'T the borrower stored in the loan PDA. Almost always means
-   the user changed wallets (ran /import after borrowing) and is
-   trying to repay from a different wallet than the one that took
-   the loan out.
-   Diagnose: \`get_my_wallet\` shows current wallet, \`lookup_loan\`
-   shows the loan_pda. The user needs to verify on Solscan which
-   wallet originally created the loan tx.
-   Fix: If they still have access to the original wallet's key,
-   re-import it via /export from the bot UI of the wallet they
-   used originally, then /import here. If the original wallet's
-   key is lost — they can't repay this loan from a different
-   wallet, period. The loan will go past-due and liquidate.
-   Be empathetic: this is a user mistake but not their fault — the
-   bot should warn before /import when there are active loans
-   (admin TODO).
+   the user has MULTIPLE wallets and the wrong one is active.
+   Magpie supports multi-wallet (custodial + imported) and one is
+   active at a time. The fix is /wallets to switch back to the
+   wallet that opened the loan — no key re-paste needed, all the
+   user's wallets are preserved in their account.
+   Diagnose: \`get_my_wallet\` shows current ACTIVE wallet,
+   \`lookup_loan\` returns the loan_pda. The user needs to /wallets
+   and toggle to the original borrower wallet.
+   Fix path: run /wallets → find the original wallet in the list
+   → tap to switch → retry the original action.
+   Edge case: if the original wallet isn't in their /wallets list
+   (e.g., they imported it via a different bot or lost the key
+   elsewhere), THEN they need to /import it OR if the key is
+   truly gone, the loan will go past-due. Escalate via /support
+   for those cases.
 
 6. CONSTRAINT_SEEDS — account derivation mismatch. Usually means
    stale state in the bot vs on-chain. Suggest refreshing /positions
