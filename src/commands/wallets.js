@@ -78,10 +78,23 @@ export async function handleWallets(ctx) {
   }
 
   // Secondary actions row — small, demoted, doesn't compete with primary
-  // "Use X" buttons above.
-  kb.text("✏️ Rename a wallet", "wallets:rename_picker").row();
+  // "Use X" buttons above. Hide the Import button if the user is already
+  // at the per-account cap so we don't lead them into an error.
+  const atCap = wallets.length >= MAX_WALLETS_PER_USER;
+  if (atCap) {
+    kb.text("✏️ Rename a wallet", "wallets:rename_picker").row();
+  } else {
+    kb
+      .text("➕ Import wallet", "wallets:import")
+      .text("✏️ Rename", "wallets:rename_picker")
+      .row();
+  }
 
-  lines.push("_To add a new wallet, run /import. Your existing wallets stay intact — switch back any time._");
+  lines.push(
+    atCap
+      ? `_You're at the ${MAX_WALLETS_PER_USER}-wallet cap. Reach out via /support if you need a slot freed._`
+      : "_Tap ➕ Import wallet to add another. Your existing wallets stay intact — switch back any time._",
+  );
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb }).catch(async () => {
     // Markdown fallback for edge cases (e.g. pubkeys with reserved chars)
@@ -128,6 +141,14 @@ export function registerWalletsCallbacks(bot) {
   bot.callbackQuery("wallets:rename_cancel", async (ctx) => {
     await ctx.answerCallbackQuery("Cancelled");
     try { await ctx.editMessageText("Rename cancelled."); } catch { /* non-critical */ }
+  });
+
+  // Shortcut into /import directly from the /wallets screen so users
+  // don't have to remember the command name.
+  bot.callbackQuery("wallets:import", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleImport } = await import("./import-wallet.js");
+    await handleImport(ctx);
   });
 
   // Step 2 of rename — user picked a wallet from the picker. Prompt
