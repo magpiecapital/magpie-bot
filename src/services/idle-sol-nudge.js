@@ -69,7 +69,7 @@ async function nudgeUser(bot, user, idleSol) {
     "",
     `Drop it in the lending pool at *magpie.capital/earn* and it earns share-based yield from every loan fee on the protocol. No lock-up — withdraw any time the pool has liquidity.`,
     "",
-    `_60% of all loan fees flow to LPs pro-rata to their share-seconds. The longer you stay, the more you earn._`,
+    `_80% of all loan fees flow to LPs pro-rata to their share-seconds. The longer you stay, the more you earn._`,
     "",
     `_One-time nudge. Tap "Don't show again" below if you'd rather not get these._`,
   ].join("\n");

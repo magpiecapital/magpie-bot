@@ -40,7 +40,7 @@ export async function handleHelp(ctx) {
     "",
     "*Earn*",
     "/refer — earn 5% of friends' loan fees (lifetime, paid in SOL)",
-    "/holders — $MAGPIE holders earn 30% of all fees pro-rata (weekly distribution)",
+    "/holders — $MAGPIE holders earn 10% of all fees pro-rata (weekly distribution)",
     "",
     "*Marketplace*",
     "/lend — lending marketplace (create pools, deposit, browse)",
