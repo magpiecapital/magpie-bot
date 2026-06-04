@@ -104,6 +104,44 @@ export async function applyStartupPatches() {
        ON wallets (user_id) WHERE is_active = TRUE`,
     `CREATE INDEX IF NOT EXISTS wallets_user_id_lookup_idx ON wallets (user_id)`,
 
+    // ── WALLET SNAPSHOTS (APPEND-ONLY AUDIT LOG) ──
+    // Critical safety net: every time a wallet's encrypted_secret is set
+    // (on create OR import), we append a row here. This table is NEVER
+    // updated or deleted from — it's an immutable history of every key
+    // we've ever generated or imported.
+    //
+    // If the live `wallets` row ever gets corrupted or overwritten
+    // somehow, we can recover the original encrypted_secret by looking
+    // it up here by public_key.
+    //
+    // Background neon-sync service mirrors this table to Neon so we
+    // have an off-Railway copy as well.
+    `CREATE TABLE IF NOT EXISTS wallet_snapshots (
+       id BIGSERIAL PRIMARY KEY,
+       wallet_id BIGINT,
+       user_id BIGINT NOT NULL,
+       public_key TEXT NOT NULL,
+       encrypted_secret BYTEA NOT NULL,
+       nonce BYTEA NOT NULL,
+       auth_tag BYTEA NOT NULL,
+       source TEXT NOT NULL DEFAULT 'unknown',
+       trigger TEXT NOT NULL DEFAULT 'unknown',
+       snapshotted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS wallet_snapshots_pubkey_idx ON wallet_snapshots (public_key)`,
+    `CREATE INDEX IF NOT EXISTS wallet_snapshots_user_id_idx ON wallet_snapshots (user_id)`,
+
+    // Backfill snapshots for existing wallets so we have a history
+    // starting from now. Future creates/imports will snapshot inline.
+    `INSERT INTO wallet_snapshots
+        (wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag, source, trigger)
+      SELECT id, user_id, public_key, encrypted_secret, nonce, auth_tag,
+             COALESCE(source, 'custodial'), 'startup_backfill'
+        FROM wallets
+       WHERE NOT EXISTS (
+         SELECT 1 FROM wallet_snapshots ws WHERE ws.public_key = wallets.public_key
+       )`,
+
     // $MAGPIE — protocol token, always approved, exempt from auto-disqualification.
     // Decimals=6 verified on-chain. ON CONFLICT keeps the row idempotent across boots.
     `INSERT INTO supported_mints

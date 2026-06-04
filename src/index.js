@@ -77,6 +77,7 @@ import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { startInfraHealth } from "./services/infra-health.js";
+import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
@@ -317,6 +318,10 @@ bot.start({
     // Infra health — probes Anthropic, Helius, public RPC, DB every 5 min
     // Alerts admin only on SUSTAINED degradation (15+ min) to avoid noise
     setTimeout(() => startInfraHealth(bot), 100_000);
+    // Neon sync — periodic backup of critical tables (users, wallets,
+    // wallet_snapshots, loans, referral_codes) to the Neon cold standby.
+    // No-op if DATABASE_URL_SECONDARY not configured.
+    setTimeout(() => startNeonSync(), 180_000);
     // AI agent quality — runs 6 eval cases every 12h, alerts admin only
     // if >25% fail (catches prompt/tool regressions). Silent when healthy.
     setTimeout(() => startAiAgentHealth(bot), 110_000);
