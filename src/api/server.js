@@ -933,14 +933,9 @@ async function computeLifetimeStats() {
   const totalFees = BigInt(p.totalFeesEarned.toString());
   const totalDeposits = BigInt(p.totalDeposits.toString());
   const totalBorrowed = BigInt(p.totalBorrowed.toString());
-  // Updated split — $MAGPIE holders bumped to 30%, LPs to 60%. Other
-  // shares unchanged. These percentages are the GOING-FORWARD formula;
-  // the actual paid_lamports / pending_lamports values returned for each
-  // stakeholder below come from real DB ledgers and reflect actual
-  // accruals.
   const split = {
-    lp_yield_lamports:        (totalFees * 60n / 100n).toString(),
-    magpie_holders_lamports:  (totalFees * 30n / 100n).toString(),
+    lp_yield_lamports:        (totalFees * 80n / 100n).toString(),
+    magpie_holders_lamports:  (totalFees * 10n / 100n).toString(),
     referrers_lamports:       (totalFees *  5n / 100n).toString(),
     lp_loyalty_lamports:      (totalFees *  2n / 100n).toString(),
     protocol_treasury_lamports: (totalFees * 3n / 100n).toString(),
