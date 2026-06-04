@@ -76,6 +76,7 @@ import { startAiConversationDigest } from "./services/ai-conversation-digest.js"
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
+import { startAiAgentHealth } from "./services/ai-agent-health.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -302,6 +303,9 @@ bot.start({
     // Infra health — probes Anthropic, Helius, public RPC, DB every 5 min
     // Alerts admin only on SUSTAINED degradation (15+ min) to avoid noise
     setTimeout(() => startInfraHealth(bot), 100_000);
+    // AI agent quality — runs 6 eval cases every 12h, alerts admin only
+    // if >25% fail (catches prompt/tool regressions). Silent when healthy.
+    setTimeout(() => startAiAgentHealth(bot), 110_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
