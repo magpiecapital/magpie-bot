@@ -80,6 +80,8 @@ import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
 import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
+import { startIdleSolNudge } from "./services/idle-sol-nudge.js";
+import { startWinbackAgent, registerWinbackCallbacks } from "./services/winback-agent.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -174,6 +176,7 @@ registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
 registerTxErrorCallbacks(bot);
 registerDormantCallbacks(bot);
+registerWinbackCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -319,6 +322,12 @@ bot.start({
     // Dormant Re-Engagement — every 6h, nudges users who hold approved
     // collateral but have never borrowed. One DM per user per 30 days.
     setTimeout(() => startDormantReengagement(bot), 135_000);
+    // Idle-SOL → /earn agent — daily, nudges users with ≥1 SOL idle
+    // and no LP position. One DM per user per 30 days.
+    setTimeout(() => startIdleSolNudge(bot), 150_000);
+    // Past-borrower win-back agent — daily, nudges users who repaid
+    // ≥1 loan but haven't been active in 30+ days. Once per 60 days.
+    setTimeout(() => startWinbackAgent(bot), 165_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

@@ -277,6 +277,11 @@ export async function applyStartupPatches() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS dormant_nudges_sent INTEGER NOT NULL DEFAULT 0`,
     // Set TRUE if user opts out of proactive engagement DMs.
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS proactive_dms_disabled BOOLEAN NOT NULL DEFAULT FALSE`,
+    // Idle-SOL agent: tracks last "deposit your idle SOL to /earn" nudge.
+    // Separate from dormant_nudge so we don't double-message users.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_idle_sol_nudge_at TIMESTAMPTZ`,
+    // Win-back agent: tracks last "come back, you've repaid before" nudge.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_winback_nudge_at TIMESTAMPTZ`,
     // Migrate legacy 'responded' status to new 'awaiting_user' state.
     `UPDATE support_tickets SET status = 'awaiting_user'
         WHERE status = 'responded'`,
