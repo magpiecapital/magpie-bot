@@ -379,8 +379,9 @@ async function handleTransparency() {
         last_distribution_at: holders.last_distribution_at,
       },
       lp_loyalty: {
-        current_pool_sol: lpLoy.current_pool_lamports
-          ? Number(lpLoy.current_pool_lamports) / 1e9 : 0,
+        // current_pool_sol is OPERATOR-PRIVATE (same reason as
+        // holder_rewards above). Only historical distribution count
+        // is public.
         lifetime_distributions: lpLoy.lifetime_distributions,
       },
       referrals: {
