@@ -269,6 +269,14 @@ export async function applyStartupPatches() {
     // Null = never auto-attempted. Used to avoid double-resolution
     // and to surface in /tickets.
     `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS auto_resolved_at TIMESTAMPTZ`,
+
+    // Dormant-re-engagement tracking. The agent nudges users who
+    // haven't borrowed yet but have approved collateral in their
+    // wallet. Hard rate limit: at most 1 nudge per user every 30 days.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_dormant_nudge_at TIMESTAMPTZ`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS dormant_nudges_sent INTEGER NOT NULL DEFAULT 0`,
+    // Set TRUE if user opts out of proactive engagement DMs.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS proactive_dms_disabled BOOLEAN NOT NULL DEFAULT FALSE`,
     // Migrate legacy 'responded' status to new 'awaiting_user' state.
     `UPDATE support_tickets SET status = 'awaiting_user'
         WHERE status = 'responded'`,

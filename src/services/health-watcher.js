@@ -11,13 +11,91 @@
  * crossing a lower threshold we haven't warned about.
  */
 import { InlineKeyboard } from "grammy";
+import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { collateralValueLamports } from "./price.js";
 import { getPrefs } from "./prefs.js";
+import { connection } from "../solana/connection.js";
+import { getSupportedBalances } from "./deposits.js";
+
+/**
+ * Look at the user's wallet and recommend the ONE best action to take
+ * given their loan's current health and what they actually hold.
+ *
+ *   • Have enough idle SOL to partial-repay back to safe? → /partialrepay
+ *   • Have more of the same collateral token in wallet? → /topup
+ *   • Have neither but loan isn't imminent? → /extend
+ *   • Have neither and loan is imminent? → /repay full (deposit + repay)
+ */
+async function recommendAction(userId, loan, healthRatio, owedLamports, collateralLamports) {
+  try {
+    const { rows: [w] } = await query(
+      `SELECT public_key FROM wallets WHERE user_id = $1`,
+      [userId],
+    );
+    if (!w?.public_key) return null;
+    const pubkey = new PublicKey(w.public_key);
+
+    // Idle SOL
+    let solLamports = 0n;
+    try {
+      solLamports = BigInt(await connection.getBalance(pubkey));
+    } catch { /* fall through */ }
+
+    // To bring health from current to 1.5x via partial repay:
+    //   newOwed = collateral / 1.5x
+    //   need to pay = owed - newOwed
+    const targetOwed = BigInt(Math.floor(Number(collateralLamports) / 1.5));
+    const owedBig = BigInt(owedLamports);
+    const partialRepayNeeded = owedBig > targetOwed ? owedBig - targetOwed : 0n;
+    const GAS_RESERVE = 3_000_000n;
+
+    if (solLamports > partialRepayNeeded + GAS_RESERVE && partialRepayNeeded > 0n) {
+      const partialSol = (Number(partialRepayNeeded) / 1e9).toFixed(4);
+      return {
+        action: "partialrepay",
+        text: `You have \`${(Number(solLamports) / 1e9).toFixed(4)} SOL\` idle in your wallet. /partialrepay ~\`${partialSol} SOL\` to bring health back above 1.5x — keeps your collateral locked but reduces risk.`,
+      };
+    }
+
+    // Do they have more of the same collateral token they could top up with?
+    try {
+      const balances = await getSupportedBalances(w.public_key);
+      const sameToken = balances.find((b) => b.mint === loan.collateral_mint);
+      if (sameToken && Number(sameToken.rawAmount) > 0) {
+        return {
+          action: "topup",
+          text: `You have \`${sameToken.humanAmount.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${sameToken.symbol}\` idle in your wallet. /topup that loan with more collateral — free besides ~0.001 SOL gas, lowers your effective LTV immediately.`,
+        };
+      }
+    } catch { /* RPC blip, fall through to generic */ }
+
+    // Imminent (< 1.2x)? Recommend full repay if they can fund it,
+    // otherwise extend buys time.
+    if (healthRatio < 1.2) {
+      return {
+        action: "deposit_repay",
+        text: `Health is in the danger zone. Either /deposit more SOL and /repay in full, or /extend to push the due date out and give yourself breathing room.`,
+      };
+    }
+
+    // Default: extend is the cheapest stall option
+    return {
+      action: "extend",
+      text: `No idle SOL or extra collateral in your wallet. /extend pushes the due date out for a small fee — buys you time to figure out next steps.`,
+    };
+  } catch (err) {
+    console.warn("[health-watcher] recommend failed:", err.message);
+    return null;
+  }
+}
 
 const POLL_INTERVAL_MS = Number(process.env.HEALTH_WATCH_MS) || 120_000;
 
 const THRESHOLDS = [
+  // Tier 0: early heads-up. Not alarming, just informational. Gives users
+  // a chance to act calmly before things actually get tight.
+  { ratio: 1.5, emoji: "🟢", label: "Heads up — your loan health dipped below 1.5x." },
   { ratio: 1.3, emoji: "🟡", label: "Your loan health is getting tight." },
   { ratio: 1.2, emoji: "🟠", label: "Your loan is close to liquidation." },
   { ratio: 1.1, emoji: "🔴", label: "Imminent liquidation risk." },
@@ -69,22 +147,46 @@ async function checkLoan(bot, row) {
     return;
   }
 
-  const kb = new InlineKeyboard()
-    .text("🔧 Repay now", `repay:loan:${row.id}`)
-    .text("➕ Top up", `topup:loan:${row.id}`)
-    .row()
-    .text("⏱ Extend", `extend:loan:${row.id}`);
+  // Personalize the recommendation based on what the user actually
+  // has in their wallet — idle SOL vs extra collateral vs neither.
+  // Slow path (RPC calls); silently falls back to generic if it fails.
+  const rec = await recommendAction(row.user_id, row, ratio, owed, valueLamports);
+
+  // Order the inline-keyboard so the recommended action comes first.
+  const kb = new InlineKeyboard();
+  if (rec?.action === "partialrepay") {
+    kb.text("💰 Partial repay", `partialrepay:loan:${row.id}`)
+      .text("✕", "fallback:dismiss")
+      .row()
+      .text("Other: /repay /topup /extend", "fallback:noop");
+  } else if (rec?.action === "topup") {
+    kb.text("➕ Top up collateral", `topup:loan:${row.id}`)
+      .text("✕", "fallback:dismiss")
+      .row()
+      .text("Other: /repay /partialrepay /extend", "fallback:noop");
+  } else if (rec?.action === "extend") {
+    kb.text("⏱ Extend term", `extend:loan:${row.id}`)
+      .text("✕", "fallback:dismiss")
+      .row()
+      .text("Other: /repay /partialrepay /topup", "fallback:noop");
+  } else {
+    // Imminent or unknown — full menu
+    kb.text("🔧 Repay now", `repay:loan:${row.id}`)
+      .text("➕ Top up", `topup:loan:${row.id}`)
+      .row()
+      .text("⏱ Extend", `extend:loan:${row.id}`);
+  }
 
   const msg = [
     `${alert.emoji} *Loan health alert*`,
     "",
     `${alert.label}`,
     "",
-    `Loan #${row.loan_id} — health ${ratio.toFixed(2)}x`,
-    `Collateral value: ${(valueLamports / 1e9).toFixed(4)} SOL`,
-    `Owed: ${(owed / 1e9).toFixed(4)} SOL`,
+    `Loan #${row.loan_id} — health *${ratio.toFixed(2)}x*`,
+    `Collateral value: \`${(valueLamports / 1e9).toFixed(4)} SOL\``,
+    `Owed: \`${(owed / 1e9).toFixed(4)} SOL\``,
     "",
-    "Options: /repay · /partialrepay · /topup collateral · /extend",
+    rec ? `*Recommended:* ${rec.text}` : "Options: /repay · /partialrepay · /topup collateral · /extend",
   ].join("\n");
 
   try {

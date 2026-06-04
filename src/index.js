@@ -79,6 +79,7 @@ import { startInfraHealth } from "./services/infra-health.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
+import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -172,6 +173,7 @@ registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
 registerTxErrorCallbacks(bot);
+registerDormantCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -314,6 +316,9 @@ bot.start({
     // autonomously instead of pinging admin. Critical-reason tickets
     // (security/bug) skipped — those go to admin as designed.
     setTimeout(() => startAutoTicketResolver(bot), 120_000);
+    // Dormant Re-Engagement — every 6h, nudges users who hold approved
+    // collateral but have never borrowed. One DM per user per 30 days.
+    setTimeout(() => startDormantReengagement(bot), 135_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },
