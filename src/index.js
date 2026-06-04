@@ -53,6 +53,7 @@ import {
   handleCloseAll,
   handleAiStats,
   handleInfraHealth,
+  handleHolderPool,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -153,6 +154,8 @@ bot.command("close", handleClose);
 bot.command("closeall", handleCloseAll);
 bot.command("aistats", handleAiStats);
 bot.command("infrahealth", handleInfraHealth);
+bot.command("holderpool", handleHolderPool);
+bot.command("pools", handleHolderPool); // alias
 
 // Inline callback registration.
 //

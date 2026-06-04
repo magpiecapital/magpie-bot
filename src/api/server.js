@@ -370,8 +370,9 @@ async function handleTransparency() {
       users,
       pool,
       holder_rewards: {
-        current_pool_sol: holders.current_pool_lamports
-          ? Number(holders.current_pool_lamports) / 1e9 : 0,
+        // current_pool_sol is OPERATOR-PRIVATE. Exposing it would let
+        // mercenary holders front-run snapshots. Only historical
+        // distributions are public (chain shows them anyway).
         lifetime_distributions: holders.lifetime_distributions,
         last_distribution_sol: holders.last_distribution_lamports
           ? Number(holders.last_distribution_lamports) / 1e9 : null,

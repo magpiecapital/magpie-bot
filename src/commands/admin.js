@@ -294,6 +294,103 @@ export async function handleTickets(ctx) {
  * Usage: /close <ticket#>
  */
 /**
+ * /holderpool — admin-only diagnostic for the $MAGPIE holder + LP
+ * loyalty reward pools. Shows internal state AND a sanity check:
+ * "based on loans in the DB, this pool SHOULD have ~N SOL accrued —
+ * does the actual accrued_lamports match?" If they don't match, the
+ * fee-routing code path is broken.
+ *
+ * OPERATOR-PRIVATE. Never expose this data through any public surface.
+ */
+export async function handleHolderPool(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+
+  const HOLDER_REWARD_BPS = 1_000;   // 10% — kept in sync with magpie-holder-rewards.js
+  const LP_LOYALTY_BPS = 200;        // 2%
+
+  const { rows: [hp] } = await query(
+    `SELECT accrued_lamports::text, last_distribution_at, updated_at,
+            next_distribution_at
+     FROM magpie_holder_pool WHERE id = 1`,
+  );
+  const { rows: [lp] } = await query(
+    `SELECT accrued_lamports::text, last_distribution_at, updated_at
+     FROM lp_loyalty_pool WHERE id = 1`,
+  );
+
+  // Expected accrual from loans — fee per loan = loan_amount × tier_bps
+  // We approximate tier_bps from ltv_percentage column.
+  const sinceClause = hp?.last_distribution_at
+    ? `start_timestamp > $1`
+    : `start_timestamp IS NOT NULL`;
+  const sinceParams = hp?.last_distribution_at ? [hp.last_distribution_at] : [];
+  const { rows: [expected] } = await query(
+    `SELECT
+       COALESCE(SUM(
+         CASE
+           WHEN ltv_percentage >= 30 THEN loan_amount_lamports::numeric * 300 / 10000
+           WHEN ltv_percentage >= 25 THEN loan_amount_lamports::numeric * 200 / 10000
+           ELSE loan_amount_lamports::numeric * 150 / 10000
+         END
+       ), 0)::text AS total_fees_lamports,
+       COUNT(*)::int AS loans_counted
+     FROM loans WHERE ${sinceClause}`,
+    sinceParams,
+  );
+
+  const totalFeesLamports = BigInt(expected.total_fees_lamports || "0");
+  const expectedHolderAccrual = (totalFeesLamports * BigInt(HOLDER_REWARD_BPS)) / 10_000n;
+  const expectedLpAccrual = (totalFeesLamports * BigInt(LP_LOYALTY_BPS)) / 10_000n;
+  const actualHolder = BigInt(hp?.accrued_lamports || "0");
+  const actualLp = BigInt(lp?.accrued_lamports || "0");
+  const holderDelta = expectedHolderAccrual - actualHolder;
+  const lpDelta = expectedLpAccrual - actualLp;
+
+  const fmt = (lamports) => (Number(lamports) / 1e9).toFixed(6);
+  const sign = (n) => (n >= 0n ? "+" : "");
+
+  const lines = [
+    "🔐 *Pool diagnostic (internal — DO NOT share)*",
+    "",
+    "*$MAGPIE Holder Pool*",
+    `  Actual accrued:  \`${fmt(actualHolder)} SOL\``,
+    `  Expected (10% of all loan fees${hp?.last_distribution_at ? " since last dist" : ""}):`,
+    `                   \`${fmt(expectedHolderAccrual)} SOL\``,
+    `  Δ (expected − actual): *\`${sign(holderDelta)}${fmt(holderDelta)} SOL\`*`,
+    `  Last distribution:  ${hp?.last_distribution_at ? new Date(hp.last_distribution_at).toISOString() : "_never_"}`,
+    `  Next distribution:  ${hp?.next_distribution_at ? new Date(hp.next_distribution_at).toISOString() : "_unscheduled_"}`,
+    `  Pool last touched:  ${hp?.updated_at ? new Date(hp.updated_at).toISOString() : "_never_"}`,
+    "",
+    "*LP Loyalty Pool*",
+    `  Actual accrued:  \`${fmt(actualLp)} SOL\``,
+    `  Expected (2%):   \`${fmt(expectedLpAccrual)} SOL\``,
+    `  Δ: *\`${sign(lpDelta)}${fmt(lpDelta)} SOL\`*`,
+    `  Pool last touched: ${lp?.updated_at ? new Date(lp.updated_at).toISOString() : "_never_"}`,
+    "",
+    `_${expected.loans_counted} loans counted in expected calc._`,
+    "",
+  ];
+
+  // Diagnosis
+  if (holderDelta > 1_000_000n) {
+    lines.push(
+      "🚨 *Bug detected*: holder pool is missing accrual.",
+      "Possible causes:",
+      "• recordLoan's `accrueToHolderPool` isn't firing",
+      "  (check Railway logs for `[holder-rewards] accrual failed`)",
+      "• A redeploy or migration reset the pool row",
+      "• Loans created via a path other than recordLoan",
+    );
+  } else if (holderDelta < -1_000_000n) {
+    lines.push("⚠️ Holder pool has MORE than expected — possible double-accrual.");
+  } else {
+    lines.push("✅ Holder pool accrual matches expected. Healthy.");
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
+/**
  * /ticket <id> — pull full detail on a specific ticket. Useful when
  * you get a critical-ticket DM and want to see exactly what the user
  * said + what the agent already tried before deciding how to respond.
