@@ -31,14 +31,20 @@ const CREDIT_ORACLE_PROGRAM_ID = new PublicKey(
 const PUBLISH_INTERVAL = parseInt(process.env.CREDIT_PUBLISH_INTERVAL || "300", 10) * 1000;
 
 /**
- * Load the authority keypair (same lender keypair used for the lending program).
+ * Load the authority keypair (same lender keypair used for the lending
+ * program). Supports both env-var (LENDER_PRIVATE_KEY = base58 string —
+ * what Railway uses in production) and file-path (LENDER_KEYPAIR_PATH —
+ * for local dev). Previously only the file path was supported, which
+ * meant the publisher silently failed in production every cycle.
  */
 function loadAuthority() {
+  const b58 = process.env.LENDER_PRIVATE_KEY;
+  if (b58) return Keypair.fromSecretKey(bs58.decode(b58));
   if (process.env.LENDER_KEYPAIR_PATH) {
     const raw = JSON.parse(readFileSync(process.env.LENDER_KEYPAIR_PATH, "utf8"));
     return Keypair.fromSecretKey(new Uint8Array(raw));
   }
-  throw new Error("LENDER_KEYPAIR_PATH not set");
+  throw new Error("Neither LENDER_PRIVATE_KEY env var nor LENDER_KEYPAIR_PATH file is set");
 }
 
 /**
