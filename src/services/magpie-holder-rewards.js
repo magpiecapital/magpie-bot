@@ -629,8 +629,18 @@ export async function claimHolderRewards({ walletAddress }) {
  * 5-10 days after each distribution. This stops mercenary holders from
  * timing a buy-just-before / dump-just-after pattern.
  */
-export function startHolderDistributor() {
+export function startHolderDistributor(bot) {
   console.log("[holder-rewards] Distributor starting (random 5-10d window, hidden timing)");
+
+  async function adminPing(text) {
+    if (!bot) return;
+    try {
+      const { notifyAdmin } = await import("./admin-notify.js");
+      await notifyAdmin(bot, text, { parse_mode: "Markdown" });
+    } catch (err) {
+      console.warn("[holder-rewards] admin notify failed (non-critical):", err.message);
+    }
+  }
 
   async function tick() {
     try {
@@ -672,9 +682,26 @@ export function startHolderDistributor() {
           `[holder-rewards] Distributed: ${Number(result.paid_lamports) / 1e9} SOL paid ` +
             `(of ${Number(result.allocated_lamports) / 1e9} allocated) to ${result.paid_count}/${result.eligible_count} holders`,
         );
+        // DM admin so the operator sees it the moment it lands — no
+        // need to poll a dashboard. Includes the numbers needed to
+        // decide what to do next (community vote, follow-up post, etc.)
+        const paidSol = (Number(result.paid_lamports) / 1e9).toFixed(6);
+        const allocSol = (Number(result.allocated_lamports) / 1e9).toFixed(6);
+        await adminPing(
+          [
+            "💎 *$MAGPIE holder snapshot complete*",
+            "",
+            `Paid: \`${paidSol} SOL\` (of \`${allocSol}\` allocated)`,
+            `Recipients paid: ${result.paid_count} / ${result.eligible_count} eligible`,
+            `Distribution ID: \`${result.distribution_id}\``,
+            "",
+            "_Next snapshot scheduled internally (timing private). Reply here when you're ready to discuss the community vote on reward economics._",
+          ].join("\n"),
+        );
       }
     } catch (err) {
       console.error("[holder-rewards] tick failed:", err.message);
+      await adminPing(`⚠️ *Holder distribution failed*\n\n\`${err.message?.slice(0, 200)}\``);
     }
   }
 

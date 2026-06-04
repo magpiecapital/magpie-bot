@@ -290,19 +290,11 @@ export async function applyStartupPatches() {
     `ALTER TABLE magpie_holder_pool
        ADD COLUMN IF NOT EXISTS next_distribution_at TIMESTAMPTZ`,
 
-    // Pin the FIRST distribution to a specific moment chosen by the
-    // operator. Only takes effect if no distribution has happened yet —
-    // once the first snapshot fires, the random-window logic takes over
-    // for subsequent runs. Idempotent across boots.
-    //
-    // The exact timestamp must remain operator-private: do not echo it
-    // to logs that ship to public dashboards, do not surface it in any
-    // API response, do not put it in commit messages that are user-facing.
-    `UPDATE magpie_holder_pool
-        SET next_distribution_at = '2026-06-08 17:00:00+00'::timestamptz,
-            updated_at = NOW()
-      WHERE id = 1
-        AND last_distribution_at IS NULL`,
+    // The first-snapshot pin lives in Railway env var (operator-private)
+    // so it doesn't leak in this public repo. Applied separately by the
+    // operator with a one-off SQL update; future schedule changes go
+    // the same way. After the first snapshot fires, the random-window
+    // logic takes over for subsequent runs.
 
     // ─────── LP LOYALTY BONUS POOL ───────
     // 2% of every loan fee accrues to this pool, distributed pro-rata to

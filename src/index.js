@@ -299,7 +299,7 @@ bot.start({
     // $MAGPIE holder reward distributions (weekly snapshot + pro-rata payout).
     // Idempotent — only runs when the pool has accrued AND 7+ days have
     // passed since the last distribution.
-    setTimeout(() => startHolderDistributor(), 90_000);
+    setTimeout(() => startHolderDistributor(bot), 90_000);
     // LP Loyalty distributor — rewards long-term LPs from 2% of fees
     setTimeout(() => startLpLoyaltyDistributor(), 120_000);
     // Loan reconciler — proactively syncs DB state with on-chain truth
