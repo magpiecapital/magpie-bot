@@ -32,6 +32,7 @@ import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/auto
 import { handleCalendar, registerCalendarCallbacks } from "./commands/calendar.js";
 import { handleHealth } from "./commands/health.js";
 import { handleShare } from "./commands/share.js";
+import { handleUnlock, registerUnlockCallbacks } from "./commands/unlock.js";
 import { handleWallet } from "./commands/wallet.js";
 import { handleHome } from "./commands/home.js";
 import { handleSubmit } from "./commands/submit.js";
@@ -125,6 +126,8 @@ bot.command("calendar", handleCalendar);
 bot.command("health", handleHealth);
 bot.command("share", handleShare);
 bot.command("flex", handleShare); // alias — crypto-native phrasing
+bot.command("unlock", handleUnlock);
+bot.command("potential", handleUnlock); // alias
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
@@ -161,6 +164,7 @@ registerSupportCallbacks(bot);
 registerMyTicketsCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
+registerUnlockCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);
@@ -217,6 +221,7 @@ async function registerBotCommands() {
     await bot.api.setMyCommands([
       { command: "home", description: "🏠 Home / main menu" },
       { command: "wallet", description: "💼 Your wallet + SOL balance" },
+      { command: "unlock", description: "🔓 See your borrow potential" },
       { command: "borrow", description: "💰 Take a loan" },
       { command: "positions", description: "📊 Active loans" },
       { command: "calendar", description: "📅 Loans sorted by due date" },

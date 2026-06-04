@@ -253,6 +253,11 @@ ONBOARDING / WALLET:
               trusted device. Bot will warn before revealing.
 
 BORROWING / LOANS:
+- /unlock      — Shows the user's borrow POTENTIAL — what they could
+                 unlock from each token they already hold. The
+                 highest-value command for someone who hasn't borrowed
+                 yet. Always suggest this to passive users wondering
+                 "what could I do here?"
 - /borrow      — Take out a SOL loan against collateral. Walks through
                  token + tier selection.
 - /simulate    — PREVIEW a loan with live prices — no commit, no wallet
