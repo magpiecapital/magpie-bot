@@ -59,6 +59,10 @@ export async function handleWallets(ctx) {
     "",
   ];
 
+  // Compact list. Each inactive wallet gets a single primary "Use this"
+  // button (one-tap switch). The active wallet shows no row-level button.
+  // Rename is demoted to a single secondary action at the bottom that
+  // opens a picker — keeps the visual focus on switching.
   const kb = new InlineKeyboard();
   for (let i = 0; i < wallets.length; i++) {
     const w = wallets[i];
@@ -68,20 +72,16 @@ export async function handleWallets(ctx) {
     lines.push(`${flag} *${w.label}* — \`${shortPubkey(w.publicKey)}\``);
     lines.push(`   _${w.source === "custodial" ? "Magpie-generated" : "Imported"} · ${balStr}_`);
     lines.push("");
-    // Per-wallet row of action buttons. Active wallet only shows
-    // [Rename] (no need to "switch to" the active one).
-    if (w.isActive) {
-      kb.text(`✏️ Rename ${w.label}`, `wallets:rename:${w.id}`).row();
-    } else {
-      kb
-        .text(`Use ${w.label}`, `wallets:switch:${w.id}`)
-        .text(`✏️ Rename`, `wallets:rename:${w.id}`)
-        .row();
+    if (!w.isActive) {
+      kb.text(`Use ${w.label}`, `wallets:switch:${w.id}`).row();
     }
   }
 
+  // Secondary actions row — small, demoted, doesn't compete with primary
+  // "Use X" buttons above.
+  kb.text("✏️ Rename a wallet", "wallets:rename_picker").row();
+
   lines.push("_To add a new wallet, run /import. Your existing wallets stay intact — switch back any time._");
-  lines.push("_Tap ✏️ Rename next to any wallet to give it a custom name._");
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb }).catch(async () => {
     // Markdown fallback for edge cases (e.g. pubkeys with reserved chars)
@@ -103,9 +103,36 @@ export function registerWalletsCallbacks(bot) {
     await handleWallets(ctx);
   });
 
-  // Prompt the user for a new label for the chosen wallet. We stash the
-  // walletId in the awaiting map and the text-message middleware below
-  // picks up the user's next message as the new name.
+  // Step 1 of rename — show a picker so the user chooses WHICH wallet
+  // to rename. Cleaner than per-row rename buttons cluttering the main list.
+  bot.callbackQuery("wallets:rename_picker", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+    const wallets = await listWallets(user.id);
+    if (wallets.length === 0) return ctx.reply("You have no wallets yet — run /start to set one up.");
+
+    const lines = [
+      "✏️ *Rename a wallet*",
+      "",
+      "Pick which wallet to rename:",
+    ];
+    const kb = new InlineKeyboard();
+    for (const w of wallets) {
+      kb.text(`${w.label} (${shortPubkey(w.publicKey)})`, `wallets:rename:${w.id}`).row();
+    }
+    kb.text("Cancel", "wallets:rename_cancel");
+
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
+  });
+
+  bot.callbackQuery("wallets:rename_cancel", async (ctx) => {
+    await ctx.answerCallbackQuery("Cancelled");
+    try { await ctx.editMessageText("Rename cancelled."); } catch { /* non-critical */ }
+  });
+
+  // Step 2 of rename — user picked a wallet from the picker. Prompt
+  // them for the new label. The text-message middleware below picks up
+  // their reply as the new name.
   bot.callbackQuery(/^wallets:rename:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const walletId = Number(ctx.match[1]);
