@@ -188,7 +188,15 @@ export async function handleReply(ctx) {
  */
 export async function handleTickets(ctx) {
   if (!(await requireAdmin(ctx))) return;
-  const arg = (ctx.message?.text || "").split(/\s+/)[1]?.toLowerCase() || "open";
+  const rawArg = (ctx.message?.text || "").split(/\s+/)[1];
+
+  // If arg is a number, show full detail on that specific ticket.
+  // /tickets 15 → detail · /tickets open → list view
+  if (rawArg && /^\d+$/.test(rawArg)) {
+    return handleTicket(ctx);
+  }
+
+  const arg = rawArg?.toLowerCase() || "open";
 
   let statusFilter, label;
   if (arg === "open") {
@@ -285,6 +293,118 @@ export async function handleTickets(ctx) {
  *
  * Usage: /close <ticket#>
  */
+/**
+ * /ticket <id> — pull full detail on a specific ticket. Useful when
+ * you get a critical-ticket DM and want to see exactly what the user
+ * said + what the agent already tried before deciding how to respond.
+ *
+ * Shows:
+ *   • Status, age, follow-up count, auto-resolve status
+ *   • User: handle, account age, loan counts, streak
+ *   • Original message (full, untruncated)
+ *   • Most-recent admin/auto reply (if any)
+ *   • Recent agent conversation if any is still in TTL window
+ */
+export async function handleTicket(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const arg = (ctx.message?.text || "").split(/\s+/)[1];
+  const ticketId = Number(arg);
+  if (!arg || !Number.isFinite(ticketId)) {
+    return ctx.reply("Usage: `/ticket <id>`", { parse_mode: "Markdown" });
+  }
+
+  const { rows } = await query(
+    `SELECT s.id, s.user_id, s.message, s.status,
+            s.admin_reply, s.admin_replied_at,
+            s.auto_resolved_at, s.last_user_followup_at, s.followup_count,
+            s.closed_at, s.created_at,
+            u.telegram_id, u.telegram_username, u.current_streak, u.created_at AS user_created_at,
+            (SELECT COUNT(*) FROM loans WHERE user_id = u.id)::int AS total_loans,
+            (SELECT COUNT(*) FROM loans WHERE user_id = u.id AND status = 'active')::int AS active_loans
+     FROM support_tickets s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.id = $1`,
+    [ticketId],
+  );
+
+  if (rows.length === 0) {
+    return ctx.reply(`Ticket #${ticketId} not found.`);
+  }
+  const t = rows[0];
+  const ageMin = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60_000);
+  const ageStr = ageMin < 60 ? `${ageMin}m` : ageMin < 60 * 24 ? `${Math.floor(ageMin / 60)}h` : `${Math.floor(ageMin / (60 * 24))}d`;
+  const userAgeDays = Math.floor((Date.now() - new Date(t.user_created_at).getTime()) / (24 * 3_600_000));
+  const fromTag = t.telegram_username ? `@${t.telegram_username}` : `tg://${t.telegram_id}`;
+
+  const lines = [
+    `🎫 *Ticket #${t.id}* · _${t.status}_ · ${ageStr} ago`,
+    "",
+    `*From:* ${fromTag}`,
+    `*User stats:* ${userAgeDays}d account · ${t.total_loans} loans (${t.active_loans} active) · streak ${t.current_streak || 0}`,
+    "",
+    "*Original message:*",
+    "```",
+    (t.message || "(empty)").slice(0, 1500),
+    "```",
+  ];
+
+  if (t.followup_count > 0) {
+    lines.push("", `_${t.followup_count} follow-up(s) — see message above for full thread._`);
+  }
+
+  if (t.admin_reply) {
+    lines.push("", "*Last reply (admin or AI auto-resolver):*");
+    if (t.auto_resolved_at) {
+      const arAgo = Math.floor((Date.now() - new Date(t.auto_resolved_at).getTime()) / 60_000);
+      lines.push(`_AI auto-resolved ${arAgo}m ago_`);
+    } else if (t.admin_replied_at) {
+      const arAgo = Math.floor((Date.now() - new Date(t.admin_replied_at).getTime()) / 60_000);
+      lines.push(`_Admin replied ${arAgo}m ago_`);
+    }
+    lines.push("```", t.admin_reply.slice(0, 1500), "```");
+  }
+
+  // Recent agent conversation if it's still in the TTL window
+  const conv = await query(
+    `SELECT messages, turns, last_active_at FROM support_conversations WHERE user_id = $1`,
+    [t.user_id],
+  );
+  if (conv.rows.length > 0) {
+    const c = conv.rows[0];
+    const lastMin = Math.floor((Date.now() - new Date(c.last_active_at).getTime()) / 60_000);
+    if (lastMin < 60) {
+      lines.push("", `*Live agent conversation* (${c.turns} turns, last active ${lastMin}m ago):`);
+      const msgs = Array.isArray(c.messages) ? c.messages : [];
+      const recent = msgs.slice(-6);
+      const transcript = [];
+      for (const m of recent) {
+        if (m.role === "user") {
+          const text = typeof m.content === "string" ? m.content : "[tool_result]";
+          transcript.push(`👤 ${text.slice(0, 200)}`);
+        } else if (m.role === "assistant" && Array.isArray(m.content)) {
+          for (const b of m.content) {
+            if (b.type === "text") transcript.push(`🤖 ${b.text.slice(0, 200)}`);
+            else if (b.type === "tool_use") transcript.push(`🛠 ${b.name}`);
+          }
+        }
+      }
+      lines.push("```", transcript.join("\n").slice(0, 1500), "```");
+    }
+  }
+
+  lines.push(
+    "",
+    `*Actions:*`,
+    `\`/reply ${t.id} <message>\` — respond to user`,
+    `\`/close ${t.id}\` — mark resolved`,
+  );
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {
+    // Markdown can choke on user-provided content — fallback plaintext
+    return ctx.reply(lines.join("\n").replace(/[*_`]/g, ""));
+  });
+}
+
 export async function handleClose(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const arg = (ctx.message?.text || "").split(/\s+/)[1];
