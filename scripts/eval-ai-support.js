@@ -259,7 +259,7 @@ function info(s) { return `${COLORS.dim}${s}${COLORS.reset}`; }
 async function setupTestUser() {
   // Insert minimal rows so tools don't blow up on "user not found"
   await query(
-    `INSERT INTO users (telegram_id, username) VALUES ($1, $2)
+    `INSERT INTO users (telegram_id, telegram_username) VALUES ($1, $2)
      ON CONFLICT (telegram_id) DO NOTHING`,
     [TEST_USER_ID, "ai_eval_harness"],
   );
