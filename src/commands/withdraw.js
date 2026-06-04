@@ -17,7 +17,7 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet, loadKeypair } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { connection } from "../solana/connection.js";
-import { translateTxError } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -131,7 +131,10 @@ export function registerWithdrawCallbacks(bot) {
       } catch (err) {
         console.error("Withdraw failed:", err);
         const friendly = translateTxError(err, { flow: "withdraw" });
-        await ctx.reply(friendly, { parse_mode: "Markdown" });
+        await ctx.reply(friendly, {
+          parse_mode: "Markdown",
+          reply_markup: errorActionKeyboard({ flow: "withdraw", errorKind: "tx_error" }),
+        });
       }
       return;
     }

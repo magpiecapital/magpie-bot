@@ -17,8 +17,31 @@
  * we surface a Solana transaction error directly to the user.
  */
 
+import { InlineKeyboard } from "grammy";
+
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
+}
+
+/**
+ * Standard inline keyboard for tx errors. Every error message ends
+ * with one of these — the "Ask the agent why" button is the killer:
+ * it routes the user to /support → AI chat with the error context
+ * preloaded so they don't have to re-explain.
+ *
+ * @param {object} opts
+ * @param {string} [opts.flow] — for the retry button label
+ * @param {string} [opts.errorKind] — short kind tag (e.g. "insufficient_sol")
+ *   passed to the agent so it has context
+ */
+export function errorActionKeyboard(opts = {}) {
+  const flow = opts.flow || "repay";
+  const kind = opts.errorKind || "tx_error";
+  return new InlineKeyboard()
+    .text("🤖 Ask the agent why", `txerr:ask:${flow}:${kind}`)
+    .text("📥 Deposit", "fallback:deposit")
+    .row()
+    .text(`🔁 Try /${flow} again`, `txerr:retry:${flow}`);
 }
 
 /**
@@ -42,19 +65,43 @@ export function translateTxError(err, ctx = {}) {
     const short = (have != null && need != null) ? need - have : null;
 
     if (flow === "repay") {
+      // Build a clear math breakdown so the user understands WHY they
+      // need more SOL than just the loan amount. The Solana network
+      // itself charges tiny fees for every tx + small "rent" for
+      // creating any new on-chain account.
       const lines = [
-        "⚠️ *Not enough SOL to repay this loan*",
+        "⚠️ *Your wallet doesn't have enough SOL*",
         "",
-        ctx.owedLamports != null ? `You owe: \`${fmtSol(ctx.owedLamports)} SOL\` (plus ~0.003 SOL for fees)` : null,
-        have != null ? `Your wallet has: \`${fmtSol(have)} SOL\`` : null,
-        short != null ? `Short by: *\`${fmtSol(short)} SOL\`*` : null,
+        "Repaying a loan needs the *loan amount + Solana network fees*. Here's the math:",
         "",
-        "*What to do:*",
-        "• Send more SOL to your Magpie wallet via /deposit, then /repay",
-        "• /partialrepay to pay part of it now and reduce liquidation risk",
-        "• /topup to add more collateral instead of paying SOL",
-        "• /extend to push the due date out for a small fee",
-      ].filter(Boolean);
+      ];
+      if (ctx.owedLamports != null) {
+        lines.push(`Loan owed:      \`${fmtSol(ctx.owedLamports)} SOL\``);
+        lines.push(`Network fees:   \`~0.003 SOL\` _(Solana charges for every tx)_`);
+        if (need != null) {
+          lines.push(`*Need total:*   \`${fmtSol(need)} SOL\``);
+        } else if (ctx.owedLamports != null) {
+          const totalNeeded = BigInt(ctx.owedLamports.toString()) + 3_000_000n;
+          lines.push(`*Need total:*   \`${fmtSol(totalNeeded)} SOL\``);
+        }
+        lines.push("");
+      }
+      if (have != null) lines.push(`Your wallet:    \`${fmtSol(have)} SOL\``);
+      if (short != null) {
+        lines.push(`*You're short:* *\`${fmtSol(short)} SOL\`*`);
+      }
+      lines.push(
+        "",
+        "*Three ways to fix this:*",
+        short != null
+          ? `1. *Send ~\`${fmtSol(short + 1_000_000n)} SOL\`* to your Magpie wallet (run /deposit for your address), then retry /repay`
+          : "1. *Send more SOL* to your Magpie wallet (run /deposit for your address), then retry /repay",
+        "2. */partialrepay* — pay only what you can right now, reduce liquidation risk",
+        "3. */topup* — add more collateral instead of paying SOL (free besides ~0.001 SOL gas)",
+        "4. */extend* — push the due date out for a small fee",
+        "",
+        "_Confused? Tap *Ask the agent* below — they'll walk you through it._",
+      );
       return lines.join("\n");
     }
     if (flow === "partialrepay") {

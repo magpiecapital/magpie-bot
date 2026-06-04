@@ -6,7 +6,7 @@ import { executeRepay, markLoanRepaid, getLiveOwedLamports } from "../services/l
 import { ensureWallet } from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
-import { translateTxError } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -92,25 +92,37 @@ export function registerRepayCallbacks(bot) {
       const needed = owedNow + REPAY_GAS_BUFFER_LAMPORTS;
       if (balanceLamports < needed) {
         const short = needed - balanceLamports;
+        // Add 0.001 SOL safety margin to the deposit amount we
+        // recommend, so users who follow the instruction exactly
+        // don't end up still ~1k lamports short.
+        const recommendedSend = short + 1_000_000n;
         await ctx.editMessageText(
           [
-            "⚠️ *Not enough SOL to repay*",
+            "⚠️ *Your wallet doesn't have enough SOL*",
+            "",
+            "Repaying a loan needs the *loan amount + Solana network fees*. Here's the math:",
             "",
             `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
-            `Owed: \`${fmtSol(owedNow)} SOL\` (plus ~0.003 SOL for fees)`,
-            `Your wallet: \`${fmtSol(balanceLamports)} SOL\``,
-            `Short by: *\`${fmtSol(short)} SOL\`*`,
+            `Loan owed:      \`${fmtSol(owedNow)} SOL\``,
+            `Network fees:   \`~0.003 SOL\` _(Solana charges for every tx)_`,
+            `*Need total:*   \`${fmtSol(needed)} SOL\``,
             "",
-            "*What to do:*",
-            `• Send at least \`${fmtSol(short)} SOL\` to your Magpie wallet, then retry /repay`,
-            "• Your deposit address: /deposit",
+            `Your wallet:    \`${fmtSol(balanceLamports)} SOL\``,
+            `*You're short:* *\`${fmtSol(short)} SOL\`*`,
             "",
-            "_Other options:_",
-            "• /partialrepay — pay only part of the loan to reduce risk",
-            "• /topup — add more collateral instead of paying down",
-            "• /extend — push the due date out for a fee",
+            "*Three ways to fix this:*",
+            `1. *Send ~\`${fmtSol(recommendedSend)} SOL\`* to your Magpie wallet, then retry /repay`,
+            "   (tap *Deposit* below for your address)",
+            "2. */partialrepay* — pay only what you can, reduce liquidation risk",
+            "3. */topup* — add more collateral instead of paying SOL",
+            "4. */extend* — push the due date out for a small fee",
+            "",
+            "_Not sure what to do? Tap *Ask the agent* — they'll walk you through it._",
           ].join("\n"),
-          { parse_mode: "Markdown" },
+          {
+            parse_mode: "Markdown",
+            reply_markup: errorActionKeyboard({ flow: "repay", errorKind: "insufficient_sol" }),
+          },
         );
         return;
       }
@@ -186,7 +198,23 @@ export function registerRepayCallbacks(bot) {
     } catch (err) {
       console.error("Repay failed:", err);
       const friendly = translateTxError(err, { flow: "repay", owedLamports: owedNow });
-      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
+      // Detect what kind of error so the "Ask the agent" button hands
+      // over precise context (insufficient_sol vs blockhash_expired etc.)
+      const raw = (err?.message || "").toString();
+      const logs = Array.isArray(err?.logs) ? err.logs.join("\n") : "";
+      const blob = raw + "\n" + logs;
+      const kind =
+        /insufficient lamports|custom program error: 0x1/i.test(blob) ? "insufficient_sol"
+        : /BlockhashNotFound|blockhash not found/i.test(blob) ? "blockhash_expired"
+        : /fetch failed|ECONNRESET|ETIMEDOUT/i.test(raw) ? "rpc_blip"
+        : /Signature verification|missing signer/i.test(blob) ? "signature_failed"
+        : /AccountAlreadyInUse|AccountNotInitialized/i.test(blob) ? "state_mismatch"
+        : /AnchorError/i.test(blob) ? "anchor_error"
+        : "tx_error";
+      await ctx.editMessageText(friendly, {
+        parse_mode: "Markdown",
+        reply_markup: errorActionKeyboard({ flow: "repay", errorKind: kind }),
+      });
     }
   });
 }

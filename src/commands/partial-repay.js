@@ -4,7 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
 import { executePartialRepay, recordPartialRepay, getLiveOwedLamports } from "../services/loans.js";
-import { translateTxError } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -158,7 +158,10 @@ export function registerPartialRepayCallbacks(bot) {
     } catch (err) {
       console.error("Partial repay failed:", err);
       const friendly = translateTxError(err, { flow: "partialrepay" });
-      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
+      await ctx.editMessageText(friendly, {
+        parse_mode: "Markdown",
+        reply_markup: errorActionKeyboard({ flow: "partialrepay", errorKind: "tx_error" }),
+      });
     }
   });
 }

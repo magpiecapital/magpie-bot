@@ -75,6 +75,7 @@ import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { startInfraHealth } from "./services/infra-health.js";
+import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -165,6 +166,7 @@ registerMyTicketsCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
+registerTxErrorCallbacks(bot);
 registerBorrowCallbacks(bot);
 registerRepayCallbacks(bot);
 registerWithdrawCallbacks(bot);

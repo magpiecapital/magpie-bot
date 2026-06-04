@@ -8,7 +8,7 @@ import { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } from "../ser
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
-import { translateTxError } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 import { renderRiskBlock } from "../services/token-risk-preview.js";
 
 const LTV_TIERS = [
@@ -482,7 +482,10 @@ export function registerBorrowCallbacks(bot) {
     } catch (err) {
       console.error("Borrow failed:", err);
       const friendly = translateTxError(err, { flow: "borrow" });
-      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
+      await ctx.editMessageText(friendly, {
+        parse_mode: "Markdown",
+        reply_markup: errorActionKeyboard({ flow: "borrow", errorKind: "tx_error" }),
+      });
     }
   });
 }

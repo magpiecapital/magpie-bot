@@ -4,7 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getTokenBalance } from "../services/deposits.js";
 import { executeAddCollateral, recordAddCollateral } from "../services/loans.js";
-import { translateTxError } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -146,7 +146,10 @@ export function registerTopupCallbacks(bot) {
     } catch (err) {
       console.error("Top-up failed:", err);
       const friendly = translateTxError(err, { flow: "topup" });
-      await ctx.editMessageText(friendly, { parse_mode: "Markdown" });
+      await ctx.editMessageText(friendly, {
+        parse_mode: "Markdown",
+        reply_markup: errorActionKeyboard({ flow: "topup", errorKind: "tx_error" }),
+      });
     }
   });
 }
