@@ -204,6 +204,24 @@ const CASES = [
     forbiddenTools: ["open_support_ticket"],
   },
   {
+    name: "Wallet-mismatch question: agent recommends /wallets, not /import",
+    prompt: "I can't repay my loan because I imported a different wallet. What do I do?",
+    forbiddenTools: ["open_support_ticket"],
+    expectInText: ["/wallets"],
+  },
+  {
+    name: "How many wallets can I have — agent knows the 10 cap",
+    prompt: "What's the maximum number of wallets I can have on my account?",
+    forbiddenTools: ["open_support_ticket"],
+    expectInText: ["10"],
+  },
+  {
+    name: "User wants to switch wallets — agent points at /wallets",
+    prompt: "How do I switch between my wallets?",
+    forbiddenTools: ["open_support_ticket"],
+    expectInText: ["/wallets"],
+  },
+  {
     name: "Vague help asks for clarification, no premature escalation",
     prompt: "help",
     expectTools: [],
