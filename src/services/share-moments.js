@@ -16,6 +16,10 @@
 
 const BRAND_HASHTAGS = "#Solana #MAGPIE";
 const SITE = "https://magpie.capital";
+// Official X / Twitter handle. NOT the same as the Telegram bot's
+// @magpie_capital_bot username. Single source of truth — keep all
+// share copy using this constant so the handle never drifts.
+export const X_HANDLE = "@MagpieLoans";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -60,7 +64,7 @@ function telegramShare(text, url) {
 export function shareBorrow({ symbol, receiveLamports, ltvPct, durationDays, referralCode }) {
   const receiveSol = fmtSol(receiveLamports);
   const text = [
-    `Just unlocked ${receiveSol} SOL against my $${symbol} bag on @magpie_capital`,
+    `Just unlocked ${receiveSol} SOL against my $${symbol} bag on ${X_HANDLE}`,
     "",
     `Why sell when you can borrow? ${ltvPct}% LTV · ${durationDays}d term`,
     "",
@@ -84,7 +88,7 @@ export function shareRepay({ symbol, originalLamports, repaidLamports, referralC
   const fee = Number(repaidLamports) - Number(originalLamports);
   const feeStr = fee > 0 ? `${(fee / 1e9).toFixed(4)} SOL` : "the fee";
   const text = [
-    `Just closed out my $${symbol} loan on @magpie_capital`,
+    `Just closed out my $${symbol} loan on ${X_HANDLE}`,
     "",
     `Borrowed ${fmtSol(originalLamports)} SOL · repaid for ${feeStr} fee · kept the full bag.`,
     "",
@@ -103,7 +107,7 @@ export function shareRepay({ symbol, originalLamports, repaidLamports, referralC
  */
 export function shareStreak({ streak, referralCode }) {
   const text = [
-    `🔥 ${streak} on-time repays in a row on @magpie_capital`,
+    `🔥 ${streak} on-time repays in a row on ${X_HANDLE}`,
     "",
     `Building real on-chain credit. Liquidity without selling memecoins.`,
     "",
@@ -122,7 +126,7 @@ export function shareStreak({ streak, referralCode }) {
  */
 export function shareVolume({ totalSol, referralCode }) {
   const text = [
-    `Just crossed ${totalSol.toFixed(1)} SOL lifetime borrowed on @magpie_capital`,
+    `Just crossed ${totalSol.toFixed(1)} SOL lifetime borrowed on ${X_HANDLE}`,
     "",
     `Memecoin bags as collateral. Never had to sell.`,
     "",

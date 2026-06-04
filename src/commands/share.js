@@ -15,6 +15,7 @@ import {
   shareRepay,
   shareStreak,
   shareVolume,
+  X_HANDLE,
 } from "../services/share-moments.js";
 
 export async function handleShare(ctx) {
@@ -73,13 +74,13 @@ export async function handleShare(ctx) {
     // Generic "I'm a magpie" — works even for non-borrowers
     card = {
       text: [
-        "Just joined @magpie_capital — Solana memecoin lending.",
+        `Just joined ${X_HANDLE} — Solana memecoin lending.`,
         "",
         "Borrow SOL against your bags. Don't sell. Build credit.",
         "",
         "Magpies collect shiny things ↓",
       ].join("\n"),
-      twitterUrl: `https://twitter.com/intent/tweet?text=${encodeURIComponent("Just joined @magpie_capital — Solana memecoin lending. Borrow SOL against your bags. Don't sell. Build credit. #Solana #MAGPIE")}&url=${encodeURIComponent(`https://t.me/magpie_capital_bot?start=${code}`)}`,
+      twitterUrl: `https://twitter.com/intent/tweet?text=${encodeURIComponent(`Just joined ${X_HANDLE} — Solana memecoin lending. Borrow SOL against your bags. Don't sell. Build credit. #Solana #MAGPIE`)}&url=${encodeURIComponent(`https://t.me/magpie_capital_bot?start=${code}`)}`,
       telegramShareUrl: `https://t.me/share/url?url=${encodeURIComponent(`https://t.me/magpie_capital_bot?start=${code}`)}&text=${encodeURIComponent("Just joined Magpie — borrow SOL against your memecoin bags without selling.")}`,
     };
     label = "📤 Share Magpie";
