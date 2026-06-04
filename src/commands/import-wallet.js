@@ -1,6 +1,6 @@
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { importWallet } from "../services/wallet.js";
+import { importWallet, WalletLimitError, MAX_WALLETS_PER_USER } from "../services/wallet.js";
 import { clearPending as clearBorrowPending } from "./borrow.js";
 import { clearPending as clearWithdrawPending } from "./withdraw.js";
 
@@ -133,6 +133,28 @@ async function doImport(ctx, tgUser, key) {
       { parse_mode: "Markdown", reply_markup: kb },
     );
   } catch (err) {
+    // Wallet-cap reached — friendly, actionable message
+    if (err instanceof WalletLimitError) {
+      const { InlineKeyboard } = await import("grammy");
+      const kb = new InlineKeyboard()
+        .text("💼 View my wallets", "wallets:view");
+      return ctx.reply(
+        [
+          `🚫 *You've hit the ${MAX_WALLETS_PER_USER}-wallet limit*`,
+          "",
+          `You already have ${err.currentCount} wallets linked to this account. Magpie caps imports at ${MAX_WALLETS_PER_USER} per user to keep the /wallets switcher manageable.`,
+          "",
+          "*To add this one, you'll need to free up a slot:*",
+          "",
+          "1. Run /wallets to see your current set",
+          "2. Make sure none have active loans tied to them (those need to stay)",
+          "3. /support — and we can remove a wallet entry for you",
+          "",
+          "_If you genuinely need more than 10 wallets, reach out via /support — we can talk about it._",
+        ].join("\n"),
+        { parse_mode: "Markdown", reply_markup: kb },
+      );
+    }
     // Surface the actual reason instead of a generic message so we can debug
     // and so users get something more useful than "Please try again."
     console.error("[import] DB/encrypt error:", err?.message, err?.stack?.split("\n")[1]);

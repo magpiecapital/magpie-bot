@@ -9,7 +9,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { listWallets, setActiveWallet } from "../services/wallet.js";
+import { listWallets, setActiveWallet, MAX_WALLETS_PER_USER } from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 
 function shortPubkey(pk) {
@@ -45,7 +45,7 @@ export async function handleWallets(ctx) {
   const balances = await fetchBalances(wallets.map((w) => w.publicKey));
 
   const lines = [
-    `💼 *Your wallets* (${wallets.length})`,
+    `💼 *Your wallets* (${wallets.length}/${MAX_WALLETS_PER_USER})`,
     "",
     "_The wallet marked ✅ is signing all your transactions right now. Tap any other wallet below to switch — your loans stay tied to whichever wallet opened them._",
     "",

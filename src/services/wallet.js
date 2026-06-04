@@ -20,6 +20,20 @@ const ALGO = "aes-256-gcm";
 const KEY_LEN = 32;
 const IV_LEN = 12;
 
+// Maximum number of wallets per user. Covers normal use (Magpie
+// custodial + a few external wallets) while keeping the /wallets UI
+// scannable and bounding any potential abuse. Re-importing an existing
+// wallet doesn't count toward this cap (it just re-activates the row).
+export const MAX_WALLETS_PER_USER = 10;
+export class WalletLimitError extends Error {
+  constructor(currentCount, max) {
+    super(`User has ${currentCount} wallets; max is ${max}`);
+    this.name = "WalletLimitError";
+    this.currentCount = currentCount;
+    this.max = max;
+  }
+}
+
 function getKey() {
   const hex = process.env.WALLET_ENCRYPTION_KEY;
   if (!hex) throw new Error("WALLET_ENCRYPTION_KEY not set");
@@ -187,7 +201,8 @@ export async function importWallet(userId, base58PrivateKey) {
   const kp = Keypair.fromSecretKey(decoded);
   const publicKey = kp.publicKey.toBase58();
 
-  // Already have this wallet? Just activate it.
+  // Already have this wallet? Just activate it. Re-imports don't count
+  // toward the wallet cap — they're a no-op on the count.
   const existing = await query(
     `SELECT id FROM wallets WHERE user_id = $1 AND public_key = $2 LIMIT 1`,
     [userId, publicKey],
@@ -195,6 +210,17 @@ export async function importWallet(userId, base58PrivateKey) {
   if (existing.rows.length > 0) {
     await setActiveWallet(userId, existing.rows[0].id);
     return { publicKey, walletId: existing.rows[0].id, alreadyExisted: true };
+  }
+
+  // Hard cap on wallets per user. New wallet only (re-imports already
+  // returned above). If they're at the limit, refuse — caller will
+  // surface a friendly message via the WalletLimitError type.
+  const { rows: [count] } = await query(
+    `SELECT COUNT(*)::int AS n FROM wallets WHERE user_id = $1`,
+    [userId],
+  );
+  if ((count?.n || 0) >= MAX_WALLETS_PER_USER) {
+    throw new WalletLimitError(count.n, MAX_WALLETS_PER_USER);
   }
 
   // New wallet — insert it. Deactivate all current actives first so

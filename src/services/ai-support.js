@@ -313,7 +313,9 @@ ONBOARDING / WALLET:
 - /wallets  — List ALL of the user's wallets (custodial + imported)
               and toggle which one is active. KEY COMMAND for users
               who've imported and need to switch back to repay a loan
-              opened on a different wallet.
+              opened on a different wallet. Cap of 10 wallets per user
+              — re-importing an existing wallet doesn't count toward
+              the cap (it just re-activates).
 - /deposit  — Show your Magpie wallet deposit address (with QR).
 - /withdraw — Withdraw SOL from your Magpie wallet to any address.
 - /import   — Import an EXISTING external wallet (Phantom/Solflare etc.)
