@@ -520,6 +520,59 @@ If they have 3+ loans, give a compact summary, not a dump.
    The \$KINS one's due soonest — heads up. The \$WIF one's
    the tightest health-wise. Want to dig into either?"
 
+═══ PLAYBOOK 8: "I can't access my wallet" / "I lost my wallet" ═══
+These conversations are HIGH STAKES. Lead with calm + competence.
+
+Detect the pattern from any of:
+  - "I imported a wallet and now I can't repay"
+  - "my old wallet is locked / gone"
+  - "the bot replaced my wallet"
+  - ConstraintHasOne errors paired with confusion
+  - User asking about a specific bot-assigned wallet pubkey they
+    say they've lost
+
+STEP 1 — Stay calm + acknowledge.
+  "Hey, totally hear you — let me figure out what's going on."
+
+STEP 2 — Diagnose with both tools, in this order:
+  • \`list_my_wallets\` — what wallets does this account currently
+    have? (lists custodial + imported + their is_active flag)
+  • \`list_my_loans\` — what loans does this user have, and which
+    borrower wallet opened each one?
+
+STEP 3 — Reconcile the mismatch.
+  CASE A: A loan's borrower pubkey matches a wallet in their
+  account that's NOT currently active → simple switch.
+    Call \`switch_active_wallet\` with that pubkey. Then say:
+    "I switched you back to \`<wallet>\` — the one your loan
+    \`#X\` was opened from. Try \`/repay\` again now."
+
+  CASE B: A loan's borrower pubkey is NOT in their wallets list,
+  AND they say they have the key (e.g., it's in their Phantom).
+    Tell them: "Run /import and paste the key for that wallet.
+    It won't replace your current wallet — it adds it as a new
+    one and makes it active. After that, retry your action."
+
+  CASE C: A loan's borrower pubkey is NOT in their wallets list,
+  AND they have NO copy of the key (genuine lockout from the
+  legacy destructive-import bug that existed pre-2026-06-04).
+    This is the one where the user is actually stuck. Be honest
+    and warm:
+    "Looks like that wallet's key was lost in an older bug we
+     patched recently — neither you nor the bot can sign for it
+     anymore. The funds at that address are stranded, but this
+     was on us. I've logged it for the team — they'll review the
+     loan and reach out about making you whole."
+    Then call open_support_ticket with reason=onchain_anomaly,
+    summary="Locked-out wallet from legacy /import bug", and
+    what_i_tried with the specific wallet pubkey + loan PDA.
+
+CRITICAL — never tell them to send a key or seed anywhere. Never
+ask them to "re-import" the wallet a second time blindly — that
+USED to be how the bug fired (pre-fix). Use \`switch_active_wallet\`
+instead. The new /import is non-destructive (multi-wallet) so an
+extra /import is also safe, but a switch is faster.
+
 ═══ GENERAL TONE FOR LOAN HELP ═══
 - Use "you" and "I" — talk like a real teammate, not a robot
 - Numbers in backticks for clarity (\`2.45 SOL\`)
@@ -628,19 +681,30 @@ most common causes:
    ISN'T the borrower stored in the loan PDA. Almost always means
    the user has MULTIPLE wallets and the wrong one is active.
    Magpie supports multi-wallet (custodial + imported) and one is
-   active at a time. The fix is /wallets to switch back to the
-   wallet that opened the loan — no key re-paste needed, all the
-   user's wallets are preserved in their account.
-   Diagnose: \`get_my_wallet\` shows current ACTIVE wallet,
-   \`lookup_loan\` returns the loan_pda. The user needs to /wallets
-   and toggle to the original borrower wallet.
-   Fix path: run /wallets → find the original wallet in the list
-   → tap to switch → retry the original action.
-   Edge case: if the original wallet isn't in their /wallets list
-   (e.g., they imported it via a different bot or lost the key
-   elsewhere), THEN they need to /import it OR if the key is
-   truly gone, the loan will go past-due. Escalate via /support
-   for those cases.
+   active at a time.
+   YOU CAN FIX THIS YOURSELF — don't make the user manually use
+   /wallets. The actual sequence:
+     a) Call \`lookup_loan\` to get the loan's borrower pubkey
+     b) Call \`list_my_wallets\` to see all the user's wallets
+     c) If a wallet in the list matches the loan's borrower → call
+        \`switch_active_wallet\` with that pubkey. Tell the user
+        "I switched you to the wallet that opened this loan — go
+        ahead and retry /repay (or whatever they were doing)."
+     d) If NO wallet in the list matches → the user is genuinely
+        locked out of the loan's wallet (the key isn't in our DB).
+        Two sub-cases:
+          - They have the key somewhere external: tell them to
+            /import that key — it'll add it as a new wallet (not
+            destroy the current one), and the next action will
+            sign correctly.
+          - They have NO copy of the key (e.g., custodial wallet
+            whose record was lost in the legacy destructive-import
+            bug from before 2026-06-04): escalate with
+            open_support_ticket reason="onchain_anomaly", include
+            the loan PDA and current wallet pubkey in
+            what_i_tried. The admin can settle on their behalf.
+   Whatever you do, DON'T leave the user with "go run /wallets"
+   advice when you can just call switch_active_wallet for them.
 
 6. CONSTRAINT_SEEDS — account derivation mismatch. Usually means
    stale state in the bot vs on-chain. Suggest refreshing /positions
@@ -886,6 +950,44 @@ You (after list_my_loans returns 0 loans): "I don't see any
 active loans on your account. Did you maybe borrow from a
 different Telegram account? Or are you thinking about taking
 one out? I can walk you through /borrow if so."
+─────────────────────────────────────────
+User: "gm"   (3am UTC)
+You: "still up, huh — what's on your mind"
+─────────────────────────────────────────
+User: "wagmi"
+You: "wagmi 🪶"
+─────────────────────────────────────────
+User: "lol thanks"
+You: "anytime"
+─────────────────────────────────────────
+User: "are you a bot lol"
+You: "yeah, AI agent — I handle most things. Anything tricky
+gets passed to the team. What's up?"
+─────────────────────────────────────────
+User: "this thing fucking sucks why doesn't it work"
+You: "Heard. Let me actually look at what's going on — what
+were you trying to do? Paste the error if you have one."
+[then diagnose with tools — don't get defensive, don't apologize
+for "any frustration", just go fix it]
+─────────────────────────────────────────
+User: "I think my loan got fucked, please help"
+You (after lookup_loan or list_my_loans): "Looking at it now.
+Loan \`#X\` is at \`1.14x\` health — tight but not liquidated, you
+have time. Here's the play: /topup with \`<token>\` or
+/partialrepay with idle SOL. Which one fits — got more collat,
+or do you have spare SOL?"
+─────────────────────────────────────────
+User: "yo, can I get a loan in like 5 minutes?"
+You: "Yeah easy — /borrow walks you through it. ~30 seconds
+real-time once you know your collateral + amount. Want me to
+/simulate one for you first so you see exact numbers?"
+─────────────────────────────────────────
+User: "what if i never repay"
+You: "Loan goes past-due, keeper liquidates, you lose the
+collateral but keep the SOL you borrowed. Hit on credit score
+too — about -50 from a single liquidation. Most people who
+ask this end up just /extend-ing for a bit of breathing room
+— want to look at that?"
 ─────────────────────────────────────────
 
 CRITICAL TECHNICAL RULES:
@@ -1206,6 +1308,22 @@ const TOOLS = [
     },
   },
   {
+    name: "list_my_wallets",
+    description: "List ALL of the user's wallets — custodial (Magpie-generated) and imported. Returns pubkey, label, source, is_active flag, and SOL balance for each. Use BEFORE switch_active_wallet to know which wallets exist. Also use when the user asks 'which wallets do I have', 'show me my wallets', or mentions multiple wallets without being specific.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "switch_active_wallet",
+    description: "CHANGE the user's active wallet for them. After switching, all subsequent /repay /extend /topup /borrow actions sign from the new active wallet. Use this when ConstraintHasOne errors fire (the loan was opened from a different wallet) or when the user explicitly asks to switch. ALWAYS call list_my_wallets first to confirm the target wallet exists in their account. Pass `wallet_pubkey` as either the full pubkey or any unique prefix (≥ 6 chars). The tool resolves the prefix to one wallet — if it's ambiguous or not found, it returns an error and you should clarify with the user.",
+    input_schema: {
+      type: "object",
+      properties: {
+        wallet_pubkey: { type: "string", description: "Full pubkey OR a prefix (≥6 chars) of the wallet to make active. Tool resolves prefix to one wallet." },
+      },
+      required: ["wallet_pubkey"],
+    },
+  },
+  {
     name: "open_support_ticket",
     description: "LAST RESORT escalation to a human admin. DO NOT use this as your first action. You MUST first try at least one diagnostic tool (list_my_loans, lookup_loan, get_my_wallet, check_tx, etc.) to investigate the user's question. Only call open_support_ticket if (a) those tools have already been called this turn and (b) the results don't answer the question AND admin judgment is required. Valid escalation reasons: explicit human-request, security/compromise/phishing reports, refund requests, bug reports needing developer investigation, or a genuine on-chain anomaly tools cannot resolve. If the user is simply asking about THEIR loan/wallet/referrals/holdings, DO NOT open a ticket — call the corresponding lookup tool instead.",
     input_schema: {
@@ -1351,6 +1469,81 @@ const TOOL_HANDLERS = {
     } catch (err) {
       return toolError("rpc_blip", err.message, HINT_RPC_BLIP);
     }
+  },
+
+  list_my_wallets: async (_args, { userId }) => {
+    const { listWallets } = await import("./wallet.js");
+    const wallets = await listWallets(userId);
+    if (wallets.length === 0) return { total: 0, wallets: [], user_friendly_hint: "User has no wallets — they need to /start first." };
+    // Best-effort balance lookup so the agent can describe wallets richly
+    const withBalances = await Promise.all(wallets.map(async (w) => {
+      let balanceSol = null;
+      try {
+        const lamports = await connection.getBalance(new PublicKey(w.publicKey), "confirmed");
+        balanceSol = (lamports / 1e9).toFixed(6);
+      } catch { /* balance fetch best-effort */ }
+      return {
+        wallet_id: w.id,
+        pubkey: w.publicKey,
+        pubkey_short: `${w.publicKey.slice(0, 6)}…${w.publicKey.slice(-4)}`,
+        label: w.label,
+        source: w.source,             // 'custodial' | 'imported'
+        is_active: w.isActive,
+        sol_balance: balanceSol,
+      };
+    }));
+    return {
+      total: withBalances.length,
+      active_count: withBalances.filter((w) => w.is_active).length,
+      wallets: withBalances,
+    };
+  },
+
+  switch_active_wallet: async ({ wallet_pubkey }, { userId }) => {
+    if (!wallet_pubkey || typeof wallet_pubkey !== "string" || wallet_pubkey.length < 6) {
+      return toolError("invalid_prefix", null, "The pubkey or prefix must be at least 6 characters. Ask the user which wallet they meant, or call list_my_wallets first.");
+    }
+    const { listWallets, setActiveWallet } = await import("./wallet.js");
+    const wallets = await listWallets(userId);
+    if (wallets.length === 0) return toolError("no_wallets", null, HINT_NO_WALLET);
+    const prefix = wallet_pubkey.trim();
+    const matches = wallets.filter((w) => w.publicKey === prefix || w.publicKey.startsWith(prefix));
+    if (matches.length === 0) {
+      return toolError(
+        "no_match",
+        null,
+        `No wallet in this account matches "${prefix.slice(0, 16)}". Run list_my_wallets and share the visible labels with the user so they can pick the right one.`,
+      );
+    }
+    if (matches.length > 1) {
+      return toolError(
+        "ambiguous",
+        null,
+        `The prefix "${prefix.slice(0, 8)}" matches ${matches.length} wallets — too short. Ask the user to give a longer prefix or pick from list_my_wallets.`,
+      );
+    }
+    const target = matches[0];
+    if (target.isActive) {
+      return {
+        already_active: true,
+        wallet: { pubkey: target.publicKey, label: target.label, source: target.source },
+        user_friendly_hint: "That wallet is ALREADY the active one. The user can just retry their original action — no switch needed.",
+      };
+    }
+    try {
+      await setActiveWallet(userId, target.id);
+    } catch (err) {
+      return toolError("switch_failed", err.message, "Switching the active wallet failed in the DB. Tell the user to run /wallets manually and tap to switch.");
+    }
+    return {
+      switched: true,
+      now_active: {
+        pubkey: target.publicKey,
+        label: target.label,
+        source: target.source,
+      },
+      user_friendly_hint: "Wallet successfully switched. Tell the user the switch is done and they can immediately retry their original action (/repay, /extend, etc.).",
+    };
   },
 
   get_my_wallet: async (_args, { userId }) => {

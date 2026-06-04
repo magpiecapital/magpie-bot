@@ -23,3 +23,9 @@ RECOVERY_RUNBOOK.md
 RAILWAY_SUPPORT_TICKET.md
 NEON_FAILOVER.md
 scripts/incident-timeline.js
+scripts/execute-reimbursement.js
+scripts/reimburse-wowloco.js
+scripts/liquidate-stuck-loan.js
+scripts/find-import-time.js
+scripts/inspect-other-txs.js
+scripts/trace-import-time.js
