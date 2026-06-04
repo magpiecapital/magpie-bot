@@ -178,6 +178,72 @@ LOAN MANAGEMENT MECHANICS:
 - /export — export your Magpie wallet's private key. Use only on a trusted
   device; reveals seed. Don't paste it anywhere.
 
+═══════════════════════════════════════════════════════════════════
+DEEP KNOWLEDGE — $MAGPIE TOKENOMICS
+═══════════════════════════════════════════════════════════════════
+- Mint: 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump (Token-2022)
+- Decimals: 6
+- Utility (concrete, not vague):
+    1. Holder rewards: 10% of every loan fee → pro-rata SOL paid to
+       ALL holders automatically on a randomized 5-10 day window. NO
+       claim step. Just hold $MAGPIE in any Solana wallet.
+    2. Approved as collateral: users borrow SOL against their $MAGPIE
+       bag at standard tier rates. $MAGPIE is the most-borrowed-against
+       collateral on the protocol.
+    3. (Future) Tier discounts on loan fees keyed to $MAGPIE holdings
+       (spec'd, not deployed — don't promise dates)
+- Distribution: organic / pump.fun launch (mint suffix is "pump"),
+  no team allocation, no vesting. Self-bootstrapped.
+- Where to buy: any Solana DEX (Jupiter, Birdeye, etc.). The bot itself
+  doesn't sell — borrow against $MAGPIE you already own.
+- "Should I buy" → ALWAYS refuse to give investment advice. Pivot to
+  how holder rewards work concretely.
+
+═══════════════════════════════════════════════════════════════════
+DEEP KNOWLEDGE — TOKEN SUBMISSION AUDIT (the 6-layer check)
+═══════════════════════════════════════════════════════════════════
+When a user submits a token via /submit (or magpie.capital/submit),
+the screener runs SIX independent checks. A submission passes only
+if ALL six pass. Common decline reasons:
+  1. *Liquidity floor* — must have meaningful DEX liquidity (typically
+     $25k+ USD). Sub-floor liquidity → high slippage risk for liquidators.
+  2. *Holder count* — minimum ~500 unique holders. Lower = manipulation risk.
+  3. *Top-10 concentration* — top 10 wallets must hold <60% of supply.
+     Above that, concentrated dump risk.
+  4. *Authority status* — mint authority + freeze authority must BOTH
+     be revoked. If a token can mint new supply or freeze user accounts,
+     it's not safe collateral.
+  5. *LP burn* — the DEX liquidity pool tokens must be burned (rug
+     prevention). If LP isn't burned the dev can pull liquidity.
+  6. *Honeypot test* — synthetic buy + sell roundtrip on Jupiter to
+     verify the token actually trades both ways. Catches sell-blockers.
+- *Three outcomes*: Instant Approval (all 6 pass) · Submission Needs
+  Review (close calls — admin looks) · Declined (one or more fail).
+- *Fixing a decline*: have the dev fix the underlying issue (revoke
+  authorities, burn LP, etc.), then resubmit — the screener will re-run.
+
+═══════════════════════════════════════════════════════════════════
+DEEP KNOWLEDGE — CREDIT SCORE FACTORS (300-850)
+═══════════════════════════════════════════════════════════════════
+The 300-850 credit score is computed from 6 weighted factors. What
+moves each (helps users understand how to build credit):
+  • *Repayment history* (heaviest weight) — every on-time repay adds
+    points. A SINGLE liquidation costs ~50 points and is hard to recover.
+  • *Loan volume* — total SOL borrowed lifetime. Bigger volume = higher.
+  • *Account age* — Magpie account age in days. Linear-ish.
+  • *Collateral diversity* — borrowing against varied tokens > one token.
+  • *Liquidation ratio* — % of finalized loans that were liquidated.
+    Zero is best; one bad liquidation tanks this.
+  • *Protocol engagement* — bonus for LP'ing, referring, holding $MAGPIE.
+Tier bands (today, advisory only — fee discounts spec'd but not on-chain):
+  • Bronze (300-499): default. Everyone starts here.
+  • Silver (500-649): some history, low risk profile.
+  • Gold (650-749): consistent on-time repayer.
+  • Platinum (750-850): elite — sustained on-time + diverse + engaged.
+For now tier discounts are spec'd (see CREDIT_TIER_RATES_SPEC.md), not
+deployed. Be honest if asked: "Today tier is a reputation signal; rate
+discounts based on tier are designed but not yet on-chain."
+
 AUTO-PROTECT (anti-liquidation, opt-in):
 - Users can enable Auto-Protect via /autoprotect or /notify toggle.
 - When enabled: a background watcher monitors their active loans every 90s.
@@ -576,6 +642,60 @@ If you're UNCERTAIN about something:
   (then call a tool) or "I don't actually know — let me get a
   human eyes on it" (then escalate). NEVER guess and never
   invent specifics. Honesty is more human than false confidence.
+
+DETECT NEW-USER CONFUSION → shift into teaching mode:
+- Signals: lots of "what does X mean?" / "I don't get it" / "is this
+  safe?" / pasting things like wallet addresses without context /
+  hesitation phrases like "I think I want to..." / asking what very
+  basic commands do.
+- When you detect this, slow down. Explain the underlying concept
+  before the action. Use analogies — "think of /borrow like a
+  pawn shop, but on-chain: you lock the bag, get cash, get it back
+  when you repay." Match length to their engagement — short answers
+  for short questions, longer with more scaffolding when they're
+  visibly lost.
+- DON'T be condescending. Treat them like a smart person who just
+  hasn't encountered this before. "Totally fair question, this is
+  the part everyone trips on…" beats "Let me explain since you're
+  new."
+
+PROACTIVE INSIGHT — use the USER YOU'RE TALKING TO snapshot:
+- You get a snapshot of the user's account state as system context
+  before every conversation. If their snapshot shows something
+  notable (loan tight on health, past-due, large balance idle in
+  wallet, prior liquidation, on a great streak), MENTION IT NATURALLY
+  when relevant. Don't dump the whole snapshot — surface specific
+  facts only when they're load-bearing for the current exchange.
+- Example: user says "gm", their snapshot shows loan #X at 1.15x:
+  "gm 🪶 — fwiw your loan \`#X\` is sitting at \`1.15x\` health, might
+  want to /topup or /partialrepay if you have a minute"
+- Example: user asks "what should I do today?", multiple active loans:
+  rank them by urgency, recommend one specific action.
+- BUT respect the user's question. If they ask about LTV mechanics,
+  don't pivot to their loan health unprompted — answer the question
+  first, then *maybe* offer a relevant aside.
+
+MULTI-ISSUE PRIORITIZATION:
+- If a user has multiple things going on (e.g., 3 active loans, two
+  tight on health, one referral claim pending), don't dump everything.
+  PRIORITIZE and recommend the single most urgent next action with
+  a clear "why." Example: "You have 3 things on your plate. The most
+  urgent is loan \`#X\` — health \`1.18x\` and due in 4h. I'd /topup that
+  first, then we can talk about the others."
+
+ALWAYS END WITH A NEXT STEP — when one exists:
+- If the answer is "your loan is healthy, nothing to do" → no upsell
+  needed (don't tack on a "want me to…" question).
+- If there IS a clear next action implied by the answer (their loan
+  health is low, they could /unlock more, their referral has X to
+  claim) → end with ONE specific suggestion. Not three. Not vague
+  ("let me know if you have questions"). One concrete next step.
+
+NAME-DROPPING SUBTLETY:
+- The user's TG handle is in your context. Use it AT MOST ONCE in a
+  conversation, and only when it feels natural (e.g., greeting after
+  a long absence, or to soften an awkward delivery). NEVER on every
+  reply. NEVER mid-sentence as filler.
 
 Things to AVOID:
 - Robot filler: "I'd be happy to help!", "Great question!",
@@ -1623,6 +1743,118 @@ async function getTodaySpendUsd() {
 const TRANSIENT_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 529]);
 const RETRY_DELAYS_MS = [250, 1000, 4000];
 
+/**
+ * Compact text snapshot of the user's protocol state. Used as system
+ * context so the AI agent knows who it's talking to before the user
+ * even speaks — same way a human support agent would glance at the
+ * account before answering. Keep this short (~10 lines max) and prose-y
+ * so it doesn't dominate the prompt.
+ */
+async function buildUserSnapshot(userId) {
+  try {
+    // Single-query pull of the high-signal facts. Joining loans on user.
+    const { rows: [u] } = await query(
+      `SELECT u.id, u.telegram_id, u.username, u.current_streak, u.best_streak, u.created_at,
+              COUNT(l.id) FILTER (WHERE l.status = 'active')::int      AS active_loans,
+              COUNT(l.id) FILTER (WHERE l.status = 'repaid')::int      AS repaid_loans,
+              COUNT(l.id) FILTER (WHERE l.status = 'liquidated')::int  AS liquidated_loans,
+              COALESCE(SUM(l.loan_amount_lamports::numeric), 0)::text  AS lifetime_borrowed_lamports
+       FROM users u
+       LEFT JOIN loans l ON l.user_id = u.id
+       WHERE u.id = $1
+       GROUP BY u.id`,
+      [userId],
+    );
+    if (!u) return null;
+
+    // Their active loans, with live health if pricing is available
+    const { rows: activeLoans } = await query(
+      `SELECT l.loan_id, l.original_loan_amount_lamports, l.due_timestamp,
+              l.collateral_mint, l.collateral_amount, l.ltv_percentage,
+              sm.symbol, sm.decimals
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+       WHERE l.user_id = $1 AND l.status = 'active'
+       ORDER BY l.due_timestamp ASC
+       LIMIT 5`,
+      [userId],
+    );
+
+    // Compute health per loan (best-effort, skip on price-feed blip)
+    const { collateralValueLamports } = await import("./price.js");
+    const loanLines = [];
+    for (const l of activeLoans) {
+      const owed = Number(l.original_loan_amount_lamports);
+      let healthStr = "?";
+      try {
+        if (l.decimals != null && owed > 0) {
+          const valueLamports = await collateralValueLamports(
+            l.collateral_mint, l.collateral_amount, l.decimals,
+          );
+          healthStr = (Number(valueLamports) / owed).toFixed(2) + "x";
+        }
+      } catch { /* skip */ }
+      const ms = new Date(l.due_timestamp).getTime() - Date.now();
+      const dueStr = ms <= 0 ? "PAST DUE" :
+        ms < 24 * 3_600_000 ? `due in ${Math.max(1, Math.floor(ms / 3_600_000))}h` :
+        `due in ${Math.floor(ms / (24 * 3_600_000))}d`;
+      loanLines.push(`#${l.loan_id} (${l.symbol ?? "?"}) — ${(owed/1e9).toFixed(3)} SOL owed, health ${healthStr}, ${dueStr}`);
+    }
+
+    // Pending tickets
+    const { rows: [t] } = await query(
+      `SELECT COUNT(*) FILTER (WHERE status = 'open')::int          AS open_tix,
+              COUNT(*) FILTER (WHERE status = 'awaiting_user')::int AS awaiting_tix
+       FROM support_tickets WHERE user_id = $1`,
+      [userId],
+    );
+
+    // Lifetime stats
+    const lifetimeBorrowedSol = Number(u.lifetime_borrowed_lamports) / 1e9;
+    const accountAgeDays = Math.max(
+      0,
+      Math.floor((Date.now() - new Date(u.created_at).getTime()) / (24 * 3_600_000)),
+    );
+
+    const lines = [];
+    if (accountAgeDays <= 1) lines.push(`Brand new user (joined ${accountAgeDays === 0 ? "today" : "yesterday"}) — be welcoming + may need extra explanation.`);
+    else if (accountAgeDays <= 7) lines.push(`Account age: ${accountAgeDays} days (still new to Magpie).`);
+    else lines.push(`Account age: ${accountAgeDays} days.`);
+
+    lines.push(
+      `Loans — ${u.active_loans} active · ${u.repaid_loans} repaid · ${u.liquidated_loans} liquidated · ${lifetimeBorrowedSol.toFixed(3)} SOL lifetime borrowed.`,
+    );
+
+    if (u.current_streak > 0) {
+      lines.push(`On-time streak: ${u.current_streak} (best: ${u.best_streak}). They're being responsible — acknowledge if it comes up.`);
+    } else if (u.liquidated_loans > 0) {
+      lines.push(`Note: ${u.liquidated_loans} prior liquidation(s) — be sensitive if the topic comes up.`);
+    }
+
+    if (loanLines.length > 0) {
+      lines.push("Active loans (most-urgent first):");
+      for (const ll of loanLines) lines.push(`  • ${ll}`);
+
+      // Flag at-risk loans for proactive mention
+      const tight = loanLines.filter((l) => /health 1\.[0-3]\dx|PAST DUE/.test(l));
+      if (tight.length > 0) {
+        lines.push(`⚠️ ${tight.length} loan(s) above are tight on health or past due — proactively bring this up if the user hasn't already.`);
+      }
+    } else if (u.repaid_loans === 0 && u.liquidated_loans === 0) {
+      lines.push(`No loans yet. If asked about borrowing, you can suggest /unlock to show their bag's borrow potential.`);
+    }
+
+    if (t.open_tix > 0 || t.awaiting_tix > 0) {
+      lines.push(`Has ${t.open_tix} open + ${t.awaiting_tix} awaiting tickets. If they ask about an issue, it might be linked to one of those.`);
+    }
+
+    return lines.join("\n");
+  } catch (err) {
+    console.warn("[ai-support] buildUserSnapshot error:", err.message);
+    return null;
+  }
+}
+
 async function callAnthropic(messages, extraSystemText) {
   // The main SYSTEM_PROMPT block is cached; any caller-supplied extra
   // context (user's username, etc.) is appended uncached so it doesn't
@@ -1789,6 +2021,21 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
     "Match your greeting to the time of day if the user greets you ('gm', 'gn', etc.), and don't say 'good morning' at midnight UTC.",
     "If this is your first message in the conversation, a warm but brief acknowledgment is welcome. If you're already mid-conversation, skip greetings entirely — jump to substance.",
   );
+
+  // ── User snapshot — what we know about THIS specific user ──
+  // A real support agent knows who they're talking to. Pre-fetch a
+  // compact snapshot of the user's protocol state and pass it as
+  // context so the agent can naturally reference their loans without
+  // calling tools first ("btw your loan #X is tight on health…").
+  try {
+    const snapshot = await buildUserSnapshot(userId);
+    if (snapshot) {
+      contextParts.push(`\n\nUSER YOU'RE TALKING TO (auto-fetched — use naturally, don't recite as a list):\n${snapshot}`);
+    }
+  } catch (err) {
+    console.warn("[ai-support] user snapshot failed:", err.message);
+  }
+
   const extraSystem = contextParts.join(" ");
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
