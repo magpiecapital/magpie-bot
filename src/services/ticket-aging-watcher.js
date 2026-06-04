@@ -17,13 +17,15 @@ const ADMIN_TG_ID = getAdminId() || null;
 const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 60 * 60 * 1000; // 1h
 
 // Tier index → minimum age in minutes
-// Note: tier 1 (2h) intentionally removed. The AI handles most tickets
-// autonomously, so a 2h-old ticket is rarely actionable AND the admin
-// wants minimal pings. Only ping at 8h+ and 24h+ — by then the user has
-// followed up or genuinely needs attention.
+// Note: tiers 1 (2h) and 2 (8h) were both removed because the AI
+// auto-ticket-resolver now handles stale tickets autonomously every
+// 30 min. The only thing that should still ping admin is a TRUE
+// dead-letter case — a ticket that the AI tried to resolve, sent
+// the user a follow-up, and the user STILL hasn't acted on 24h+ later
+// AND the ticket isn't closed. At that point it might be a critical
+// issue the AI mishandled or a user who needs human attention.
 const TIERS = [
-  { idx: 2, mins: 8 * 60,  emoji: "🟠", label: "8h+ open" },
-  { idx: 3, mins: 24 * 60, emoji: "🔴", label: "24h+ open — getting embarrassing" },
+  { idx: 3, mins: 24 * 60, emoji: "🔴", label: "24h+ open — AI auto-resolver didn't get a user response" },
 ];
 
 function tierForAge(ageMins) {

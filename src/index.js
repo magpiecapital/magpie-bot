@@ -77,6 +77,7 @@ import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
+import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -306,6 +307,10 @@ bot.start({
     // AI agent quality — runs 6 eval cases every 12h, alerts admin only
     // if >25% fail (catches prompt/tool regressions). Silent when healthy.
     setTimeout(() => startAiAgentHealth(bot), 110_000);
+    // Auto-Ticket Resolver — every 30 min, AI handles stale tickets
+    // autonomously instead of pinging admin. Critical-reason tickets
+    // (security/bug) skipped — those go to admin as designed.
+    setTimeout(() => startAutoTicketResolver(bot), 120_000);
     // Credit oracle publisher disabled: requires funded authority wallet.
     // setTimeout(() => startCreditOraclePublisher(), 20_000);
   },

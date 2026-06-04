@@ -264,6 +264,11 @@ export async function applyStartupPatches() {
     `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS last_user_followup_at TIMESTAMPTZ`,
     `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS followup_count INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS last_alerted_tier INTEGER`,
+    // Tracks whether the AI auto-resolver has taken a pass at this
+    // ticket. Set after the AI generates + sends a follow-up reply.
+    // Null = never auto-attempted. Used to avoid double-resolution
+    // and to surface in /tickets.
+    `ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS auto_resolved_at TIMESTAMPTZ`,
     // Migrate legacy 'responded' status to new 'awaiting_user' state.
     `UPDATE support_tickets SET status = 'awaiting_user'
         WHERE status = 'responded'`,
