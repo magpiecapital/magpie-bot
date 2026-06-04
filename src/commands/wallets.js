@@ -114,7 +114,9 @@ export async function handleWallets(ctx) {
 async function renderWalletDetail(ctx, walletId) {
   const user = await upsertUser(ctx.from.id, ctx.from.username);
   const wallets = await listWallets(user.id);
-  const w = wallets.find((x) => x.id === walletId);
+  // Postgres BIGSERIAL ids come back as strings; the callback regex
+  // captures a numeric substring. Compare via String() to be safe.
+  const w = wallets.find((x) => String(x.id) === String(walletId));
   if (!w) return ctx.reply("That wallet isn't in your account anymore. Try /wallets again.");
 
   let balanceSol = null;
@@ -166,7 +168,9 @@ export function registerWalletsCallbacks(bot) {
     const walletId = Number(ctx.match[1]);
     const user = await upsertUser(ctx.from.id, ctx.from.username);
     const wallets = await listWallets(user.id);
-    const w = wallets.find((x) => x.id === walletId);
+    // Postgres BIGSERIAL ids come back as strings; the callback regex
+  // captures a numeric substring. Compare via String() to be safe.
+  const w = wallets.find((x) => String(x.id) === String(walletId));
     if (!w) return ctx.reply("That wallet isn't in your account anymore. Try /wallets again.");
     if (w.isActive) {
       try { await ctx.editMessageText(`${w.label} is already your active wallet.`); } catch {}
