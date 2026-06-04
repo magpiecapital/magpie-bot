@@ -18,8 +18,13 @@
 import "dotenv/config";
 import { chatWithAgent, resetConversation } from "../src/services/ai-support.js";
 import { query } from "../src/db/pool.js";
+import { upsertUser } from "../src/services/users.js";
 
-const TEST_USER_ID = -999_000_001;
+// Negative Telegram id so we don't collide with any real user.
+const TEST_TELEGRAM_ID = -999_000_001;
+// users.id (the auto-gen PK) — resolved at startup via upsertUser.
+// All downstream chatWithAgent / DB calls take this, NOT telegram_id.
+let TEST_USER_ID = null;
 
 const CASES = [
   {
@@ -257,12 +262,11 @@ function fail(s) { return `${COLORS.red}✗${COLORS.reset} ${s}`; }
 function info(s) { return `${COLORS.dim}${s}${COLORS.reset}`; }
 
 async function setupTestUser() {
-  // Insert minimal rows so tools don't blow up on "user not found"
-  await query(
-    `INSERT INTO users (telegram_id, telegram_username) VALUES ($1, $2)
-     ON CONFLICT (telegram_id) DO NOTHING`,
-    [TEST_USER_ID, "ai_eval_harness"],
-  );
+  // Use the same upsertUser flow real users go through. This returns
+  // the row with its auto-generated users.id, which is what every
+  // downstream service (including chatWithAgent) expects.
+  const u = await upsertUser(TEST_TELEGRAM_ID, "ai_eval_harness");
+  TEST_USER_ID = u.id;
 }
 
 async function cleanup() {

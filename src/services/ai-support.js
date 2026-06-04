@@ -991,6 +991,38 @@ ask this end up just /extend-ing for a bit of breathing room
 ─────────────────────────────────────────
 
 ═══════════════════════════════════════════════════════════════════
+CREDIT SCORE ACROSS MULTIPLE WALLETS — IT'S ONE SCORE PER ACCOUNT
+═══════════════════════════════════════════════════════════════════
+A user's credit score is tracked at the Telegram-account level, NOT
+per wallet. Every loan from every one of their wallets — custodial
+or imported — counts toward the SAME aggregated score.
+
+On-chain, the publisher mirrors that one aggregated score to EVERY
+wallet's credit-score PDA. So when any program (P2P marketplace,
+future fee discounts, etc.) reads credit by wallet pubkey, they see
+the same number regardless of which of the user's wallets is signing.
+
+Common questions and how to answer:
+
+— "Will my new wallet get credit for my old wallet's loans?"
+  Yes. Credit is at the user-account level. Borrowing from any of
+  their wallets builds the same score, and the score is mirrored to
+  all their wallets on-chain. New imports get the user's existing
+  score published to them automatically.
+
+— "If I have multiple wallets, do they each have their own score?"
+  No — one score across all. You'd see a wallet-mismatch issue only
+  if the on-chain publisher couldn't reach a wallet's PDA (rare).
+
+— "How do I unlock Gold / Platinum faster — should I use one wallet?"
+  Doesn't matter. The score's the same whether you concentrate
+  borrowing on one wallet or spread it across several. What MATTERS
+  is on-time repayment history, account age, and engagement.
+
+— "Will using a fresh imported wallet 'reset' my credit?"
+  No. The new wallet inherits your account-level score on import.
+
+═══════════════════════════════════════════════════════════════════
 WALLET KNOWLEDGE — KNOW EVERY WALLET, ACT ON THEIR BEHALF
 ═══════════════════════════════════════════════════════════════════
 The user's wallet list is pre-fetched into the snapshot at the top
@@ -1778,12 +1810,22 @@ const TOOL_HANDLERS = {
          FROM credit_scores WHERE user_id = $1`,
         [userId],
       );
+      // Count of user's wallets — for the cross-wallet aggregation note.
+      const { rows: [wc] } = await query(
+        `SELECT COUNT(*)::int AS n FROM wallets WHERE user_id = $1`,
+        [userId],
+      );
+      const walletCount = wc?.n || 1;
+
       if (rows.length === 0) {
         return {
           has_score: false,
           default_score: 300,
           tier: "bronze",
-          user_friendly_hint: "User hasn't built credit yet — they're at the bronze starting tier. Tell them their score grows automatically as they borrow & repay. First successful loan is the biggest jump.",
+          wallets_count: walletCount,
+          user_friendly_hint: walletCount > 1
+            ? `User hasn't built credit yet — they're at the bronze starting tier. They have ${walletCount} wallets, but score is tracked at the ACCOUNT level: every loan from any wallet counts toward ONE aggregated score that's mirrored to all of their wallets on-chain. So they can sign loans from any wallet and build the same reputation.`
+            : "User hasn't built credit yet — they're at the bronze starting tier. Tell them their score grows automatically as they borrow & repay. First successful loan is the biggest jump.",
         };
       }
       const r = rows[0];
@@ -1795,6 +1837,10 @@ const TOOL_HANDLERS = {
         fee_rate_pct: (Number(r.fee_rate) * 100).toFixed(2),
         max_duration_days: r.max_duration_days,
         loans_scored: r.loans_scored,
+        wallets_count: walletCount,
+        wallets_aggregation_note: walletCount > 1
+          ? `Cross-wallet: this score combines ALL ${walletCount} of the user's wallets' loan history into ONE reputation. Same score is mirrored to every wallet on-chain, so it doesn't matter which they sign from.`
+          : null,
         factors: {
           repayment_history: Number(r.f_repayment_history),
           loan_volume: Number(r.f_loan_volume),
@@ -2193,7 +2239,7 @@ async function buildUserSnapshot(userId) {
   try {
     // Single-query pull of the high-signal facts. Joining loans on user.
     const { rows: [u] } = await query(
-      `SELECT u.id, u.telegram_id, u.username, u.current_streak, u.best_streak, u.created_at,
+      `SELECT u.id, u.telegram_id, u.telegram_username AS username, u.current_streak, u.best_streak, u.created_at,
               COUNT(l.id) FILTER (WHERE l.status = 'active')::int      AS active_loans,
               COUNT(l.id) FILTER (WHERE l.status = 'repaid')::int      AS repaid_loans,
               COUNT(l.id) FILTER (WHERE l.status = 'liquidated')::int  AS liquidated_loans,

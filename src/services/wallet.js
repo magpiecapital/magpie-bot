@@ -242,6 +242,21 @@ export async function importWallet(userId, base58PrivateKey) {
   // The `wallets_auto_snapshot` DB trigger writes a wallet_snapshots
   // row automatically on every INSERT — no app-side call needed.
 
+  // Mirror the user's aggregated credit score to the newly-imported
+  // wallet on-chain so its reputation is visible from this signer the
+  // moment any program reads it. Fire-and-forget — if the publisher
+  // hits a transient RPC blip or the oracle isn't deployed yet, the
+  // import flow doesn't care. The batch publisher will catch up on
+  // its next cycle.
+  (async () => {
+    try {
+      const { publishScoreOnChain } = await import("./credit-oracle-publisher.js");
+      await publishScoreOnChain(userId);
+    } catch (err) {
+      console.warn("[wallet-import] credit publish failed (non-blocking):", err.message);
+    }
+  })();
+
   return { publicKey, walletId: inserted.id, alreadyExisted: false };
 }
 

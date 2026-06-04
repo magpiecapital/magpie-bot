@@ -34,15 +34,11 @@ const PUBLISH_INTERVAL = parseInt(process.env.CREDIT_PUBLISH_INTERVAL || "300", 
  * Load the authority keypair (same lender keypair used for the lending program).
  */
 function loadAuthority() {
-  if (process.env.LENDER_PRIVATE_KEY) {
-    const decoded = bs58.decode(process.env.LENDER_PRIVATE_KEY);
-    return Keypair.fromSecretKey(decoded);
-  }
   if (process.env.LENDER_KEYPAIR_PATH) {
     const raw = JSON.parse(readFileSync(process.env.LENDER_KEYPAIR_PATH, "utf8"));
     return Keypair.fromSecretKey(new Uint8Array(raw));
   }
-  throw new Error("No authority keypair available for credit oracle publishing");
+  throw new Error("LENDER_KEYPAIR_PATH not set");
 }
 
 /**
@@ -67,27 +63,38 @@ function getCreditOracleProgram(signer) {
 
 /**
  * Publish a credit score on-chain for a specific user.
+ *
+ * A user can hold up to 10 wallets (custodial + imports). The credit
+ * score itself is computed at the USER level (one score per Telegram
+ * account, aggregated across every wallet's loan history). To make
+ * that aggregated reputation usable from any of the user's wallets
+ * — for P2P matching, future fee discounts, or any on-chain program
+ * that reads credit by signer pubkey — we publish the SAME score to
+ * EACH of the user's wallet PDAs.
+ *
+ * Returns an array of { wallet, signature, status } — one entry per
+ * wallet attempted. Status is 'ok' for new publishes, 'unchanged' if
+ * we skipped a no-op write, 'no-program' if the oracle isn't deployed
+ * yet, or 'error' with a message.
  */
 export async function publishScoreOnChain(userId) {
   const authority = loadAuthority();
   const program = getCreditOracleProgram(authority);
 
-  // Get the user's wallet address
-  const { rows: [wallet] } = await query(
-    `SELECT public_key FROM wallets WHERE user_id = $1`,
+  // ALL wallets for this user — not just the active one. Every wallet
+  // gets the aggregated user-level score, so the user's reputation is
+  // visible from whichever wallet they're signing with.
+  const { rows: walletRows } = await query(
+    `SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY created_at ASC`,
     [userId],
   );
-  if (!wallet) return null;
+  if (walletRows.length === 0) return [];
 
-  // Get their credit score
   const { rows: [score] } = await query(
     `SELECT * FROM credit_scores WHERE user_id = $1`,
     [userId],
   );
-  if (!score) return null;
-
-  const walletPk = new PublicKey(wallet.public_key);
-  const [scorePda] = creditScorePda(walletPk);
+  if (!score) return [];
 
   const factors = {
     repaymentHistory: Math.round(Number(score.f_repayment_history)),
@@ -99,44 +106,54 @@ export async function publishScoreOnChain(userId) {
     loansScored: score.loans_scored,
   };
 
-  try {
-    // Check if account already exists
-    const accountInfo = await connection.getAccountInfo(scorePda);
+  const results = [];
+  for (const { public_key } of walletRows) {
+    const walletPk = new PublicKey(public_key);
+    const [scorePda] = creditScorePda(walletPk);
 
-    if (!accountInfo) {
-      // Initialize
+    try {
+      const accountInfo = await connection.getAccountInfo(scorePda);
+
+      if (!accountInfo) {
+        const sig = await program.methods
+          .initializeScore(walletPk)
+          .accounts({
+            scoreAccount: scorePda,
+            authority: authority.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc({ commitment: "confirmed" });
+        console.log(`[credit-oracle] Initialized score for ${public_key}: ${sig}`);
+      }
+
       const sig = await program.methods
-        .initializeScore(walletPk)
+        .updateScore(score.score, factors)
         .accounts({
           scoreAccount: scorePda,
           authority: authority.publicKey,
-          systemProgram: SystemProgram.programId,
         })
         .rpc({ commitment: "confirmed" });
 
-      console.log(`[credit-oracle] Initialized score for ${wallet.public_key}: ${sig}`);
-    }
+      console.log(`[credit-oracle] Published score ${score.score} for ${public_key}: ${sig}`);
+      results.push({ wallet: public_key, signature: sig, status: "ok" });
 
-    // Update
-    const sig = await program.methods
-      .updateScore(score.score, factors)
-      .accounts({
-        scoreAccount: scorePda,
-        authority: authority.publicKey,
-      })
-      .rpc({ commitment: "confirmed" });
-
-    console.log(`[credit-oracle] Published score ${score.score} for ${wallet.public_key}: ${sig}`);
-    return sig;
-  } catch (err) {
-    // Don't crash if the oracle program isn't deployed yet
-    if (err.message?.includes("AccountNotFound") || err.message?.includes("Program") ) {
-      console.log(`[credit-oracle] Program not deployed yet, skipping on-chain publish`);
-      return null;
+      // Light pacing between wallets to avoid RPC rate-limit spikes for
+      // power users with many wallets.
+      if (walletRows.length > 1) {
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    } catch (err) {
+      if (err.message?.includes("AccountNotFound") || err.message?.includes("Program")) {
+        console.log(`[credit-oracle] Program not deployed yet, skipping ${public_key}`);
+        results.push({ wallet: public_key, status: "no-program" });
+        // No point retrying for other wallets in this batch — same program.
+        break;
+      }
+      console.error(`[credit-oracle] Error publishing for user ${userId} wallet ${public_key}:`, err.message);
+      results.push({ wallet: public_key, status: "error", message: err.message });
     }
-    console.error(`[credit-oracle] Error publishing for user ${userId}:`, err.message);
-    return null;
   }
+  return results;
 }
 
 /**
