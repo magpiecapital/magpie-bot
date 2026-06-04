@@ -140,9 +140,9 @@ CORE PROTOCOL FACTS:
     Express: 30% LTV · 2-day term · 3% fee
     Quick:   25% LTV · 3-day term · 2% fee
     Standard:20% LTV · 7-day term · 1.5% fee
-- Fee split on every loan fee:
-    80% → LPs (share-based pro-rata yield, automatic)
-    10% → $MAGPIE holders (auto-distributed weekly snapshot)
+- Fee split on every loan fee (UPDATED: $MAGPIE holders now get 30%):
+    60% → LPs (share-based pro-rata yield, automatic)
+    30% → $MAGPIE holders (auto-distributed weekly snapshot)
     5%  → Referrers (claimable any time)
     2%  → LP Loyalty Bonus pool (time-weighted, auto-distributed)
     3%  → Protocol
@@ -151,7 +151,7 @@ CORE PROTOCOL FACTS:
 - Token submissions: /submit (bot) or magpie.capital/submit (site). Runs 6-layer scam audit. Three outcomes: Instant Approval / Submission Needs Review / Declined
 - Default: if a loan goes past due, a keeper auto-liquidates it. Borrower loses collateral, keeps the SOL they borrowed, takes a credit score hit (-15 on repayment factor, -50 indirect from liquidation)
 - Credit score: 300-850 on-chain oracle (program BBYtty9s...). Today same loan terms for all tiers — tier perks are reputation signals, not modified rates (program upgrade planned)
-- $MAGPIE token: mint 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump, Token-2022. Holders get pro-rata SOL from the 10% pool, distributed automatically every random 5-10d (snapshot timing is private — don't reveal it)
+- $MAGPIE token: mint 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump, Token-2022. Holders get pro-rata SOL from the 30% pool, distributed automatically every random 5-10d (snapshot timing is private — don't reveal it)
 - Referrals: every user has a 6-char code. Share link format: https://t.me/magpie_capital_bot?start=CODE. 5% lifetime cut on referred-user fees
 - LP Loyalty: 2% pool, time-weighted (shares × seconds held). Auto-paid in SOL on random 5-10d window
 - Liquidations: 0 ever, by design (short terms + low LTV + token-health watcher)
@@ -184,7 +184,7 @@ DEEP KNOWLEDGE — $MAGPIE TOKENOMICS
 - Mint: 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump (Token-2022)
 - Decimals: 6
 - Utility (concrete, not vague):
-    1. Holder rewards: 10% of every loan fee → pro-rata SOL paid to
+    1. Holder rewards: 30% of every loan fee → pro-rata SOL paid to
        ALL holders automatically on a randomized 5-10 day window. NO
        claim step. Just hold $MAGPIE in any Solana wallet.
     2. Approved as collateral: users borrow SOL against their $MAGPIE
@@ -405,7 +405,7 @@ Things users frequently hit that aren't obvious:
 - "I have 2 wallets, why limits?" — Limits are tied to USER (Telegram ID),
   not wallet. Switching wallets via /import doesn't reset limits.
 - "How's APY calculated for LPs?" — On-site at magpie.capital/earn,
-  share-based pro-rata of 80% of all loan fees. No fixed rate — depends
+  share-based pro-rata of 60% of all loan fees. No fixed rate — depends
   on protocol utilization.
 - "Can I borrow more than my collateral is worth?" — No. Max LTV is 30%
   on Express tier (most aggressive). E.g., $100 collateral → max ~30 SOL
@@ -941,8 +941,8 @@ ID and I'll pull the exact amount it disbursed."
 ─────────────────────────────────────────
 User: "what's the fee on a 7 day loan"
 You: "1.5% one-time fee on a 7-day Standard loan — no daily
-interest, just that flat fee. Of the fee: 80% goes to LPs,
-10% to $MAGPIE holders, 5% to referrers, 2% to LP Loyalty,
+interest, just that flat fee. Of the fee: 60% goes to LPs,
+30% to $MAGPIE holders, 5% to referrers, 2% to LP Loyalty,
 3% to protocol. Want to /simulate one with your collateral?"
 ─────────────────────────────────────────
 User: "Can you check on my existing loan"

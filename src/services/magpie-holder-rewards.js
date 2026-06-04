@@ -1,9 +1,9 @@
 /**
  * $MAGPIE Holder Rewards.
  *
- * Economics: 10% of every loan fee accrues to a holder reward pool.
+ * Economics: 30% of every loan fee accrues to a holder reward pool.
  * Sourced from the protocol's 20% fee slice — LPs are unaffected (still
- * earn full 80%). Weekly snapshots distribute the pool pro-rata across
+ * earn full 60%). Weekly snapshots distribute the pool pro-rata across
  * all on-chain $MAGPIE holders, filtering out system/DEX/CEX addresses.
  *
  * Holders claim their earned SOL via /claimholder (or the dashboard).
@@ -40,7 +40,12 @@ export const MAGPIE_MINT = new PublicKey(
 // All ATA derivations and program-account scans for $MAGPIE must use
 // TOKEN_2022_PROGRAM_ID, NOT TOKEN_PROGRAM_ID.
 export const MAGPIE_TOKEN_PROGRAM = TOKEN_2022_PROGRAM_ID;
-export const HOLDER_REWARD_BPS = 1_000; // 10% of every loan fee
+// 30% of every loan fee. Bumped from 1000 (10%) to reward $MAGPIE holders
+// more aggressively. NOTE: the on-chain LendingPool.protocol_fee_bps must
+// also be updated from 2000 to 4000 for the protocol to be fully solvent
+// at this rate; until that program upgrade lands, the lender wallet
+// absorbs the difference (~3% of every loan fee) as a temporary subsidy.
+export const HOLDER_REWARD_BPS = 3_000;
 export const MIN_HOLDER_CLAIM_LAMPORTS = 5_000_000n; // 0.005 SOL
 export const MIN_HOLDER_BALANCE_RAW = 1n; // require at least 1 raw unit ($MAGPIE has 6 decimals → 0.000001)
 export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL safety floor
@@ -91,7 +96,7 @@ function loadLenderKeypair() {
 }
 
 /**
- * Add 10% of a loan fee to the holder reward pool. Idempotent NOT
+ * Add 30% of a loan fee to the holder reward pool. Idempotent NOT
  * guaranteed — caller must ensure they call once per fee event. Safe
  * to call from inside the loan-recording try/catch (errors don't
  * propagate up to the user-facing flow).

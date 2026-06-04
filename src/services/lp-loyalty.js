@@ -3,7 +3,7 @@
  *
  * Mechanic:
  *   - 2% of every loan fee accrues to the lp_loyalty_pool (source: the
- *     protocol's 5% slice — LPs keep their full 80% base yield).
+ *     protocol's 5% slice — LPs keep their full 60% base yield).
  *   - Each LP's "weight" at snapshot time = current shares × seconds
  *     since their weighted_deposit_at (the time-weighted average of
  *     their deposit moments).

@@ -307,9 +307,8 @@ export async function applyStartupPatches() {
     // ─────── LP LOYALTY BONUS POOL ───────
     // 2% of every loan fee accrues to this pool, distributed pro-rata to
     // each LP's share-seconds (shares × time held). Long-term holders
-    // earn meaningfully more than flippers on top of the base 80% LP
-    // yield. Sourced from the protocol's 5% slice (drops to 3%); LPs
-    // keep their full 80%.
+    // earn meaningfully more than flippers on top of the base 60% LP
+    // yield.
     `CREATE TABLE IF NOT EXISTS lp_loyalty_pool (
        id INTEGER PRIMARY KEY,
        accrued_lamports NUMERIC(30,0) NOT NULL DEFAULT 0,

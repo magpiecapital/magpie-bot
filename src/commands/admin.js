@@ -305,7 +305,7 @@ export async function handleTickets(ctx) {
 export async function handleHolderPool(ctx) {
   if (!(await requireAdmin(ctx))) return;
 
-  const HOLDER_REWARD_BPS = 1_000;   // 10% — kept in sync with magpie-holder-rewards.js
+  const HOLDER_REWARD_BPS = 3_000;   // 30% — kept in sync with magpie-holder-rewards.js
   const LP_LOYALTY_BPS = 200;        // 2%
 
   const { rows: [hp] } = await query(
