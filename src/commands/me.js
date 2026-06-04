@@ -3,7 +3,7 @@
  * referral code, and lifetime stats.
  */
 import { upsertUser } from "../services/users.js";
-import { ensureWallet } from "../services/wallet.js";
+import { ensureWallet, listWallets } from "../services/wallet.js";
 import { getSolBalance } from "../services/deposits.js";
 import { tierFor, nextTierHint, getUserStats } from "../services/reputation.js";
 import { getOrCreateCode, referralStats } from "../services/referrals.js";
@@ -14,6 +14,10 @@ function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
 
+function shortPubkey(pk) {
+  return pk ? `${pk.slice(0, 6)}…${pk.slice(-4)}` : "?";
+}
+
 export async function handleMe(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
@@ -21,7 +25,7 @@ export async function handleMe(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  const [sol, stats, code, refs, activeRow, botInfo, limits, streakRow] = await Promise.all([
+  const [sol, stats, code, refs, activeRow, botInfo, limits, streakRow, wallets] = await Promise.all([
     getSolBalance(publicKey),
     getUserStats(user.id),
     getOrCreateCode(user.id),
@@ -30,6 +34,7 @@ export async function handleMe(ctx) {
     ctx.api.getMe(),
     getLoanLimits(user.id),
     query(`SELECT current_streak, best_streak FROM users WHERE id = $1`, [user.id]),
+    listWallets(user.id),
   ]);
   const streak = streakRow.rows[0] || { current_streak: 0, best_streak: 0 };
 
@@ -45,13 +50,35 @@ export async function handleMe(ctx) {
   if (hint) {
     lines.push(`  ↳ ${hint.repaysNeeded} more repay(s) → ${hint.next.emoji} ${hint.next.label}`);
   }
+  // Wallet section — single line if one wallet, full list if multiple.
+  // Showing every wallet here means users see at a glance what's loaded
+  // into their account without having to dig into /wallets.
+  if (wallets.length <= 1) {
+    lines.push(
+      "",
+      "*Wallet*",
+      `\`${publicKey}\``,
+      `Balance: ${fmtSol(sol)} SOL`,
+      `Active loans: ${activeRow.rows[0].n}`,
+      "",
+    );
+  } else {
+    lines.push(
+      "",
+      `*Wallets* (${wallets.length} loaded · /wallets to switch)`,
+    );
+    for (const w of wallets) {
+      const flag = w.isActive ? "✅" : "⚪️";
+      const note = w.isActive ? " *(active)*" : "";
+      lines.push(`${flag} *${w.label}*${note}  \`${shortPubkey(w.publicKey)}\``);
+    }
+    lines.push(
+      `Active-wallet balance: ${fmtSol(sol)} SOL`,
+      `Active loans: ${activeRow.rows[0].n}`,
+      "",
+    );
+  }
   lines.push(
-    "",
-    "*Wallet*",
-    `\`${publicKey}\``,
-    `Balance: ${fmtSol(sol)} SOL`,
-    `Active loans: ${activeRow.rows[0].n}`,
-    "",
     "*Loan limits*",
     `Tier: *${limits.tier}*`,
     `Max per loan: ${fmtSol(limits.maxPerLoan)} SOL`,

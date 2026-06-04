@@ -1,8 +1,42 @@
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { ensureWallet } from "../services/wallet.js";
+import { ensureWallet, listWallets } from "../services/wallet.js";
 import { getOrCreateCode, attribute } from "../services/referrals.js";
 import { getPrefs } from "../services/prefs.js";
+
+// Short pubkey for compact display (e.g. abcdef…1234)
+function shortPubkey(pk) {
+  if (!pk) return "?";
+  return `${pk.slice(0, 6)}…${pk.slice(-4)}`;
+}
+
+/**
+ * Build the wallet section of the home/welcome message.
+ * Single wallet: shows just the address (clean, unchanged behaviour).
+ * Multiple wallets: surfaces active + count + brief listing so the user
+ * never forgets which wallets are loaded into their account.
+ */
+function renderWalletSection(wallets, activePubkey) {
+  if (!wallets || wallets.length <= 1) {
+    return [
+      "Your Magpie wallet:",
+      `\`${activePubkey}\``,
+    ];
+  }
+  const active = wallets.find((w) => w.isActive);
+  const inactives = wallets.filter((w) => !w.isActive);
+  const inactiveLabels = inactives
+    .map((w) => `${w.label} (\`${shortPubkey(w.publicKey)}\`)`)
+    .join(", ");
+  return [
+    `*Your wallets* (${wallets.length} loaded · /wallets to manage)`,
+    "",
+    `✅ Active: *${active?.label || "Magpie wallet"}*`,
+    `\`${active?.publicKey || activePubkey}\``,
+    "",
+    `_+ ${inactives.length} more: ${inactiveLabels}_`,
+  ];
+}
 
 export async function handleStart(ctx) {
   const tgUser = ctx.from;
@@ -10,6 +44,10 @@ export async function handleStart(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
+
+  // Pull every wallet so the home page can surface multi-wallet state.
+  // Cheap query (one indexed select); safe to do on every /start.
+  const wallets = await listWallets(user.id);
 
   // Ensure prefs row + referral code exist on first /start.
   await getPrefs(user.id);
@@ -72,13 +110,15 @@ export async function handleStart(ctx) {
     }
   }
 
+  const walletSection = renderWalletSection(wallets, publicKey);
+  const multiWallet = wallets.length > 1;
+
   const msg = [
     "🏦 *Welcome to Magpie*",
     "",
     "_Where your memecoin bags unlock SOL._",
     "",
-    "Your Magpie wallet:",
-    `\`${publicKey}\``,
+    ...walletSection,
     "",
     "*How it works*",
     "1\\. Send memecoins to the address above",
@@ -95,17 +135,25 @@ export async function handleStart(ctx) {
     "/borrow — take out a SOL loan",
     "/deposit — show your deposit address",
     "/import — use your existing wallet",
+    "/wallets — view + switch between your wallets",
     "/me — your wallet, tier, and referral code",
     "/magpie — official $MAGPIE token info",
     "/support — chat with our AI agent or open a ticket",
     "/help — full command list",
   ].join("\n");
 
+  // When the user has more than one wallet, surface a dedicated
+  // "My Wallets" button so they can hop to the switcher in one tap.
+  // For single-wallet users we keep the original layout to avoid
+  // adding noise.
   const kb = new InlineKeyboard()
     .text("💰 Borrow now", "start:borrow")
     .text("📋 Supported tokens", "start:supported")
-    .row()
-    .text("🔑 Import existing wallet", "start:import")
+    .row();
+  if (multiWallet) {
+    kb.text(`💼 My wallets (${wallets.length})`, "start:wallets").row();
+  }
+  kb.text("🔑 Import existing wallet", "start:import")
     .row()
     .text("🛟 Get help", "start:support");
 
@@ -150,5 +198,11 @@ export function registerStartCallbacks(bot) {
     await ctx.answerCallbackQuery();
     ctx.match = "";
     await handleStart(ctx);
+  });
+
+  bot.callbackQuery("start:wallets", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleWallets } = await import("./wallets.js");
+    await handleWallets(ctx);
   });
 }
