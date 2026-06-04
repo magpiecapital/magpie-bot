@@ -59,28 +59,6 @@ function decrypt(ciphertext, iv, authTag) {
 }
 
 /**
- * Append a wallet's encrypted_secret to the immutable snapshots table.
- * Called on every create + import — never on read. The snapshots table
- * is NEVER updated or deleted from, so this gives us a permanent
- * history of every key the bot has ever held.
- *
- * Failures here NEVER block the parent operation. Snapshot is a safety
- * net, not a critical path. We log and continue.
- */
-async function snapshotWallet({ walletId, userId, publicKey, encrypted_secret, nonce, auth_tag, source, trigger }) {
-  try {
-    await query(
-      `INSERT INTO wallet_snapshots
-         (wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag, source, trigger)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [walletId, userId, publicKey, encrypted_secret, nonce, auth_tag, source, trigger],
-    );
-  } catch (err) {
-    console.error("[wallet-snapshot] write failed (continuing):", err.message);
-  }
-}
-
-/**
  * Get or create the ACTIVE wallet for a user. If they have no wallets
  * yet, generate a custodial one and mark it active.
  *
@@ -136,14 +114,8 @@ export async function ensureWallet(userId) {
      RETURNING id`,
     [userId, publicKey, ciphertext, iv, authTag],
   );
-
-  // Immutable audit-log write. Future-proofs against any code path
-  // ever overwriting this row again.
-  await snapshotWallet({
-    walletId: inserted.id, userId, publicKey,
-    encrypted_secret: ciphertext, nonce: iv, auth_tag: authTag,
-    source: "custodial", trigger: "create",
-  });
+  // The `wallets_auto_snapshot` DB trigger writes a wallet_snapshots
+  // row automatically on every INSERT — no app-side call needed.
 
   return {
     publicKey,
@@ -267,13 +239,8 @@ export async function importWallet(userId, base58PrivateKey) {
      RETURNING id`,
     [userId, publicKey, ciphertext, iv, authTag],
   );
-
-  // Immutable audit-log write
-  await snapshotWallet({
-    walletId: inserted.id, userId, publicKey,
-    encrypted_secret: ciphertext, nonce: iv, auth_tag: authTag,
-    source: "imported", trigger: "import",
-  });
+  // The `wallets_auto_snapshot` DB trigger writes a wallet_snapshots
+  // row automatically on every INSERT — no app-side call needed.
 
   return { publicKey, walletId: inserted.id, alreadyExisted: false };
 }

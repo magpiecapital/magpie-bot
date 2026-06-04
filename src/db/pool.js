@@ -132,7 +132,8 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS wallet_snapshots_user_id_idx ON wallet_snapshots (user_id)`,
 
     // Backfill snapshots for existing wallets so we have a history
-    // starting from now. Future creates/imports will snapshot inline.
+    // starting from now. Future creates/imports will snapshot via the
+    // DB trigger below.
     `INSERT INTO wallet_snapshots
         (wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag, source, trigger)
       SELECT id, user_id, public_key, encrypted_secret, nonce, auth_tag,
@@ -141,6 +142,63 @@ export async function applyStartupPatches() {
        WHERE NOT EXISTS (
          SELECT 1 FROM wallet_snapshots ws WHERE ws.public_key = wallets.public_key
        )`,
+
+    // ── DB-LEVEL AUTO-SNAPSHOT TRIGGER ──
+    // Belt-and-suspenders on top of the app-level safety. Even if a
+    // future code path bypasses the application's snapshot logic — a
+    // raw psql session, a forgotten migration script, a dev tool, a
+    // brand new code path that just writes to `wallets` directly — the
+    // database itself guarantees a snapshot row gets written.
+    //
+    // Fires on INSERT and on UPDATE where encrypted_secret actually
+    // changes. UPDATEs that only flip is_active / label / etc. don't
+    // snapshot (no key material changes). On a destructive UPDATE
+    // we snapshot BOTH the OLD and NEW values so the original key
+    // material survives even the overwrite itself.
+    `CREATE OR REPLACE FUNCTION wallet_auto_snapshot() RETURNS TRIGGER AS $$
+     BEGIN
+       IF TG_OP = 'INSERT' THEN
+         INSERT INTO wallet_snapshots (
+           wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag,
+           source, trigger
+         ) VALUES (
+           NEW.id, NEW.user_id, NEW.public_key,
+           NEW.encrypted_secret, NEW.nonce, NEW.auth_tag,
+           COALESCE(NEW.source, 'unknown'),
+           CASE COALESCE(NEW.source, 'unknown')
+             WHEN 'custodial' THEN 'create'
+             WHEN 'imported'  THEN 'import'
+             ELSE 'insert'
+           END
+         );
+       ELSIF TG_OP = 'UPDATE'
+             AND NEW.encrypted_secret IS DISTINCT FROM OLD.encrypted_secret THEN
+         -- Capture the OLD value first — this is the one at risk of being
+         -- lost. Then capture the NEW value.
+         INSERT INTO wallet_snapshots (
+           wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag,
+           source, trigger
+         ) VALUES (
+           OLD.id, OLD.user_id, OLD.public_key,
+           OLD.encrypted_secret, OLD.nonce, OLD.auth_tag,
+           COALESCE(OLD.source, 'unknown'), 'pre_update'
+         );
+         INSERT INTO wallet_snapshots (
+           wallet_id, user_id, public_key, encrypted_secret, nonce, auth_tag,
+           source, trigger
+         ) VALUES (
+           NEW.id, NEW.user_id, NEW.public_key,
+           NEW.encrypted_secret, NEW.nonce, NEW.auth_tag,
+           COALESCE(NEW.source, 'unknown'), 'post_update'
+         );
+       END IF;
+       RETURN NEW;
+     END;
+     $$ LANGUAGE plpgsql`,
+    `DROP TRIGGER IF EXISTS wallets_auto_snapshot ON wallets`,
+    `CREATE TRIGGER wallets_auto_snapshot
+       AFTER INSERT OR UPDATE ON wallets
+       FOR EACH ROW EXECUTE FUNCTION wallet_auto_snapshot()`,
 
     // $MAGPIE — protocol token, always approved, exempt from auto-disqualification.
     // Decimals=6 verified on-chain. ON CONFLICT keeps the row idempotent across boots.
