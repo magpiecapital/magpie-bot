@@ -92,6 +92,52 @@ export async function getLiveOwedLamports(loan) {
 }
 
 /**
+ * Pre-flight wallet-ownership check. Reads the on-chain loan PDA and
+ * compares the stored `borrower` pubkey against the wallet currently
+ * tied to this user account. If they don't match, the user changed
+ * wallets after taking out the loan (typically via /import) — repaying,
+ * extending, topping up, etc. will fail on-chain with ConstraintHasOne.
+ *
+ * This function lets every loan-action command catch that BEFORE
+ * building the tx — so users see a clear, friendly explanation instead
+ * of a cryptic Solana error.
+ *
+ * Returns:
+ *   { ok: true }                                                if wallets match
+ *   { ok: false, reason: "wallet_mismatch", currentWallet, borrowerWallet, loanId }
+ *                                                              if mismatched
+ *   { ok: true, skipped: true }                                 on RPC blip (don't block the user)
+ */
+export async function checkLoanOwnership(userId, loan) {
+  try {
+    const { ensureWallet } = await import("./wallet.js");
+    const current = await ensureWallet(userId);
+    const currentPubkey = current.publicKey;
+
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const program = getReadOnlyProgram();
+    const onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
+    const borrowerPubkey = onChain.borrower.toBase58();
+
+    if (currentPubkey !== borrowerPubkey) {
+      return {
+        ok: false,
+        reason: "wallet_mismatch",
+        currentWallet: currentPubkey,
+        borrowerWallet: borrowerPubkey,
+        loanId: loan.loan_id,
+      };
+    }
+    return { ok: true };
+  } catch (err) {
+    // RPC blip — don't block the user. The tx will surface the error
+    // via the translator if there's actually a problem.
+    console.warn("[checkLoanOwnership] failed:", err?.message);
+    return { ok: true, skipped: true };
+  }
+}
+
+/**
  * Borrow flow:
  *   1. Compute collateral value in lamports.
  *   2. Ensure borrower has wSOL ATA (will receive loan here).

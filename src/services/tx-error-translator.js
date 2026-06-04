@@ -45,6 +45,43 @@ export function errorActionKeyboard(opts = {}) {
 }
 
 /**
+ * Render the user-facing message for a wallet-mismatch preflight reject.
+ * Called by /repay, /partialrepay, /extend, /topup, /reborrow when the
+ * current wallet doesn't match the loan's on-chain borrower.
+ *
+ * The flow-specific verb in the headline keeps the copy grounded in what
+ * the user was actually trying to do.
+ */
+export function renderWalletMismatchMessage(ownership, flow = "act on") {
+  const flowVerbs = {
+    repay: "repaid",
+    partialrepay: "partial-repaid",
+    extend: "extended",
+    topup: "topped up",
+    reborrow: "re-borrowed",
+  };
+  const verb = flowVerbs[flow] || "modified";
+  const shortB = `${ownership.borrowerWallet.slice(0, 8)}…${ownership.borrowerWallet.slice(-8)}`;
+  const shortC = `${ownership.currentWallet.slice(0, 8)}…${ownership.currentWallet.slice(-8)}`;
+  return [
+    "⚠️ *This loan was opened by a different wallet*",
+    "",
+    `Loan #${ownership.loanId} can only be ${verb} by the wallet that originally took it out — that's how Solana enforces ownership on-chain.`,
+    "",
+    `*Original borrower:* \`${shortB}\``,
+    `*Your current wallet:* \`${shortC}\``,
+    "",
+    "*Looks like you ran /import after borrowing.* To proceed, switch back to the original wallet:",
+    "",
+    "1. Find the private key for the original wallet (in Phantom/Solflare, or wherever you stored it)",
+    "2. Run /import and paste that key — the bot will swap your active wallet",
+    `3. Retry /${flow}`,
+    "",
+    "_If you've lost access to the original wallet's key, hit /support and we'll talk through your options. The loan will go past-due if unpaid — you'd keep the borrowed SOL but lose the collateral._",
+  ].join("\n");
+}
+
+/**
  * @param {Error} err — the caught error (usually a SendTransactionError or thrown by anchor)
  * @param {object} ctx — optional context for richer messages
  * @param {bigint|string|number} [ctx.owedLamports] — amount user owes (for repay-flow phrasing)

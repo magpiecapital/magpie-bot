@@ -2,11 +2,11 @@ import { InlineKeyboard } from "grammy";
 import { PublicKey } from "@solana/web3.js";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
-import { executeRepay, markLoanRepaid, getLiveOwedLamports } from "../services/loans.js";
+import { executeRepay, markLoanRepaid, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { ensureWallet } from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
-import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
+import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -81,6 +81,20 @@ export function registerRepayCallbacks(bot) {
     // Capture the live owed amount so the success message reflects what
     // was actually paid (not whatever stale value happens to be in the DB).
     const owedNow = await getLiveOwedLamports(loan);
+
+    // ── Preflight: wallet ownership check ──
+    // Loans have an on-chain has_one = borrower constraint. If the user
+    // ran /import and switched wallets after borrowing, the tx will fail
+    // with ConstraintHasOne. Catch it BEFORE building the tx so they get
+    // a clear explanation instead of a cryptic Anchor error.
+    const ownership = await checkLoanOwnership(user.id, loan);
+    if (!ownership.ok && ownership.reason === "wallet_mismatch") {
+      await ctx.editMessageText(
+        renderWalletMismatchMessage(ownership, "repay"),
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
 
     // ── Preflight: do they have enough SOL to actually repay? ──
     // Without this check the user gets a cryptic Solana simulation error

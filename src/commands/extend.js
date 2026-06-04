@@ -3,8 +3,8 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
-import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports } from "../services/loans.js";
-import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
+import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
+import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 
 const pending = new Map();
 
@@ -141,6 +141,19 @@ export function registerExtendCallbacks(bot) {
     }
 
     await ctx.answerCallbackQuery();
+
+    // Pre-flight wallet ownership check — catches the /import-switched-
+    // wallets case BEFORE the tx.
+    const ownership = await checkLoanOwnership(state.userId, state.loan);
+    if (!ownership.ok && ownership.reason === "wallet_mismatch") {
+      pending.delete(ctx.chat.id);
+      await ctx.editMessageText(
+        renderWalletMismatchMessage(ownership, "extend"),
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
     await ctx.editMessageText("⏳ Extending loan on-chain...");
 
     try {
