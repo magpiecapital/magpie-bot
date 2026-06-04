@@ -2011,7 +2011,10 @@ const TOOL_HANDLERS = {
     try {
       // Try mint first, fall back to symbol (case-insensitive)
       const { rows } = await query(
-        `SELECT mint, symbol, name, decimals, enabled, max_ltv_pct, category
+        `SELECT mint, symbol, name, decimals, enabled, category,
+                liquidity_usd, holder_count, lp_burned,
+                has_mint_authority, has_freeze_authority, protected,
+                screened_at
          FROM supported_mints
          WHERE mint = $1 OR LOWER(symbol) = LOWER($1)
          LIMIT 1`,
@@ -2031,11 +2034,19 @@ const TOOL_HANDLERS = {
         symbol: t.symbol,
         name: t.name,
         enabled: t.enabled,
-        max_ltv_pct: Number(t.max_ltv_pct),
         category: t.category,
+        // Surface the screener signals so the agent can answer
+        // "is this safe" with real numbers, not vibes.
+        liquidity_usd: Number(t.liquidity_usd || 0),
+        holder_count: t.holder_count || 0,
+        lp_burned: t.lp_burned,
+        has_mint_authority: t.has_mint_authority,
+        has_freeze_authority: t.has_freeze_authority,
+        protected: t.protected,
+        last_screened_at: t.screened_at?.toISOString?.() || null,
         user_friendly_hint: t.enabled
-          ? `Confirm to the user that ${t.symbol} is enabled. They can borrow against it up to ${t.max_ltv_pct}% LTV.`
-          : `Tell the user ${t.symbol} is listed but currently disabled (likely due to a health issue). Borrows against it are paused until it's re-enabled.`,
+          ? `${t.symbol} is currently ENABLED as collateral. The exact LTV depends on the loan tier the user picks (Express 30%, Quick 25%, Standard 20%).`
+          : `${t.symbol} is listed but currently DISABLED. Either the token-health watcher flagged it, or an admin took it down for safety reasons. Borrows against it are paused; existing loans can still be repaid.`,
       };
     } catch (err) {
       return toolError("supported_lookup_failed", err.message, HINT_RPC_BLIP);
