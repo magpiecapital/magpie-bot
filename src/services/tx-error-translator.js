@@ -221,15 +221,92 @@ export function translateTxError(err, ctx = {}) {
     ].join("\n");
   }
 
-  // Pattern 6: explicit anchor errors with names
-  const anchorMatch = blob.match(/AnchorError.*?(?:Error Code:|error code:)\s*([A-Za-z][A-Za-z0-9_]+)/i);
+  // Pattern 6: explicit anchor errors with names — recognize the
+  // common ones and give a specific, actionable explanation.
+  const anchorMatch = blob.match(/AnchorError.*?(?:Error Code:|error code:)\s*([A-Za-z][A-Za-z0-9_]+)/i)
+    || blob.match(/Error Code:\s*([A-Za-z][A-Za-z0-9_]+)/i);
   if (anchorMatch) {
+    const code = anchorMatch[1];
+    // Specific friendly explanations for known Anchor + Magpie program errors
+    const knownErrors = {
+      // Anchor framework: has_one constraint failed. In Magpie this almost
+      // always means the wallet signing doesn't match the borrower stored
+      // in the loan PDA — i.e., user changed wallets after borrowing.
+      ConstraintHasOne: [
+        "⚠️ *This wallet didn't take out the loan*",
+        "",
+        "The loan you're trying to act on was opened by a DIFFERENT wallet than the one currently signing. The on-chain loan record requires the original borrower's wallet to repay / extend / top-up.",
+        "",
+        "*This usually means:*",
+        "• You ran /import after borrowing and switched to a different wallet",
+        "• Or you have two TG accounts and are using the wrong one",
+        "",
+        "*To fix:*",
+        "1. Run /wallet to see your current Magpie wallet address",
+        "2. Check Solscan for the loan tx — see which wallet originally took it out",
+        "3. If different: switch back via /import using the ORIGINAL wallet's key",
+        "4. Then retry /repay",
+        "",
+        "_If you've lost access to the original wallet, message us via /support — we can help you understand your options._",
+      ].join("\n"),
+      ConstraintSeeds: [
+        "⚠️ *Account mismatch*",
+        "",
+        "The transaction tried to reference an account that doesn't match what the program expects. Usually means stale data — refresh the bot menu and try again.",
+        "",
+        "If it keeps happening, /support and we'll dig in.",
+      ].join("\n"),
+      AccountNotInitialized: [
+        "⚠️ *Account doesn't exist yet*",
+        "",
+        "The on-chain account this transaction needs hasn't been created. For a first-time deposit this is usually automatic — for other flows it may mean the program state isn't where the bot thinks it is.",
+        "",
+        "Retry the action. If it persists, /support.",
+      ].join("\n"),
+      LoanNotActive: [
+        "⚠️ *Loan is no longer active*",
+        "",
+        "This loan has already been closed (repaid, extended, or liquidated). It's no longer borrowable / repayable.",
+        "",
+        "Check /positions for your CURRENT active loans, or /history for past ones.",
+      ].join("\n"),
+      LoanExpired: [
+        "⚠️ *Loan is past its due date*",
+        "",
+        "The deadline passed. Any moment now a keeper will auto-liquidate it. You may not be able to extend or partial-repay anymore — your only option is to /repay in full IMMEDIATELY, before the liquidation tx lands.",
+        "",
+        "If liquidation already happened, your collateral has been claimed but you keep the borrowed SOL. Check /history for the final state.",
+      ].join("\n"),
+      InsufficientCollateral: [
+        "⚠️ *Not enough collateral for this action*",
+        "",
+        "The collateral value relative to debt doesn't satisfy the requirement. Likely the token price moved against you between when you confirmed and when the tx landed.",
+        "",
+        "Try again at the current price — the bot will quote fresh numbers.",
+      ].join("\n"),
+      MintNotEnabled: [
+        "⚠️ *This token is currently paused as collateral*",
+        "",
+        "The token-health watcher disabled this mint (liquidity dropped, holder concentration spiked, or another safety signal). Existing loans stay active; new borrows are blocked until the token recovers.",
+        "",
+        "Check /supported for currently-enabled collateral tokens.",
+      ].join("\n"),
+      BorrowingPaused: [
+        "⚠️ *Protocol borrowing is paused*",
+        "",
+        "Admin paused new borrows (maintenance, emergency, etc.). Existing loans are unaffected.",
+        "",
+        "Try /repay or /extend if you have an active loan. New borrows will resume once admin /resume.",
+      ].join("\n"),
+    };
+    if (knownErrors[code]) return knownErrors[code];
+    // Unknown anchor error — generic fallback with the code surfaced
     return [
-      `⚠️ *Transaction rejected: ${anchorMatch[1]}*`,
+      `⚠️ *Transaction rejected: ${code}*`,
       "",
-      "The program declined this transaction. Common causes: loan is past due, token is disabled, or limits exceeded.",
+      "The program declined this transaction. This is a specific on-chain rule failure — common ones include past-due loans, disabled tokens, and limit issues.",
       "",
-      `Run /support → Chat with agent and ask why \`${anchorMatch[1]}\` was raised — the agent can usually explain.`,
+      `Tap *Ask the agent why* below — they have the full list of error codes and can usually identify exactly what triggered \`${code}\`.`,
     ].join("\n");
   }
 

@@ -507,6 +507,39 @@ most common causes:
    Diagnose: \`lookup_loan\` shows status=repaid or liquidated.
    Fix: It's already settled. Their collateral is back.
 
+5. CONSTRAINT_HAS_ONE — Anchor error meaning the signing wallet
+   ISN'T the borrower stored in the loan PDA. Almost always means
+   the user changed wallets (ran /import after borrowing) and is
+   trying to repay from a different wallet than the one that took
+   the loan out.
+   Diagnose: \`get_my_wallet\` shows current wallet, \`lookup_loan\`
+   shows the loan_pda. The user needs to verify on Solscan which
+   wallet originally created the loan tx.
+   Fix: If they still have access to the original wallet's key,
+   re-import it via /export from the bot UI of the wallet they
+   used originally, then /import here. If the original wallet's
+   key is lost — they can't repay this loan from a different
+   wallet, period. The loan will go past-due and liquidate.
+   Be empathetic: this is a user mistake but not their fault — the
+   bot should warn before /import when there are active loans
+   (admin TODO).
+
+6. CONSTRAINT_SEEDS — account derivation mismatch. Usually means
+   stale state in the bot vs on-chain. Suggest refreshing /positions
+   and retrying.
+
+7. LOAN_EXPIRED / LOAN_NOT_ACTIVE — past due or already closed.
+   Diagnose via lookup_loan; surface the actual status.
+
+8. MINT_NOT_ENABLED — collateral token was just disabled by the
+   token-health watcher. Existing loans CAN still be repaid even
+   if the mint is disabled. If they get this on repay specifically,
+   that's a bug — escalate.
+
+9. BORROWING_PAUSED — admin /pause is active. Repays/extends/repays
+   should still work (only NEW borrows are blocked). If user sees
+   this on a repay, escalate.
+
 ═══════════════════════════════════════════════════════════════════
 BORROWING FAILURE MODES — DIAGNOSE FAST
 ═══════════════════════════════════════════════════════════════════

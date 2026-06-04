@@ -1,10 +1,24 @@
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { importWallet } from "../services/wallet.js";
+import { query } from "../db/pool.js";
 import { clearPending as clearBorrowPending } from "./borrow.js";
 import { clearPending as clearWithdrawPending } from "./withdraw.js";
 
 const awaiting = new Map();
+
+// Check whether this user has active loans on the CURRENT wallet. Importing
+// a different wallet while loans exist will lock them out of repaying —
+// the on-chain loan record has the original borrower's pubkey as a
+// has_one constraint, so signing from a different wallet fails with
+// ConstraintHasOne. We warn before they shoot themselves in the foot.
+async function hasActiveLoans(userId) {
+  const { rows: [r] } = await query(
+    `SELECT COUNT(*)::int AS n FROM loans WHERE user_id = $1 AND status = 'active'`,
+    [userId],
+  );
+  return (r?.n || 0) > 0;
+}
 
 export async function handleImport(ctx) {
   const tgUser = ctx.from;
@@ -12,6 +26,36 @@ export async function handleImport(ctx) {
 
   // Immediately delete the message in case it contains a private key.
   try { await ctx.deleteMessage(); } catch (_) {}
+
+  const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // SAFETY GATE: if they have active loans, importing a different wallet
+  // makes those loans un-repayable from this account. Show a hard warning
+  // with confirmation before proceeding.
+  if (await hasActiveLoans(user.id)) {
+    const kb = new InlineKeyboard()
+      .text("✕ Cancel — keep current wallet", "import:cancel")
+      .row()
+      .text("⚠️ I understand — import anyway", "import:active_loans_warn");
+    return ctx.reply(
+      [
+        "🚨 *You have active loans on your current wallet*",
+        "",
+        "If you import a different wallet, you *will not be able to repay those loans*. Magpie loans are bound to the wallet that opened them — switching wallets locks you out.",
+        "",
+        "*Before importing:*",
+        "1. /positions — see your active loans",
+        "2. /repay or /partialrepay them from your CURRENT wallet first",
+        "3. THEN /import the new wallet",
+        "",
+        "*If you import anyway:*",
+        "Your active loans will go past-due, get liquidated, and you'll lose the collateral. The borrowed SOL is yours to keep, but the bag stays gone.",
+        "",
+        "_Are you sure?_",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  }
 
   // Support legacy inline usage: /import <key>
   // Only treat ctx.match as a key if it actually looks like base58 — otherwise
@@ -163,6 +207,25 @@ export function registerImportCallbacks(bot) {
     await ctx.answerCallbackQuery();
     awaiting.delete(ctx.chat.id);
     await ctx.reply("Import cancelled. Use /home to go back.");
+  });
+
+  // User confirmed the active-loans warning — proceed to normal import flow.
+  bot.callbackQuery("import:active_loans_warn", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const kb = new InlineKeyboard()
+      .text("📋 Paste my private key", "import:ready")
+      .row()
+      .text("❌ Cancel", "import:cancel");
+    await ctx.editMessageText(
+      [
+        "🔑 *Import — confirmed override*",
+        "",
+        "You acknowledged the active-loan risk. Tap below to paste your key.",
+        "",
+        "_Your current active loans will become un-repayable from this account._",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
   });
 
   // Middleware to catch the pasted private key.
