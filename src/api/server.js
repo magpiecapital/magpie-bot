@@ -904,6 +904,193 @@ async function handleAdminPoolStats(req, url) {
   };
 }
 
+// ─── Admin lifetime stats — cached 1h ───
+// Returns the full earnings/distribution picture per stakeholder so the
+// operator can see lifetime numbers without asking the bot operator's
+// engineer. Auth: same wallet-gate as handleAdminPoolStats.
+//
+// Cache: 1-hour in-memory. First request after expiry computes fresh and
+// caches; subsequent requests within the hour return the cached snapshot.
+// Acceptable trade-off because the underlying data only meaningfully
+// changes when loans are taken/repaid (low single-digit per hour at
+// current volume).
+let _lifetimeStatsCache = null;
+let _lifetimeStatsCachedAt = 0;
+const LIFETIME_STATS_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+async function computeLifetimeStats() {
+  const { PublicKey } = await import("@solana/web3.js");
+  const { getReadOnlyProgram } = await import("../solana/program.js");
+  const { lendingPoolPda } = await import("../solana/pdas.js");
+
+  const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
+  const lender = new PublicKey(LENDER_PUBKEY);
+  const [poolPda] = lendingPoolPda(lender);
+  const program = getReadOnlyProgram();
+  const p = await program.account.lendingPool.fetch(poolPda);
+
+  // On-chain pool — canonical source for fees + deposits + utilization
+  const totalFees = BigInt(p.totalFeesEarned.toString());
+  const totalDeposits = BigInt(p.totalDeposits.toString());
+  const totalBorrowed = BigInt(p.totalBorrowed.toString());
+  const split = {
+    lp_yield_lamports:        (totalFees * 80n / 100n).toString(),
+    magpie_holders_lamports:  (totalFees * 10n / 100n).toString(),
+    referrers_lamports:       (totalFees *  5n / 100n).toString(),
+    lp_loyalty_lamports:      (totalFees *  2n / 100n).toString(),
+    protocol_treasury_lamports: (totalFees * 3n / 100n).toString(),
+  };
+
+  // DB pulls
+  const [
+    { rows: [loans] },
+    { rows: [refs] },
+    { rows: [holderDist] },
+    { rows: [holderRewards] },
+    { rows: [holderPool] },
+    { rows: [loyaltyDist] },
+    { rows: [loyaltyPool] },
+    { rows: [loyaltyRewards] },
+    { rows: [users] },
+  ] = await Promise.all([
+    query(`SELECT
+              COUNT(*)::int                                                  AS total,
+              COUNT(*) FILTER (WHERE status='active')::int                   AS active,
+              COUNT(*) FILTER (WHERE status='repaid')::int                   AS repaid,
+              COUNT(*) FILTER (WHERE status='liquidated')::int               AS liquidated,
+              COUNT(DISTINCT user_id)::int                                   AS unique_borrowers,
+              COALESCE(SUM(loan_amount_lamports::numeric), 0)::text          AS volume_lamports
+            FROM loans`),
+    query(`SELECT
+              COUNT(*)::int                                                                                  AS events,
+              COUNT(DISTINCT referrer_user_id)::int                                                          AS unique_referrers,
+              COALESCE(SUM(reward_lamports::numeric), 0)::text                                               AS accrued_lamports,
+              COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text       AS paid_lamports,
+              COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text    AS pending_lamports
+            FROM referral_earnings`),
+    query(`SELECT COUNT(*)::int AS count,
+                  COALESCE(SUM(pool_lamports::numeric), 0)::text AS total_distributed_lamports
+            FROM magpie_holder_distributions`),
+    query(`SELECT
+              COUNT(*) FILTER (WHERE status='paid')::int                                                     AS paid_count,
+              COUNT(*) FILTER (WHERE status='accrued')::int                                                  AS pending_count,
+              COUNT(DISTINCT wallet_address)::int                                                            AS unique_recipients,
+              COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text       AS paid_lamports,
+              COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text    AS pending_lamports
+            FROM magpie_holder_rewards`),
+    query(`SELECT accrued_lamports::text AS accrued_lamports, next_distribution_at
+            FROM magpie_holder_pool WHERE id=1`),
+    query(`SELECT COUNT(*)::int AS count,
+                  COALESCE(SUM(pool_lamports::numeric), 0)::text AS total_distributed_lamports
+            FROM lp_loyalty_distributions`),
+    query(`SELECT accrued_lamports::text AS accrued_lamports FROM lp_loyalty_pool WHERE id=1`),
+    query(`SELECT
+              COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text       AS paid_lamports,
+              COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text    AS pending_lamports
+            FROM lp_loyalty_rewards`),
+    query(`SELECT
+              COUNT(*)::int                                                                  AS total,
+              COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int          AS new_24h,
+              COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int            AS new_7d,
+              COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days')::int           AS new_30d
+            FROM users`),
+  ]);
+
+  return {
+    generated_at: new Date().toISOString(),
+    pool: {
+      pda: poolPda.toBase58(),
+      total_deposits_lamports: totalDeposits.toString(),
+      total_borrowed_lamports: totalBorrowed.toString(),
+      utilization_pct: totalDeposits > 0n
+        ? Number((totalBorrowed * 10000n / totalDeposits)) / 100
+        : 0,
+      total_loans_issued: Number(p.totalLoansIssued),
+      total_liquidations: Number(p.totalLiquidations),
+      total_fees_earned_lamports: totalFees.toString(),
+      paused: p.paused,
+    },
+    fee_split: split,
+    loans: {
+      total: loans.total,
+      active: loans.active,
+      repaid: loans.repaid,
+      liquidated: loans.liquidated,
+      unique_borrowers: loans.unique_borrowers,
+      lifetime_volume_lamports: loans.volume_lamports,
+    },
+    referrals: {
+      reward_events: refs.events,
+      unique_referrers_paid: refs.unique_referrers,
+      lifetime_accrued_lamports: refs.accrued_lamports,
+      paid_lamports: refs.paid_lamports,
+      pending_claim_lamports: refs.pending_lamports,
+    },
+    magpie_holders: {
+      distributions_to_date: holderDist.count,
+      total_distributed_lamports: holderDist.total_distributed_lamports,
+      paid_count: holderRewards.paid_count,
+      pending_count: holderRewards.pending_count,
+      unique_recipients: holderRewards.unique_recipients,
+      paid_lamports: holderRewards.paid_lamports,
+      pending_lamports: holderRewards.pending_lamports,
+      accrued_lamports: holderPool.accrued_lamports,
+      next_distribution_at: holderPool.next_distribution_at,
+    },
+    lp_loyalty: {
+      distributions_to_date: loyaltyDist.count,
+      total_distributed_lamports: loyaltyDist.total_distributed_lamports,
+      paid_lamports: loyaltyRewards.paid_lamports,
+      pending_lamports: loyaltyRewards.pending_lamports,
+      accrued_lamports: loyaltyPool.accrued_lamports,
+    },
+    users: {
+      total: users.total,
+      new_24h: users.new_24h,
+      new_7d: users.new_7d,
+      new_30d: users.new_30d,
+    },
+  };
+}
+
+async function handleAdminLifetimeStats(req, url) {
+  const wallet = url.searchParams.get("wallet");
+  const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
+  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+  }
+
+  const now = Date.now();
+  const ageMs = now - _lifetimeStatsCachedAt;
+  if (_lifetimeStatsCache && ageMs < LIFETIME_STATS_TTL_MS) {
+    return {
+      status: 200,
+      body: { ..._lifetimeStatsCache, cached_age_seconds: Math.floor(ageMs / 1000) },
+    };
+  }
+
+  try {
+    const fresh = await computeLifetimeStats();
+    _lifetimeStatsCache = fresh;
+    _lifetimeStatsCachedAt = now;
+    return { status: 200, body: { ...fresh, cached_age_seconds: 0 } };
+  } catch (err) {
+    console.error("[admin/lifetime-stats] compute failed:", err.message);
+    // Stale-on-error: if we have any cached data, return it rather than 500
+    if (_lifetimeStatsCache) {
+      return {
+        status: 200,
+        body: {
+          ..._lifetimeStatsCache,
+          cached_age_seconds: Math.floor(ageMs / 1000),
+          warning: "Compute failed; returning stale cache. Check server logs.",
+        },
+      };
+    }
+    return { status: 500, body: { error: "Failed to compute stats", detail: err.message } };
+  }
+}
+
 async function handleMarketplaceStats() {
   const { getMarketplaceStats } = await import("../services/p2p-marketplace.js");
   const stats = await getMarketplaceStats();
@@ -934,9 +1121,10 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/loans",
   "/api/v1/wallet/balance",
   "/api/v1/credit/score",
-  // Admin route is "public" at the HTTP layer but gates internally on
+  // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
+  "/api/v1/admin/lifetime-stats",
   "/api/v1/pool/stats",
   "/api/v1/referrals",
   "/api/v1/holders",
@@ -1054,6 +1242,9 @@ async function router(req, res) {
         break;
       case "/api/v1/admin/pool-stats":
         result = await handleAdminPoolStats(req, url);
+        break;
+      case "/api/v1/admin/lifetime-stats":
+        result = await handleAdminLifetimeStats(req, url);
         break;
       case "/api/v1/pool/stats":
         result = await handlePublicPoolStats();
