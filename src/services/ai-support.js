@@ -990,6 +990,58 @@ ask this end up just /extend-ing for a bit of breathing room
 — want to look at that?"
 ─────────────────────────────────────────
 
+═══════════════════════════════════════════════════════════════════
+WALLET KNOWLEDGE — KNOW EVERY WALLET, ACT ON THEIR BEHALF
+═══════════════════════════════════════════════════════════════════
+The user's wallet list is pre-fetched into the snapshot at the top
+of every conversation. You already know:
+  - How many wallets they have (out of 10)
+  - Each wallet's label + full pubkey + source (custodial vs imported)
+  - Which one is active
+
+USE THIS DIRECTLY. Don't call list_my_wallets just to answer "what
+wallets do I have" — the snapshot has it. Only call list_my_wallets
+if you need a balance refresh or you suspect the snapshot is stale.
+
+Three direct-action tools you can fire whenever the request is clear:
+  • switch_active_wallet — flip which wallet signs going forward
+  • rename_wallet       — set a custom label on any wallet
+  • list_my_wallets     — refetch with live balances if needed
+
+Common wallet conversations and how to handle them:
+
+— "What wallets do I have?"
+  Answer FROM the snapshot. List them with active flag. No tool call.
+
+— "Switch me to my Phantom" (or any specific wallet name)
+  Find the wallet in the snapshot by label match. Call
+  switch_active_wallet with its pubkey. Confirm in one line.
+
+— "Rename my Magpie wallet to 'Main'"
+  Find the wallet, call rename_wallet directly. Confirm.
+
+— "Why can't I repay loan #X?"
+  Look up the loan's borrower pubkey via lookup_loan. Compare to the
+  active wallet in the snapshot. If they're different, switch them
+  to the right wallet with switch_active_wallet, then tell them to
+  retry /repay.
+
+— "Where did my SOL go?" / "Why is my balance different?"
+  Active wallet's SOL ≠ total SOL across wallets. Each wallet has
+  its own balance. Be precise about which wallet you're discussing.
+
+— "I have multiple wallets, this is confusing"
+  Slow down + explain. The active wallet signs everything. Switching
+  is non-destructive — all wallets stay in their account, switching
+  just changes which one's key signs the next tx. Their loans are
+  bound to whichever wallet opened them — they need to switch back
+  to that wallet to repay it.
+
+If the user names a wallet vaguely ("my Phantom", "the one with the
+$MAGPIE", "my second one") and the snapshot has only one match — use
+it. If multiple match, ask which one. Don't dump the whole list at
+them every time.
+
 CRITICAL TECHNICAL RULES:
 - Use Markdown that Telegram parses: *bold*, _italic_, \`code\`, [text](url). No headers, no \`\`\`code blocks, no tables.
 - Wrap loan numbers, tx signatures, wallet addresses, exact amounts in \`backticks\`.
@@ -1314,13 +1366,25 @@ const TOOLS = [
   },
   {
     name: "switch_active_wallet",
-    description: "CHANGE the user's active wallet for them. After switching, all subsequent /repay /extend /topup /borrow actions sign from the new active wallet. Use this when ConstraintHasOne errors fire (the loan was opened from a different wallet) or when the user explicitly asks to switch. ALWAYS call list_my_wallets first to confirm the target wallet exists in their account. Pass `wallet_pubkey` as either the full pubkey or any unique prefix (≥ 6 chars). The tool resolves the prefix to one wallet — if it's ambiguous or not found, it returns an error and you should clarify with the user.",
+    description: "CHANGE the user's active wallet for them. After switching, all subsequent /repay /extend /topup /borrow actions sign from the new active wallet. Use this when ConstraintHasOne errors fire (the loan was opened from a different wallet) or when the user explicitly asks to switch. The pre-fetched snapshot already lists all the user's wallets, so you usually DON'T need to call list_my_wallets first — just pick the right one from the snapshot. Pass `wallet_pubkey` as either the full pubkey or any unique prefix (≥ 6 chars). The tool resolves the prefix to one wallet — if it's ambiguous or not found, it returns an error and you should clarify with the user.",
     input_schema: {
       type: "object",
       properties: {
         wallet_pubkey: { type: "string", description: "Full pubkey OR a prefix (≥6 chars) of the wallet to make active. Tool resolves prefix to one wallet." },
       },
       required: ["wallet_pubkey"],
+    },
+  },
+  {
+    name: "rename_wallet",
+    description: "Rename one of the user's wallets to a custom label (max 40 chars). Use when the user asks to rename, label, or relabel a wallet ('call my Phantom \"Hot wallet\"'). Identify the target wallet by its pubkey (full or prefix ≥6 chars — same resolution rules as switch_active_wallet). The new label can be any non-empty string up to 40 chars — emojis are fine but DON'T include the user's full name or anything that looks like a PII leak.",
+    input_schema: {
+      type: "object",
+      properties: {
+        wallet_pubkey: { type: "string", description: "Full pubkey OR a prefix (≥6 chars) identifying the wallet to rename." },
+        new_label: { type: "string", description: "The new label (max 40 chars). Trimmed and clamped to 40 chars by the handler." },
+      },
+      required: ["wallet_pubkey", "new_label"],
     },
   },
   {
@@ -1543,6 +1607,37 @@ const TOOL_HANDLERS = {
         source: target.source,
       },
       user_friendly_hint: "Wallet successfully switched. Tell the user the switch is done and they can immediately retry their original action (/repay, /extend, etc.).",
+    };
+  },
+
+  rename_wallet: async ({ wallet_pubkey, new_label }, { userId }) => {
+    if (!wallet_pubkey || typeof wallet_pubkey !== "string" || wallet_pubkey.length < 6) {
+      return toolError("invalid_prefix", null, "Wallet pubkey/prefix must be at least 6 chars. Pick from the wallets in the user snapshot.");
+    }
+    if (!new_label || typeof new_label !== "string") {
+      return toolError("invalid_label", null, "Need a label string. Ask the user what they want to call it.");
+    }
+    const clean = new_label.trim().slice(0, 40);
+    if (clean.length === 0) {
+      return toolError("empty_label", null, "Label is empty after trimming. Ask the user for a real name.");
+    }
+    const { listWallets, renameWallet } = await import("./wallet.js");
+    const wallets = await listWallets(userId);
+    if (wallets.length === 0) return toolError("no_wallets", null, HINT_NO_WALLET);
+    const matches = wallets.filter((w) => w.publicKey === wallet_pubkey || w.publicKey.startsWith(wallet_pubkey));
+    if (matches.length === 0) return toolError("no_match", null, `No wallet in this account starts with "${wallet_pubkey.slice(0, 16)}". List the snapshot wallets and ask the user which one.`);
+    if (matches.length > 1) return toolError("ambiguous", null, `Prefix matches ${matches.length} wallets. Ask for a longer prefix.`);
+    try {
+      await renameWallet(userId, matches[0].id, clean);
+    } catch (err) {
+      return toolError("rename_failed", err.message, "DB write failed. Tell the user to try /wallets manually.");
+    }
+    return {
+      renamed: true,
+      wallet_pubkey: matches[0].publicKey,
+      old_label: matches[0].label,
+      new_label: clean,
+      user_friendly_hint: `Wallet renamed. Tell the user: "Renamed \`${matches[0].publicKey.slice(0,6)}…\` to *${clean}*." Be brief.`,
     };
   },
 
@@ -2190,6 +2285,32 @@ async function buildUserSnapshot(userId) {
 
     if (t.open_tix > 0 || t.awaiting_tix > 0) {
       lines.push(`Has ${t.open_tix} open + ${t.awaiting_tix} awaiting tickets. If they ask about an issue, it might be linked to one of those.`);
+    }
+
+    // ─── Wallets — the agent should ALWAYS know which wallets the user has ───
+    // Listed inline so the agent doesn't need to call list_my_wallets just
+    // to answer "what wallets do I have" or to spot wallet-mismatch issues.
+    // The mapping below is also critical for diagnosing ConstraintHasOne
+    // errors — the agent can immediately check whether a loan's borrower
+    // address is in this list.
+    try {
+      const { listWallets } = await import("./wallet.js");
+      const wallets = await listWallets(userId);
+      if (wallets.length > 0) {
+        lines.push("");
+        lines.push(`Wallets on this account (${wallets.length}/10) — every one is something the user can switch to via /wallets:`);
+        for (const w of wallets) {
+          const flag = w.isActive ? "✅ ACTIVE" : "⚪️";
+          const src = w.source === "custodial" ? "Magpie-generated" : "Imported";
+          lines.push(`  ${flag} ${w.label} · ${w.publicKey} · ${src}`);
+        }
+        if (wallets.length > 1) {
+          lines.push("If the user asks about A SPECIFIC wallet, you already know its address + source — answer directly without calling list_my_wallets.");
+          lines.push("If a loan's borrower pubkey matches one of the inactive wallets above, that's a switch candidate — use switch_active_wallet to flip them, don't make them /wallets manually.");
+        }
+      }
+    } catch (err) {
+      console.warn("[ai-support] snapshot wallets fetch failed:", err.message);
     }
 
     return lines.join("\n");
