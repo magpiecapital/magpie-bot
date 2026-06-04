@@ -180,6 +180,30 @@ const CASES = [
     expectInText: ["topup"],
   },
   {
+    name: "Open-ended 'help with my loan' triggers a lookup, not a list",
+    prompt: "Hey can you help with my loan?",
+    expectAnyTool: ["list_my_loans", "lookup_loan"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Worried/anxious user gets empathetic + tools",
+    prompt: "I'm worried about my loan getting liquidated",
+    expectAnyTool: ["list_my_loans", "lookup_loan"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "Extend question doesn't escalate, calls lookup",
+    prompt: "Can I extend loan #1780?",
+    expectAnyTool: ["lookup_loan"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
+    name: "'What's my best move' question uses snapshot, recommends",
+    prompt: "What's my best move right now with my loans?",
+    expectAnyTool: ["list_my_loans"],
+    forbiddenTools: ["open_support_ticket"],
+  },
+  {
     name: "Vague help asks for clarification, no premature escalation",
     prompt: "help",
     expectTools: [],
