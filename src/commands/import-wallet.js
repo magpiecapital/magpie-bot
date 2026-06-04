@@ -110,9 +110,11 @@ async function doImport(ctx, tgUser, key) {
 
   try {
     const result = await importWallet(user.id, normalizedKey);
-    const { publicKey, alreadyExisted } = result;
+    const { publicKey, walletId, alreadyExisted } = result;
 
     const kb = new InlineKeyboard()
+      .text("✏️ Name this wallet", `wallets:rename:${walletId}`)
+      .row()
       .text("💼 My wallets", "wallets:view")
       .row()
       .text("💰 Borrow now", "start:borrow")
@@ -127,6 +129,8 @@ async function doImport(ctx, tgUser, key) {
         alreadyExisted
           ? "You already had this wallet — it's now your active one. Any previously-active wallet has been deactivated (but its keys are preserved — switch back via /wallets)."
           : "This wallet is now your active wallet. *Your previous wallet's keys are preserved* — switch back any time via /wallets if you need to repay loans you opened from a different wallet.",
+        "",
+        "_Tap *✏️ Name this wallet* to give it a custom label — makes it easier to spot in /wallets._",
         "",
         "_All transactions will sign from this wallet until you switch._",
       ].join("\n"),
