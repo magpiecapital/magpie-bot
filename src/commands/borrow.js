@@ -442,6 +442,7 @@ export function registerBorrowCallbacks(bot) {
         ltvPercentage: tier.ltv,
         durationDays: tier.days,
         txSignature: result.signature,
+        programId: result.programId,
       });
       await incrementBorrowed(state.userId, loanAmountPreFee);
 

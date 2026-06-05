@@ -21,7 +21,12 @@ import fs from "node:fs";
 import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
-import { getProgramForSigner } from "../solana/program.js";
+import {
+  getProgramForSigner,
+  PROGRAM_ID,
+  chooseProgramIdForCategory,
+  chooseProgramIdForLoan,
+} from "../solana/program.js";
 import {
   lendingPoolPda,
   loanTokenVaultPda,
@@ -74,7 +79,8 @@ async function getMintTokenProgram(mint) {
 export async function getLiveOwedLamports(loan) {
   try {
     const { getReadOnlyProgram } = await import("../solana/program.js");
-    const program = getReadOnlyProgram();
+    const programId = chooseProgramIdForLoan(loan);
+    const program = getReadOnlyProgram(programId);
     const onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
     const live = BigInt(onChain.repayAmount.toString());
     const stored = BigInt(loan.original_loan_amount_lamports);
@@ -115,7 +121,8 @@ export async function checkLoanOwnership(userId, loan) {
     const currentPubkey = current.publicKey;
 
     const { getReadOnlyProgram } = await import("../solana/program.js");
-    const program = getReadOnlyProgram();
+    const programId = chooseProgramIdForLoan(loan);
+    const program = getReadOnlyProgram(programId);
     const onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
     const borrowerPubkey = onChain.borrower.toBase58();
 
@@ -151,21 +158,32 @@ export async function executeBorrow({
   collateralValueLamports,
   loanOption,
 }) {
+  // Look up the collateral's category to decide which lending program to use.
+  // RWAs (stocks/ETFs/metals) route to v2 (newer anchor-spl with Token-2022
+  // extension support); everything else routes to v1. If v2 isn't configured
+  // (PROGRAM_ID_V2 env unset), every borrow routes to v1 — fail-safe.
+  const { rows: catRows } = await query(
+    `SELECT category FROM supported_mints WHERE mint = $1`,
+    [collateralMint],
+  );
+  const category = catRows[0]?.category ?? "memecoin";
+  const programId = chooseProgramIdForCategory(category);
+
   const borrower = await loadKeypair(userId);
-  const program = getProgramForSigner(borrower);
+  const program = getProgramForSigner(borrower, programId);
 
   const collateralMintPk = new PublicKey(collateralMint);
   const loanTokenMintPk = NATIVE_MINT; // wSOL
 
-  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
-  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
 
   const collateralTokenProgram = await getMintTokenProgram(collateralMint);
   const loanTokenProgram = TOKEN_PROGRAM_ID; // wSOL is classic SPL
 
   const loanId = new BN(Date.now());
-  const [loanAccount] = loanPda(borrower.publicKey, loanId);
-  const [collateralVault] = collateralVaultPda(loanAccount);
+  const [loanAccount] = loanPda(borrower.publicKey, loanId, programId);
+  const [collateralVault] = collateralVaultPda(loanAccount, programId);
 
   const borrowerCollateralAta = getAssociatedTokenAddressSync(
     collateralMintPk,
@@ -250,7 +268,7 @@ export async function executeBorrow({
       feeWalletTokenAccount: feeWalletWsolAta,
       borrower: borrower.publicKey,
       authority: LENDER_PUBKEY,
-      priceFeed: priceFeedPda(collateralMintPk, lendingPool)[0],
+      priceFeed: priceFeedPda(collateralMintPk, lendingPool, programId)[0],
       systemProgram: SystemProgram.programId,
       tokenProgram: collateralTokenProgram,
       loanTokenProgram,
@@ -261,7 +279,12 @@ export async function executeBorrow({
     .postInstructions(postIxs)
     .rpc({ commitment: "confirmed" });
 
-  return { signature: sig, loanId: loanId.toString(), loanPda: loanAccount.toBase58() };
+  return {
+    signature: sig,
+    loanId: loanId.toString(),
+    loanPda: loanAccount.toBase58(),
+    programId: programId.toBase58(),
+  };
 }
 
 /**
@@ -271,16 +294,20 @@ export async function executeBorrow({
  *   3. Close wSOL ATA (recover rent, convert leftover wSOL back to SOL).
  */
 export async function executeRepay({ userId, loanDbRow }) {
+  // Use the program the loan was originally created on (v1 for everything
+  // pre-v2-launch, populated via the program_id column at borrow time).
+  const programId = chooseProgramIdForLoan(loanDbRow);
+
   const borrower = await loadKeypair(userId);
-  const program = getProgramForSigner(borrower);
+  const program = getProgramForSigner(borrower, programId);
 
   const collateralMintPk = new PublicKey(loanDbRow.collateral_mint);
   const loanTokenMintPk = NATIVE_MINT;
 
-  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
-  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
   const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
-  const [collateralVault] = collateralVaultPda(loanPdaPk);
+  const [collateralVault] = collateralVaultPda(loanPdaPk, programId);
 
   const collateralTokenProgram = await getMintTokenProgram(loanDbRow.collateral_mint);
   const loanTokenProgram = TOKEN_PROGRAM_ID;
@@ -408,17 +435,22 @@ export async function recordLoan({
   ltvPercentage,
   durationDays,
   txSignature,
+  programId,
 }) {
   const startTs = new Date();
   const dueTs = new Date(startTs.getTime() + durationDays * 24 * 60 * 60 * 1000);
+
+  // Persist which program this loan was created against. Older callers that
+  // don't pass programId fall through to v1 — matches the column backfill.
+  const recordedProgramId = programId ?? PROGRAM_ID.toBase58();
 
   const { rows } = await query(
     `INSERT INTO loans (
        user_id, loan_id, loan_pda, collateral_mint, collateral_amount,
        loan_amount_lamports, original_loan_amount_lamports,
        ltv_percentage, duration_days,
-       start_timestamp, due_timestamp, status, tx_signature
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)
+       start_timestamp, due_timestamp, status, tx_signature, program_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)
      RETURNING id`,
     [
       userId,
@@ -433,6 +465,7 @@ export async function recordLoan({
       startTs,
       dueTs,
       txSignature,
+      recordedProgramId,
     ],
   );
 
@@ -539,12 +572,14 @@ export async function markLoanRepaid(loanDbId, txSignature) {
  * No fee charged. Collateral can be same mint as original loan.
  */
 export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }) {
+  const programId = chooseProgramIdForLoan(loanDbRow);
+
   const borrower = await loadKeypair(userId);
-  const program = getProgramForSigner(borrower);
+  const program = getProgramForSigner(borrower, programId);
 
   const collateralMintPk = new PublicKey(loanDbRow.collateral_mint);
   const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
-  const [collateralVault] = collateralVaultPda(loanPdaPk);
+  const [collateralVault] = collateralVaultPda(loanPdaPk, programId);
   const collateralTokenProgram = await getMintTokenProgram(loanDbRow.collateral_mint);
 
   const borrowerCollateralAta = getAssociatedTokenAddressSync(
@@ -578,12 +613,14 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
  * Requires amount < original_loan_amount (full repayment must use /repay).
  */
 export async function executePartialRepay({ userId, loanDbRow, repayLamports }) {
+  const programId = chooseProgramIdForLoan(loanDbRow);
+
   const borrower = await loadKeypair(userId);
-  const program = getProgramForSigner(borrower);
+  const program = getProgramForSigner(borrower, programId);
 
   const loanTokenMintPk = NATIVE_MINT;
-  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
-  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
   const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
   const loanTokenProgram = TOKEN_PROGRAM_ID;
 
@@ -645,12 +682,14 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
  * If already past due, clock resets from now.
  */
 export async function executeExtendLoan({ userId, loanDbRow }) {
+  const programId = chooseProgramIdForLoan(loanDbRow);
+
   const borrower = await loadKeypair(userId);
-  const program = getProgramForSigner(borrower);
+  const program = getProgramForSigner(borrower, programId);
 
   const loanTokenMintPk = NATIVE_MINT;
-  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY);
-  const [loanTokenVault] = loanTokenVaultPda(lendingPool);
+  const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
   const loanPdaPk = new PublicKey(loanDbRow.loan_pda);
   const loanTokenProgram = TOKEN_PROGRAM_ID;
 

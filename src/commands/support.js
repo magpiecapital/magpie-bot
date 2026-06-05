@@ -17,7 +17,7 @@ import { PublicKey } from "@solana/web3.js";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
-import { getReadOnlyProgram } from "../solana/program.js";
+import { getReadOnlyProgram, chooseProgramIdForLoan } from "../solana/program.js";
 import { getLiveOwedLamports } from "../services/loans.js";
 import { collateralValueLamports } from "../services/price.js";
 import { clearPending as clearBorrowPending } from "./borrow.js";
@@ -106,7 +106,9 @@ export async function handleSupport(ctx) {
 }
 
 async function diagnoseLoan(ctx, loan) {
-  const program = getReadOnlyProgram();
+  // Route loan reads to the program the loan was created on (v1 for everything
+  // pre-v2-launch). Loans store their program_id; falls back to v1 default.
+  const program = getReadOnlyProgram(chooseProgramIdForLoan(loan));
   let onChain;
   try {
     onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
