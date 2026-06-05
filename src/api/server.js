@@ -13,6 +13,7 @@ import http from "node:http";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
+import { handleCosignBorrow } from "./cosign-borrow.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1134,6 +1135,12 @@ const PUBLIC_ROUTES = new Set([
   // Designed for public consumption (the transparency page on the site,
   // third-party trackers, etc.). No auth, cached for 60s upstream.
   "/api/v1/transparency",
+  // Co-sign borrow — security is enforced INTERNALLY by the handler
+  // (strict instruction-discriminator allowlist). The endpoint will only
+  // sign request_and_fund_loan and rejects anything else. No API-key gate
+  // because the site needs to call it from any user's browser; the
+  // protection is in the handler's own validation, not the auth layer.
+  "/api/v1/cosign-borrow",
 ]);
 
 async function router(req, res) {
@@ -1272,6 +1279,9 @@ async function router(req, res) {
         break;
       case "/api/v1/lp-loyalty":
         result = await handleLpLoyalty(req, url);
+        break;
+      case "/api/v1/cosign-borrow":
+        result = await handleCosignBorrow(req);
         break;
       default:
         result = {
