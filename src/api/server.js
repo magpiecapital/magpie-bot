@@ -17,6 +17,7 @@ import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
 import { handleSupportTickets } from "./support-api.js";
+import { handleSupportAsk } from "./support-ask.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1157,6 +1158,9 @@ const PUBLIC_ROUTES = new Set([
   // Support tickets viewer — by-wallet read of linked user's tickets.
   // Same risk envelope as /api/v1/loans (wallet-keyed read).
   "/api/v1/support/tickets",
+  // Signed support actions (open ticket, follow up, close). Auth +
+  // replay protection enforced inside the handler (see support-ask.js).
+  "/api/v1/support/ask",
 ]);
 
 async function router(req, res) {
@@ -1310,6 +1314,9 @@ async function router(req, res) {
         break;
       case "/api/v1/support/tickets":
         result = await handleSupportTickets(req, url);
+        break;
+      case "/api/v1/support/ask":
+        result = await handleSupportAsk(req);
         break;
       default:
         result = {
