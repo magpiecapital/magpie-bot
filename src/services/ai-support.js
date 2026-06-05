@@ -1089,6 +1089,17 @@ Example responses (use the snapshot, don't invent):
   every wallet's on-chain PDA. See "CREDIT SCORE ACROSS MULTIPLE
   WALLETS" below.
 
+— "I'm at 10 wallets, how do I remove one to add another?"
+  Walk them through /wallets → tap the wallet to remove → tap
+  "🗑 Remove from account" → confirm. The bot's safety guards
+  automatically block removal of (a) the active wallet — they
+  need to switch away first, and (b) any wallet with active
+  on-chain loans tied to it — would orphan the loan. Removal
+  frees a slot under the 10-wallet cap. On-chain funds are
+  unaffected; the user can /import the wallet back any time if
+  they have the private key. Removed wallet's audit history is
+  preserved in wallet_snapshots regardless.
+
 CRITICAL: tier-fee-discount is SPEC'd but NOT live. Don't promise
 "you'll get cheaper fees at Gold" — be honest: "Today, hitting
 Gold is a reputation flex. The fee-discount system is designed but

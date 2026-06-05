@@ -9,7 +9,11 @@
 import { PublicKey } from "@solana/web3.js";
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { listWallets, setActiveWallet, renameWallet, MAX_WALLETS_PER_USER } from "../services/wallet.js";
+import {
+  listWallets, setActiveWallet, renameWallet, removeWallet,
+  CannotRemoveActiveWalletError, WalletHasActiveLoansError,
+  MAX_WALLETS_PER_USER,
+} from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 
 // Tracks chat sessions waiting for the user to send a wallet's new name.
@@ -142,6 +146,12 @@ async function renderWalletDetail(ctx, walletId) {
     kb.text(`🔁 Switch to ${w.label}`, `wallets:confirm_switch:${w.id}`).row();
   }
   kb.text("✏️ Rename this wallet", `wallets:rename:${w.id}`).row();
+  // Remove is only offered for non-active wallets. The service layer
+  // also blocks removal if the wallet has active loans tied to it,
+  // surfaced via the confirm step below.
+  if (!w.isActive) {
+    kb.text("🗑 Remove from account", `wallets:confirm_remove:${w.id}`).row();
+  }
   kb.text("← Back to wallets", "wallets:back");
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb })
@@ -211,6 +221,80 @@ export function registerWalletsCallbacks(bot) {
   // Back-to-list button from the wallet detail view.
   bot.callbackQuery("wallets:back", async (ctx) => {
     await ctx.answerCallbackQuery();
+    await handleWallets(ctx);
+  });
+
+  // Confirm step before removing a wallet — irreversible action gets
+  // a hard prompt. The service layer's safety guards (can't remove
+  // active wallet, can't remove wallet with active loans) are still
+  // the ultimate gate, but we surface a friendly confirm here first.
+  bot.callbackQuery(/^wallets:confirm_remove:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const walletId = Number(ctx.match[1]);
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+    const wallets = await listWallets(user.id);
+    const w = wallets.find((x) => String(x.id) === String(walletId));
+    if (!w) return ctx.reply("That wallet isn't in your account anymore. Try /wallets again.");
+    if (w.isActive) {
+      return ctx.reply("Can't remove the active wallet. Switch to a different wallet first, then remove this one.");
+    }
+    const lines = [
+      "🗑 *Remove this wallet from your account?*",
+      "",
+      `*${w.label}*`,
+      `\`${w.publicKey}\``,
+      "",
+      "What this does:",
+      "• Frees up a slot under the 10-wallet cap so you can /import a different wallet.",
+      "• Removes the bot's stored access — you'll lose bot signing for this wallet.",
+      "• Does *not* affect on-chain funds. The wallet still exists; the bot just stops using it.",
+      "• If you have the wallet's private key elsewhere, you can /import it back any time.",
+      "",
+      "Blocked automatically if this wallet has any active on-chain loans tied to it.",
+    ];
+    const kb = new InlineKeyboard()
+      .text(`Yes, remove ${w.label}`, `wallets:do_remove:${w.id}`)
+      .row()
+      .text("Cancel", `wallets:view:${w.id}`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb })
+      .catch(async () => {
+        // Markdown fallback for edge-case pubkeys
+        await ctx.reply(lines.join("\n").replace(/[*_`]/g, ""), { reply_markup: kb });
+      });
+  });
+
+  // Execute the removal after confirm.
+  bot.callbackQuery(/^wallets:do_remove:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const walletId = Number(ctx.match[1]);
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+    try {
+      await removeWallet(user.id, walletId);
+    } catch (err) {
+      if (err instanceof CannotRemoveActiveWalletError) {
+        return ctx.reply("⚠️ Can't remove the active wallet. Switch to a different wallet first via /wallets.");
+      }
+      if (err instanceof WalletHasActiveLoansError) {
+        return ctx.reply(
+          [
+            "⚠️ *Can't remove — active loans on this wallet*",
+            "",
+            `This wallet is the on-chain borrower on ${err.loanPdas.length} active loan(s). Removing it would orphan them — the bot wouldn't be able to sign repayments.`,
+            "",
+            "*To proceed*, either:",
+            "1. /repay or /partialrepay the loans first, then come back and remove the wallet",
+            "2. Keep this wallet so you can repay when ready",
+            "",
+            "_If you absolutely need to free a slot now and accept losing access to those loans, reach out via /support and we can do it manually with full diagnosis._",
+          ].join("\n"),
+          { parse_mode: "Markdown" },
+        );
+      }
+      console.error("[wallets] remove failed:", err.message);
+      return ctx.reply(`Couldn't remove that wallet right now: ${err.message?.slice(0, 100)}. Try again in a moment.`);
+    }
+    await ctx.reply(`✅ Wallet removed. You now have a free slot to /import a different wallet.`);
+    // Re-render the list so they see the updated state immediately.
     await handleWallets(ctx);
   });
 

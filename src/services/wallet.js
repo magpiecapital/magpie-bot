@@ -295,3 +295,84 @@ export async function renameWallet(userId, walletId, label) {
     [clean || null, walletId, userId],
   );
 }
+
+// Errors specific to remove flow — caller maps these to friendly messages.
+export class CannotRemoveActiveWalletError extends Error {
+  constructor() {
+    super("Active wallet cannot be removed. Switch to another wallet first.");
+    this.name = "CannotRemoveActiveWalletError";
+  }
+}
+export class WalletHasActiveLoansError extends Error {
+  constructor(loanPdas) {
+    super(`Wallet has ${loanPdas.length} active loan(s) tied to it on-chain.`);
+    this.name = "WalletHasActiveLoansError";
+    this.loanPdas = loanPdas;
+  }
+}
+
+/**
+ * Remove a wallet from the user's account, freeing a slot under the
+ * 10-wallet cap so they can /import a different one.
+ *
+ * SAFETY GUARDS:
+ *   - Refuses to remove the user's currently-active wallet (no orphaned
+ *     signer state). They must /wallets switch first.
+ *   - Refuses to remove a wallet that's the on-chain BORROWER of any
+ *     active loan. Removing such a wallet would orphan the loan —
+ *     exactly the wallet-loss bug class we fixed. Per the on-chain
+ *     `Loan.borrower` field, we cross-reference each of the user's
+ *     active loans and block removal if any borrow from this wallet.
+ *   - The wallet_snapshots history is NEVER touched, so if the user
+ *     ever wants to re-import the same wallet, the historical key
+ *     material is preserved in the audit log.
+ *
+ * Returns nothing on success; throws one of the typed errors above on
+ * refusal. Caller is responsible for rendering an appropriate message.
+ */
+export async function removeWallet(userId, walletId) {
+  // 1. Verify ownership + fetch state
+  const { rows } = await query(
+    `SELECT id, public_key, is_active, label
+       FROM wallets
+      WHERE id = $1 AND user_id = $2 LIMIT 1`,
+    [walletId, userId],
+  );
+  if (rows.length === 0) throw new Error("Wallet not found or not yours");
+  const wallet = rows[0];
+  if (wallet.is_active) throw new CannotRemoveActiveWalletError();
+
+  // 2. Cross-reference active loans against this wallet's pubkey.
+  // The loans table only stores user_id + loan_pda, not the on-chain
+  // borrower. So we fetch the borrower field from each loan PDA and
+  // check if any match the wallet we're trying to remove.
+  const { rows: activeLoans } = await query(
+    `SELECT id, loan_pda FROM loans WHERE user_id = $1 AND status = 'active'`,
+    [userId],
+  );
+  if (activeLoans.length > 0) {
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const program = getReadOnlyProgram();
+    const tiedLoans = [];
+    for (const l of activeLoans) {
+      try {
+        const onChain = await program.account.loan.fetch(new PublicKey(l.loan_pda));
+        if (onChain.borrower?.toBase58?.() === wallet.public_key) {
+          tiedLoans.push(l.loan_pda);
+        }
+      } catch (err) {
+        // Couldn't fetch — fail safe: assume it might be tied, refuse removal.
+        // This is rare (RPC blip) and the user can retry after a moment.
+        console.warn(`[wallet-remove] couldn't verify loan ${l.loan_pda}: ${err.message}`);
+        throw new Error(`Couldn't verify all active loans right now. Try again in a moment.`);
+      }
+    }
+    if (tiedLoans.length > 0) {
+      throw new WalletHasActiveLoansError(tiedLoans);
+    }
+  }
+
+  // 3. Safe to remove. The wallet_snapshots audit log keeps the
+  // encrypted_secret history regardless of this DELETE.
+  await query(`DELETE FROM wallets WHERE id = $1 AND user_id = $2`, [walletId, userId]);
+}
