@@ -18,6 +18,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { getPrefs } from "../services/prefs.js";
+import { alertPrefChanged } from "../services/security-alerts.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -224,6 +225,8 @@ export async function handlePrefsSet(req) {
     `UPDATE user_prefs SET ${key} = $2, updated_at = NOW() WHERE user_id = $1`,
     [userId, value],
   );
+
+  alertPrefChanged({ userId, key, value }).catch(() => {});
 
   return { status: 200, body: { ok: true, key, value } };
 }

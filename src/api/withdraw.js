@@ -50,6 +50,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { loadKeypair } from "../services/wallet.js";
+import { alertWithdraw } from "../services/security-alerts.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -393,6 +394,20 @@ export async function handleSiteWithdraw(req) {
     `UPDATE site_withdrawals SET status='confirmed', tx_signature=$2 WHERE id=$1`,
     [auditId, signature],
   );
+
+  // Fire-and-forget TG security DM. Failure is non-critical — the
+  // withdraw already succeeded; the alert is defense-in-depth so the
+  // user notices a stolen-seed scenario quickly.
+  const displayAmount = (Number(rawAmount) / 10 ** decimals).toFixed(
+    decimals === 9 ? 4 : Math.min(decimals, 6),
+  );
+  alertWithdraw({
+    userId,
+    asset: Asset,
+    displayAmount,
+    destination: To,
+    txSig: signature,
+  }).catch(() => {});
 
   return {
     status: 200,

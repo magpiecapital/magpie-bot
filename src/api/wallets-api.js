@@ -19,6 +19,7 @@ import bs58 from "bs58";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
+import { alertSetActiveWallet } from "../services/security-alerts.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -230,6 +231,8 @@ export async function handleWalletsSetActive(req) {
     await query("ROLLBACK").catch(() => {});
     throw e;
   }
+
+  alertSetActiveWallet({ userId: match.user_id, newActivePubkey: targetPubkey }).catch(() => {});
 
   return { status: 200, body: { ok: true, active_wallet: targetPubkey } };
 }

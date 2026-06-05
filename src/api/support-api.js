@@ -18,6 +18,7 @@ import bs58 from "bs58";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
+import { alertTicketDeleted } from "../services/security-alerts.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -198,20 +199,24 @@ export async function handleSupportDeleteTicket(req) {
   // Only allow deletion of CLOSED tickets — open/awaiting tickets stay
   // until resolved so the team can complete in-flight investigations.
   // Single statement so a non-owner / wrong-status case gets the same
-  // 404 as a non-existent id (no enumeration disclosure).
-  const { rowCount } = await query(
+  // 404 as a non-existent id (no enumeration disclosure). Return user_id
+  // so we can fire the security alert after deletion.
+  const { rows } = await query(
     `DELETE FROM support_tickets
        WHERE id = $2
          AND status = 'closed'
-         AND user_id = (SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1)`,
+         AND user_id = (SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1)
+       RETURNING user_id`,
     [signerPubkey, ticketId],
   );
-  if (rowCount === 0) {
+  if (rows.length === 0) {
     return {
       status: 404,
       body: { error: "Ticket not found, not yours, or not closed" },
     };
   }
+
+  alertTicketDeleted({ userId: rows[0].user_id, ticketId }).catch(() => {});
 
   return { status: 200, body: { ok: true, deleted: ticketId } };
 }
