@@ -854,8 +854,8 @@ function vetToken(onChain, market, holderCount, category) {
   // Holders (stocks can have fewer holders and still be legitimate).
   // holderCount == -1 means "unknown" (lookup failed) — skip the gate
   // rather than incorrectly treating a failed lookup as zero holders.
-  const minHolders = isStock ? 50 : MIN_CONSIDER.minHolders;
-  const autoHolders = isStock ? 100 : AUTO_APPROVE.minHolders;
+  const minHolders = rwa ? 50 : MIN_CONSIDER.minHolders;
+  const autoHolders = rwa ? 100 : AUTO_APPROVE.minHolders;
   const holdersKnown = holderCount >= 0;
   if (holdersKnown && holderCount < minHolders) {
     fails.push(`${holderCount} holders < ${minHolders} minimum`);
@@ -878,7 +878,7 @@ function vetToken(onChain, market, holderCount, category) {
   // authority audit) make the decision.
   const holderOk = (threshold) => !holdersKnown || holderCount >= threshold;
 
-  if (isStock) {
+  if (rwa) {
     // Stocks: don't check mint/freeze authority, lower holder threshold
     canAutoApprove =
       market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
