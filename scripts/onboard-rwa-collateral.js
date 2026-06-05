@@ -1,5 +1,27 @@
 #!/usr/bin/env node
 /**
+ * ⚠️ DISABLED — DO NOT RE-RUN.
+ *
+ * Backed Finance xStocks use Token-2022 extensions (TransferHook,
+ * ConfidentialTransferMint, PausableConfig, ScaledUiAmountConfig,
+ * DefaultAccountState, PermanentDelegate) that the currently-deployed
+ * Magpie Anchor program cannot init a collateral_vault for. The on-chain
+ * program errors with InvalidAccountData at collateral_vault init time.
+ *
+ * Verified 2026-06-05 via scripts/test-rwa-borrow.js — MAGPIE memecoin
+ * (basic Token-2022) simulates clean; NVDAx (Token-2022 + extensions)
+ * fails. All 9 RWA tokens this script enabled have been DISABLED in DB.
+ *
+ * Re-enabling requires:
+ *   1. Upgrade anchor-spl to a version that handles all newer Token-2022
+ *      account-level extensions (PausableAccount, ConfidentialTransferAccount)
+ *   2. Rebuild + redeploy the magpie-lending program
+ *   3. Re-run this script + re-verify with scripts/test-rwa-borrow.js
+ *
+ * Until then, this script is a no-op tool kept for the eventual fix.
+ *
+ * ──────────────────────────────────────────────────────────────────────
+ *
  * Onboard tokenized real-world assets (Stocks, ETFs, Metals) as collateral.
  *
  * Three jobs in one script:
