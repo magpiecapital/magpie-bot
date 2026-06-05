@@ -306,15 +306,50 @@ async function tick(bot) {
     }
   }
 
-  // Also check enabled DB rows that did NOT appear in candidates (DexScreener
-  // search missed them). If a mint is enabled but invisible to DexScreener,
-  // its pool may have been pulled — flag, don't auto-disable since the search
-  // can be flaky.
+  // Self-healing pass: DexScreener's "xStock" search ranks by some metric,
+  // so a token whose pool shrinks can drop off the index even though it
+  // still exists. Direct-probe every enabled RWA the search missed, then
+  // run them through the same decision engine. Catches the PLTRx case
+  // (liq collapsed $103k → $22k, fell off the search, was invisible to
+  // the screener's primary discovery path).
   const candidateMints = new Set(candidates.map((c) => c.mint));
   for (const row of dbRows) {
     if (!row.enabled) continue;
     if (candidateMints.has(row.mint)) continue;
-    warnings.push({ symbol: row.symbol, reason: "enabled but missing from DexScreener — pool pulled?" });
+    try {
+      const r = await fetch(`https://api.dexscreener.com/tokens/v1/solana/${row.mint}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) {
+        warnings.push({ symbol: row.symbol, reason: `direct probe HTTP ${r.status}` });
+        continue;
+      }
+      const json = await r.json();
+      const pairs = Array.isArray(json) ? json : (json.pairs || []);
+      if (pairs.length === 0) {
+        warnings.push({ symbol: row.symbol, reason: "no DexScreener pairs found — pool fully pulled?" });
+        continue;
+      }
+      const top = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+      const probed = {
+        mint: row.mint,
+        symbol: top.baseToken?.symbol || row.symbol,
+        name: top.baseToken?.name || row.symbol,
+        liquidity: top.liquidity?.usd || 0,
+        volume24h: top.volume?.h24 || 0,
+        priceUsd: parseFloat(top.priceUsd) || 0,
+      };
+      const decision = await decideForCandidate(probed, row);
+      if (decision.action === "disable") {
+        await disableMint(row.mint, decision.reason);
+        disables.push({ symbol: row.symbol, reason: decision.reason + " (via direct probe)" });
+        console.log(`[rwa-screener] - disabled ${row.symbol} (direct probe) — ${decision.reason}`);
+      } else if (decision.action === "warn") {
+        warnings.push({ symbol: row.symbol, reason: decision.reason + " (direct probe)" });
+      }
+    } catch (err) {
+      warnings.push({ symbol: row.symbol, reason: `direct probe failed: ${err.message}` });
+    }
   }
 
   // Admin notification — only if something actionable happened
