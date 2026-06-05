@@ -5,12 +5,28 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import "dotenv/config";
 import { getPriceInSol, getPricesInSolBatch } from "./price.js";
-import { getProgramForSigner } from "../solana/program.js";
+import { getProgramForSigner, chooseProgramIdForCategory } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
+
+// Cached mint→category lookup so we don't query the DB on every attest tick.
+// Category never changes after a mint is enabled (we never re-categorize live
+// mints), so a process-lifetime cache is safe. Invalidated on bot restart.
+const categoryCache = new Map();
+async function resolveCategory(mintStr) {
+  const cached = categoryCache.get(mintStr);
+  if (cached !== undefined) return cached;
+  const { rows } = await query(
+    `SELECT category FROM supported_mints WHERE mint = $1`,
+    [mintStr],
+  );
+  const category = rows[0]?.category ?? "memecoin";
+  categoryCache.set(mintStr, category);
+  return category;
+}
 
 /**
  * Load the lender keypair. Prefers LENDER_PRIVATE_KEY env var (base58) for
@@ -47,8 +63,12 @@ function loadLenderKeypair() {
 export async function getPriceFeedAgeSeconds(mintStr) {
   try {
     const mintPk = new PublicKey(mintStr);
-    const [pool] = lendingPoolPda(LENDER_PUBKEY);
-    const [priceFeed] = priceFeedPda(mintPk, pool);
+    // Route to v1 or v2 based on category. Each program has its own pool
+    // and price-feed PDAs — read from the right one.
+    const category = await resolveCategory(mintStr);
+    const programId = chooseProgramIdForCategory(category);
+    const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+    const [priceFeed] = priceFeedPda(mintPk, pool, programId);
     const info = await connection.getAccountInfo(priceFeed);
     if (!info || info.data.length < 120) return null;
     const ts = info.data.readBigInt64LE(112);
@@ -64,11 +84,13 @@ export async function getPriceFeedAgeSeconds(mintStr) {
  * { alreadyExists: true } if the PDA is already on chain.
  */
 export async function initializePriceFeed(mintStr) {
+  const category = await resolveCategory(mintStr);
+  const programId = chooseProgramIdForCategory(category);
   const lender = loadLenderKeypair();
-  const program = getProgramForSigner(lender);
+  const program = getProgramForSigner(lender, programId);
   const mintPk = new PublicKey(mintStr);
-  const [pool] = lendingPoolPda(LENDER_PUBKEY);
-  const [priceFeed] = priceFeedPda(mintPk, pool);
+  const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [priceFeed] = priceFeedPda(mintPk, pool, programId);
 
   const existing = await connection.getAccountInfo(priceFeed);
   if (existing) {
@@ -97,11 +119,13 @@ export async function initializePriceFeed(mintStr) {
  * getPricesInSolBatch and pass the per-mint price to avoid rate limits.
  */
 export async function attestPrice(mintStr, decimals, priceSolOverride) {
+  const category = await resolveCategory(mintStr);
+  const programId = chooseProgramIdForCategory(category);
   const lender = loadLenderKeypair();
-  const program = getProgramForSigner(lender);
+  const program = getProgramForSigner(lender, programId);
   const mintPk = new PublicKey(mintStr);
-  const [pool] = lendingPoolPda(LENDER_PUBKEY);
-  const [priceFeed] = priceFeedPda(mintPk, pool);
+  const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [priceFeed] = priceFeedPda(mintPk, pool, programId);
 
   const priceSol = priceSolOverride ?? (await getPriceInSol(mintStr));
   // Convert to lamports per 1 full token (10^decimals raw units)
