@@ -18,6 +18,7 @@ import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
 import { handleSupportTickets } from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
+import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1161,6 +1162,9 @@ const PUBLIC_ROUTES = new Set([
   // Signed support actions (open ticket, follow up, close). Auth +
   // replay protection enforced inside the handler (see support-ask.js).
   "/api/v1/support/ask",
+  // Wallets list (by-wallet read) and signed set-active.
+  "/api/v1/wallets",
+  "/api/v1/wallets/set-active",
 ]);
 
 async function router(req, res) {
@@ -1317,6 +1321,12 @@ async function router(req, res) {
         break;
       case "/api/v1/support/ask":
         result = await handleSupportAsk(req);
+        break;
+      case "/api/v1/wallets":
+        result = await handleWalletsList(req, url);
+        break;
+      case "/api/v1/wallets/set-active":
+        result = await handleWalletsSetActive(req);
         break;
       default:
         result = {
