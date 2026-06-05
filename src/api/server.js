@@ -16,7 +16,7 @@ import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
-import { handleSupportTickets } from "./support-api.js";
+import { handleSupportTickets, handleSupportTicketDetails } from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
@@ -1161,9 +1161,13 @@ const PUBLIC_ROUTES = new Set([
   // destination = signer (unless MAGPIE_SITE_WITHDRAW_ANY_DEST=1).
   // See src/api/withdraw.js for the full gate list.
   "/api/v1/withdraw",
-  // Support tickets viewer — by-wallet read of linked user's tickets.
-  // Same risk envelope as /api/v1/loans (wallet-keyed read).
+  // Support tickets viewer — METADATA ONLY by-wallet read. Message
+  // bodies + admin replies are gated behind the signed
+  // /api/v1/support/ticket-details endpoint so a public wallet pubkey
+  // alone can't unlock the user's private messages.
   "/api/v1/support/tickets",
+  // Signed read for a single ticket's full content.
+  "/api/v1/support/ticket-details",
   // Signed support actions (open ticket, follow up, close). Auth +
   // replay protection enforced inside the handler (see support-ask.js).
   "/api/v1/support/ask",
@@ -1332,6 +1336,9 @@ async function router(req, res) {
         break;
       case "/api/v1/support/tickets":
         result = await handleSupportTickets(req, url);
+        break;
+      case "/api/v1/support/ticket-details":
+        result = await handleSupportTicketDetails(req);
         break;
       case "/api/v1/support/ask":
         result = await handleSupportAsk(req);
