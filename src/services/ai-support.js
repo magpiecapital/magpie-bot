@@ -677,6 +677,45 @@ most common causes:
    Diagnose: \`lookup_loan\` shows status=repaid or liquidated.
    Fix: It's already settled. Their collateral is back.
 
+4b. "COLLATERAL DIDN'T RETURN AFTER REPAY" — user repaid but believes
+    the collateral never came back to their wallet. This is the most
+    common false-alarm support ticket. **MANDATORY** flow:
+
+      a) \`lookup_loan(loan_id)\` — confirm status='repaid'
+      b) \`check_my_token_balance(<collateral_mint_or_symbol>)\` — read
+         the LIVE on-chain ATA balance of that token in the user's
+         active wallet. THIS IS NON-NEGOTIABLE. Do NOT tell the user
+         "the collateral should be there" without first verifying with
+         this tool. \`get_my_wallet\` only returns SOL — it will NOT
+         show token balances and you'll miss the actual answer.
+      c) If \`balance_ui\` ≥ the loan's collateral_amount → tokens are
+         in their wallet. Tell them clearly. Use this script:
+
+           "Your collateral was returned to your Magpie wallet
+           [WALLET_PUBKEY] when the loan was repaid on [DATE]. Confirmed
+           on-chain right now: that wallet holds [BALANCE] [SYMBOL].
+
+           Critical clarification — [WALLET_PUBKEY] IS YOUR Magpie
+           wallet. The bot generated it when you /started and manages
+           the keys for you. It's not an escrow or intermediate wallet.
+
+           To move those tokens elsewhere (Phantom, exchange, etc.):
+           use /withdraw in this bot — paste your destination address.
+
+           To export the wallet's keys into Phantom directly: /export
+           (carefully — anyone with the seed controls the funds)."
+
+      d) If \`balance_ui\` < collateral_amount AND status=repaid →
+         genuine anomaly. Escalate with open_support_ticket,
+         reason='onchain_anomaly', include loan_id, wallet pubkey,
+         expected vs actual amount in what_i_tried.
+
+    NEVER skip step (b). Half the support volume on "missing collateral"
+    is users who don't realize their Magpie-managed wallet IS theirs —
+    they sent collateral "to it" (not realizing) and expect the tokens
+    "back" to a different wallet (Phantom). Reading the ATA balance
+    settles it in one tool call.
+
 5. CONSTRAINT_HAS_ONE — Anchor error meaning the signing wallet
    ISN'T the borrower stored in the loan PDA. Almost always means
    the user has MULTIPLE wallets and the wrong one is active.
@@ -1434,6 +1473,17 @@ const TOOLS = [
     input_schema: { type: "object", properties: {} },
   },
   {
+    name: "check_my_token_balance",
+    description: "Verify the user's on-chain token balance for ANY specific mint or symbol. Returns the live ATA balance of that token in the user's active wallet. Use this WHENEVER the user says collateral 'didn't return' / 'is missing' / 'wasn't released' after a repay — verify on-chain before saying anything else. Also use when they ask 'do I have any $X' or 'where are my Y tokens'. Returns: { ata, balance_raw, balance_ui, decimals, found } — found=false means no ATA exists (definitively zero balance).",
+    input_schema: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "Token symbol (e.g. 'MAGPIE', 'WIF', 'NVDAx') or full mint address" },
+      },
+      required: ["token"],
+    },
+  },
+  {
     name: "get_my_referrals",
     description: "Get the current user's referral code, share link, invited-count, lifetime earned, and claimable balance.",
     input_schema: { type: "object", properties: {} },
@@ -1806,6 +1856,75 @@ const TOOL_HANDLERS = {
       balance_fresh: balanceFresh,
       user_friendly_hint: balanceFresh ? undefined : "Balance reads failed; tell the user the address but note that you couldn't verify the live balance right now.",
     };
+  },
+
+  check_my_token_balance: async ({ token }, { userId }) => {
+    const pubkey = await getUserWallet(userId);
+    if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
+    // Resolve token (symbol or mint) to a real mint
+    let mintRow;
+    try {
+      const isMintLike = typeof token === "string" && token.length >= 32;
+      const lookup = isMintLike
+        ? await query(`SELECT mint, symbol, decimals FROM supported_mints WHERE mint = $1 LIMIT 1`, [token])
+        : await query(`SELECT mint, symbol, decimals FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [token]);
+      mintRow = lookup.rows[0];
+      // Fall back to using the raw input as mint even if not in supported_mints
+      // (e.g., user asking about a token they hold but isn't approved collateral)
+      if (!mintRow && isMintLike) mintRow = { mint: token, symbol: null, decimals: null };
+    } catch {
+      return toolError("lookup_failed", null, "DB lookup for the mint failed; retry or escalate.");
+    }
+    if (!mintRow) return toolError("unknown_token", null, "Token symbol not recognized. Pass a full mint address if it's not in the approved-collateral list.");
+    const { mint, symbol } = mintRow;
+    try {
+      const splToken = await import("@solana/spl-token");
+      const mintPk = new PublicKey(mint);
+      const ownerPk = new PublicKey(pubkey);
+      // Detect Token vs Token-2022 by reading the mint's owner program
+      const mintInfo = await connection.getAccountInfo(mintPk);
+      if (!mintInfo) return { found: false, balance_raw: "0", balance_ui: 0, reason: "mint not found on-chain" };
+      const isT22 = mintInfo.owner.equals(splToken.TOKEN_2022_PROGRAM_ID);
+      const tokenProgram = isT22 ? splToken.TOKEN_2022_PROGRAM_ID : splToken.TOKEN_PROGRAM_ID;
+      const ata = splToken.getAssociatedTokenAddressSync(mintPk, ownerPk, false, tokenProgram);
+      let decimals = mintRow.decimals;
+      if (decimals == null) {
+        // Read decimals from mint on-chain (first byte after authority+supply blob)
+        try {
+          const m = await splToken.getMint(connection, mintPk, "confirmed", tokenProgram);
+          decimals = m.decimals;
+        } catch {
+          decimals = 9;
+        }
+      }
+      let balanceRaw = "0";
+      let balanceUi = 0;
+      let found = false;
+      try {
+        const acct = await splToken.getAccount(connection, ata, "confirmed", tokenProgram);
+        balanceRaw = acct.amount.toString();
+        balanceUi = Number(acct.amount) / 10 ** decimals;
+        found = true;
+      } catch {
+        // ATA doesn't exist or empty — definitive zero
+      }
+      return {
+        ata: ata.toBase58(),
+        wallet: pubkey,
+        mint,
+        symbol: symbol ?? null,
+        token_program: isT22 ? "Token-2022" : "Token",
+        decimals,
+        found,
+        balance_raw: balanceRaw,
+        balance_ui: balanceUi,
+        user_friendly_hint: found && balanceUi > 0
+          ? `The user HOLDS ${balanceUi} ${symbol ?? "tokens"} in their wallet right now. If they reported it was missing, tell them it's there and explain that THIS wallet (${pubkey}) IS their Magpie-managed wallet — they can /withdraw to move tokens elsewhere or /export to import the keypair into Phantom.`
+          : `No ${symbol ?? "token"} balance found in the user's wallet. If they expected some to be there after a repay, escalate with reason='onchain_anomaly' and include the loan_id, mint, and wallet.`,
+      };
+    } catch (err) {
+      return toolError("rpc_error", null, `Token balance lookup failed: ${err.message?.slice(0, 100)}`);
+    }
   },
 
   get_my_referrals: async (_args, { userId }) => {
