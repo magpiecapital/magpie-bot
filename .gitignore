@@ -10,6 +10,10 @@ dist/
 *keypair*.json
 **/*keypair*.json
 target/
+target-sbf/
+test-ledger/
+programs/*/test-ledger/
+programs/*/Cargo.lock
 .next/
 .anchor/
 telegram-avatar.svg
