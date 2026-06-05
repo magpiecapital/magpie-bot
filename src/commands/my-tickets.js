@@ -194,25 +194,10 @@ export function registerMyTicketsCallbacks(bot) {
       { parse_mode: "Markdown" },
     );
 
-    // DM admin
-    if (ADMIN_TG_ID) {
-      try {
-        const fromTag = ctx.from.username ? `@${ctx.from.username}` : `tg://${ctx.from.id}`;
-        await ctx.api.sendMessage(
-          ADMIN_TG_ID,
-          [
-            `💬 *Ticket #${t.id} reopened by user follow-up*`,
-            "",
-            `From: ${fromTag}`,
-            `Follow-up #${t.followup_count}:`,
-            "",
-            followup.slice(0, 500),
-            "",
-            `Reply with: \`/reply ${t.id} <message>\``,
-          ].join("\n"),
-          { parse_mode: "Markdown" },
-        );
-      } catch {}
-    }
+    // NOTE: We intentionally do NOT DM admin on every follow-up. Per operator
+    // mandate, the AI auto-resolver handles follow-ups autonomously — it
+    // re-engages within ~30 min (its tick interval) using the new follow-up
+    // content. Admin only gets pinged after 3+ failed AI attempts (handled
+    // by auto-ticket-resolver.js — see DEAD_LETTER_FOLLOWUP_COUNT).
   });
 }

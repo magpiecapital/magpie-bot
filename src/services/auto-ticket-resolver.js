@@ -26,11 +26,16 @@
 import { InlineKeyboard } from "grammy";
 import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "./ai-support.js";
+import { getAdminId } from "./admin-notify.js";
 
-const POLL_INTERVAL_MS = Number(process.env.AUTO_RESOLVER_POLL_MS) || 30 * 60 * 1000; // 30 min
-const MIN_TICKET_AGE_MS = 30 * 60 * 1000;          // 30 min — give live response time first
+const POLL_INTERVAL_MS = Number(process.env.AUTO_RESOLVER_POLL_MS) || 15 * 60 * 1000; // 15 min — tighter cadence so follow-ups don't sit
+const MIN_TICKET_AGE_MS = 30 * 60 * 1000;          // 30 min — give live response time on FIRST ticket
+const MIN_FOLLOWUP_AGE_MS = 3 * 60 * 1000;          // 3 min — follow-ups already have an AI thread, engage fast
 const MAX_PER_TICK = 5;                             // cap burst spend at ~$0.10/tick
 const FIRST_RUN_DELAY_MS = 5 * 60 * 1000;          // 5 min after boot
+// After this many user follow-ups with no resolution, escalate to admin
+// rather than have the AI keep trying. The AI clearly isn't cracking it.
+const DEAD_LETTER_FOLLOWUP_COUNT = 3;
 
 // Reasons we do NOT auto-resolve — these genuinely need a human.
 const SKIP_REASONS = [
@@ -148,6 +153,39 @@ async function resolveTicket(bot, ticket) {
   return { ok: true, action: "resolved", aiOpenedNewTicket };
 }
 
+async function escalateToAdmin(bot, ticket) {
+  const adminId = getAdminId();
+  if (!adminId) return;
+  const fromTag = ticket.telegram_username ? `@${ticket.telegram_username}` : `tg://${ticket.telegram_id}`;
+  try {
+    await bot.api.sendMessage(
+      adminId,
+      [
+        `🆘 *Ticket #${ticket.id} — AI couldn't resolve after ${ticket.followup_count} follow-ups*`,
+        "",
+        `From: ${fromTag}`,
+        `User has followed up ${ticket.followup_count} times. The AI tried each time but didn't satisfy them.`,
+        "",
+        "Latest user message:",
+        "",
+        (ticket.message || "").split("\n").slice(-6).join("\n").slice(-800),
+        "",
+        `Reply with: \`/reply ${ticket.id} <message>\``,
+        `Or close: \`/close ${ticket.id}\``,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+    // Mark as escalated so we don't keep pinging admin every tick
+    await query(
+      `UPDATE support_tickets SET last_alerted_tier = 99 WHERE id = $1`,
+      [ticket.id],
+    );
+    console.log(`[auto-resolver] #${ticket.id} escalated to admin (${ticket.followup_count} follow-ups, AI gave up)`);
+  } catch (err) {
+    console.warn("[auto-resolver] admin escalation DM failed:", err.message);
+  }
+}
+
 async function tick(bot) {
   if (!isAiSupportEnabled()) {
     console.log("[auto-resolver] AI agent disabled — skipping");
@@ -155,21 +193,40 @@ async function tick(bot) {
   }
   if (!bot) return;
 
-  const cutoffMs = new Date(Date.now() - MIN_TICKET_AGE_MS).toISOString();
+  // Pull tickets that need an AI pass. Two cases:
+  //   (a) Never auto-resolved AND created_at older than MIN_TICKET_AGE_MS
+  //       → first-time resolution
+  //   (b) Already auto-resolved BUT user followed up since the last AI
+  //       reply AND that follow-up is older than MIN_FOLLOWUP_AGE_MS
+  //       → re-engage on follow-up
+  // followup_count >= DEAD_LETTER_FOLLOWUP_COUNT → escalate to admin
+  // and don't let the AI try again (it's clearly missing something).
+  const firstCutoff = new Date(Date.now() - MIN_TICKET_AGE_MS).toISOString();
+  const followupCutoff = new Date(Date.now() - MIN_FOLLOWUP_AGE_MS).toISOString();
 
   let candidates;
   try {
     const { rows } = await query(
-      `SELECT s.id, s.user_id, s.message, s.created_at,
+      `SELECT s.id, s.user_id, s.message, s.created_at, s.followup_count,
+              s.auto_resolved_at, s.last_user_followup_at, s.admin_replied_at,
+              s.last_alerted_tier,
               u.telegram_id, u.telegram_username
        FROM support_tickets s
        JOIN users u ON u.id = s.user_id
        WHERE s.status = 'open'
-         AND s.auto_resolved_at IS NULL
-         AND s.created_at < $1
-       ORDER BY s.created_at ASC
-       LIMIT $2`,
-      [cutoffMs, MAX_PER_TICK * 3], // pull more than we'll process so skipped-reason ones don't block real work
+         AND (
+           -- First-time resolution path
+           (s.auto_resolved_at IS NULL AND s.created_at < $1)
+           OR
+           -- Follow-up re-engagement path
+           (s.auto_resolved_at IS NOT NULL
+             AND s.last_user_followup_at IS NOT NULL
+             AND s.last_user_followup_at > COALESCE(s.admin_replied_at, s.created_at)
+             AND s.last_user_followup_at < $2)
+         )
+       ORDER BY COALESCE(s.last_user_followup_at, s.created_at) ASC
+       LIMIT $3`,
+      [firstCutoff, followupCutoff, MAX_PER_TICK * 3],
     );
     candidates = rows;
   } catch (err) {
@@ -187,13 +244,24 @@ async function tick(bot) {
 
   console.log(`[auto-resolver] ${eligible.length} eligible ticket(s), processing up to ${MAX_PER_TICK}`);
   let resolved = 0;
+  let escalated = 0;
   let failed = 0;
   for (const t of eligible.slice(0, MAX_PER_TICK)) {
+    // Dead-letter: AI has tried too many times — escalate, don't retry.
+    if ((t.followup_count ?? 0) >= DEAD_LETTER_FOLLOWUP_COUNT && t.last_alerted_tier !== 99) {
+      await escalateToAdmin(bot, t);
+      escalated++;
+      continue;
+    }
+    if ((t.followup_count ?? 0) >= DEAD_LETTER_FOLLOWUP_COUNT) {
+      // Already escalated — skip silently
+      continue;
+    }
     try {
       const r = await resolveTicket(bot, t);
       if (r.ok) {
         resolved++;
-        console.log(`[auto-resolver] #${t.id} ${r.action}`);
+        console.log(`[auto-resolver] #${t.id} ${r.action}` + (t.auto_resolved_at ? " (follow-up)" : ""));
       } else {
         failed++;
         console.warn(`[auto-resolver] #${t.id} failed: ${r.reason}`);
@@ -202,10 +270,9 @@ async function tick(bot) {
       failed++;
       console.error(`[auto-resolver] #${t.id} threw:`, err.message);
     }
-    // Small pace to be polite to Telegram + Anthropic rate limits
     await new Promise((res) => setTimeout(res, 750));
   }
-  console.log(`[auto-resolver] tick done: ${resolved} resolved, ${failed} failed`);
+  console.log(`[auto-resolver] tick done: ${resolved} resolved, ${escalated} escalated, ${failed} failed`);
 }
 
 export function startAutoTicketResolver(bot) {
