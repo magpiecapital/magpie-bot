@@ -663,16 +663,25 @@ export async function handleReconcile(ctx) {
  */
 export async function handleFundPool(ctx) {
   if (!(await requireAdmin(ctx))) return;
-  const arg = ctx.message.text.split(/\s+/)[1];
+  const parts = ctx.message.text.split(/\s+/).slice(1);
+  const arg = parts[0];
+  const poolArg = (parts[1] || "v1").toLowerCase();
   const amountSol = parseFloat(arg);
   if (!arg || isNaN(amountSol) || amountSol <= 0) {
-    return ctx.reply("Usage: `/fundpool <sol_amount>` — e.g. `/fundpool 5`", { parse_mode: "Markdown" });
+    return ctx.reply(
+      "Usage: `/fundpool <sol_amount> [pool]`\n\n" +
+      "• `/fundpool 5` → memecoin pool (v1)\n" +
+      "• `/fundpool 5 v2` or `/fundpool 5 rwa` → RWA pool (v2b)",
+      { parse_mode: "Markdown" },
+    );
   }
   if (amountSol > 100) {
     return ctx.reply("❌ Refusing to deposit > 100 SOL in a single call. Split it up.");
   }
+  const isV2 = ["v2", "v2b", "rwa", "rwas", "stocks"].includes(poolArg);
+  const poolLabel = isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)";
 
-  await ctx.reply(`⏳ Depositing ${amountSol} SOL into the pool from lender wallet…`);
+  await ctx.reply(`⏳ Depositing ${amountSol} SOL into the ${poolLabel} from lender wallet…`);
 
   try {
     const { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
@@ -701,9 +710,16 @@ export async function handleFundPool(ctx) {
     }
 
     const { connection } = await import("../solana/connection.js");
-    const { getProgramForSigner } = await import("../solana/program.js");
+    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2 } = await import("../solana/program.js");
     const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
-    const program = getProgramForSigner(lender);
+
+    // Route to v1 or v2b based on the pool arg. If v2 was requested but
+    // PROGRAM_ID_V2 isn't configured (e.g., local dev), fail clearly.
+    if (isV2 && !PROGRAM_ID_V2) {
+      return ctx.reply("❌ v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
+    }
+    const programId = isV2 ? PROGRAM_ID_V2 : PROGRAM_ID;
+    const program = getProgramForSigner(lender, programId);
 
     // Pre-flight: lender balance must cover deposit + safety reserve + tx fees
     const lamports = BigInt(Math.floor(amountSol * 1e9));
@@ -716,11 +732,11 @@ export async function handleFundPool(ctx) {
       );
     }
 
-    const [pool] = lendingPoolPda(lender.publicKey);
-    const [loanTokenVault] = loanTokenVaultPda(pool);
+    const [pool] = lendingPoolPda(lender.publicKey, programId);
+    const [loanTokenVault] = loanTokenVaultPda(pool, programId);
     const [position] = PublicKey.findProgramAddressSync(
       [Buffer.from("position"), pool.toBuffer(), lender.publicKey.toBuffer()],
-      program.programId,
+      programId,
     );
 
     const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, lender.publicKey);
@@ -764,7 +780,7 @@ export async function handleFundPool(ctx) {
 
     await ctx.reply(
       [
-        "✅ *Pool funded*",
+        `✅ *${poolLabel} funded*`,
         "",
         `Deposited: \`${amountSol} SOL\``,
         `New pool TVL: \`${newTvl.toFixed(4)} SOL\``,
