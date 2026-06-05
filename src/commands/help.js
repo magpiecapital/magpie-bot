@@ -53,6 +53,17 @@ export async function handleHelp(ctx) {
     "",
     "*Support*",
     "/support — diagnose a loan, check a tx, or message the team",
+    "/mytickets — your support history",
+    "",
+    "*Site*",
+    "/site — open magpie.capital (does almost everything this bot does)",
+    "/link <code> — link a wallet connected on the site",
+    "",
+    "*Privacy & security*",
+    "/privacy — what data we store + how to control it",
+    "/security — single-screen security view + lock buttons",
+    "/lock [hours] — emergency pause on site signed actions (24h default)",
+    "/lock 0 — clear the lock",
     "",
     "*How it works*",
     "1. Deposit memecoins to your Magpie wallet",
@@ -72,6 +83,9 @@ export async function handleHelp(ctx) {
       "/disablemint <symbol|mint>",
       "/broadcast <message> — DM everyone",
       "/reviewtokens — review auto-screened tokens",
+      "/siteops — site-action telemetry (24h locks, withdraws, signed actions)",
+      "/adminlock <user> [hours] — force-lock a user (DMs them)",
+      "/adminunlock <user> — clear a user's lock (DMs them)",
     );
   }
 
