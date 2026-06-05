@@ -16,6 +16,7 @@ import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
+import { handleSupportTickets } from "./support-api.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1153,6 +1154,9 @@ const PUBLIC_ROUTES = new Set([
   // destination = signer (unless MAGPIE_SITE_WITHDRAW_ANY_DEST=1).
   // See src/api/withdraw.js for the full gate list.
   "/api/v1/withdraw",
+  // Support tickets viewer — by-wallet read of linked user's tickets.
+  // Same risk envelope as /api/v1/loans (wallet-keyed read).
+  "/api/v1/support/tickets",
 ]);
 
 async function router(req, res) {
@@ -1303,6 +1307,9 @@ async function router(req, res) {
         break;
       case "/api/v1/withdraw":
         result = await handleSiteWithdraw(req);
+        break;
+      case "/api/v1/support/tickets":
+        result = await handleSupportTickets(req, url);
         break;
       default:
         result = {
