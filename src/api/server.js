@@ -19,6 +19,7 @@ import { handleSiteWithdraw } from "./withdraw.js";
 import { handleSupportTickets } from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
+import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1165,6 +1166,10 @@ const PUBLIC_ROUTES = new Set([
   // Wallets list (by-wallet read) and signed set-active.
   "/api/v1/wallets",
   "/api/v1/wallets/set-active",
+  // User prefs (notifications, auto-protect). Read is wallet-keyed,
+  // write is signed JSON.
+  "/api/v1/prefs",
+  "/api/v1/prefs/set",
 ]);
 
 async function router(req, res) {
@@ -1327,6 +1332,12 @@ async function router(req, res) {
         break;
       case "/api/v1/wallets/set-active":
         result = await handleWalletsSetActive(req);
+        break;
+      case "/api/v1/prefs":
+        result = await handlePrefsList(req, url);
+        break;
+      case "/api/v1/prefs/set":
+        result = await handlePrefsSet(req);
         break;
       default:
         result = {
