@@ -170,6 +170,16 @@ async function tick(bot) {
 
 async function maybeAlertTransition(bot, probe, transition) {
   if (!getAdminId() || !bot) return;
+
+  // Public Solana RPC frequently rate-limits Railway's shared IPs with
+  // 429s. The bot doesn't use the public RPC for actual operations
+  // (Helius handles everything), so a public-RPC degradation is monitor
+  // noise — not user impact. Log it but don't DM the operator.
+  if (probe.name === "Public RPC") {
+    console.log(`[infra-health] ${probe.name} ${transition.from} → ${transition.to} (log-only; not user-facing)`);
+    return;
+  }
+
   const now = Date.now();
   // Cooldown to prevent flapping
   if (probe.lastAlertedStatus === transition.to
