@@ -93,3 +93,47 @@ export async function handleLock(ctx) {
     { parse_mode: "Markdown" },
   );
 }
+
+/**
+ * Register callback handlers for the lock buttons embedded in security
+ * alert DMs (services/security-alerts.js → lockKeyboard).
+ */
+export function registerLockCallbacks(bot) {
+  bot.callbackQuery(/^sec:lock:(\d+|status)$/, async (ctx) => {
+    const arg = ctx.match[1];
+    const user = await upsertUser(ctx.from.id, ctx.from.username);
+
+    if (arg === "status") {
+      const { locked, until } = await getSiteLock(user.id);
+      await ctx.answerCallbackQuery(
+        locked
+          ? `Locked until ${until.toISOString().slice(0, 16).replace("T", " ")} UTC`
+          : "Not locked",
+      );
+      return;
+    }
+
+    const hours = Number(arg);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      await ctx.answerCallbackQuery("Invalid duration");
+      return;
+    }
+    const { hours: applied } = await setSiteLock(user.id, hours);
+    await ctx.answerCallbackQuery({
+      text: `🔒 Site locked for ${applied}h`,
+      show_alert: true,
+    });
+    // Also confirm in chat so the user has a persistent record + the
+    // /lock 0 instructions for later.
+    try {
+      await ctx.reply(
+        [
+          `🔒 *Site locked for ${applied} hour${applied === 1 ? "" : "s"}*`,
+          "",
+          "Move funds from the compromised wallet to a fresh one, then run `/lock 0` to clear the lock.",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    } catch { /* non-critical */ }
+  });
+}
