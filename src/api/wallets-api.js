@@ -83,6 +83,12 @@ export async function handleWalletsList(req, url) {
     [linked.user_id],
   );
 
+  // Note: user-chosen `label` is deliberately NOT returned here.
+  // Wallet pubkeys are public on-chain, so anyone could query this
+  // endpoint with a known wallet; user-authored labels might contain
+  // private context ("trading-stash", "main-acc", etc.) the user did
+  // not intend to be public. If we ever surface labels on the site,
+  // do it behind a signed endpoint.
   return {
     status: 200,
     body: {
@@ -91,7 +97,6 @@ export async function handleWalletsList(req, url) {
         id: r.id,
         public_key: r.public_key,
         source: r.source,
-        label: r.label,
         is_active: r.is_active,
         // The server holds keys for custodial + imported; site-link is
         // the user's external Phantom and signs its own txs.
