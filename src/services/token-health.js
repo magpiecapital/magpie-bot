@@ -176,11 +176,13 @@ async function delistToken(mint, symbol, reason, bot) {
 // ── Main tick ───────────────────────────────────────────────────────────────
 
 async function tick(bot) {
-  // Get all enabled tokens (skip protected and stock tokens — stocks legitimately have mint/freeze authority)
+  // Get all enabled tokens (skip protected and RWA tokens — stocks/ETFs/metals
+  // legitimately have mint/freeze authority from their issuer)
   const { rows: tokens } = await query(
     `SELECT mint, symbol, has_mint_authority, health_strikes, category
      FROM supported_mints
-     WHERE enabled = TRUE AND (protected IS NOT TRUE) AND (category IS DISTINCT FROM 'stock')`,
+     WHERE enabled = TRUE AND (protected IS NOT TRUE)
+       AND (category NOT IN ('stock','etf','metal') OR category IS NULL)`,
   );
 
   if (tokens.length === 0) return;

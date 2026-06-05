@@ -20,6 +20,13 @@ import { markCycle } from "../lib/heartbeat.js";
 const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 600_000; // 10 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
 
+// Categories that represent tokenized real-world assets (RWA). Curated
+// manually (Backed Finance xStocks, gold-backed tokens, ETFs) — not run
+// through the memecoin screener since authority/age/holder heuristics
+// don't apply. Keep this list in sync with supported_mints.category values.
+const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
+const isRwa = (c) => RWA_CATEGORIES.has(c);
+
 // Symbols to never approve — wrapped/bridged L1 tokens that aren't real memecoins
 const BLOCKED_SYMBOLS = new Set([
   "SOL", "WSOL", "ETH", "WETH", "BTC", "WBTC", "BNB", "WBNB",
@@ -807,16 +814,17 @@ export async function checkSellable(mint, decimals) {
 function vetToken(onChain, market, holderCount, category) {
   const fails = [];
   let safetyScore = 100;
-  const isStock = category === "stock";
+  const rwa = isRwa(category);
 
   const ageHours = market.pairCreatedAt
     ? Math.floor((Date.now() - market.pairCreatedAt) / 3_600_000)
     : 0;
 
   // ── Authority checks ──
-  // Stocks: mint/freeze authority is EXPECTED (issuer manages supply to track real price)
-  // Memecoins: mint/freeze authority is a red flag
-  if (!isStock) {
+  // RWAs (stocks/ETFs/metals): mint/freeze authority is EXPECTED — the
+  // issuer (Backed Finance, VNX, etc.) manages supply to track the
+  // underlying real-world price. Memecoins: those are red flags.
+  if (!rwa) {
     if (onChain.hasMintAuthority) {
       fails.push("Mint authority enabled — supply can be inflated");
       safetyScore -= 30;
@@ -914,7 +922,7 @@ function vetToken(onChain, market, holderCount, category) {
 // ─── Actions ────────────────────────────────────────────────────────────────
 
 async function autoApproveToken(mint, onChain, market, holderCount, ageHours, category) {
-  const isStock = category === "stock";
+  const rwa = isRwa(category);
   await query(
     `INSERT INTO supported_mints
        (mint, symbol, name, decimals, category, image_url, liquidity_usd,
@@ -936,7 +944,7 @@ async function autoApproveToken(mint, onChain, market, holderCount, ageHours, ca
       onChain.hasFreezeAuthority,
       false, // lp_burned — can't reliably check, default false
       ageHours,
-      isStock, // stocks are auto-protected from health monitor delisting
+      rwa, // RWAs are auto-protected from health monitor delisting
     ],
   );
 }
@@ -1041,8 +1049,8 @@ async function tick(bot) {
     // Scam-token guard: before promoting to approved OR review, run the
     // full audit suite. Order: impersonation (cheap, in-memory) →
     // sellability/extensions/concentration (parallel) → rugcheck (slow
-    // external). Skips stocks since they route through their issuer.
-    if (category !== "stock" && (verdict === "auto_approve" || verdict === "review")) {
+    // external). Skips RWAs since they route through their issuer.
+    if (!isRwa(category) && (verdict === "auto_approve" || verdict === "review")) {
       const imp = checkImpersonation(mint, market.symbol, market.name);
       if (!imp.ok) {
         await markSeen(mint);
@@ -1106,7 +1114,7 @@ async function tick(bot) {
     if (approved.length > 0) {
       lines.push(`*Auto-approved (${approved.length}):*`);
       for (const t of approved) {
-        const tag = t.category === "stock" ? " [STOCK]" : "";
+        const tag = isRwa(t.category) ? ` [${t.category.toUpperCase()}]` : "";
         lines.push(`  + ${t.symbol}${tag} — $${Math.floor(t.liquidity).toLocaleString()} liq, $${Math.floor(t.marketCap).toLocaleString()} mcap`);
       }
       lines.push("");
@@ -1115,7 +1123,7 @@ async function tick(bot) {
     if (queued.length > 0) {
       lines.push(`*Needs review (${queued.length}):*`);
       for (const t of queued) {
-        const tag = t.category === "stock" ? " [STOCK]" : "";
+        const tag = isRwa(t.category) ? ` [${t.category.toUpperCase()}]` : "";
         lines.push(`  ? ${t.symbol}${tag} (score: ${t.safetyScore}) — ${t.fails[0] || "borderline"}`);
       }
       lines.push("");
@@ -1201,7 +1209,7 @@ export function registerScreenerCallbacks(bot) {
 
     // Full scam audit re-check at approval time. Token state may have
     // changed between submission and admin review.
-    if (t.category !== "stock") {
+    if (!isRwa(t.category)) {
       const imp = checkImpersonation(t.mint, t.symbol, t.name);
       if (!imp.ok) {
         await ctx.answerCallbackQuery(`Blocked: ${imp.reason.slice(0, 40)}`);
@@ -1334,7 +1342,7 @@ async function processReviewQueue(bot) {
     }
 
     // Full scam audit re-check before promoting a 1h-aged review entry.
-    if (t.category !== "stock") {
+    if (!isRwa(t.category)) {
       const imp = checkImpersonation(t.mint, t.symbol, t.name);
       let scamReason = imp.ok ? null : `impersonation — ${imp.reason}`;
       if (!scamReason) {
