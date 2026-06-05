@@ -16,7 +16,11 @@ import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
-import { handleSupportTickets, handleSupportTicketDetails } from "./support-api.js";
+import {
+  handleSupportTickets,
+  handleSupportTicketDetails,
+  handleSupportDeleteTicket,
+} from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
@@ -1168,6 +1172,8 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/support/tickets",
   // Signed read for a single ticket's full content.
   "/api/v1/support/ticket-details",
+  // Signed delete for a single CLOSED ticket — privacy / data minimization.
+  "/api/v1/support/delete-ticket",
   // Signed support actions (open ticket, follow up, close). Auth +
   // replay protection enforced inside the handler (see support-ask.js).
   "/api/v1/support/ask",
@@ -1339,6 +1345,9 @@ async function router(req, res) {
         break;
       case "/api/v1/support/ticket-details":
         result = await handleSupportTicketDetails(req);
+        break;
+      case "/api/v1/support/delete-ticket":
+        result = await handleSupportDeleteTicket(req);
         break;
       case "/api/v1/support/ask":
         result = await handleSupportAsk(req);
