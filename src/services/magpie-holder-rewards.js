@@ -142,6 +142,7 @@ export async function getHolderPoolState() {
     accrued_lamports: BigInt(rows[0].accrued_lamports ?? "0"),
     last_distribution_at: rows[0].last_distribution_at ?? null,
     next_distribution_at: rows[0].next_distribution_at ?? null,
+    next_run_snapshot_only: rows[0].next_run_snapshot_only === true,
   };
 }
 
@@ -344,7 +345,16 @@ const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana t
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
-  if (pool <= 0n) return null;
+  // If the operator has armed a snapshot-only run, capture the holder set
+  // and pro-rata allocations but defer the actual SOL transfers. The flag
+  // resets to FALSE after this run; subsequent distributions auto-pay
+  // again unless re-armed.
+  const snapshotOnly = state.next_run_snapshot_only === true;
+  // Auto-pay path needs a non-empty pool; snapshot-only path captures the
+  // holder list regardless (allocations may be zero — operator can override
+  // the amount at /distribute time and recompute pro-rata using the stored
+  // balance_at_snapshot per row).
+  if (!snapshotOnly && pool <= 0n) return null;
 
   // Don't run a distribution if the pool is too small — tx fees would
   // eat more than the rewards. Wait for it to build up over more weeks.
@@ -355,14 +365,17 @@ export async function snapshotAndDistribute() {
     return null;
   }
 
-  // Pre-flight: lender must cover the entire pool + safety reserve
+  // Pre-flight: lender must cover the entire pool + safety reserve.
+  // Skipped in snapshot-only mode since no SOL moves during the snapshot.
   const lender = loadLenderKeypair();
-  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-  if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn(
-      `[holder-rewards] Distribution skipped: lender ${lenderBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
-    );
-    return null;
+  if (!snapshotOnly) {
+    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
+    if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+      console.warn(
+        `[holder-rewards] Distribution skipped: lender ${lenderBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+      );
+      return null;
+    }
   }
 
   const holders = await snapshotMagpieHolders();
@@ -398,8 +411,12 @@ export async function snapshotAndDistribute() {
     }
 
     if (inserts.length > 0) {
+      // Snapshot-only mode: rows go to 'snapshot_pending' so the retry
+      // loop ignores them. Operator flips them to 'accrued' via /distribute
+      // when ready, at which point the retry loop pays them out.
+      const initialStatus = snapshotOnly ? "snapshot_pending" : "accrued";
       const placeholders = inserts
-        .map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}, 'accrued')`)
+        .map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}, '${initialStatus}')`)
         .join(", ");
       await client.query(
         `INSERT INTO magpie_holder_rewards
@@ -418,21 +435,33 @@ export async function snapshotAndDistribute() {
       rewardRows = rows;
     }
 
-    // Atomically decrement the pool by what we ALLOCATED — never overwrite
-    // to a fixed value. If a concurrent accrueToHolderPool call slips in
-    // during this transaction, its increment is preserved.
-    // Also set the next snapshot time to a random moment 5-10 days from
-    // now — internal only, never exposed via any public API.
-    const nextDelayMs = pickNextDistributionDelay();
-    await client.query(
-      `UPDATE magpie_holder_pool
-          SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
-              last_distribution_at = NOW(),
-              next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
-              updated_at = NOW()
-        WHERE id = 1`,
-      [allocatedSum.toString(), Math.floor(nextDelayMs).toString()],
-    );
+    // Snapshot-only: don't decrement the pool, don't advance the cron,
+    // don't set last_distribution_at — the SOL hasn't actually moved.
+    // Just reset the snapshot-only flag so a future fire defaults back to
+    // auto-pay behavior. Operator decides next steps via /distribute.
+    if (snapshotOnly) {
+      await client.query(
+        `UPDATE magpie_holder_pool
+            SET next_run_snapshot_only = FALSE,
+                updated_at = NOW()
+          WHERE id = 1`,
+      );
+    } else {
+      // Normal path: atomically decrement the pool by what we ALLOCATED
+      // — never overwrite to a fixed value. If a concurrent
+      // accrueToHolderPool call slips in during this transaction, its
+      // increment is preserved. Also reschedule the next run privately.
+      const nextDelayMs = pickNextDistributionDelay();
+      await client.query(
+        `UPDATE magpie_holder_pool
+            SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
+                last_distribution_at = NOW(),
+                next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
+                updated_at = NOW()
+          WHERE id = 1`,
+        [allocatedSum.toString(), Math.floor(nextDelayMs).toString()],
+      );
+    }
 
     await client.query("COMMIT");
   } catch (err) {
@@ -441,6 +470,22 @@ export async function snapshotAndDistribute() {
     throw err;
   }
   client.release();
+
+  // Snapshot-only: bail out before any SOL transfers. Return the
+  // captured allocation summary so the caller can DM admin.
+  if (snapshotOnly) {
+    return {
+      distribution_id: distributionId,
+      pool_lamports: pool,
+      holder_count: holders.length,
+      eligible_count: rewardRows.length,
+      total_balance: totalBalance,
+      paid_count: 0,
+      paid_lamports: 0n,
+      allocated_lamports: allocatedSum,
+      mode: "snapshot_only",
+    };
+  }
 
   // Phase 2: send SOL in batches, mark rows paid as each batch confirms
   let paidCount = 0;
@@ -675,29 +720,49 @@ export function startHolderDistributor(bot) {
         return;
       }
 
-      // 3. Snapshot + auto-pay.
+      // 3. Snapshot — auto-pay unless operator armed snapshot-only mode.
       const result = await snapshotAndDistribute();
       if (result) {
-        console.log(
-          `[holder-rewards] Distributed: ${Number(result.paid_lamports) / 1e9} SOL paid ` +
-            `(of ${Number(result.allocated_lamports) / 1e9} allocated) to ${result.paid_count}/${result.eligible_count} holders`,
-        );
-        // DM admin so the operator sees it the moment it lands — no
-        // need to poll a dashboard. Includes the numbers needed to
-        // decide what to do next (community vote, follow-up post, etc.)
-        const paidSol = (Number(result.paid_lamports) / 1e9).toFixed(6);
-        const allocSol = (Number(result.allocated_lamports) / 1e9).toFixed(6);
-        await adminPing(
-          [
-            "💎 *$MAGPIE holder snapshot complete*",
-            "",
-            `Paid: \`${paidSol} SOL\` (of \`${allocSol}\` allocated)`,
-            `Recipients paid: ${result.paid_count} / ${result.eligible_count} eligible`,
-            `Distribution ID: \`${result.distribution_id}\``,
-            "",
-            "_Next snapshot scheduled internally (timing private). Reply here when you're ready to discuss the community vote on reward economics._",
-          ].join("\n"),
-        );
+        if (result.mode === "snapshot_only") {
+          // Holder set captured, allocations computed, NO SOL moved.
+          // Operator reviews + triggers payouts manually via /distribute.
+          const allocSol = (Number(result.allocated_lamports) / 1e9).toFixed(6);
+          const poolSol = (Number(result.pool_lamports) / 1e9).toFixed(6);
+          console.log(
+            `[holder-rewards] Snapshot-only captured: ${result.eligible_count} eligible holders, ${allocSol} SOL allocated (no payouts yet)`,
+          );
+          await adminPing(
+            [
+              "*$MAGPIE holder snapshot captured (snapshot-only mode)*",
+              "",
+              `Eligible holders: ${result.eligible_count} / ${result.holder_count}`,
+              `Pool at snapshot: \`${poolSol} SOL\``,
+              `Allocated (pro-rata): \`${allocSol} SOL\``,
+              `Distribution ID: \`${result.distribution_id}\``,
+              "",
+              "_No SOL was sent. Rows are at `snapshot_pending`._",
+              `_Trigger payouts with \`/distribute ${result.distribution_id}\` when you're ready._`,
+            ].join("\n"),
+          );
+        } else {
+          console.log(
+            `[holder-rewards] Distributed: ${Number(result.paid_lamports) / 1e9} SOL paid ` +
+              `(of ${Number(result.allocated_lamports) / 1e9} allocated) to ${result.paid_count}/${result.eligible_count} holders`,
+          );
+          const paidSol = (Number(result.paid_lamports) / 1e9).toFixed(6);
+          const allocSol = (Number(result.allocated_lamports) / 1e9).toFixed(6);
+          await adminPing(
+            [
+              "*$MAGPIE holder snapshot complete*",
+              "",
+              `Paid: \`${paidSol} SOL\` (of \`${allocSol}\` allocated)`,
+              `Recipients paid: ${result.paid_count} / ${result.eligible_count} eligible`,
+              `Distribution ID: \`${result.distribution_id}\``,
+              "",
+              "_Next snapshot scheduled internally (timing private)._",
+            ].join("\n"),
+          );
+        }
       }
     } catch (err) {
       console.error("[holder-rewards] tick failed:", err.message);

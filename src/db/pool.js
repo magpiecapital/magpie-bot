@@ -290,6 +290,16 @@ export async function applyStartupPatches() {
     `ALTER TABLE magpie_holder_pool
        ADD COLUMN IF NOT EXISTS next_distribution_at TIMESTAMPTZ`,
 
+    // When TRUE, the next time next_distribution_at fires the cron does a
+    // SNAPSHOT-ONLY pass: it captures the holder set + pro-rata allocations
+    // into rows with status='snapshot_pending', but skips the actual SOL
+    // transfers. Operator reviews the captured snapshot and triggers
+    // payouts manually via /distribute <id> when ready. Flag resets to
+    // FALSE after the snapshot-only pass runs so subsequent distributions
+    // resume normal auto-pay behavior.
+    `ALTER TABLE magpie_holder_pool
+       ADD COLUMN IF NOT EXISTS next_run_snapshot_only BOOLEAN NOT NULL DEFAULT FALSE`,
+
     // The first-snapshot pin lives in Railway env var (operator-private)
     // so it doesn't leak in this public repo. Applied separately by the
     // operator with a one-off SQL update; future schedule changes go

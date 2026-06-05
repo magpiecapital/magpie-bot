@@ -796,6 +796,193 @@ export async function handleFundPool(ctx) {
 }
 
 /**
+ * /snapshotonly — arm the next holder distribution to be snapshot-only.
+ *
+ * When `next_distribution_at` fires next, the cron captures the holder
+ * set and pro-rata allocations into rows with status='snapshot_pending'
+ * but does NOT send SOL. Operator reviews + triggers payouts via
+ * `/distribute <id>` when ready. Flag auto-resets after the next run.
+ */
+export async function handleSnapshotOnly(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  await query(
+    `UPDATE magpie_holder_pool SET next_run_snapshot_only = TRUE WHERE id = 1`,
+  );
+  await ctx.reply(
+    [
+      "*Next holder distribution armed as SNAPSHOT-ONLY.*",
+      "",
+      "When the scheduled distribution time arrives, the bot will:",
+      "  1. Capture the holder set + pro-rata allocations",
+      "  2. Write rows with status `snapshot_pending`",
+      "  3. NOT send any SOL",
+      "  4. DM you with the distribution ID + summary",
+      "",
+      "Trigger payouts later with `/distribute <distribution_id>`.",
+      "",
+      "_Flag auto-resets to FALSE after this run._",
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
+}
+
+/**
+ * /distribute <distribution_id> — execute payouts for a snapshot-pending
+ * distribution. Flips rows from 'snapshot_pending' to 'accrued', which
+ * the holder-rewards retry loop will pick up and pay out in batches.
+ *
+ * Also decrements the pool's accrued_lamports by the allocated total so
+ * the accounting matches what would have happened in the normal auto-pay
+ * path. Idempotent — re-running on the same id is a no-op.
+ */
+export async function handleDistribute(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const parts = ctx.message.text.split(/\s+/).slice(1);
+  const distId = parseInt(parts[0], 10);
+  const overrideSol = parts[1] ? parseFloat(parts[1]) : null;
+  if (!parts[0] || isNaN(distId)) {
+    return ctx.reply(
+      "Usage: `/distribute <distribution_id> [sol_amount]`\n\n" +
+      "• `/distribute 42` — pay out what was allocated at snapshot time\n" +
+      "• `/distribute 42 1.5` — recompute pro-rata using 1.5 SOL total, pay that instead",
+      { parse_mode: "Markdown" },
+    );
+  }
+  if (overrideSol !== null && (isNaN(overrideSol) || overrideSol <= 0)) {
+    return ctx.reply("❌ Override amount must be a positive SOL number.");
+  }
+
+  const { rows: dist } = await query(
+    `SELECT id, pool_lamports, snapshot_at FROM magpie_holder_distributions WHERE id = $1`,
+    [distId],
+  );
+  if (dist.length === 0) {
+    return ctx.reply(`❌ Distribution ID \`${distId}\` not found.`, { parse_mode: "Markdown" });
+  }
+
+  // Recompute pro-rata if operator passed an override amount
+  if (overrideSol !== null) {
+    const overrideLamports = BigInt(Math.floor(overrideSol * 1e9));
+    const { rows: snapshotRows } = await query(
+      `SELECT id, balance_at_snapshot FROM magpie_holder_rewards
+        WHERE distribution_id = $1 AND status = 'snapshot_pending'`,
+      [distId],
+    );
+    if (snapshotRows.length === 0) {
+      return ctx.reply(`No \`snapshot_pending\` rows found for \`${distId}\`. Already triggered or no eligible holders captured?`, { parse_mode: "Markdown" });
+    }
+    const totalBalance = snapshotRows.reduce((s, r) => s + BigInt(r.balance_at_snapshot), 0n);
+    if (totalBalance <= 0n) {
+      return ctx.reply(`❌ Captured holder balances sum to 0 — nothing to allocate.`);
+    }
+    // Update each row's reward_lamports to its pro-rata share of the override
+    const { pool: dbPool } = await import("../db/pool.js");
+    const client = await dbPool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const row of snapshotRows) {
+        const share = (overrideLamports * BigInt(row.balance_at_snapshot)) / totalBalance;
+        await client.query(
+          `UPDATE magpie_holder_rewards SET reward_lamports = $1 WHERE id = $2`,
+          [share.toString(), row.id],
+        );
+      }
+      await client.query(
+        `UPDATE magpie_holder_distributions SET pool_lamports = $1 WHERE id = $2`,
+        [overrideLamports.toString(), distId],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      client.release();
+      return ctx.reply(`❌ Pro-rata recompute failed: ${err.message?.slice(0, 200)}`);
+    }
+    client.release();
+  }
+
+  const { rows: pending } = await query(
+    `SELECT id, reward_lamports FROM magpie_holder_rewards
+      WHERE distribution_id = $1 AND status = 'snapshot_pending'`,
+    [distId],
+  );
+  if (pending.length === 0) {
+    return ctx.reply(`No \`snapshot_pending\` rows found for distribution \`${distId}\`. Already triggered or already paid?`, { parse_mode: "Markdown" });
+  }
+
+  const totalAllocated = pending.reduce((s, r) => s + BigInt(r.reward_lamports), 0n);
+  if (totalAllocated <= 0n) {
+    return ctx.reply(
+      `Distribution \`${distId}\` has \`snapshot_pending\` rows but total allocation is 0 SOL.\n\n` +
+      "Pass an override amount: `/distribute " + distId + " <sol_amount>`",
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // Pre-flight: lender must cover the total payout
+  const { Keypair, Connection } = await import("@solana/web3.js");
+  const bs58mod = await import("bs58");
+  const bs58 = bs58mod.default || bs58mod;
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  let lender;
+  if (process.env.LENDER_PRIVATE_KEY) {
+    lender = Keypair.fromSecretKey(bs58.decode(process.env.LENDER_PRIVATE_KEY));
+  } else {
+    const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+    lender = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(kpPath, "utf-8"))));
+  }
+  const { connection } = await import("../solana/connection.js");
+  const balance = BigInt(await connection.getBalance(lender.publicKey));
+  const RESERVE = 200_000_000n;
+  if (balance < totalAllocated + RESERVE) {
+    const balSol = (Number(balance) / 1e9).toFixed(4);
+    const needSol = (Number(totalAllocated + RESERVE) / 1e9).toFixed(4);
+    return ctx.reply(`❌ Lender balance ${balSol} SOL can't cover ${needSol} SOL (payout + 0.2 SOL reserve). Top up the lender wallet first.`);
+  }
+
+  const { pool: dbPool } = await import("../db/pool.js");
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE magpie_holder_rewards
+          SET status = 'accrued'
+        WHERE distribution_id = $1 AND status = 'snapshot_pending'`,
+      [distId],
+    );
+    // Decrement pool by what's about to be paid out (matches the
+    // accounting the auto-pay path would have done at snapshot time).
+    await client.query(
+      `UPDATE magpie_holder_pool
+          SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
+              last_distribution_at = NOW(),
+              updated_at = NOW()
+        WHERE id = 1`,
+      [totalAllocated.toString()],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
+    return ctx.reply(`❌ Flip failed: ${err.message?.slice(0, 200)}`);
+  }
+  client.release();
+
+  const allocSol = (Number(totalAllocated) / 1e9).toFixed(6);
+  await ctx.reply(
+    [
+      `✅ *Distribution ${distId} armed for payout*`,
+      "",
+      `Rows flipped: ${pending.length}`,
+      `Total to pay: \`${allocSol} SOL\``,
+      "",
+      "_The holder-rewards retry loop runs every 6h and will pay these out in batches of 10. First batch usually lands within minutes. You'll get a final DM when all batches confirm._",
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
+}
+
+/**
  * /aistats — last-24h snapshot of the AI support agent.
  *
  * Shows total conversations, turns, tool usage breakdown,

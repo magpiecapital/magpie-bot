@@ -47,6 +47,8 @@ import {
   handleDisableMint,
   handleBroadcast,
   handleFundPool,
+  handleSnapshotOnly,
+  handleDistribute,
   handleReconcile,
   handleReply,
   handleTickets,
@@ -155,6 +157,8 @@ bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
 bot.command("reviewtokens", handleReviewTokens);
 bot.command("fundpool", handleFundPool);
+bot.command("snapshotonly", handleSnapshotOnly);
+bot.command("distribute", handleDistribute);
 bot.command("reconcile", handleReconcile);
 bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
