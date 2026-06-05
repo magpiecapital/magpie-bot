@@ -19,7 +19,7 @@ import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { getPrefs } from "../services/prefs.js";
 import { alertPrefChanged } from "../services/security-alerts.js";
-import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfLocked, getSiteLock } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -87,16 +87,19 @@ export async function handlePrefsList(req, url) {
     return { status: 200, body: { linked: false, prefs: null, recent_actions: [] } };
   }
 
-  const prefs = await getPrefs(u.user_id);
-  const { rows: actions } = await query(
-    `SELECT action_type, amount_lamports::text AS amount_lamports,
-            health_before, health_after, signature, loan_id, created_at
-       FROM auto_protect_actions
-      WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '14 days'
-      ORDER BY created_at DESC
-      LIMIT 5`,
-    [u.user_id],
-  );
+  const [prefs, lock, actionsRes] = await Promise.all([
+    getPrefs(u.user_id),
+    getSiteLock(u.user_id),
+    query(
+      `SELECT action_type, amount_lamports::text AS amount_lamports,
+              health_before, health_after, signature, loan_id, created_at
+         FROM auto_protect_actions
+        WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '14 days'
+        ORDER BY created_at DESC
+        LIMIT 5`,
+      [u.user_id],
+    ),
+  ]);
 
   return {
     status: 200,
@@ -110,7 +113,11 @@ export async function handlePrefsList(req, url) {
         notify_liquidations: !!prefs.notify_liquidations,
         notify_health: !!prefs.notify_health,
       },
-      recent_actions: actions,
+      site_lock: {
+        locked: lock.locked,
+        until: lock.until ? lock.until.toISOString() : null,
+      },
+      recent_actions: actionsRes.rows,
     },
   };
 }
