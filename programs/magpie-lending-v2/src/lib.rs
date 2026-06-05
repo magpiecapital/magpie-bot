@@ -9,10 +9,12 @@ use anchor_spl::token_interface::{
     TransferChecked,
 };
 
-// v2 program pubkey. Keypair at ~/.config/solana/magpie-lending-v2.json,
-// backup at ~/.config/solana/backups/. Distinct from v1 (4FEFPeMH...) so
-// the live program holding existing user loans is never touched.
-declare_id!("4EcnHCEgMTfaXrLwn4sv7a9BPHQekKANzQEr7bA2rUzW");
+// v2 program pubkey (v2b — second keypair after first v2 program was
+// closed to recover rent for re-deploy with anchor-spl 0.32 / spl-token-2022
+// v8 upgrade). Keypair at ~/.config/solana/magpie-lending-v2b.json with
+// backup. Distinct from v1 (4FEFPeMH...) — v1 holding existing user loans
+// is never touched.
+declare_id!("6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe");
 
 /// Basis-point helpers
 const BPS_DENOM: u64 = 10_000;

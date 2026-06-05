@@ -41,7 +41,7 @@ import anchor from "@coral-xyz/anchor";
 const { BN } = anchor;
 import { query } from "../src/db/pool.js";
 import { connection } from "../src/solana/connection.js";
-import { getReadOnlyProgram } from "../src/solana/program.js";
+import { getReadOnlyProgram, chooseProgramIdForCategory } from "../src/solana/program.js";
 import {
   lendingPoolPda,
   loanTokenVaultPda,
@@ -94,17 +94,21 @@ async function buildBorrowTx({
   collateralProgram,
   collateralAmountRaw,
   collateralValueLamportsBN,
+  category,
 }) {
   const collateralMintPk = new PublicKey(collateralMint);
   const loanTokenMintPk = NATIVE_MINT;
 
-  const [pool] = lendingPoolPda(LENDER_PUBKEY);
-  const [loanTokenVault] = loanTokenVaultPda(pool);
-  const [priceFeed] = priceFeedPda(collateralMintPk, pool);
+  // Route to v1 or v2 based on category — same as production borrow path
+  const programId = chooseProgramIdForCategory(category);
+
+  const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const [loanTokenVault] = loanTokenVaultPda(pool, programId);
+  const [priceFeed] = priceFeedPda(collateralMintPk, pool, programId);
 
   const loanId = new BN(Date.now());
-  const [loanAccount] = loanPda(borrower, loanId);
-  const [collateralVault] = collateralVaultPda(loanAccount);
+  const [loanAccount] = loanPda(borrower, loanId, programId);
+  const [collateralVault] = collateralVaultPda(loanAccount, programId);
 
   const borrowerCollateralAta = getAssociatedTokenAddressSync(
     collateralMintPk, borrower, false, collateralProgram,
@@ -116,13 +120,19 @@ async function buildBorrowTx({
     loanTokenMintPk, LENDER_PUBKEY, false, TOKEN_PROGRAM_ID,
   );
 
-  const program = getReadOnlyProgram();
+  const program = getReadOnlyProgram(programId);
 
   const preIxs = [
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower, borrowerWsolAta, borrower, loanTokenMintPk, TOKEN_PROGRAM_ID,
+    ),
+    // Fee wallet's wSOL ATA — mirrors loans.js production borrow path.
+    // Idempotent so safe even if it already exists. Required so the
+    // borrow tx can transfer fees into it.
+    createAssociatedTokenAccountIdempotentInstruction(
+      borrower, feeWalletWsolAta, LENDER_PUBKEY, loanTokenMintPk, TOKEN_PROGRAM_ID,
     ),
   ];
   const postIxs = [
@@ -257,6 +267,7 @@ async function testOne(token) {
       collateralProgram,
       collateralAmountRaw: depositRaw,
       collateralValueLamportsBN: new BN(depositValueLamports.toString()),
+      category: token.category,
     });
     tx = result.tx;
     console.log(`  [4] Built tx: deposit=${(Number(depositRaw) / 10 ** mintData.decimals).toFixed(6)} ${symbol} worth ${fmtSol(depositValueLamports)} SOL`);
@@ -300,8 +311,8 @@ async function testOne(token) {
 // If user passed --symbol, allow ANY enabled mint (so we can run a memecoin
 // control). Otherwise default to RWA only.
 const sql = onlySymbol
-  ? `SELECT mint, symbol, decimals FROM supported_mints WHERE symbol = $1 AND enabled = TRUE`
-  : `SELECT mint, symbol, decimals FROM supported_mints WHERE category IN ('stock','etf','metal') AND enabled = TRUE ORDER BY category, symbol`;
+  ? `SELECT mint, symbol, decimals, category FROM supported_mints WHERE symbol = $1 AND enabled = TRUE`
+  : `SELECT mint, symbol, decimals, category FROM supported_mints WHERE category IN ('stock','etf','metal') AND enabled = TRUE ORDER BY category, symbol`;
 const { rows } = await query(sql, onlySymbol ? [onlySymbol] : []);
 const targets = rows;
 

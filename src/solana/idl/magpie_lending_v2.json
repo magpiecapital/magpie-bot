@@ -1,11 +1,11 @@
 {
-  "address": "4EcnHCEgMTfaXrLwn4sv7a9BPHQekKANzQEr7bA2rUzW",
+  "address": "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe",
   "metadata": {
     "name": "magpie_lending",
     "version": "0.1.0",
     "spec": "0.1.0",
     "description": "Permissionless memecoin-collateralized lending protocol",
-    "address": "4EcnHCEgMTfaXrLwn4sv7a9BPHQekKANzQEr7bA2rUzW"
+    "address": "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe"
   },
   "instructions": [
     {

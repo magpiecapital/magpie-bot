@@ -25,7 +25,7 @@ import {
 import anchor from "@coral-xyz/anchor";
 const { AnchorProvider, Program, Wallet } = anchor;
 
-const V2_PROGRAM_ID = new PublicKey("4EcnHCEgMTfaXrLwn4sv7a9BPHQekKANzQEr7bA2rUzW");
+const V2_PROGRAM_ID = new PublicKey("6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe");
 const NVDAX_MINT = new PublicKey("Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh");
 const LENDER_KP_PATH = process.env.LENDER_KEYPAIR_PATH ?? "./lender-keypair-v2.json";
 const RPC = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
