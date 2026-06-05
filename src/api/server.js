@@ -14,6 +14,7 @@ import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
+import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1141,6 +1142,11 @@ const PUBLIC_ROUTES = new Set([
   // because the site needs to call it from any user's browser; the
   // protection is in the handler's own validation, not the auth layer.
   "/api/v1/cosign-borrow",
+  // Account linking endpoints — no API-key gate. Site needs to call from
+  // any user's browser. Security is in the code's 15-min TTL + 5e14
+  // keyspace + 5-codes-per-wallet throttle.
+  "/api/v1/link/request",
+  "/api/v1/link/status",
 ]);
 
 async function router(req, res) {
@@ -1282,6 +1288,12 @@ async function router(req, res) {
         break;
       case "/api/v1/cosign-borrow":
         result = await handleCosignBorrow(req);
+        break;
+      case "/api/v1/link/request":
+        result = await handleLinkRequest(req);
+        break;
+      case "/api/v1/link/status":
+        result = await handleLinkStatus(req, url);
         break;
       default:
         result = {

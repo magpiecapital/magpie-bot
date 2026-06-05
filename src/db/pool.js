@@ -449,6 +449,26 @@ export async function applyStartupPatches() {
        last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        escalated_to_ticket_id BIGINT
      )`,
+
+    // ─────── ACCOUNT LINK CODES ───────
+    // Bridges a wallet (connected on the site) to a TG user account.
+    // Flow: site requests a code, user pastes '/link <code>' in TG bot,
+    // the bot adds the wallet to that user's wallets table. After
+    // linking, the same Magpie account is reachable from both surfaces.
+    // Codes expire after 15 min if not claimed.
+    `CREATE TABLE IF NOT EXISTS account_link_codes (
+       code TEXT PRIMARY KEY,
+       wallet_pubkey TEXT NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '15 minutes'),
+       claimed_at TIMESTAMPTZ,
+       claimed_by_user_id BIGINT
+     )`,
+    `CREATE INDEX IF NOT EXISTS account_link_codes_wallet_idx
+       ON account_link_codes(wallet_pubkey)`,
+    `CREATE INDEX IF NOT EXISTS account_link_codes_unclaimed_idx
+       ON account_link_codes(claimed_at)
+       WHERE claimed_at IS NULL`,
   ];
   for (const sql of patches) {
     try {
