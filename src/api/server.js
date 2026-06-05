@@ -1128,6 +1128,8 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/loans",
   "/api/v1/wallet/balance",
   "/api/v1/credit/score",
+  // Public leaderboard — no PII, just usernames (TG handles) + scores.
+  "/api/v1/credit/leaderboard",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
