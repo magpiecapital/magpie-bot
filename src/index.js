@@ -9,6 +9,7 @@ import { handleRepay, registerRepayCallbacks } from "./commands/repay.js";
 import { handlePrice } from "./commands/price.js";
 import { handleWithdraw, registerWithdrawCallbacks } from "./commands/withdraw.js";
 import { handleLink } from "./commands/link.js";
+import { handleSite } from "./commands/site.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
 import { handleMagpie } from "./commands/magpie.js";
@@ -112,6 +113,8 @@ bot.command("supported", handleSupported);
 bot.command("withdraw", handleWithdraw);
 bot.command("export", handleExport);
 bot.command("link", handleLink);
+bot.command("site", handleSite);
+bot.command("web", handleSite); // alias
 bot.command("stats", handleStats);
 bot.command("me", handleMe);
 bot.command("notify", handleNotify);
