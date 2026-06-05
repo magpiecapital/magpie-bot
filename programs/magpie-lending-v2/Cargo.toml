@@ -1,0 +1,26 @@
+[package]
+name = "magpie-lending-v2"
+version = "0.1.0"
+description = "Magpie lending — RWA-capable variant. Source mirrors v1; only dependency bump is anchor-spl (newer spl-token-2022 that recognizes PausableConfig + ScaledUiAmountConfig). Deployed at a separate program ID; v1 program with existing user loans is never touched."
+edition = "2021"
+# Constrain cargo's resolver to pick crate versions compatible with the
+# Rust 1.79 bundled in solana platform-tools v1.43 (which Anchor 0.31.1
+# uses by default). Without this, cargo may select newer crate versions
+# that require edition2024 / Rust 1.85+ and break the SBF build.
+rust-version = "1.79"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "magpie_lending_v2"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"

@@ -1,5 +1,6 @@
 [workspace]
 members = ["programs/magpie-credit-oracle", "programs/agent-vault", "programs/vault-consumer"]
+exclude = ["programs/magpie-lending-v2"]
 resolver = "2"
 
 [workspace.dependencies]
