@@ -20,6 +20,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { alertSetActiveWallet } from "../services/security-alerts.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -206,6 +207,9 @@ export async function handleWalletsSetActive(req) {
       body: { error: "Externally-held wallets can't be set as active — only custodial wallets the server signs for" },
     };
   }
+
+  const lockResp = await rejectIfLocked(match.user_id);
+  if (lockResp) return lockResp;
 
   // Nonce one-shot.
   try {

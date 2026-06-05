@@ -67,7 +67,7 @@ export async function alertWithdraw({ userId, asset, displayAmount, destination,
     `To: \`${shortAddr(destination)}\``,
     txSig ? `Tx: [view on Solscan](https://solscan.io/tx/${txSig})` : "",
     "",
-    "_If this wasn't you, your wallet may be compromised. Move funds to a fresh wallet immediately._",
+    "_If this wasn't you, your wallet may be compromised. Run `/lock` to freeze site actions, then move funds to a fresh wallet._",
   ].filter(Boolean));
 }
 
@@ -79,7 +79,7 @@ export async function alertSetActiveWallet({ userId, newActivePubkey }) {
     "",
     `New active: \`${shortAddr(newActivePubkey)}\``,
     "",
-    "_If this wasn't you, secure your account: run /wallets here to verify, or contact support via /support._",
+    "_If this wasn't you, run `/lock` immediately to freeze site actions, then check /wallets._",
   ]);
 }
 
@@ -91,7 +91,7 @@ export async function alertTicketDeleted({ userId, ticketId }) {
     "",
     `Ticket #${ticketId}`,
     "",
-    "_If this wasn't you, your Phantom signature may have been used by someone else. Secure your wallet._",
+    "_If this wasn't you, run `/lock` immediately — your Phantom signature may have been used by someone else._",
   ]);
 }
 
@@ -107,6 +107,6 @@ export async function alertPrefChanged({ userId, key, value }) {
     "",
     value
       ? "_Auto-Protect will now auto-pay-down loans at risk of liquidation._"
-      : "_Auto-Protect is now off. If this wasn't you, re-enable it via /autoprotect or magpie.capital/dashboard._",
+      : "_Auto-Protect is now off. If this wasn't you, run `/lock` immediately and re-enable via /autoprotect once you've rotated keys._",
   ]);
 }

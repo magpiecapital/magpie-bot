@@ -20,6 +20,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -158,6 +159,9 @@ export async function handleAiChat(req) {
   if (!linked) {
     return { status: 403, body: { error: "Signer wallet is not linked to a Magpie account" } };
   }
+
+  const lockResp = await rejectIfLocked(linked.id);
+  if (lockResp) return lockResp;
 
   try {
     await query(

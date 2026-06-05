@@ -19,6 +19,7 @@ import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { getPrefs } from "../services/prefs.js";
 import { alertPrefChanged } from "../services/security-alerts.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -203,6 +204,9 @@ export async function handlePrefsSet(req) {
     return { status: 403, body: { error: "Signer wallet is not linked to a Magpie account" } };
   }
   const userId = linked.user_id;
+
+  const lockResp = await rejectIfLocked(userId);
+  if (lockResp) return lockResp;
 
   try {
     await query(

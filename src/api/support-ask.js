@@ -31,6 +31,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -191,6 +192,9 @@ export async function handleSupportAsk(req) {
     };
   }
   const userId = linked.id;
+
+  const lockResp = await rejectIfLocked(userId);
+  if (lockResp) return lockResp;
 
   // ── Nonce one-shot ──
   try {

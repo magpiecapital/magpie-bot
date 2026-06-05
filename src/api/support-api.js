@@ -19,6 +19,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { alertTicketDeleted } from "../services/security-alerts.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -183,6 +184,17 @@ export async function handleSupportDeleteTicket(req) {
     return { status: 400, body: { error: "Signature verification failed" } };
   }
   if (!sigOk) return { status: 401, body: { error: "Signature does not match signer" } };
+
+  // Look up user to gate on the kill-switch BEFORE consuming a nonce.
+  const { rows: [linked] } = await query(
+    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+    [signerPubkey],
+  );
+  if (!linked) {
+    return { status: 403, body: { error: "Signer wallet is not linked to a Magpie account" } };
+  }
+  const lockResp = await rejectIfLocked(linked.user_id);
+  if (lockResp) return lockResp;
 
   try {
     await query(

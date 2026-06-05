@@ -501,6 +501,11 @@ export async function applyStartupPatches() {
        ON site_withdrawals(user_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS site_withdrawals_signer_idx
        ON site_withdrawals(signer_pubkey, created_at DESC)`,
+    // Kill-switch: while site_locked_until > NOW(), signed API actions
+    // for this user are rejected. Pairs with the /lock TG command for
+    // suspected-compromise recovery. The user sets it from TG (different
+    // auth surface) so a stolen Phantom seed can't suppress the lock.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS site_locked_until TIMESTAMPTZ`,
   ];
   for (const sql of patches) {
     try {

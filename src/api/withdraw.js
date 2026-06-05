@@ -51,6 +51,7 @@ import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { loadKeypair } from "../services/wallet.js";
 import { alertWithdraw } from "../services/security-alerts.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -228,6 +229,10 @@ export async function handleSiteWithdraw(req) {
     };
   }
   const userId = walletRow.user_id;
+
+  // ── Gate 5b: kill-switch check ──
+  const lockResp = await rejectIfLocked(userId);
+  if (lockResp) return lockResp;
 
   // ── Gate 6: From must equal user's active custodial wallet ──
   let signer;
