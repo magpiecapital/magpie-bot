@@ -469,6 +469,38 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS account_link_codes_unclaimed_idx
        ON account_link_codes(claimed_at)
        WHERE claimed_at IS NULL`,
+    // Per-message nonce store for site-initiated actions (e.g. withdraw).
+    // Each signed message includes a random nonce; we insert it here and
+    // reject on duplicate-key, which makes replay attempts structurally
+    // impossible regardless of clock skew.
+    `CREATE TABLE IF NOT EXISTS used_nonces (
+       nonce TEXT PRIMARY KEY,
+       purpose TEXT NOT NULL,
+       signer_pubkey TEXT NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS used_nonces_created_idx
+       ON used_nonces(created_at)`,
+    // Audit log of every site-initiated withdraw. Separate from generic
+    // tx logs so it's easy to alert / spot-check / rate-limit.
+    `CREATE TABLE IF NOT EXISTS site_withdrawals (
+       id BIGSERIAL PRIMARY KEY,
+       user_id BIGINT NOT NULL,
+       signer_pubkey TEXT NOT NULL,
+       from_pubkey TEXT NOT NULL,
+       to_pubkey TEXT NOT NULL,
+       asset TEXT NOT NULL,
+       raw_amount NUMERIC NOT NULL,
+       decimals INT NOT NULL,
+       tx_signature TEXT,
+       status TEXT NOT NULL DEFAULT 'submitted',
+       error_text TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS site_withdrawals_user_idx
+       ON site_withdrawals(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS site_withdrawals_signer_idx
+       ON site_withdrawals(signer_pubkey, created_at DESC)`,
   ];
   for (const sql of patches) {
     try {

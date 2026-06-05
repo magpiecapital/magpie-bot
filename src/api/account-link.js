@@ -140,11 +140,22 @@ export async function handleLinkStatus(req, url) {
     return { status: 200, body: { linked: false } };
   }
   const u = rows[0];
+  // Look up the user's currently-active custodial wallet — the one
+  // site-withdraw would draw from. Returning its pubkey lets the dashboard
+  // show "your custodial holdings" without a separate round-trip. Pubkey-
+  // only, never the secret.
+  const { rows: activeRows } = await query(
+    `SELECT public_key FROM wallets
+       WHERE user_id = $1 AND is_active = TRUE
+       LIMIT 1`,
+    [u.id],
+  );
   return {
     status: 200,
     body: {
       linked: true,
       telegram_username: u.telegram_username ? `@${u.telegram_username}` : null,
+      active_custodial_wallet: activeRows[0]?.public_key ?? null,
     },
   };
 }
