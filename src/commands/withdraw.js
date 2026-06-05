@@ -18,6 +18,12 @@ import { ensureWallet, loadKeypair } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { connection } from "../solana/connection.js";
 import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
+import { parseAmountInput, clampToMax } from "../lib/amount-input.js";
+
+// Reserve for SOL withdraws so the wallet retains gas for at least one more
+// outgoing tx after a "max" withdraw. Without this, a "max" SOL withdraw
+// leaves the wallet with literally 0 lamports and any subsequent op fails.
+const SOL_GAS_RESERVE_LAMPORTS = 5_000_000n; // 0.005 SOL
 
 const pending = new Map();
 
@@ -115,17 +121,76 @@ export function registerWithdrawCallbacks(bot) {
     }
 
     if (state.stage === "await_amount") {
-      const amount = Number(ctx.message.text.trim());
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return ctx.reply("❌ Invalid amount.");
+      // Get the actual on-chain max for this asset BEFORE parsing input.
+      // This is the integer source of truth — no display rounding involved.
+      const signer = await loadKeypair(state.userId);
+      let maxLamports = 0n;
+      let decimals = 9;
+      try {
+        if (state.asset === "SOL") {
+          const balance = BigInt(await connection.getBalance(signer.publicKey));
+          // Reserve gas so a "max" doesn't strand the wallet
+          maxLamports = balance > SOL_GAS_RESERVE_LAMPORTS ? balance - SOL_GAS_RESERVE_LAMPORTS : 0n;
+          decimals = 9;
+        } else {
+          const mint = new PublicKey(state.asset);
+          const tokenProgram = await getMintTokenProgram(state.asset);
+          const mintInfo = await connection.getParsedAccountInfo(mint);
+          decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+          const ata = getAssociatedTokenAddressSync(mint, signer.publicKey, false, tokenProgram);
+          const ataInfo = await connection.getTokenAccountBalance(ata).catch(() => null);
+          maxLamports = ataInfo ? BigInt(ataInfo.value.amount) : 0n;
+        }
+      } catch (err) {
+        console.error("[withdraw] balance lookup failed:", err.message);
+        return ctx.reply(`❌ Couldn't read your ${state.asset === "SOL" ? "SOL" : "token"} balance right now. Try again in a moment.`);
       }
-      state.amount = amount;
+
+      if (maxLamports <= 0n) {
+        pending.delete(ctx.chat.id);
+        return ctx.reply(
+          state.asset === "SOL"
+            ? `❌ No SOL available to withdraw (after gas reserve).`
+            : `❌ No tokens available to withdraw.`,
+        );
+      }
+
+      // Parse the input — keywords like "max"/"all"/"50%" return EXACT integers
+      const parsed = parseAmountInput(ctx.message.text, { maxLamports, decimals });
+      if (parsed.kind === "invalid") {
+        return ctx.reply(`❌ ${parsed.reason}. Try a number like \`0.5\`, or \`max\`/\`all\` to send everything.`, { parse_mode: "Markdown" });
+      }
+
+      // Hard clamp — submission can NEVER exceed actual on-chain balance
+      const clamp = clampToMax(parsed.lamports, maxLamports);
+      if (!clamp.ok) {
+        const reqSol = (Number(clamp.lamports) / 10 ** decimals).toFixed(decimals === 9 ? 4 : Math.min(decimals, 6));
+        const maxSol = (Number(clamp.max) / 10 ** decimals).toFixed(decimals === 9 ? 4 : Math.min(decimals, 6));
+        return ctx.reply(
+          [
+            `❌ *Amount exceeds your balance*`,
+            ``,
+            `You asked for: \`${reqSol}\``,
+            `You have:     \`${maxSol}\``,
+            ``,
+            `Try \`max\` (or \`all\`) to send everything, or a smaller amount.`,
+          ].join("\n"),
+          { parse_mode: "Markdown" },
+        );
+      }
+
+      state.rawAmount = clamp.lamports; // exact integer, never re-derived from a float
       pending.delete(ctx.chat.id);
 
       try {
-        const sig = await doWithdraw(state);
+        const sig = await doWithdraw({
+          ...state,
+          rawAmount: clamp.lamports,
+          decimals,
+        });
+        const displayAmount = (Number(clamp.lamports) / 10 ** decimals).toFixed(decimals === 9 ? 4 : Math.min(decimals, 6));
         await ctx.reply(
-          `✅ Sent ${amount} ${state.asset === "SOL" ? "SOL" : "tokens"}.\n[View tx](https://solscan.io/tx/${sig})`,
+          `✅ Sent ${displayAmount} ${state.asset === "SOL" ? "SOL" : "tokens"}.\n[View tx](https://solscan.io/tx/${sig})`,
           { parse_mode: "Markdown", disable_web_page_preview: true },
         );
       } catch (err) {
@@ -141,19 +206,21 @@ export function registerWithdrawCallbacks(bot) {
   });
 }
 
-async function doWithdraw({ userId, asset, destination, amount }) {
+async function doWithdraw({ userId, asset, destination, rawAmount, decimals }) {
+  // rawAmount is an exact BigInt of base units (lamports for SOL, raw token
+  // amount for SPL). It came from clampToMax() against the live on-chain
+  // balance, so over-sending is structurally impossible.
   const signer = await loadKeypair(userId);
   const dest = new PublicKey(destination);
 
   if (asset === "SOL") {
-    const lamports = BigInt(Math.floor(amount * 1e9));
     const tx = new Transaction().add(
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
       SystemProgram.transfer({
         fromPubkey: signer.publicKey,
         toPubkey: dest,
-        lamports,
+        lamports: rawAmount,
       }),
     );
     return sendAndConfirmTransaction(connection, tx, [signer]);
@@ -162,9 +229,6 @@ async function doWithdraw({ userId, asset, destination, amount }) {
   // SPL token withdraw
   const mint = new PublicKey(asset);
   const tokenProgram = await getMintTokenProgram(asset);
-  const mintInfo = await connection.getParsedAccountInfo(mint);
-  const decimals = mintInfo.value.data.parsed.info.decimals;
-  const rawAmount = BigInt(Math.floor(amount * 10 ** decimals));
 
   const fromAta = getAssociatedTokenAddressSync(mint, signer.publicKey, false, tokenProgram);
   const toAta = getAssociatedTokenAddressSync(mint, dest, false, tokenProgram);

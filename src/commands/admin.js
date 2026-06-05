@@ -664,24 +664,19 @@ export async function handleReconcile(ctx) {
 export async function handleFundPool(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const parts = ctx.message.text.split(/\s+/).slice(1);
-  const arg = parts[0];
+  const rawArg = parts[0];
   const poolArg = (parts[1] || "v1").toLowerCase();
-  const amountSol = parseFloat(arg);
-  if (!arg || isNaN(amountSol) || amountSol <= 0) {
+  if (!rawArg) {
     return ctx.reply(
-      "Usage: `/fundpool <sol_amount> [pool]`\n\n" +
-      "• `/fundpool 5` → memecoin pool (v1)\n" +
-      "• `/fundpool 5 v2` or `/fundpool 5 rwa` → RWA pool (v2b)",
+      "Usage: `/fundpool <sol_amount|max|N%> [pool]`\n\n" +
+      "• `/fundpool 5` → 5 SOL into memecoin pool (v1)\n" +
+      "• `/fundpool max v2` → all lender SOL (minus 0.2 reserve) into RWA pool\n" +
+      "• `/fundpool 50% v2` → half of lender SOL into RWA pool",
       { parse_mode: "Markdown" },
     );
   }
-  if (amountSol > 100) {
-    return ctx.reply("❌ Refusing to deposit > 100 SOL in a single call. Split it up.");
-  }
   const isV2 = ["v2", "v2b", "rwa", "rwas", "stocks"].includes(poolArg);
   const poolLabel = isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)";
-
-  await ctx.reply(`⏳ Depositing ${amountSol} SOL into the ${poolLabel} from lender wallet…`);
 
   try {
     const { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
@@ -712,6 +707,7 @@ export async function handleFundPool(ctx) {
     const { connection } = await import("../solana/connection.js");
     const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2 } = await import("../solana/program.js");
     const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
+    const { parseAmountInput, clampToMax } = await import("../lib/amount-input.js");
 
     // Route to v1 or v2b based on the pool arg. If v2 was requested but
     // PROGRAM_ID_V2 isn't configured (e.g., local dev), fail clearly.
@@ -721,16 +717,30 @@ export async function handleFundPool(ctx) {
     const programId = isV2 ? PROGRAM_ID_V2 : PROGRAM_ID;
     const program = getProgramForSigner(lender, programId);
 
-    // Pre-flight: lender balance must cover deposit + safety reserve + tx fees
-    const lamports = BigInt(Math.floor(amountSol * 1e9));
+    // Read actual on-chain balance, parse input against it (handles "max"/"50%"
+    // keywords using exact lamports — never round-tripped through display).
     const balance = BigInt(await connection.getBalance(lender.publicKey));
     const RESERVE = 200_000_000n; // 0.2 SOL safety floor for ops
-    if (balance < lamports + RESERVE) {
+    const maxFundable = balance > RESERVE ? balance - RESERVE : 0n;
+    if (maxFundable <= 0n) {
+      return ctx.reply(`❌ Lender balance ${Number(balance) / 1e9} SOL is at or below the 0.2 SOL reserve. Top up first.`);
+    }
+    const parsed = parseAmountInput(rawArg, { maxLamports: maxFundable });
+    if (parsed.kind === "invalid") {
+      return ctx.reply(`❌ Invalid amount: ${parsed.reason}. Try \`5\`, \`max\`, or \`50%\`.`, { parse_mode: "Markdown" });
+    }
+    const clamp = clampToMax(parsed.lamports, maxFundable);
+    if (!clamp.ok) {
       return ctx.reply(
-        `❌ Lender balance ${Number(balance) / 1e9} SOL can't cover ${amountSol} SOL deposit + 0.2 SOL reserve. ` +
-          `Top up the lender wallet first.`,
+        `❌ Asked for ${(Number(clamp.lamports) / 1e9).toFixed(4)} SOL but only ${(Number(clamp.max) / 1e9).toFixed(4)} SOL is fundable (lender balance ${(Number(balance) / 1e9).toFixed(4)} SOL minus 0.2 SOL reserve).`,
       );
     }
+    const lamports = clamp.lamports;
+    const amountSol = Number(lamports) / 1e9;
+    if (lamports > 100_000_000_000n) {
+      return ctx.reply("❌ Refusing to deposit > 100 SOL in a single call. Split it up.");
+    }
+    await ctx.reply(`⏳ Depositing ${amountSol.toFixed(4)} SOL into the ${poolLabel} from lender wallet…`);
 
     const [pool] = lendingPoolPda(lender.publicKey, programId);
     const [loanTokenVault] = loanTokenVaultPda(pool, programId);
