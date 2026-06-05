@@ -68,6 +68,7 @@ import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
+import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
@@ -296,6 +297,11 @@ bot.start({
     // 45s interval so refresh fires before the 60s force-attest gap.
     // Keeps on-chain feed timestamp comfortably under 120s contract limit.
     setTimeout(() => startPriceAttestor(45_000), 35_000);
+    // RWA screener — discovers Backed Finance xStocks + similar via DexScreener
+    // search every 4h. Auto-adds new mints meeting liquidity/volume thresholds.
+    // Auto-disables enabled RWAs that degrade or get paused by the issuer.
+    // Delayed start to avoid bunching with other startup workers.
+    setTimeout(() => startRwaScreener(bot), 180_000);
     // $MAGPIE holder reward distributions (weekly snapshot + pro-rata payout).
     // Idempotent — only runs when the pool has accrued AND 7+ days have
     // passed since the last distribution.
