@@ -11,6 +11,7 @@ import { handleWithdraw, registerWithdrawCallbacks } from "./commands/withdraw.j
 import { handleLink } from "./commands/link.js";
 import { handleSite } from "./commands/site.js";
 import { handleLock, registerLockCallbacks } from "./commands/lock.js";
+import { handleSiteOps } from "./commands/siteops.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
 import { handleMagpie } from "./commands/magpie.js";
@@ -160,6 +161,7 @@ bot.command("holder", handleHolders); // alias
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
+bot.command("siteops", handleSiteOps);
 bot.command("enablemint", handleEnableMint);
 bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);
