@@ -26,6 +26,7 @@ import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
+import { handleMeExport } from "./me-export.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1189,6 +1190,8 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/activity",
   // Ephemeral AI chat — signed, doesn't create tickets.
   "/api/v1/ai/chat",
+  // Signed JSON dump of all of the user's data — privacy / GDPR.
+  "/api/v1/me/export",
 ]);
 
 async function router(req, res) {
@@ -1369,6 +1372,9 @@ async function router(req, res) {
         break;
       case "/api/v1/ai/chat":
         result = await handleAiChat(req);
+        break;
+      case "/api/v1/me/export":
+        result = await handleMeExport(req);
         break;
       default:
         result = {
