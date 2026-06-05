@@ -8,6 +8,7 @@ import { getSolBalance } from "../services/deposits.js";
 import { tierFor, nextTierHint, getUserStats } from "../services/reputation.js";
 import { getOrCreateCode, referralStats } from "../services/referrals.js";
 import { getLoanLimits } from "../services/loan-limits.js";
+import { getSiteLock } from "../services/site-lock.js";
 import { query } from "../db/pool.js";
 
 function fmtSol(lamports) {
@@ -25,7 +26,7 @@ export async function handleMe(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  const [sol, stats, code, refs, activeRow, botInfo, limits, streakRow, wallets] = await Promise.all([
+  const [sol, stats, code, refs, activeRow, botInfo, limits, streakRow, wallets, siteLock] = await Promise.all([
     getSolBalance(publicKey),
     getUserStats(user.id),
     getOrCreateCode(user.id),
@@ -35,6 +36,7 @@ export async function handleMe(ctx) {
     getLoanLimits(user.id),
     query(`SELECT current_streak, best_streak FROM users WHERE id = $1`, [user.id]),
     listWallets(user.id),
+    getSiteLock(user.id),
   ]);
   const streak = streakRow.rows[0] || { current_streak: 0, best_streak: 0 };
 
@@ -98,6 +100,14 @@ export async function handleMe(ctx) {
     `Share: ${shareLink}`,
     `Referred: ${refs.total}`,
   );
+
+  if (siteLock.locked) {
+    const until = siteLock.until.toISOString().slice(0, 16).replace("T", " ");
+    lines.push(
+      "",
+      `🔒 *Site actions locked until ${until} UTC* — run \`/lock 0\` to clear.`,
+    );
+  }
 
   const { InlineKeyboard } = await import("grammy");
   const kb = new InlineKeyboard()
