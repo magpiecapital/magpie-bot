@@ -30,6 +30,7 @@ async function buildReport() {
     { rows: nonces },
     { rows: [tickets] },
     { rows: [lockEvents] },
+    { rows: [loans24h] },
     siteState,
   ] = await Promise.all([
     query(
@@ -66,6 +67,15 @@ async function buildReport() {
          FROM site_lock_events
         WHERE created_at > NOW() - INTERVAL '24 hours'`,
     ),
+    query(
+      `SELECT
+         COUNT(*)::int AS new_loans,
+         COUNT(*) FILTER (WHERE status = 'repaid')::int AS repaid,
+         COUNT(*) FILTER (WHERE status = 'liquidated')::int AS liquidated,
+         COALESCE(SUM(original_loan_amount_lamports::numeric), 0)::text AS volume_lamports
+         FROM loans
+        WHERE start_timestamp > NOW() - INTERVAL '24 hours'`,
+    ),
     getGlobalSiteState(),
   ]);
 
@@ -79,6 +89,10 @@ async function buildReport() {
     "*Users (24h):*",
     `  New: ${users.new}  ·  Total: ${users.total}`,
     `  Currently locked: ${locked.n}`,
+    "",
+    "*Loans (24h):*",
+    `  ${loans24h.new_loans} originated · ${loans24h.repaid} repaid · ${loans24h.liquidated} liquidated`,
+    `  Volume: ${fmtSol(loans24h.volume_lamports)} SOL`,
     "",
     "*Site withdraws (24h):*",
     `  ${withdraws.total} total · ${withdraws.ok} ok · ${withdraws.fail} failed`,
