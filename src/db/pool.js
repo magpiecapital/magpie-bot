@@ -547,6 +547,16 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS site_lock_events_user_idx
        ON site_lock_events(user_id, created_at DESC)`,
+    // Operator notepad — persistent admin notes across deploys.
+    // Useful for "remember to do X", incident notes, etc.
+    `CREATE TABLE IF NOT EXISTS admin_notes (
+       id BIGSERIAL PRIMARY KEY,
+       note TEXT NOT NULL,
+       set_by TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS admin_notes_created_idx
+       ON admin_notes(created_at DESC)`,
   ];
   for (const sql of patches) {
     try {
