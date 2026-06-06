@@ -296,6 +296,8 @@ async function registerBotCommands() {
       { command: "security", description: "🔐 Account security view + lock buttons" },
       { command: "privacy", description: "🔒 What we store + your controls" },
       { command: "lock", description: "🚨 Emergency pause on site signed actions" },
+      { command: "exportdata", description: "📦 DM yourself a JSON file of your account" },
+      { command: "tx", description: "🔍 Lookup any Solana tx by signature" },
       { command: "help", description: "ℹ️ Full command list" },
     ]);
     await bot.api.setChatMenuButton({
