@@ -27,6 +27,7 @@ import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handleMeExport } from "./me-export.js";
+import { handleDashboardAggregate } from "./dashboard-api.js";
 
 // Staleness thresholds for each periodic service.
 // 2x the configured POLL_INTERVAL_MS gives one missed cycle of slack.
@@ -1192,6 +1193,8 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/ai/chat",
   // Signed JSON dump of all of the user's data — privacy / GDPR.
   "/api/v1/me/export",
+  // Dashboard aggregate — single-fetch primer for the linked-user dashboard.
+  "/api/v1/dashboard",
 ]);
 
 async function router(req, res) {
@@ -1401,6 +1404,9 @@ async function router(req, res) {
         break;
       case "/api/v1/me/export":
         result = await handleMeExport(req);
+        break;
+      case "/api/v1/dashboard":
+        result = await handleDashboardAggregate(req, url);
         break;
       default:
         result = {
