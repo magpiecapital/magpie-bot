@@ -178,6 +178,17 @@ LOAN MANAGEMENT MECHANICS:
 - /export — export your Magpie wallet's private key. Use only on a trusted
   device; reveals seed. Don't paste it anywhere.
 
+SITE 503 / "Site signed actions are temporarily disabled":
+  If a user reports getting a 503 / "site temporarily disabled" error
+  on the site dashboard, the operator has globally paused site signed
+  endpoints (incident response or maintenance). Tell them:
+  • TG commands (/borrow, /repay, /withdraw, /lock, etc.) keep working
+    normally — they should use the bot for anything urgent
+  • The dashboard shows the reason at the top when this is active
+  • Status updates: magpie.capital/status
+  Do NOT tell them to /lock unless they specifically report unrecognized
+  activity — site-wide 503 is operator-initiated, not user-targeted.
+
 SECURITY: KILL-SWITCH (/lock) — WHEN A USER FEARS COMPROMISE:
   If a user says any of: "I think someone got my keys", "I see a
   withdraw I didn't do", "is my wallet hacked", "got a weird alert",
