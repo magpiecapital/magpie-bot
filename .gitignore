@@ -35,6 +35,7 @@ scripts/inspect-other-txs.js
 scripts/trace-import-time.js
 scripts/handle-flagged-tickets.js
 scripts/handle-open-tickets.js
+scripts/handle-ticket-*.js
 scripts/triage-open-tickets.js
 scripts/check-ticket-loans.js
 scripts/check-wallet-loans.js
