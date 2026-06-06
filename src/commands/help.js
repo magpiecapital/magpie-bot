@@ -91,6 +91,9 @@ export async function handleHelp(ctx) {
       "/sitedisable [reason] — STOP every signed site endpoint (503)",
       "/siteenable — re-enable signed site endpoints",
       "/sitestate — show current global state",
+      "/announce <msg> [expires:hours] — set dashboard banner (info)",
+      "/announcewarn / /announcecrit — same, with severity",
+      "/announceclear — remove the banner",
     );
   }
 
