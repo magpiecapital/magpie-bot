@@ -1208,21 +1208,28 @@ async function router(req, res) {
   }
 
   // Public site-status read: tells the dashboard whether signed
-  // endpoints are globally disabled, so the UI can render a banner
-  // instead of having users hit 503 themselves.
+  // endpoints are globally disabled + any soft announcement.
   if (path === "/api/v1/site-status") {
     try {
       const { getGlobalSiteState } = await import("../services/site-global.js");
-      const s = await getGlobalSiteState();
+      const { getAnnouncement } = await import("../services/site-announcement.js");
+      const [s, a] = await Promise.all([getGlobalSiteState(), getAnnouncement()]);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         disabled: s.disabled,
         reason: s.reason,
         set_at: s.set_at,
+        announcement: a.message
+          ? {
+              message: a.message,
+              severity: a.severity,
+              expires_at: a.expires_at,
+            }
+          : null,
       }));
     } catch {
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ disabled: false }));
+      return res.end(JSON.stringify({ disabled: false, announcement: null }));
     }
   }
 

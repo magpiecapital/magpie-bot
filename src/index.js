@@ -20,6 +20,12 @@ import { handleLock, registerLockCallbacks } from "./commands/lock.js";
 import { handleSiteOps } from "./commands/siteops.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
 import { handleSiteDisable, handleSiteEnable, handleSiteState } from "./commands/site-toggle.js";
+import {
+  handleAnnounce,
+  handleAnnounceWarn,
+  handleAnnounceCrit,
+  handleAnnounceClear,
+} from "./commands/announcement.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
 import { handleMagpie } from "./commands/magpie.js";
@@ -184,6 +190,10 @@ bot.command("adminunlock", handleAdminUnlock);
 bot.command("sitedisable", handleSiteDisable);
 bot.command("siteenable", handleSiteEnable);
 bot.command("sitestate", handleSiteState);
+bot.command("announce", handleAnnounce);
+bot.command("announcewarn", handleAnnounceWarn);
+bot.command("announcecrit", handleAnnounceCrit);
+bot.command("announceclear", handleAnnounceClear);
 bot.command("enablemint", handleEnableMint);
 bot.command("disablemint", handleDisableMint);
 bot.command("broadcast", handleBroadcast);

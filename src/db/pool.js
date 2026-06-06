@@ -519,6 +519,20 @@ export async function applyStartupPatches() {
      )`,
     `INSERT INTO site_global_state(id, disabled) VALUES (1, FALSE)
        ON CONFLICT (id) DO NOTHING`,
+    // Site-wide announcement banner. Operator-posted soft-announce.
+    // Doesn't halt anything (use /sitedisable for that) — just shows
+    // a non-blocking banner on the dashboard. NULL when no active
+    // announcement.
+    `CREATE TABLE IF NOT EXISTS site_announcement (
+       id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+       message TEXT,
+       severity TEXT NOT NULL DEFAULT 'info',
+       set_by TEXT,
+       set_at TIMESTAMPTZ,
+       expires_at TIMESTAMPTZ
+     )`,
+    `INSERT INTO site_announcement(id, message, severity)
+       VALUES (1, NULL, 'info') ON CONFLICT (id) DO NOTHING`,
     // Audit log of every lock/unlock action — both user-initiated
     // (/lock) and operator-initiated (/adminlock). Lets ops trace
     // suspicious patterns and users see their own lock history.
