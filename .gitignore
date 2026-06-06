@@ -39,6 +39,9 @@ scripts/handle-ticket-*.js
 scripts/find-lp-position.js
 scripts/find-lp-position-direct.js
 scripts/verify-lp-offset-fix.js
+scripts/audit-mint-decimals.js
+scripts/check-mint-decimals.js
+scripts/reconcile-mint-decimals.js
 scripts/triage-open-tickets.js
 scripts/check-ticket-loans.js
 scripts/check-wallet-loans.js

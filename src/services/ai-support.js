@@ -2081,6 +2081,28 @@ const TOOL_HANDLERS = {
     if (!mintRow) return toolError("token_not_supported", null, `${trimmed} isn't a supported collateral. Tell the user to check /tokens for the list.`);
     if (!mintRow.enabled) return toolError("token_disabled", null, `${mintRow.symbol} is currently disabled as collateral. Tell the user — they should pick a different token or wait until it's re-enabled.`);
 
+    // CRITICAL: verify DB decimals match on-chain ground truth before doing
+    // any value math. A drift here silently 1000x's the user's loan size in
+    // the wrong direction. If they don't match, refuse the borrow and alert
+    // the operator instead of guessing. See ticket #38 / #204 history.
+    try {
+      const mintInfo = await connection.getParsedAccountInfo(new PublicKey(mintRow.mint));
+      const chainDecimals = mintInfo.value?.data?.parsed?.info?.decimals;
+      if (chainDecimals == null) {
+        return toolError("mint_unreadable", null, "Couldn't read the token's on-chain decimals. Ask the user to retry in 30s.");
+      }
+      if (chainDecimals !== mintRow.decimals) {
+        console.error(`[propose_borrow] DECIMALS DRIFT for ${mintRow.symbol} (${mintRow.mint}): db=${mintRow.decimals} chain=${chainDecimals}. REFUSING borrow.`);
+        return toolError(
+          "decimals_drift",
+          `db=${mintRow.decimals} chain=${chainDecimals}`,
+          `Internal safety check: our records show ${mintRow.symbol} at ${mintRow.decimals} decimals but on-chain says ${chainDecimals}. We can't safely compute the loan value with this mismatch. Tell the user we've flagged this for the team — they should pick a different collateral or try again later.`,
+        );
+      }
+    } catch (err) {
+      return toolError("decimals_check_failed", err.message, "Couldn't verify the token's on-chain decimals. Ask the user to retry in 30s.");
+    }
+
     const uiAmount = parseFloat(String(collateral_amount));
     if (!Number.isFinite(uiAmount) || uiAmount <= 0) return toolError("bad_amount", null, "Collateral amount must be a positive number.");
 

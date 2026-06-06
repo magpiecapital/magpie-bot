@@ -4,7 +4,9 @@ import {
   resumeBorrowing,
   isBorrowingPaused,
 } from "../services/admin.js";
+import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
+import { connection } from "../solana/connection.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
 
@@ -73,6 +75,28 @@ export async function handleEnableMint(ctx) {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
     return ctx.reply("❌ Invalid decimals.");
   }
+  // Guard: the typed decimals MUST match what's on-chain. Wrong decimals
+  // silently corrupts every borrow value calc for this token. Verify
+  // against the mint account before inserting.
+  let chainDecimals;
+  try {
+    const info = await connection.getParsedAccountInfo(new PublicKey(mint));
+    chainDecimals = info.value?.data?.parsed?.info?.decimals;
+  } catch (err) {
+    return ctx.reply(`❌ Couldn't read mint on-chain: ${err.message?.slice(0, 100)}`);
+  }
+  if (chainDecimals == null) {
+    return ctx.reply(`❌ Mint ${mint} not found on-chain or unreadable.`);
+  }
+  if (chainDecimals !== decimals) {
+    return ctx.reply(
+      `❌ Decimals mismatch.\n\n` +
+      `You typed: \`${decimals}\`\n` +
+      `On-chain: \`${chainDecimals}\`\n\n` +
+      `Re-run with the correct on-chain value: \`/enablemint ${mint} ${symbol} ${chainDecimals}${nameParts.length ? " " + nameParts.join(" ") : ""}\``,
+      { parse_mode: "Markdown" },
+    );
+  }
   const name = nameParts.join(" ") || null;
   await query(
     `INSERT INTO supported_mints (mint, symbol, name, decimals, enabled)
@@ -84,7 +108,7 @@ export async function handleEnableMint(ctx) {
            enabled = TRUE`,
     [mint, symbol.toUpperCase(), name, decimals],
   );
-  await ctx.reply(`✅ ${symbol.toUpperCase()} enabled.`);
+  await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
 }
 
 export async function handleBroadcast(ctx) {
