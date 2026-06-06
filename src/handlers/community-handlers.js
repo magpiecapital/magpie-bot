@@ -182,6 +182,15 @@ async function handleGroupMessage(ctx) {
     // Skip the bot itself
     if (sender.id === ctx.me?.id) return;
 
+    // ── Pip Q&A trigger ────────────────────────────────────────
+    // Triggers (any one):
+    //   1. Message starts with /ask
+    //   2. Message mentions the bot by @username
+    //   3. Message is a reply to a previous bot message
+    // We run this BEFORE the admin-skip below so even admins can /ask
+    // and get a public answer (helps demo the feature in-group).
+    if (await maybeAnswerPipQuestion(ctx, msg, sender)) return;
+
     // Skip operator / chat admins
     if (isVerifiedAccount(sender)) return;
     if (await isChatAdmin(ctx, sender.id)) return;
@@ -249,6 +258,74 @@ async function handleGroupMessage(ctx) {
   } catch (err) {
     console.warn("[community] message handler failed (fail-open):", err.message);
   }
+}
+
+/** Detect + answer a Pip-question trigger in a group. Returns true if
+ *  we handled it (caller should short-circuit other moderation rules). */
+async function maybeAnswerPipQuestion(ctx, msg, sender) {
+  const text = (msg.text || msg.caption || "").trim();
+  if (!text) return false;
+
+  const botUsername = ctx.me?.username || "magpie_capital_bot";
+  const botMentionRe = new RegExp(`@${botUsername}\\b`, "i");
+
+  // Trigger detection (one of three):
+  let question = null;
+  // 1. /ask <question> command
+  const askMatch = text.match(/^\/ask(?:@\w+)?\s+([\s\S]+)$/i);
+  if (askMatch) {
+    question = askMatch[1].trim();
+  }
+  // 2. Direct @-mention (anywhere in the message)
+  else if (botMentionRe.test(text)) {
+    question = text.replace(botMentionRe, "").trim();
+  }
+  // 3. Reply to a previous bot message
+  else if (msg.reply_to_message && msg.reply_to_message.from?.id === ctx.me?.id) {
+    question = text;
+  }
+  if (!question) return false;
+
+  // Rate limit per user per chat
+  const { checkRateLimit, answerGroupQuestion } = await import("../services/community-pip.js");
+  const rl = checkRateLimit(ctx.chat.id, sender.id);
+  if (!rl.allowed) {
+    await ctx.api.sendMessage(
+      ctx.chat.id,
+      `⏳ Easy — you've asked me a lot already. Try again in ~${rl.retry_in_min}m.`,
+      { reply_to_message_id: msg.message_id, allow_sending_without_reply: true },
+    ).catch(() => {});
+    return true;
+  }
+
+  // Show typing indicator while Anthropic is working
+  ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
+
+  let answer;
+  try {
+    answer = await answerGroupQuestion(question);
+  } catch (err) {
+    console.warn("[community] Pip group answer failed:", err.message);
+    answer = null;
+  }
+  if (!answer) {
+    // Fail-quiet: don't post a stub. The model may have been blocked by
+    // rate limit / outage. User can try again.
+    return true;
+  }
+
+  try {
+    await ctx.api.sendMessage(ctx.chat.id, answer, {
+      reply_to_message_id: msg.message_id,
+      allow_sending_without_reply: true,
+      // No markdown parse — group text could include unbalanced *_`
+      // and we don't want a Pip answer to crash on parse.
+    });
+    await recordModAction(ctx.chat.id, sender.id, "pip_group_answer", null, question.slice(0, 200));
+  } catch (err) {
+    console.warn("[community] Pip group reply failed:", err.message);
+  }
+  return true;
 }
 
 async function tryDelete(ctx, messageId) {
