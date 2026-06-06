@@ -99,7 +99,7 @@ export async function handleLock(ctx) {
  * alert DMs (services/security-alerts.js → lockKeyboard).
  */
 export function registerLockCallbacks(bot) {
-  bot.callbackQuery(/^sec:lock:(\d+|status)$/, async (ctx) => {
+  bot.callbackQuery(/^sec:lock:(\d+|status|clear)$/, async (ctx) => {
     const arg = ctx.match[1];
     const user = await upsertUser(ctx.from.id, ctx.from.username);
 
@@ -113,12 +113,32 @@ export function registerLockCallbacks(bot) {
       return;
     }
 
+    if (arg === "clear") {
+      const { locked } = await getSiteLock(user.id);
+      if (!locked) {
+        await ctx.answerCallbackQuery("Not locked");
+        return;
+      }
+      await clearSiteLock(user.id, { setBy: "callback" });
+      await ctx.answerCallbackQuery({
+        text: "🔓 Site lock cleared",
+        show_alert: true,
+      });
+      try {
+        await ctx.reply(
+          "🔓 *Site lock cleared.* Make sure you've rotated your Phantom seed before continuing.",
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* non-critical */ }
+      return;
+    }
+
     const hours = Number(arg);
     if (!Number.isFinite(hours) || hours <= 0) {
       await ctx.answerCallbackQuery("Invalid duration");
       return;
     }
-    const { hours: applied } = await setSiteLock(user.id, hours);
+    const { hours: applied } = await setSiteLock(user.id, hours, { setBy: "callback" });
     await ctx.answerCallbackQuery({
       text: `🔒 Site locked for ${applied}h`,
       show_alert: true,

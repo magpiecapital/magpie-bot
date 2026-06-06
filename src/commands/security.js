@@ -135,9 +135,11 @@ export async function handleSecurity(ctx) {
     "_Anything you don't recognize? Run /lock 24 right now and reach out via /support._",
   );
 
-  const kb = new InlineKeyboard()
-    .text("🔒 Lock 24h", "sec:lock:24")
-    .text("🔒 Lock 7d", "sec:lock:168");
+  const kb = lock.locked
+    ? new InlineKeyboard().text("🔓 Clear lock", "sec:lock:clear")
+    : new InlineKeyboard()
+        .text("🔒 Lock 24h", "sec:lock:24")
+        .text("🔒 Lock 7d", "sec:lock:168");
 
   await ctx.reply(lines.join("\n"), {
     parse_mode: "Markdown",
