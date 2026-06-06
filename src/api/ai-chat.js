@@ -119,7 +119,7 @@ export async function handleAiChat(req) {
   if (payload?.magpie !== "ai-chat/v1") {
     return { status: 400, body: { error: "Bad payload header" } };
   }
-  const { action, message, nonce, issuedAt } = payload;
+  const { action, message, nonce, issuedAt, page_context } = payload;
   if (!nonce || !issuedAt) {
     return { status: 400, body: { error: "Payload missing nonce or issuedAt" } };
   }
@@ -212,9 +212,16 @@ export async function handleAiChat(req) {
     console.warn("[ai-chat] gate error, proceeding anyway:", e.message);
   }
 
+  // Inject light page-context hint when the floating chat passes
+  // one. The agent's prompt knows to use it to ground answers
+  // ("you're on /tokens, so let me check the tokens table…").
+  const finalMessage = page_context
+    ? `(User is currently on the page: ${String(page_context).slice(0, 64)})\n\n${message}`
+    : message;
+
   let result;
   try {
-    result = await chatWithAgent(linked.id, message, {
+    result = await chatWithAgent(linked.id, finalMessage, {
       username: linked.telegram_username,
     });
   } catch (e) {
