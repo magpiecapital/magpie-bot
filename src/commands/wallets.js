@@ -142,17 +142,34 @@ async function renderWalletDetail(ctx, walletId) {
   ];
 
   const kb = new InlineKeyboard();
-  if (!w.isActive) {
+
+  // ── Quick actions ──────────────────────────────────────────────
+  // For the ACTIVE wallet, surface the next-step actions a user
+  // typically wants when they tap on it (borrow, view loans, manage
+  // health). These callbacks route into the existing /borrow,
+  // /positions, /topup, /extend handlers — same flow as typing the
+  // slash command, just one tap closer.
+  // For non-active wallets, gate the actions behind a switch first
+  // (we can't borrow against wallet X if it isn't signing).
+  if (w.isActive) {
+    kb.text("💸 Borrow", "wallets:action:borrow")
+      .text("📊 My loans", "wallets:action:positions").row();
+    kb.text("➕ Top up", "wallets:action:topup")
+      .text("⏰ Extend", "wallets:action:extend").row();
+    kb.text("🤖 Ask Pip about this wallet", "wallets:action:pip").row();
+  } else {
     kb.text(`🔁 Switch to ${w.label}`, `wallets:confirm_switch:${w.id}`).row();
   }
-  kb.text("✏️ Rename this wallet", `wallets:rename:${w.id}`).row();
+
+  // ── Wallet management ──────────────────────────────────────────
+  kb.text("✏️ Rename", `wallets:rename:${w.id}`);
   // Remove is only offered for non-active wallets. The service layer
   // also blocks removal if the wallet has active loans tied to it,
   // surfaced via the confirm step below.
   if (!w.isActive) {
-    kb.text("🗑 Remove from account", `wallets:confirm_remove:${w.id}`).row();
+    kb.text("🗑 Remove", `wallets:confirm_remove:${w.id}`);
   }
-  kb.text("← Back to wallets", "wallets:back");
+  kb.row().text("← Back to wallets", "wallets:back");
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb })
     .catch(async () => {
@@ -166,6 +183,36 @@ export function registerWalletsCallbacks(bot) {
     await ctx.answerCallbackQuery();
     const walletId = Number(ctx.match[1]);
     await renderWalletDetail(ctx, walletId);
+  });
+
+  // Quick-action shortcuts on the wallet detail view. Each one
+  // routes into the same handler the user would hit via /<command>,
+  // just one tap closer. We import lazily to avoid a circular import
+  // (wallets.js ← borrow.js ← positions.js etc.).
+  bot.callbackQuery("wallets:action:borrow", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleBorrow } = await import("./borrow.js");
+    await handleBorrow(ctx);
+  });
+  bot.callbackQuery("wallets:action:positions", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handlePositions } = await import("./positions.js");
+    await handlePositions(ctx);
+  });
+  bot.callbackQuery("wallets:action:topup", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleTopup } = await import("./topup.js");
+    await handleTopup(ctx);
+  });
+  bot.callbackQuery("wallets:action:extend", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleExtend } = await import("./extend.js");
+    await handleExtend(ctx);
+  });
+  bot.callbackQuery("wallets:action:pip", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const { handleSupport } = await import("./support.js");
+    await handleSupport(ctx);
   });
 
   // From the detail view, tap "Switch to X" → confirm via a small prompt
