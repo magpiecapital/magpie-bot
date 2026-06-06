@@ -124,7 +124,7 @@ async function runChatForUser({ signerPubkey, action, message, pageContext }) {
   let gate;
   try {
     [result, gate] = await Promise.all([
-      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username }),
+      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username, signerPubkey }),
       topicGatePromise,
     ]);
   } catch (e) {
@@ -352,7 +352,7 @@ export async function handleAiChat(req) {
   let gate;
   try {
     [result, gate] = await Promise.all([
-      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username }),
+      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username, signerPubkey }),
       topicGatePromise,
     ]);
   } catch (e) {

@@ -33,9 +33,6 @@ function loadIdl() {
 }
 
 function loadLenderKeypair() {
-  if (config.lenderPrivateKey) {
-    return Keypair.fromSecretKey(bs58.decode(config.lenderPrivateKey));
-  }
   const bytes = new Uint8Array(JSON.parse(readFileSync(config.lenderKeypairPath, "utf8")));
   return Keypair.fromSecretKey(bytes);
 }

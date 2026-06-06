@@ -2,9 +2,8 @@
  * Backend configuration.
  *
  * The liquidation service signs on-chain instructions as the `lender` — i.e.
- * the same pubkey that initialized the lending pool. The keypair can be
- * provided either as a base58 secret key (LENDER_PRIVATE_KEY) or as a path
- * to a solana-cli keypair JSON (LENDER_KEYPAIR_PATH).
+ * the same pubkey that initialized the lending pool. The keypair is loaded
+ * from a solana-cli keypair JSON file via LENDER_KEYPAIR_PATH.
  */
 import "dotenv/config";
 import { PublicKey } from "@solana/web3.js";
@@ -19,8 +18,7 @@ export const config = {
   rpcEndpoint: process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com",
   network: process.env.SOLANA_NETWORK || "devnet",
 
-  lenderPrivateKey: process.env.LENDER_PRIVATE_KEY, // base58 (optional)
-  lenderKeypairPath: process.env.LENDER_KEYPAIR_PATH, // JSON path (optional)
+  lenderKeypairPath: required("LENDER_KEYPAIR_PATH"),
   lenderWallet: new PublicKey(required("LENDER_PUBKEY")),
 
   programId: new PublicKey(required("PROGRAM_ID")),
@@ -33,10 +31,6 @@ export const config = {
   // How often (seconds) to poll all active loans.
   priceCheckInterval: parseInt(process.env.PRICE_CHECK_INTERVAL, 10) || 30,
 };
-
-if (!config.lenderPrivateKey && !config.lenderKeypairPath) {
-  throw new Error("Either LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set");
-}
 
 console.log("✅ Backend config loaded");
 console.log(`   Network:              ${config.network}`);

@@ -31,7 +31,7 @@ import "dotenv/config";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const idl = JSON.parse(
-  readFileSync(path.join(__dirname, "..", "src", "solana", "idl", "magpie.json"), "utf8"),
+  readFileSync(path.join(__dirname, "..", "src", "solana", "idl", "magpie_lending.json"), "utf8"),
 );
 
 function parseArgs() {
@@ -67,7 +67,7 @@ async function main() {
   console.log("Cluster: ", provider.connection.rpcEndpoint);
 
   const [lendingPool] = PublicKey.findProgramAddressSync(
-    [Buffer.from("lending-pool"), lender.publicKey.toBuffer()],
+    [Buffer.from("pool"), lender.publicKey.toBuffer()],
     programId,
   );
   const [loanTokenVault] = PublicKey.findProgramAddressSync(
@@ -82,17 +82,18 @@ async function main() {
   if (poolInfo) {
     console.log("\n✓ Pool already initialized, skipping init.");
   } else {
-    const feeWallet = lender.publicKey; // use lender as fee recipient by default
-    console.log("\nInitializing pool...");
+    const protocolFeeBps = 2000; // 20% protocol fee
+    const keeperRewardBps = 500; // 5% keeper liquidation bounty
+    console.log("\nInitializing pool (protocol fee:", protocolFeeBps, "bps, keeper reward:", keeperRewardBps, "bps)...");
     const sig = await program.methods
-      .initializeLendingPool(feeWallet)
+      .initializePool(protocolFeeBps, keeperRewardBps)
       .accounts({
-        lendingPool,
+        pool: lendingPool,
         loanTokenVault,
         loanTokenMint: NATIVE_MINT,
-        lender: lender.publicKey,
+        authority: lender.publicKey,
         systemProgram: SystemProgram.programId,
-        loanTokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
         rent: SYSVAR_RENT_PUBKEY,
       })
       .rpc({ commitment: "confirmed" });
@@ -123,18 +124,9 @@ async function main() {
   }
 
   if (fund > 0) {
-    const lamports = BigInt(Math.floor(fund * 1e9));
-    console.log(`\nFunding vault with ${fund} SOL (wrapped)...`);
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
-        toPubkey: loanTokenVault,
-        lamports,
-      }),
-      createSyncNativeInstruction(loanTokenVault, TOKEN_PROGRAM_ID),
-    );
-    const sig = await sendAndConfirmTransaction(connection, tx, [lender]);
-    console.log("✓ Vault funded:", sig);
+    console.log(`\n⚠ To fund the vault, use the deposit script (creates withdrawable shares):`);
+    console.log(`  LENDER_KEYPAIR_PATH=${kpPath} node scripts/deposit-vault.js --amount ${fund}`);
+    console.log(`\n  Do NOT send SOL directly to the vault — it won't be withdrawable.`);
   }
 
   const vaultInfo = await connection.getTokenAccountBalance(loanTokenVault).catch(() => null);

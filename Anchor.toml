@@ -5,24 +5,23 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
+magpie_lending = "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh"
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
-agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
-vault_consumer = "4m4NB1tRKvWE6okuvU1Sf7HQLc6VWGrUpwFoc6ZZU4nX"
 
 [programs.devnet]
+magpie_lending = "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh"
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
-agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
 
 [programs.mainnet]
+magpie_lending = "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh"
 magpie_credit_oracle = "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E"
-agent_vault = "J9R83EHNJtrzwcS9PxJ9yyLs4SrWAsgQ6Laf6zNBeF8t"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "~/.config/solana/id.json"
+cluster = "mainnet"
+wallet = "lender-keypair.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"

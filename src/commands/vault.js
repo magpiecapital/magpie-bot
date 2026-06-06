@@ -39,10 +39,11 @@ function deriveVaultPDA(owner, agent) {
 }
 
 function loadAuthority() {
-  if (process.env.LENDER_PRIVATE_KEY) {
-    return Keypair.fromSecretKey(bs58.decode(process.env.LENDER_PRIVATE_KEY));
+  if (process.env.LENDER_KEYPAIR_PATH) {
+    const raw = JSON.parse(readFileSync(process.env.LENDER_KEYPAIR_PATH, "utf8"));
+    return Keypair.fromSecretKey(new Uint8Array(raw));
   }
-  throw new Error("No keypair available for vault operations");
+  throw new Error("LENDER_KEYPAIR_PATH not set");
 }
 
 function getProgram(signer) {

@@ -1986,8 +1986,11 @@ const TOOL_HANDLERS = {
     };
   },
 
-  get_my_eligible_collateral: async (_args, { userId }) => {
-    const pubkey = await getUserWallet(userId);
+  get_my_eligible_collateral: async (_args, { userId, signerPubkey }) => {
+    // Prefer the browser-connected wallet (signerPubkey from the Pip
+    // session). Falls back to the user's stored active wallet for the
+    // TG side where there's no session-pubkey.
+    const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     let holdings;
     try {
@@ -2503,8 +2506,10 @@ const TOOL_HANDLERS = {
     };
   },
 
-  get_my_wallet: async (_args, { userId }) => {
-    const pubkey = await getUserWallet(userId);
+  get_my_wallet: async (_args, { userId, signerPubkey }) => {
+    // Prefer the wallet the user is signed into Pip with — that's
+    // what they actually mean when they say "my wallet" on the site.
+    const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     let balanceSol = 0;
     let balanceFresh = true;
@@ -2522,8 +2527,8 @@ const TOOL_HANDLERS = {
     };
   },
 
-  check_my_token_balance: async ({ token }, { userId }) => {
-    const pubkey = await getUserWallet(userId);
+  check_my_token_balance: async ({ token }, { userId, signerPubkey }) => {
+    const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     // Resolve token (symbol or mint) to a real mint
     let mintRow;
@@ -2615,8 +2620,8 @@ const TOOL_HANDLERS = {
     };
   },
 
-  get_my_holder_stats: async (_args, { userId }) => {
-    const pubkey = await getUserWallet(userId);
+  get_my_holder_stats: async (_args, { userId, signerPubkey }) => {
+    const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     try {
       const { getHolderInfoByWallet } = await import("./magpie-holder-rewards.js");
@@ -2635,8 +2640,8 @@ const TOOL_HANDLERS = {
     }
   },
 
-  get_my_lp_position: async (_args, { userId }) => {
-    const pubkey = await getUserWallet(userId);
+  get_my_lp_position: async (_args, { userId, signerPubkey }) => {
+    const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
     // Use site helper via a direct on-chain read here
     try {
@@ -3384,6 +3389,12 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
   // language without explicit translation infrastructure.
   const username = opts.username || null;
   const languageCode = opts.languageCode || null;
+  // signerPubkey: the wallet currently authenticated to Pip (the one
+  // that minted the session or signed the message). When present,
+  // wallet-scoped tools should prefer it over the user's stored
+  // "active" wallet — this way the user is talking to Pip ABOUT
+  // whatever wallet they have connected in their browser RIGHT NOW.
+  const signerPubkey = opts.signerPubkey || null;
 
   // PII scrub: never let an accidentally-pasted seed phrase or private
   // key leave our infra. Refuse with a clear warning instead.
@@ -3559,7 +3570,7 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
         try {
           // Pass the list of tools already called this turn so the
           // open_support_ticket guard can see prior diagnostic calls.
-          result = await handler(tu.input || {}, { userId, toolsCalledThisTurn: [...usedTools] });
+          result = await handler(tu.input || {}, { userId, signerPubkey, toolsCalledThisTurn: [...usedTools] });
           if (tu.name === "open_support_ticket" && result?.ticket_id) {
             escalatedTicketId = result.ticket_id;
             escalatedReason = result.reason || null;
