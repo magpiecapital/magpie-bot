@@ -113,11 +113,23 @@ export async function handleMe(ctx) {
   const kb = new InlineKeyboard()
     .text("🏠 Home", "start:home")
     .text("💰 Borrow", "start:borrow")
-    .text("📋 Wallet", "fallback:deposit");
+    .row()
+    .text("📋 Wallet", "fallback:deposit")
+    .text("🔐 Security", "me:security");
 
   await ctx.reply(lines.filter((l) => l != null).join("\n"), {
     parse_mode: "Markdown",
     disable_web_page_preview: true,
     reply_markup: kb,
+  });
+}
+
+export function registerMeCallbacks(bot) {
+  bot.callbackQuery("me:security", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    // Lazy-import to avoid circular dependency with services that may
+    // touch this module.
+    const { handleSecurity } = await import("./security.js");
+    await handleSecurity(ctx);
   });
 }
