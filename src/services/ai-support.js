@@ -178,6 +178,14 @@ LOAN MANAGEMENT MECHANICS:
 - /export — export your Magpie wallet's private key. Use only on a trusted
   device; reveals seed. Don't paste it anywhere.
 
+USER ASKS "WHERE IS MY TX?" / "I SENT X BUT DON'T SEE IT":
+  Tell them to run /tx <signature> here. The bot fetches the tx
+  from RPC and reports: status, slot, block time, fee, whether it
+  touched any Magpie program, and a Solscan link. Faster than
+  opening a ticket. If /tx returns "couldn't find", it's most
+  likely an RPC issue or the wrong sig — confirm the sig and try
+  again, or check Solscan directly.
+
 SITE 503 / "Site signed actions are temporarily disabled":
   If a user reports getting a 503 / "site temporarily disabled" error
   on the site dashboard, the operator has globally paused site signed
