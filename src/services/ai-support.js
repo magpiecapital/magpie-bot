@@ -1505,6 +1505,8 @@ Mandatory tool triggers — pattern → tool:
 - User asks "what did I do recently", "show my activity", "history" generally → \`get_my_recent_activity\`
 - User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
 - User asks "what would I get if I borrow against X", "simulate a loan", "preview a loan", "rate for Y tokens" → \`simulate_loan\`
+- User says "I want to borrow", "let me take a loan", "borrow against my X", "lend me SOL", "I want to take out a loan" → \`propose_borrow\` (ask for tier/amount inline if missing). DO NOT redirect them to /borrow in Telegram — borrow happens here. The card the user sees does the signing.
+- User says "repay my loan", "pay off #X", "I want to close out my loan", "settle the loan" → \`propose_repay\`. DO NOT redirect them to /repay in Telegram — repay happens here too.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
 - User asks "how do I see all my loans by date", "loan calendar", "when are my loans due" → point at /calendar
@@ -1694,6 +1696,19 @@ const TOOLS = [
         loan_id: { type: "string", description: "The numeric loan ID (the long number, e.g. '1780497452120')" },
       },
       required: ["loan_id"],
+    },
+  },
+  {
+    name: "propose_borrow",
+    description: "Prepare a NEW LOAN action the user can sign with one tap on the site. Use this when the user clearly wants to borrow / take out a loan / get SOL against their collateral. Required: token (symbol or mint they want to use as collateral), collateral_amount (the UI-friendly amount like '1000' for 1000 BONK — NOT raw token base units), tier (one of: express | quick | standard). The site renders an inline confirmation card with the previewed SOL principal + fee + due date and a Sign & Borrow button. Pip does NOT execute the loan — the borrower wallet does the signing. Your text response after calling should be one short line introducing the card. Do NOT tell the user to go to the Telegram bot — they can borrow right here.",
+    input_schema: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "Collateral token symbol (e.g. 'BONK', 'MAGPIE') or mint address. Must be an approved/enabled collateral." },
+        collateral_amount: { type: "string", description: "UI-friendly amount of the collateral token, e.g. '1000' for 1000 BONK. NOT base units. Decimals handled server-side." },
+        tier: { type: "string", enum: ["express", "quick", "standard"], description: "Loan tier. express=30% LTV/2d/3% fee, quick=25%/3d/2%, standard=20%/7d/1.5%." },
+      },
+      required: ["token", "collateral_amount", "tier"],
     },
   },
   {
@@ -1921,6 +1936,97 @@ const TOOL_HANDLERS = {
       due_at_utc: dueIsoUtc,
       hours_to_due: ((dueMs - Date.now()) / 3_600_000).toFixed(1),
       past_due: dueMs < Date.now(),
+    };
+  },
+
+  propose_borrow: async ({ token, collateral_amount, tier }, { userId }) => {
+    // Tier lookup matches src/commands/borrow.js LTV_TIERS.
+    const TIERS = {
+      express: { option: 0, ltv: 30, days: 2, feeBps: 300, label: "Express" },
+      quick: { option: 1, ltv: 25, days: 3, feeBps: 200, label: "Quick" },
+      standard: { option: 2, ltv: 20, days: 7, feeBps: 150, label: "Standard" },
+    };
+    const t = TIERS[String(tier || "").toLowerCase()];
+    if (!t) return toolError("bad_tier", null, "Tier must be express, quick, or standard.");
+
+    // Resolve token → mint via supported_mints. Must be enabled.
+    const trimmed = String(token || "").trim().replace(/^\$/, "");
+    const isMintLike = trimmed.length >= 32;
+    const lookup = isMintLike
+      ? await query(`SELECT mint, symbol, decimals, enabled FROM supported_mints WHERE mint = $1 LIMIT 1`, [trimmed])
+      : await query(`SELECT mint, symbol, decimals, enabled FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [trimmed]);
+    const mintRow = lookup.rows[0];
+    if (!mintRow) return toolError("token_not_supported", null, `${trimmed} isn't a supported collateral. Tell the user to check /tokens for the list.`);
+    if (!mintRow.enabled) return toolError("token_disabled", null, `${mintRow.symbol} is currently disabled as collateral. Tell the user — they should pick a different token or wait until it's re-enabled.`);
+
+    const uiAmount = parseFloat(String(collateral_amount));
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) return toolError("bad_amount", null, "Collateral amount must be a positive number.");
+
+    // Compute the indicative SOL principal. Price from oracle; exact value
+    // gets recomputed client-side at tx-build time so small drift between
+    // here and signing is fine.
+    let priceSol;
+    try {
+      const { getPriceInSol } = await import("./price.js");
+      priceSol = await getPriceInSol(mintRow.mint);
+    } catch (err) {
+      return toolError("price_fetch_failed", err.message, "Couldn't get the live price. Ask the user to try in 30s.");
+    }
+    if (!priceSol || priceSol <= 0) return toolError("no_price", null, `No live price for ${mintRow.symbol}. Try a different token.`);
+
+    const collateralValueSol = uiAmount * priceSol;
+    const collateralValueLamports = BigInt(Math.floor(collateralValueSol * 1e9));
+    const principalLamports = (collateralValueLamports * BigInt(t.ltv)) / 100n;
+    const feeLamports = (principalLamports * BigInt(t.feeBps)) / 10_000n;
+    const receivedLamports = principalLamports - feeLamports;
+    const collateralAmountRaw = BigInt(Math.floor(uiAmount * Math.pow(10, mintRow.decimals))).toString();
+
+    // Enforce user's tier limits (max per loan + max outstanding).
+    let limits = null;
+    try {
+      const { getLoanLimits } = await import("./loan-limits.js");
+      limits = await getLoanLimits(userId);
+    } catch (err) {
+      console.warn("[propose_borrow] limits fetch failed:", err.message);
+    }
+    if (limits) {
+      const maxPerLoan = BigInt(limits.maxPerLoan ?? 0n);
+      const availableToBorrow = BigInt(limits.availableToBorrow ?? 0n);
+      if (maxPerLoan > 0n && principalLamports > maxPerLoan) {
+        return toolError("over_per_loan", null,
+          `That'd be ~${fmtSol(principalLamports)} SOL but their ${limits.tier} tier caps each loan at ${fmtSol(maxPerLoan)} SOL. Tell them they need to reduce the collateral OR pick a tier with lower LTV (Standard = 20% LTV, less SOL out).`);
+      }
+      if (principalLamports > availableToBorrow) {
+        return toolError("over_outstanding", null,
+          `They have other loans open. This would push past their ${fmtSol(BigInt(limits.maxOutstanding ?? 0n))} SOL outstanding cap. Available headroom right now: ${fmtSol(availableToBorrow)} SOL — they should repay an existing loan or reduce collateral.`);
+      }
+    }
+
+    const dueAt = new Date(Date.now() + t.days * 24 * 3600 * 1000);
+    return {
+      action_proposed: {
+        type: "borrow",
+        collateral_mint: mintRow.mint,
+        collateral_symbol: mintRow.symbol,
+        collateral_decimals: mintRow.decimals,
+        collateral_amount_raw: collateralAmountRaw,
+        collateral_ui_amount: String(uiAmount),
+        collateral_value_lamports: collateralValueLamports.toString(),
+        tier_option: t.option,
+        tier_label: t.label,
+        ltv_pct: t.ltv,
+        duration_days: t.days,
+        fee_bps: t.feeBps,
+        principal_lamports: principalLamports.toString(),
+        principal_sol: fmtSol(principalLamports),
+        fee_lamports: feeLamports.toString(),
+        fee_sol: fmtSol(feeLamports),
+        received_lamports: receivedLamports.toString(),
+        received_sol: fmtSol(receivedLamports),
+        due_at_utc: dueAt.toISOString(),
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction: "Respond with ONE short line introducing the borrow card (e.g. 'Here's your ${tier} borrow against ${amount} ${symbol} — tap Sign & Borrow when you're ready.'). Do NOT repeat the numbers — the card shows everything. Never tell them to use /borrow in TG.",
     };
   },
 
