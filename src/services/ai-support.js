@@ -1505,7 +1505,11 @@ Mandatory tool triggers — pattern → tool:
 - User asks "what did I do recently", "show my activity", "history" generally → \`get_my_recent_activity\`
 - User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
 - User asks "what would I get if I borrow against X", "simulate a loan", "preview a loan", "rate for Y tokens" → \`simulate_loan\`
-- User says "I want to borrow", "let me take a loan", "borrow against my X", "lend me SOL", "I want to take out a loan" → \`propose_borrow\` (ask for tier/amount inline if missing). DO NOT redirect them to /borrow in Telegram — borrow happens here. The card the user sees does the signing.
+- User says ANY borrow intent ("I want to borrow", "can I take a loan", "lend me SOL", "borrow against my X", "I want to take out a loan", "loan?"):
+    STEP 1: Call \`get_my_eligible_collateral\` FIRST — never ask the user what they have, look it up. This returns their wallet + every eligible token they hold + max-borrow per tier + their current tier limits.
+    STEP 2: Present concisely: their wallet short-id, then a 1-liner per eligible token with the best-tier SOL estimate, plus their per-loan cap. Recommend ONE option grounded in numbers. End with "Want me to set up [token] at [tier]?"
+    STEP 3: Once they confirm collateral + tier (and amount if not implicit), call \`propose_borrow\` with the exact values. The site renders the confirm card.
+    NEVER redirect to /borrow in Telegram. NEVER ask "what do you want to borrow against" without checking first.
 - User says "repay my loan", "pay off #X", "I want to close out my loan", "settle the loan" → \`propose_repay\`. DO NOT redirect them to /repay in Telegram — repay happens here too.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
@@ -1697,6 +1701,11 @@ const TOOLS = [
       },
       required: ["loan_id"],
     },
+  },
+  {
+    name: "get_my_eligible_collateral",
+    description: "List the tokens in the user's wallet that ARE supported as collateral, with live SOL value and per-tier max-borrow estimates. Use this PROACTIVELY when the user expresses any intent to borrow ('I want a loan', 'can I borrow', 'take out a loan', 'lend me SOL'). Don't ask the user what they have — look it up first, then present the options.",
+    input_schema: { type: "object", properties: {} },
   },
   {
     name: "propose_borrow",
@@ -1936,6 +1945,70 @@ const TOOL_HANDLERS = {
       due_at_utc: dueIsoUtc,
       hours_to_due: ((dueMs - Date.now()) / 3_600_000).toFixed(1),
       past_due: dueMs < Date.now(),
+    };
+  },
+
+  get_my_eligible_collateral: async (_args, { userId }) => {
+    const pubkey = await getUserWallet(userId);
+    if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
+    let holdings;
+    try {
+      const { getSupportedBalances } = await import("./deposits.js");
+      holdings = await getSupportedBalances(pubkey);
+    } catch (err) {
+      return toolError("rpc_blip", err.message, HINT_RPC_BLIP);
+    }
+    if (!holdings || holdings.length === 0) {
+      return {
+        wallet: pubkey,
+        eligible: [],
+        user_friendly_hint: "User holds no approved collateral tokens in this wallet. Tell them: they'd need to acquire one of the supported tokens first (see /tokens for the list), OR — if they have unsupported tokens — they can /submit one for review.",
+      };
+    }
+
+    const { getPriceInSol } = await import("./price.js");
+    const enriched = [];
+    for (const h of holdings) {
+      let priceSol = 0;
+      try { priceSol = await getPriceInSol(h.mint); } catch { /* keep zero */ }
+      const valueSol = h.humanAmount * priceSol;
+      const valueLamports = BigInt(Math.floor(valueSol * 1e9));
+      enriched.push({
+        symbol: h.symbol,
+        mint: h.mint,
+        ui_amount: h.humanAmount,
+        decimals: h.decimals,
+        price_sol_per_token: priceSol > 0 ? priceSol.toFixed(9) : null,
+        total_value_sol: valueSol > 0 ? valueSol.toFixed(6) : null,
+        max_borrow_sol: {
+          express: valueSol > 0 ? (valueSol * 0.30).toFixed(6) : null,  // 30% LTV
+          quick:    valueSol > 0 ? (valueSol * 0.25).toFixed(6) : null,  // 25% LTV
+          standard: valueSol > 0 ? (valueSol * 0.20).toFixed(6) : null,  // 20% LTV
+        },
+      });
+    }
+    // Sort by total value desc so the biggest options come first.
+    enriched.sort((a, b) => (parseFloat(b.total_value_sol || "0") - parseFloat(a.total_value_sol || "0")));
+
+    // Pull user's borrow limits too — Pip should always present these alongside.
+    let limits = null;
+    try {
+      const { getLoanLimits } = await import("./loan-limits.js");
+      const raw = await getLoanLimits(userId);
+      limits = {
+        tier: raw.tier,
+        max_per_loan_sol: fmtSol(raw.maxPerLoan),
+        max_outstanding_sol: fmtSol(raw.maxOutstanding),
+        currently_outstanding_sol: fmtSol(raw.currentOutstanding),
+        available_to_borrow_sol: fmtSol(raw.availableToBorrow),
+      };
+    } catch (_) { /* limits non-critical */ }
+
+    return {
+      wallet: pubkey,
+      eligible: enriched,
+      limits,
+      user_friendly_hint: "Present this concisely: '[wallet short-id] Here's what's available to borrow against —' then 1 line per token with its top tier estimate. Recommend a tier based on the user's risk profile (Standard = safest, Express = most SOL out but tightest term). Then ASK which one + tier they want and call propose_borrow.",
     };
   },
 
