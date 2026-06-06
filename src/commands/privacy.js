@@ -38,6 +38,7 @@ export async function handlePrivacy(ctx) {
       "• `/me` — full account summary",
       "• `/wallets` — list, switch, or remove wallets",
       "• `/mytickets` — see your support history",
+      "• `/exportdata` — DMs you a JSON file with everything (same content the dashboard download produces)",
       "• On the dashboard: tap *Download my data* to get a JSON export of everything",
       "• On the dashboard: closed tickets can be permanently deleted",
       "",

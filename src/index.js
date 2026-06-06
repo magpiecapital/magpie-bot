@@ -12,6 +12,7 @@ import { handleLink } from "./commands/link.js";
 import { handleSite } from "./commands/site.js";
 import { handlePrivacy } from "./commands/privacy.js";
 import { handleSecurity } from "./commands/security.js";
+import { handleExportData } from "./commands/export-data.js";
 import { handleLock, registerLockCallbacks } from "./commands/lock.js";
 import { handleSiteOps } from "./commands/siteops.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
@@ -125,6 +126,7 @@ bot.command("site", handleSite);
 bot.command("web", handleSite); // alias
 bot.command("privacy", handlePrivacy);
 bot.command("security", handleSecurity);
+bot.command("exportdata", handleExportData);
 bot.command("lock", handleLock);
 bot.command("stats", handleStats);
 bot.command("me", handleMe);
