@@ -10,32 +10,47 @@
  * Rate limiting: per-key, configurable
  */
 import http from "node:http";
-import { gzip } from "node:zlib";
+import { gzip, brotliCompress } from "node:zlib";
 import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 
 const gzipAsync = promisify(gzip);
-const GZIP_MIN_BYTES = 1024; // Don't bother compressing tiny responses.
+const brotliAsync = promisify(brotliCompress);
+const COMPRESS_MIN_BYTES = 1024; // Don't bother compressing tiny responses.
 
 /**
- * Write a JSON response, gzipping if the client supports it and the
- * body is large enough to benefit. Big aggregate endpoints
- * (/transparency, /dashboard, /loans) shrink ~70% over the wire,
- * which is material on mobile networks.
+ * Write a JSON response, compressing if the client supports it and
+ * the body is large enough to benefit. Prefers brotli (better
+ * compression ratio than gzip) when the client advertises it.
+ *
+ * Big aggregate endpoints (/transparency, /dashboard, /tokens) shrink
+ * ~70-80% over the wire, which is material on mobile networks.
  */
 async function writeJson(req, res, status, headers, body) {
   const json = JSON.stringify(body);
   const accept = (req.headers["accept-encoding"] || "").toString();
-  if (json.length >= GZIP_MIN_BYTES && /\bgzip\b/.test(accept)) {
-    try {
-      const gz = await gzipAsync(json);
-      res.writeHead(status, { ...headers, "Content-Encoding": "gzip", "Vary": "Accept-Encoding" });
-      res.end(gz);
-      return;
-    } catch (e) {
-      // Fall through to uncompressed on any gzip failure.
-      console.warn("[api] gzip failed, sending plain:", e.message);
+
+  if (json.length >= COMPRESS_MIN_BYTES) {
+    if (/\bbr\b/.test(accept)) {
+      try {
+        const br = await brotliAsync(json);
+        res.writeHead(status, { ...headers, "Content-Encoding": "br", "Vary": "Accept-Encoding" });
+        res.end(br);
+        return;
+      } catch (e) {
+        console.warn("[api] brotli failed, falling back:", e.message);
+      }
+    }
+    if (/\bgzip\b/.test(accept)) {
+      try {
+        const gz = await gzipAsync(json);
+        res.writeHead(status, { ...headers, "Content-Encoding": "gzip", "Vary": "Accept-Encoding" });
+        res.end(gz);
+        return;
+      } catch (e) {
+        console.warn("[api] gzip failed, sending plain:", e.message);
+      }
     }
   }
   res.writeHead(status, headers);
