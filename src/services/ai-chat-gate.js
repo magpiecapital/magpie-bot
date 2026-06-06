@@ -19,7 +19,6 @@
  * off-topic messages. Mixed conversation (one off-topic, then a
  * magpie question, then another tangent) doesn't trigger it.
  */
-import Anthropic from "@anthropic-ai/sdk";
 import { query } from "../db/pool.js";
 
 const DAILY_CAP = Number(process.env.PIP_DAILY_CAP || 50);
@@ -27,14 +26,6 @@ const OFFTOPIC_LIMIT = 3;
 const COOLDOWN_MINUTES = 30;
 
 const CLASSIFIER_MODEL = "claude-haiku-4-5-20251001";
-let _client = null;
-function getClient() {
-  if (_client) return _client;
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error("ANTHROPIC_API_KEY not set");
-  _client = new Anthropic({ apiKey: key });
-  return _client;
-}
 
 const CLASSIFIER_PROMPT = `You decide if a message belongs in a chat with Pip, the Magpie Capital AI agent.
 
@@ -58,17 +49,35 @@ OFF-TOPIC = clearly nothing to do with Magpie or the user's account:
 Output STRICTLY one word: "on" or "off". No punctuation, no explanation.`;
 
 async function classify(message) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    // No key configured → don't block legitimate users; treat all as
+    // on-topic. Matches ai-support.js's graceful-degrade behavior.
+    return "on";
+  }
   try {
-    const resp = await getClient().messages.create({
-      model: CLASSIFIER_MODEL,
-      max_tokens: 4,
-      temperature: 0,
-      system: CLASSIFIER_PROMPT,
-      messages: [{ role: "user", content: message.slice(0, 1500) }],
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: CLASSIFIER_MODEL,
+        max_tokens: 4,
+        temperature: 0,
+        system: CLASSIFIER_PROMPT,
+        messages: [{ role: "user", content: message.slice(0, 1500) }],
+      }),
     });
-    const text = resp.content?.[0]?.type === "text"
-      ? resp.content[0].text.trim().toLowerCase()
-      : "on";
+    if (!res.ok) {
+      console.warn("[ai-gate] classifier HTTP", res.status, "→ defaulting on-topic");
+      return "on";
+    }
+    const body = await res.json();
+    const block = Array.isArray(body?.content) ? body.content[0] : null;
+    const text = block?.type === "text" ? String(block.text || "").trim().toLowerCase() : "on";
     return text.startsWith("off") ? "off" : "on";
   } catch (err) {
     // If the classifier itself fails, default to "on" — don't block
