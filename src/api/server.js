@@ -10,8 +10,37 @@
  * Rate limiting: per-key, configurable
  */
 import http from "node:http";
+import { gzip } from "node:zlib";
+import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
+
+const gzipAsync = promisify(gzip);
+const GZIP_MIN_BYTES = 1024; // Don't bother compressing tiny responses.
+
+/**
+ * Write a JSON response, gzipping if the client supports it and the
+ * body is large enough to benefit. Big aggregate endpoints
+ * (/transparency, /dashboard, /loans) shrink ~70% over the wire,
+ * which is material on mobile networks.
+ */
+async function writeJson(req, res, status, headers, body) {
+  const json = JSON.stringify(body);
+  const accept = (req.headers["accept-encoding"] || "").toString();
+  if (json.length >= GZIP_MIN_BYTES && /\bgzip\b/.test(accept)) {
+    try {
+      const gz = await gzipAsync(json);
+      res.writeHead(status, { ...headers, "Content-Encoding": "gzip", "Vary": "Accept-Encoding" });
+      res.end(gz);
+      return;
+    } catch (e) {
+      // Fall through to uncompressed on any gzip failure.
+      console.warn("[api] gzip failed, sending plain:", e.message);
+    }
+  }
+  res.writeHead(status, headers);
+  res.end(json);
+}
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
@@ -1439,11 +1468,10 @@ async function router(req, res) {
     result = { status: 500, body: { error: "Internal server error" } };
   }
 
-  res.writeHead(result.status, {
+  await writeJson(req, res, result.status, {
     "Content-Type": "application/json",
     "Cache-Control": "public, max-age=30",
-  });
-  res.end(JSON.stringify(result.body));
+  }, result.body);
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
