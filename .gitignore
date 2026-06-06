@@ -33,3 +33,15 @@ scripts/liquidate-stuck-loan.js
 scripts/find-import-time.js
 scripts/inspect-other-txs.js
 scripts/trace-import-time.js
+scripts/handle-flagged-tickets.js
+scripts/handle-open-tickets.js
+scripts/triage-open-tickets.js
+scripts/check-ticket-loans.js
+scripts/check-wallet-loans.js
+scripts/inspect-loans-schema.js
+scripts/admin-withdraw.js
+scripts/deposit-vault.js
+scripts/withdraw-vault.js
+
+# Backup files (e.g. Cargo.lock.bak) — never ship.
+*.bak
