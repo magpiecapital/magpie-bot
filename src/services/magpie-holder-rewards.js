@@ -104,7 +104,7 @@ export async function accrueToHolderPool(feeLamports) {
   try {
     await query(
       `UPDATE magpie_holder_pool
-          SET accrued_lamports = (accrued_lamports::numeric + $1::numeric)::text,
+          SET accrued_lamports = accrued_lamports + $1::numeric,
               updated_at = NOW()
         WHERE id = 1`,
       [reward.toString()],
@@ -454,7 +454,7 @@ export async function snapshotAndDistribute() {
       const nextDelayMs = pickNextDistributionDelay();
       await client.query(
         `UPDATE magpie_holder_pool
-            SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
+            SET accrued_lamports = accrued_lamports - $1::numeric,
                 last_distribution_at = NOW(),
                 next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
                 updated_at = NOW()

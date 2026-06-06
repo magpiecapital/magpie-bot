@@ -810,7 +810,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
 export async function recordAddCollateral(loanDbId, extraRawAmount, userId = null) {
   await query(
     `UPDATE loans
-     SET collateral_amount = (collateral_amount::numeric + $2::numeric)::text,
+     SET collateral_amount = collateral_amount + $2::numeric,
          last_health_alert = NULL,
          updated_at = NOW()
      WHERE id = $1`,
@@ -827,7 +827,7 @@ export async function recordAddCollateral(loanDbId, extraRawAmount, userId = nul
 export async function recordPartialRepay(loanDbId, repayLamports, userId = null) {
   await query(
     `UPDATE loans
-     SET original_loan_amount_lamports = (original_loan_amount_lamports::numeric - $2::numeric)::text,
+     SET original_loan_amount_lamports = original_loan_amount_lamports - $2::numeric,
          last_health_alert = NULL,
          updated_at = NOW()
      WHERE id = $1`,

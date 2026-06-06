@@ -67,7 +67,7 @@ export async function accrueToLpLoyaltyPool(feeLamports) {
   try {
     await query(
       `UPDATE lp_loyalty_pool
-          SET accrued_lamports = (accrued_lamports::numeric + $1::numeric)::text,
+          SET accrued_lamports = accrued_lamports + $1::numeric,
               updated_at = NOW()
         WHERE id = 1`,
       [reward.toString()],
@@ -300,7 +300,7 @@ export async function snapshotAndDistributeLpLoyalty() {
     const nextDelay = pickNextDistributionDelay();
     await client.query(
       `UPDATE lp_loyalty_pool
-          SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
+          SET accrued_lamports = accrued_lamports - $1::numeric,
               last_distribution_at = NOW(),
               next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
               updated_at = NOW()

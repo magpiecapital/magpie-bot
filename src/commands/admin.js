@@ -975,7 +975,7 @@ export async function handleDistribute(ctx) {
     // accounting the auto-pay path would have done at snapshot time).
     await client.query(
       `UPDATE magpie_holder_pool
-          SET accrued_lamports = (accrued_lamports::numeric - $1::numeric)::text,
+          SET accrued_lamports = accrued_lamports - $1::numeric,
               last_distribution_at = NOW(),
               updated_at = NOW()
         WHERE id = 1`,
