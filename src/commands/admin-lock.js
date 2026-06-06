@@ -70,7 +70,8 @@ export async function handleAdminLock(ctx) {
     return ctx.reply(`User '${target}' not found.`);
   }
 
-  const { hours: applied } = await setSiteLock(user.id, hours);
+  const adminTag = ctx.from?.username ? `admin:@${ctx.from.username}` : `admin:#${ctx.from?.id}`;
+  const { hours: applied } = await setSiteLock(user.id, hours, { setBy: adminTag });
 
   // DM the affected user so they're not surprised — this is a
   // power-asymmetric action and the audit trail should be visible to
@@ -120,7 +121,8 @@ export async function handleAdminUnlock(ctx) {
     return ctx.reply(`User isn't locked.`);
   }
 
-  await clearSiteLock(user.id);
+  const adminTag = ctx.from?.username ? `admin:@${ctx.from.username}` : `admin:#${ctx.from?.id}`;
+  await clearSiteLock(user.id, { setBy: adminTag });
 
   try {
     await ctx.api.sendMessage(

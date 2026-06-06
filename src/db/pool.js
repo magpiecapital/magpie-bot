@@ -519,6 +519,20 @@ export async function applyStartupPatches() {
      )`,
     `INSERT INTO site_global_state(id, disabled) VALUES (1, FALSE)
        ON CONFLICT (id) DO NOTHING`,
+    // Audit log of every lock/unlock action — both user-initiated
+    // (/lock) and operator-initiated (/adminlock). Lets ops trace
+    // suspicious patterns and users see their own lock history.
+    `CREATE TABLE IF NOT EXISTS site_lock_events (
+       id BIGSERIAL PRIMARY KEY,
+       user_id BIGINT NOT NULL,
+       action TEXT NOT NULL,
+       hours INTEGER,
+       set_by TEXT NOT NULL,
+       reason TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS site_lock_events_user_idx
+       ON site_lock_events(user_id, created_at DESC)`,
   ];
   for (const sql of patches) {
     try {

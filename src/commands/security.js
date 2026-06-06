@@ -13,7 +13,7 @@
  */
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { getSiteLock } from "../services/site-lock.js";
+import { getSiteLock, getLockHistory } from "../services/site-lock.js";
 import { getPrefs } from "../services/prefs.js";
 import { query } from "../db/pool.js";
 
@@ -40,7 +40,7 @@ export async function handleSecurity(ctx) {
   if (!tgUser) return;
   const user = await upsertUser(tgUser.id, tgUser.username);
 
-  const [lock, prefs, walletsRes, withdrawsRes, noncesRes] = await Promise.all([
+  const [lock, prefs, walletsRes, withdrawsRes, noncesRes, lockHist] = await Promise.all([
     getSiteLock(user.id),
     getPrefs(user.id),
     query(
@@ -66,6 +66,7 @@ export async function handleSecurity(ctx) {
         ORDER BY n DESC`,
       [user.id],
     ),
+    getLockHistory(user.id, 5),
   ]);
 
   const lines = [
@@ -113,6 +114,19 @@ export async function handleSecurity(ctx) {
         : `${(Number(w.raw_amount) / 10 ** (w.decimals || 0)).toFixed(2)} ${shortAddr(w.asset)}`;
       const status = w.status === "confirmed" ? "✓" : w.status === "failed" ? "✗" : "…";
       lines.push(`  ${status} ${amt} → ${shortAddr(w.to_pubkey)} · ${ageStr(w.created_at)}`);
+    }
+  }
+
+  if (lockHist.length > 0) {
+    lines.push("", "*Lock history (last 5):*");
+    for (const e of lockHist) {
+      const ago = ageStr(e.created_at);
+      const who = e.set_by === "self" ? "you" : e.set_by;
+      if (e.action === "set") {
+        lines.push(`  • ${ago}: locked for ${e.hours}h by ${who}`);
+      } else {
+        lines.push(`  • ${ago}: cleared by ${who}`);
+      }
     }
   }
 
