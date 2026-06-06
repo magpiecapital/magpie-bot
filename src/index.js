@@ -226,11 +226,12 @@ bot.command("pools", handleHolderPool); // alias
 // Community moderation operator commands. Always registered so the
 // operator can enable it on demand; the per-chat enable check inside
 // the handlers ensures it does nothing in groups that haven't opted in.
-import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist } from "./commands/community-admin.js";
+import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow } from "./commands/community-admin.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
 bot.command("community_allowlist", handleCommunityAllowlist);
+bot.command("community_broadcast_now", handleCommunityBroadcastNow);
 
 // Inline callback registration.
 //
@@ -358,6 +359,9 @@ bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
     setBotTgId(info.id); // community moderation needs to whitelist the bot's own messages
+    // Community daily digest — checks every 15min, fires once per UTC day at the configured hour.
+    // No-op until at least one chat has been enabled via /community_enable.
+    import("./services/community-broadcast.js").then((m) => m.startCommunityBroadcast(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.

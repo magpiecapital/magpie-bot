@@ -83,6 +83,19 @@ export async function handleCommunityStatus(ctx) {
   return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
 
+export async function handleCommunityBroadcastNow(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const { fireDigestNow } = await import("../services/community-broadcast.js");
+  try {
+    // In DM → preview to operator only. In group → post to that group.
+    const target = isGroup(ctx) ? ctx.chat.id : ctx.from.id;
+    await fireDigestNow({ api: ctx.api }, target);
+    if (!isGroup(ctx)) await ctx.reply("✅ Digest preview sent (just to you). Run inside a moderated group to post there.");
+  } catch (err) {
+    await ctx.reply(`❌ Broadcast failed: ${err.message?.slice(0, 200)}`);
+  }
+}
+
 export async function handleCommunityAllowlist(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const items = [...URL_ALLOWLIST];
