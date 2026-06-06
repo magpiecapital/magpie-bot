@@ -557,6 +557,37 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS admin_notes_created_idx
        ON admin_notes(created_at DESC)`,
+    // 2026-06-06: Auto-Protect default flipped from opt-in to opt-out.
+    // Backfill existing users who never explicitly disabled it (i.e.,
+    // their current auto_protect is the old default of false AND they
+    // have no record of toggling it off). Conservative: only flip rows
+    // where auto_protect is FALSE — never touch a user who already
+    // chose either direction.
+    //
+    // Idempotent: re-running this UPDATE only affects users who are
+    // still on the old default. Once a user toggles either direction,
+    // their row stays as-is forever.
+    //
+    // Migration-event log so we can identify "this was the backfill,
+    // not the user's choice" if they later ask.
+    `CREATE TABLE IF NOT EXISTS prefs_migrations (
+       id BIGSERIAL PRIMARY KEY,
+       name TEXT NOT NULL UNIQUE,
+       applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       rows_affected INTEGER
+     )`,
+    `DO $$
+     DECLARE n INT;
+     BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM prefs_migrations WHERE name = 'auto_protect_default_on_2026_06_06'
+       ) THEN
+         UPDATE user_prefs SET auto_protect = TRUE WHERE auto_protect = FALSE;
+         GET DIAGNOSTICS n = ROW_COUNT;
+         INSERT INTO prefs_migrations(name, rows_affected) VALUES ('auto_protect_default_on_2026_06_06', n);
+         RAISE NOTICE 'Backfilled auto_protect=TRUE on % rows', n;
+       END IF;
+     END $$`,
   ];
   for (const sql of patches) {
     try {

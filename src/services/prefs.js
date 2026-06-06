@@ -12,7 +12,12 @@ const DEFAULTS = {
   notify_liquidations: true,
   notify_health: true,
   auto_repay: false,
-  auto_protect: false,
+  // Auto-Protect was opt-in until 2026-06-06; users had to discover
+  // and enable it to get the protocol's main anti-liquidation lever.
+  // Most never did. Defaulting to ON aligns the experience with the
+  // "zero liquidations" trust claim — users get protection without
+  // having to know it exists. They can opt out via /autoprotect.
+  auto_protect: true,
 };
 
 export async function getPrefs(userId) {

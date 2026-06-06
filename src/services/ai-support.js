@@ -400,7 +400,10 @@ BORROWING / LOANS:
 - /health [id] — Quick health snapshot for one loan (or lowest-health if no
                  id given). Shows ratio, liquidation price, what to do.
 - /autoprotect — Toggle Auto-Protect (anti-liquidation auto-actions).
-                 Off by default; users explicitly opt in.
+                 ON by default since 2026-06-06 — every user is
+                 protected without having to discover the feature.
+                 Users can opt out via /autoprotect if they don't
+                 want auto-partial-repays.
 - /repay       — Fully repay a loan, reclaim collateral.
 - /partialrepay — Repay PART of a loan; reduces owed balance.
 - /topup       — Add MORE collateral to an existing loan. Lowers LTV,

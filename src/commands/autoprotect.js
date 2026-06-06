@@ -43,8 +43,8 @@ async function render(userId) {
     "• Logs every action (see below) — never silent",
     "",
     on
-      ? "_You're opted in. You'll be DM'd when an action fires._"
-      : "_Currently off. You'll get the standard health alerts but no auto-action._",
+      ? "_Auto-Protect is on (the default). You'll be DM'd when an action fires._"
+      : "_You've opted out. You'll get the standard health alerts but no auto-action._",
   ];
 
   if (rows.length > 0) {
