@@ -255,10 +255,110 @@ async function handleGroupMessage(ctx) {
       }
     }
 
+    // ── FUD / bad-intent classifier ─────────────────────────────
+    // Runs ONLY when the message contains a negative-sentiment marker
+    // (scam/rug/fake/etc) — that pre-filter keeps LLM cost on ~5-10%
+    // of group messages instead of 100%. Conservative by design:
+    // confidence below 0.75 → no action. "criticism" → never acted on.
+    await maybeRunFudCheck(ctx, msg, sender);
+
     // Touch last_message_at for rate-limit tracking
     await touchLastMessage(ctx.chat.id, sender.id);
   } catch (err) {
     console.warn("[community] message handler failed (fail-open):", err.message);
+  }
+}
+
+/** Conservative FUD classifier — see community-fud-classifier.js for
+ *  the action mapping. NEVER auto-bans. Flags operator on edge cases. */
+async function maybeRunFudCheck(ctx, msg, sender) {
+  const text = msg.text || msg.caption || "";
+  const { hasSentimentSignal, classifyMessage, actionForVerdict } =
+    await import("../services/community-fud-classifier.js");
+  if (!hasSentimentSignal(text)) return;
+
+  // Pull member context to help the classifier
+  const member = await getMember(ctx.chat.id, sender.id);
+  const memberAgeHours = member?.joined_at
+    ? (Date.now() - new Date(member.joined_at).getTime()) / 3_600_000
+    : null;
+
+  let verdictObj;
+  try {
+    verdictObj = await classifyMessage(text, {
+      member_age_hours: memberAgeHours,
+      warned_count: member?.warned_count ?? 0,
+      in_quarantine: !!(member?.quarantine_until && new Date(member.quarantine_until) > new Date()),
+    });
+  } catch (err) {
+    console.warn("[community] FUD classify error:", err.message);
+    return;
+  }
+  if (!verdictObj) return; // fail-open
+
+  // Always LOG the classification, even when we don't act on it.
+  // Gives the operator audit visibility.
+  await recordModAction(
+    ctx.chat.id, sender.id,
+    `fud_${verdictObj.verdict}`,
+    `confidence=${verdictObj.confidence.toFixed(2)} · ${verdictObj.reason}`,
+    text.slice(0, 500),
+  );
+
+  const action = actionForVerdict(verdictObj);
+  if (action.action === "skip") return;
+
+  if (action.action === "delete") {
+    await tryDelete(ctx, msg.message_id);
+  }
+  if (action.warn) {
+    await bumpWarnedCount(ctx.chat.id, sender.id);
+    const warnText =
+      verdictObj.verdict === "misinformation"
+        ? `Your message was removed from the Magpie community group because it contained a factual claim about the protocol that doesn't match reality. If you have a real concern, DM the team via @magpie_capital_bot — we'd rather hear it directly. Repeated removals may result in a mute.`
+        : verdictObj.verdict === "harassment"
+        ? `Your message was removed for harassment. Personal attacks aren't tolerated, even when the criticism is valid. You've been temporarily muted (24h). After that, you're welcome back if the conversation stays civil.`
+        : `Your message was removed by the community moderator. If you think this was a mistake, DM @magpie_capital_bot.`;
+    await softWarn(sender.id, warnText);
+  }
+  if (action.mute_sec > 0) {
+    try {
+      const until = Math.floor(Date.now() / 1000) + action.mute_sec;
+      await ctx.api.restrictChatMember(ctx.chat.id, sender.id, {
+        permissions: { can_send_messages: false },
+        until_date: until,
+      });
+    } catch (err) {
+      console.warn("[community] mute failed:", err.message);
+    }
+  }
+  if (action.flag_operator) {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        { api: ctx.api },
+        [
+          `🚨 *FUD-classifier flag* — needs your judgment`,
+          ``,
+          `Chat: \`${ctx.chat.title || ctx.chat.id}\``,
+          `From: ${sender.username ? `@${sender.username}` : `user ${sender.id}`}`,
+          `Verdict: *${verdictObj.verdict}* (confidence ${verdictObj.confidence.toFixed(2)})`,
+          `Reason: ${verdictObj.reason}`,
+          ``,
+          `Message:`,
+          "```",
+          text.slice(0, 800),
+          "```",
+          ``,
+          `Auto-action taken: ${action.action}${action.mute_sec ? ` + ${Math.round(action.mute_sec/3600)}h mute` : ""}`,
+          ``,
+          `If you want to ban this user, do it via the group's admin UI (Telegram → group → user → Ban). I will not auto-ban.`,
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      console.warn("[community] operator flag DM failed:", err.message);
+    }
   }
 }
 
