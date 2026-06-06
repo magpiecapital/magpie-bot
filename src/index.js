@@ -77,6 +77,7 @@ import { startTokenHealth } from "./services/token-health.js";
 import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { setSecurityAlertBot } from "./services/security-alerts.js";
+import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
@@ -305,6 +306,7 @@ bot.start({
     // Re-enable when a dedicated RPC endpoint is available.
     setSecurityAlertBot(bot);
     startApiServer();
+    setTimeout(() => startDailyOpsReport(bot), 60_000);
     // startDepositWatcher(bot);
     setTimeout(() => startLoanWatcher(bot), 5_000);
     setTimeout(() => startHealthWatcher(bot), 10_000);
