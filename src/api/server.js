@@ -1207,6 +1207,25 @@ async function router(req, res) {
     return res.end();
   }
 
+  // Public site-status read: tells the dashboard whether signed
+  // endpoints are globally disabled, so the UI can render a banner
+  // instead of having users hit 503 themselves.
+  if (path === "/api/v1/site-status") {
+    try {
+      const { getGlobalSiteState } = await import("../services/site-global.js");
+      const s = await getGlobalSiteState();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        disabled: s.disabled,
+        reason: s.reason,
+        set_at: s.set_at,
+      }));
+    } catch {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ disabled: false }));
+    }
+  }
+
   // Health check (no auth) — real liveness probe
   if (path === "/api/v1/health") {
     const checks = { db: "unknown", screener: "unknown", "token-health": "unknown" };

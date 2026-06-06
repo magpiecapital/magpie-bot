@@ -14,6 +14,7 @@
  */
 import { isAdmin } from "../services/admin.js";
 import { query } from "../db/pool.js";
+import { getGlobalSiteState } from "../services/site-global.js";
 
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx.from?.id)) {
@@ -30,6 +31,8 @@ function fmtSol(lamports) {
 
 export async function handleSiteOps(ctx) {
   if (!(await requireAdmin(ctx))) return;
+
+  const globalState = await getGlobalSiteState();
 
   const [
     { rows: lockedRows },
@@ -87,6 +90,10 @@ export async function handleSiteOps(ctx) {
 
   const lines = [
     "*🔭 Site Ops — last 24h*",
+    "",
+    globalState.disabled
+      ? `🛑 *GLOBAL SITE DISABLED* — ${globalState.reason || "no reason given"}`
+      : "✅ Global state: enabled",
     "",
     `*Locked accounts:* ${locked}`,
   ];

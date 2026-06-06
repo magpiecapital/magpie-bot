@@ -86,6 +86,9 @@ export async function handleHelp(ctx) {
       "/siteops — site-action telemetry (24h locks, withdraws, signed actions)",
       "/adminlock <user> [hours] — force-lock a user (DMs them)",
       "/adminunlock <user> — clear a user's lock (DMs them)",
+      "/sitedisable [reason] — STOP every signed site endpoint (503)",
+      "/siteenable — re-enable signed site endpoints",
+      "/sitestate — show current global state",
     );
   }
 
