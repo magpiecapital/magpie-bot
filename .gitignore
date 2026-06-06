@@ -36,6 +36,9 @@ scripts/trace-import-time.js
 scripts/handle-flagged-tickets.js
 scripts/handle-open-tickets.js
 scripts/handle-ticket-*.js
+scripts/find-lp-position.js
+scripts/find-lp-position-direct.js
+scripts/verify-lp-offset-fix.js
 scripts/triage-open-tickets.js
 scripts/check-ticket-loans.js
 scripts/check-wallet-loans.js

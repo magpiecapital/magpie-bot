@@ -124,9 +124,14 @@ export async function syncOnChainPositions() {
   const program = getReadOnlyProgram();
   const [poolPda] = lendingPoolPda(LENDER_PUBKEY);
 
-  // Enumerate all depositor positions
+  // Enumerate all depositor positions for this pool.
+  // Layout: [discriminator(8)] [owner pubkey(32)] [pool pubkey(32)] ...
+  // So `pool` lives at offset 40, not 8. The earlier offset=8 silently
+  // filtered out every position (matched on `owner` bytes against the
+  // pool pubkey, which obviously never matched), leaving the entire
+  // lp_positions table empty.
   const positions = await program.account.depositorPosition.all([
-    { memcmp: { offset: 8, bytes: poolPda.toBase58() } }, // pool field is right after discriminator
+    { memcmp: { offset: 40, bytes: poolPda.toBase58() } },
   ]);
 
   const onChainByOwner = new Map();
