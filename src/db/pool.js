@@ -637,6 +637,17 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS community_mod_actions_chat_idx
        ON community_mod_actions(chat_id, created_at DESC)`,
+    // Per-rule cooldown for operator anomaly DMs so a single incident
+    // doesn't page the operator every 2-min watcher tick.
+    `CREATE TABLE IF NOT EXISTS community_anomaly_alerts (
+       id BIGSERIAL PRIMARY KEY,
+       chat_id BIGINT NOT NULL,
+       rule_key TEXT NOT NULL,
+       n_actions INT NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS community_anomaly_alerts_lookup_idx
+       ON community_anomaly_alerts(chat_id, rule_key, created_at DESC)`,
   ];
   for (const sql of patches) {
     try {

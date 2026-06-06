@@ -362,6 +362,8 @@ bot.start({
     // Community daily digest — checks every 15min, fires once per UTC day at the configured hour.
     // No-op until at least one chat has been enabled via /community_enable.
     import("./services/community-broadcast.js").then((m) => m.startCommunityBroadcast(bot));
+    // Community anomaly watcher — DMs operator on suspicious mod-action volume.
+    import("./services/community-anomaly.js").then((m) => m.startCommunityAnomalyWatcher(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.
