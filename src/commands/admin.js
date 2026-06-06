@@ -30,21 +30,32 @@ export async function handleResume(ctx) {
 
 export async function handleAdminStatus(ctx) {
   if (!(await requireAdmin(ctx))) return;
-  const { rows } = await query(
-    `SELECT
-       (SELECT COUNT(*) FROM users) AS users,
-       (SELECT COUNT(*) FROM loans WHERE status = 'active') AS active,
-       (SELECT COUNT(*) FROM loans WHERE status = 'liquidated') AS liquidated`,
-  );
+  const { getGlobalSiteState } = await import("../services/site-global.js");
+  const [{ rows }, siteState, lockedRow] = await Promise.all([
+    query(
+      `SELECT
+         (SELECT COUNT(*) FROM users) AS users,
+         (SELECT COUNT(*) FROM loans WHERE status = 'active') AS active,
+         (SELECT COUNT(*) FROM loans WHERE status = 'liquidated') AS liquidated`,
+    ),
+    getGlobalSiteState(),
+    query(
+      `SELECT COUNT(*)::int AS n FROM users
+        WHERE site_locked_until IS NOT NULL AND site_locked_until > NOW()`,
+    ),
+  ]);
   const r = rows[0];
   const lines = [
     "🛠 *Admin*",
     "",
     `Borrowing: ${isBorrowingPaused() ? "⏸ PAUSED" : "▶️ open"}`,
+    `Site signed actions: ${siteState.disabled ? "🛑 DISABLED" : "✅ enabled"}`,
+    siteState.disabled && siteState.reason ? `  ↳ ${siteState.reason}` : null,
     `Users:        ${r.users}`,
     `Active loans: ${r.active}`,
     `Liquidated:   ${r.liquidated}`,
-  ];
+    `User locks active: ${lockedRow.rows[0].n}`,
+  ].filter(Boolean);
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
 
