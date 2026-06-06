@@ -1470,7 +1470,11 @@ async function router(req, res) {
 
   await writeJson(req, res, result.status, {
     "Content-Type": "application/json",
-    "Cache-Control": "public, max-age=30",
+    // 30s fresh, 60s stale-while-revalidate: clients get instant
+    // responses for the next 90s after a fetch, with the background
+    // revalidating after 30s. Material on mobile where re-fetches
+    // pause UI; staleness for read-only public data is acceptable.
+    "Cache-Control": "public, max-age=30, stale-while-revalidate=60",
   }, result.body);
 }
 
