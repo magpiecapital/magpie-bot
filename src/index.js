@@ -286,6 +286,10 @@ async function registerBotCommands() {
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "support", description: "🛟 Self-serve help / message the team" },
       { command: "mytickets", description: "🎫 Your support tickets + status" },
+      { command: "site", description: "🌐 Open magpie.capital" },
+      { command: "security", description: "🔐 Account security view + lock buttons" },
+      { command: "privacy", description: "🔒 What we store + your controls" },
+      { command: "lock", description: "🚨 Emergency pause on site signed actions" },
       { command: "help", description: "ℹ️ Full command list" },
     ]);
     await bot.api.setChatMenuButton({
