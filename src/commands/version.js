@@ -7,6 +7,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { getStartedAt } from "../lib/heartbeat.js";
 
 let pkgVersion = "unknown";
@@ -16,6 +17,17 @@ try {
   );
   pkgVersion = pkg.version || "unknown";
 } catch { /* non-critical */ }
+
+// Compute the git short SHA once at module load. On Railway the
+// repo is checked out, so git is usually available. Fall back to env
+// vars (RAILWAY_GIT_COMMIT_SHA, GIT_COMMIT) for hosts that don't.
+let gitSha = "unknown";
+try {
+  gitSha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+    .toString().trim();
+} catch {
+  gitSha = (process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || "unknown").slice(0, 7);
+}
 
 function fmtDuration(ms) {
   const s = Math.floor(ms / 1000);
@@ -35,6 +47,7 @@ export async function handleVersion(ctx) {
     "🤖 *Magpie bot*",
     "",
     `Version: ${pkgVersion}`,
+    `Commit:  \`${gitSha}\``,
     `Node:    ${process.version}`,
     `Started: ${new Date(startedAt).toISOString().replace("T", " ").slice(0, 19)} UTC`,
     `Uptime:  ${fmtDuration(uptime)}`,
