@@ -1,8 +1,8 @@
 /**
  * Pip cost-protection gate.
  *
- * Two protections that sit BEFORE the expensive chatWithAgent call
- * for site-initiated AI chats (/api/v1/ai/chat):
+ * Two protections sit around the expensive chatWithAgent call for
+ * site-initiated AI chats (/api/v1/ai/chat):
  *
  *   1. Per-user daily message cap. Resets every 24h from first
  *      message in the window. Prevents one user from draining the
@@ -14,6 +14,14 @@
  *      Three off-topic in a row → polite redirect + cooldown.
  *      Cooldown auto-clears when the user comes back with a
  *      Magpie-related question.
+ *
+ * The fast gates (cooldown + daily cap) run BEFORE chatWithAgent so
+ * we can short-circuit. The classifier runs IN PARALLEL with the
+ * agent (see applyTopicGate) — Haiku ~400ms beats Sonnet ~2-6s, so
+ * the user pays Sonnet latency only, not the sum. If the classifier
+ * comes back "off" with streak reaching the limit, we discard the
+ * Sonnet response and serve the cooldown copy instead. Small waste
+ * on the rare cooldown case for much faster typical responses.
  *
  * "A few jokes is fine" — the gate only fires after THREE consecutive
  * off-topic messages. Mixed conversation (one off-topic, then a
@@ -104,12 +112,16 @@ async function getOrCreateUsage(userId) {
 }
 
 /**
- * Run all the pre-flight gates. Returns one of:
- *   { ok: true } — proceed to chatWithAgent
- *   { ok: false, response: string, reason: string } — short-circuit
- *     with this canned response (no Anthropic call)
+ * Fast pre-flight: cooldown + daily cap. Synchronous-fast (one DB read,
+ * maybe one write to roll the 24h window). NO Anthropic call. Always
+ * run BEFORE kicking off the main chat — these conditions short-circuit
+ * the expensive call.
+ *
+ * Returns:
+ *   { ok: true } — proceed to chat + topic gate
+ *   { ok: false, response, reason } — short-circuit with canned copy
  */
-export async function preflightAiChat({ userId, message }) {
+export async function preflightFast({ userId }) {
   const usage = await getOrCreateUsage(userId);
 
   // 1. Cooldown check (set by previous off-topic streak)
@@ -120,7 +132,7 @@ export async function preflightAiChat({ userId, message }) {
     return {
       ok: false,
       reason: "cooldown",
-      response: `I stepped away for a sec. Back in ~${minsLeft}m. If it's urgent, /support in the Telegram bot reaches the team directly.`,
+      response: `Stepped away for a sec — back in ~${minsLeft}m. If it's urgent, /support in the Telegram bot reaches the team directly.`,
     };
   }
 
@@ -134,24 +146,43 @@ export async function preflightAiChat({ userId, message }) {
       [userId],
     );
     usage.messages_24h = 0;
-    usage.window_start = new Date().toISOString();
   }
   if (usage.messages_24h >= DAILY_CAP) {
     return {
       ok: false,
       reason: "daily_cap",
-      response: `You've hit today's chat limit with me (${DAILY_CAP} messages). I'll be back in ~24h — in the meantime, /support in the Telegram bot still works.`,
+      response: `You've hit today's chat limit with me (${DAILY_CAP} messages). Back in ~24h — /support in the Telegram bot still works in the meantime.`,
     };
   }
 
-  // 3. Topic classifier
+  return { ok: true };
+}
+
+/**
+ * Slow gate: run the Haiku classifier and update the off-topic streak.
+ * Safe to invoke IN PARALLEL with chatWithAgent — the caller awaits
+ * both, then decides whether to serve the agent's response or the
+ * cooldown copy.
+ *
+ * Returns:
+ *   { ok: true } — agent response is fine to serve
+ *   { ok: false, response, reason } — serve this copy instead and
+ *     discard the agent's reply (rare path)
+ */
+export async function applyTopicGate({ userId, message }) {
+  // Re-read usage so we have the latest streak (in case another
+  // concurrent message updated it). Cheap — single primary-key lookup.
+  const { rows: [usage] } = await query(
+    `SELECT offtopic_streak FROM ai_chat_usage WHERE user_id = $1`,
+    [userId],
+  );
+  const currentStreak = usage?.offtopic_streak ?? 0;
+
   const topic = await classify(message);
 
   if (topic === "off") {
-    const nextStreak = (usage.offtopic_streak || 0) + 1;
+    const nextStreak = currentStreak + 1;
     if (nextStreak >= OFFTOPIC_LIMIT) {
-      // Lock for COOLDOWN_MINUTES and reset streak so the user can
-      // come back after the timer.
       await query(
         `UPDATE ai_chat_usage
             SET offtopic_streak = 0,
@@ -164,7 +195,7 @@ export async function preflightAiChat({ userId, message }) {
       return {
         ok: false,
         reason: "offtopic_cooldown",
-        response: `Alright, I love a good tangent but I'm here to help with Magpie stuff — loans, your account, the protocol. Let's pick it back up in ${COOLDOWN_MINUTES} minutes when we can stay on track. If you genuinely need the team, /support in the bot is always open.`,
+        response: `Gotta hop for a bit — catch you in ${COOLDOWN_MINUTES} min? If something Magpie-related comes up urgent before then, /support in the Telegram bot pings the team.`,
       };
     }
     await query(
@@ -175,12 +206,11 @@ export async function preflightAiChat({ userId, message }) {
         WHERE user_id = $1`,
       [userId, nextStreak],
     );
-    // Off-topic but under the limit — let the message through. Pip's
-    // system prompt knows to lightly steer back without being preachy.
+    // Off-topic but under the limit — let the agent's response stand.
     return { ok: true };
   }
 
-  // On-topic — reset streak, increment count, proceed.
+  // On-topic — reset streak, increment count.
   await query(
     `UPDATE ai_chat_usage
         SET offtopic_streak = 0,
@@ -190,4 +220,15 @@ export async function preflightAiChat({ userId, message }) {
     [userId],
   );
   return { ok: true };
+}
+
+/**
+ * Legacy composite: fast + slow gates in series. Retained for any
+ * caller that doesn't want to parallelize. New code should use
+ * preflightFast + applyTopicGate in parallel.
+ */
+export async function preflightAiChat({ userId, message }) {
+  const fast = await preflightFast({ userId });
+  if (!fast.ok) return fast;
+  return applyTopicGate({ userId, message });
 }

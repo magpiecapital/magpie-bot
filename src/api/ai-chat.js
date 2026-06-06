@@ -22,7 +22,7 @@ import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
-import { preflightAiChat } from "../services/ai-chat-gate.js";
+import { preflightFast, applyTopicGate } from "../services/ai-chat-gate.js";
 import { verifyChatSession } from "../services/pip-session.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
@@ -92,36 +92,56 @@ async function runChatForUser({ signerPubkey, action, message, pageContext }) {
     return { status: 200, body: { ok: true, action: "reset" } };
   }
 
+  // Fast pre-flight first: cooldown + daily cap. Short-circuits the
+  // expensive Sonnet call when the user is gated.
   try {
-    const gate = await preflightAiChat({ userId: linked.id, message });
-    if (!gate.ok) {
+    const fast = await preflightFast({ userId: linked.id });
+    if (!fast.ok) {
       return {
         status: 200,
-        body: {
-          ok: true,
-          action: "chat",
-          response: gate.response,
-          gated: gate.reason,
-        },
+        body: { ok: true, action: "chat", response: fast.response, gated: fast.reason },
       };
     }
   } catch (e) {
-    console.warn("[ai-chat] gate error, proceeding anyway:", e.message);
+    console.warn("[ai-chat] preflight error, proceeding anyway:", e.message);
   }
 
   const finalMessage = pageContext
     ? `(User is currently on the page: ${String(pageContext).slice(0, 64)})\n\n${message}`
     : message;
 
-  let result;
-  try {
-    result = await chatWithAgent(linked.id, finalMessage, {
-      username: linked.telegram_username,
+  // Run the topic classifier IN PARALLEL with Sonnet. Haiku ~400ms,
+  // Sonnet ~2-6s — user pays Sonnet latency, not the sum. If the
+  // classifier comes back with a cooldown trigger, we discard the
+  // Sonnet response and serve the cooldown copy instead.
+  const topicGatePromise = applyTopicGate({ userId: linked.id, message })
+    .catch((e) => {
+      console.warn("[ai-chat] topic-gate error, treating as ok:", e.message);
+      return { ok: true };
     });
+
+  let result;
+  let gate;
+  try {
+    [result, gate] = await Promise.all([
+      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username }),
+      topicGatePromise,
+    ]);
   } catch (e) {
     console.error("[ai-chat] agent error:", e.message);
     return { status: 500, body: { error: "AI agent error", detail: e.message?.slice(0, 200) } };
   }
+
+  // If the classifier tripped the cooldown, serve that copy and
+  // discard the agent's response. Small cost we eat to keep the
+  // hot path fast — the typical user never hits this branch.
+  if (gate && gate.ok === false) {
+    return {
+      status: 200,
+      body: { ok: true, action: "chat", response: gate.response, gated: gate.reason },
+    };
+  }
+
   if (!result?.text) {
     return { status: 500, body: { error: "AI agent returned no response" } };
   }
@@ -299,26 +319,17 @@ export async function handleAiChat(req) {
     return { status: 200, body: { ok: true, action: "reset" } };
   }
 
-  // ── Cost-protection gate ──
-  // Checks per-user daily cap, off-topic streak with cooldown.
-  // Short-circuits with a canned response (no Anthropic call) on
-  // gate-fail — so abusers can't burn through credits.
+  // Fast pre-flight first: cooldown + daily cap (no Anthropic call).
   try {
-    const gate = await preflightAiChat({ userId: linked.id, message });
-    if (!gate.ok) {
+    const fast = await preflightFast({ userId: linked.id });
+    if (!fast.ok) {
       return {
         status: 200,
-        body: {
-          ok: true,
-          action: "chat",
-          response: gate.response,
-          gated: gate.reason,
-        },
+        body: { ok: true, action: "chat", response: fast.response, gated: fast.reason },
       };
     }
   } catch (e) {
-    // Don't block legitimate users if the gate itself crashes.
-    console.warn("[ai-chat] gate error, proceeding anyway:", e.message);
+    console.warn("[ai-chat] preflight error, proceeding anyway:", e.message);
   }
 
   // Inject light page-context hint when the floating chat passes
@@ -328,15 +339,33 @@ export async function handleAiChat(req) {
     ? `(User is currently on the page: ${String(page_context).slice(0, 64)})\n\n${message}`
     : message;
 
-  let result;
-  try {
-    result = await chatWithAgent(linked.id, finalMessage, {
-      username: linked.telegram_username,
+  // Topic classifier runs alongside Sonnet so the user pays the max
+  // of the two latencies, not the sum.
+  const topicGatePromise = applyTopicGate({ userId: linked.id, message })
+    .catch((e) => {
+      console.warn("[ai-chat] topic-gate error, treating as ok:", e.message);
+      return { ok: true };
     });
+
+  let result;
+  let gate;
+  try {
+    [result, gate] = await Promise.all([
+      chatWithAgent(linked.id, finalMessage, { username: linked.telegram_username }),
+      topicGatePromise,
+    ]);
   } catch (e) {
     console.error("[ai-chat] agent error:", e.message);
     return { status: 500, body: { error: "AI agent error", detail: e.message?.slice(0, 200) } };
   }
+
+  if (gate && gate.ok === false) {
+    return {
+      status: 200,
+      body: { ok: true, action: "chat", response: gate.response, gated: gate.reason },
+    };
+  }
+
   if (!result?.text) {
     return { status: 500, body: { error: "AI agent returned no response" } };
   }
