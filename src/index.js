@@ -114,6 +114,7 @@ bot.use(rateLimit());
 bot.command("start", handleStart);
 bot.command("deposit", handleDeposit);
 bot.command("positions", handlePositions);
+bot.command("loans", handlePositions); // alias — users type /loans more often
 bot.command("history", handleHistory);
 bot.command("borrow", handleBorrow);
 bot.command("repay", handleRepay);
