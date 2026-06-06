@@ -553,10 +553,11 @@ async function handleLoans(req, url) {
     [w.user_id],
   );
 
-  const shape = (l) => ({
+  const shape = (l, healthRatio) => ({
     loan_id: l.loan_id?.toString?.() ?? null,
     loan_pda: l.loan_pda,
     status: l.status,
+    health_ratio: healthRatio,
     collateral: {
       mint: l.collateral_mint,
       symbol: l.symbol,
@@ -580,12 +581,39 @@ async function handleLoans(req, url) {
     tx_signature: l.tx_signature,
   });
 
+  // Compute live health_ratio for ACTIVE loans only (history doesn't need it).
+  // Bounded parallelism via Promise.all; helpers fail-soft to null.
+  // Health = collateral_value_in_lamports / owed_lamports.
+  const activeRows = rows.filter((r) => r.status === "active");
+  const historyRows = rows.filter((r) => r.status !== "active");
+  let healthByLoanId = new Map();
+  try {
+    const { getLiveOwedLamports } = await import("../services/loans.js");
+    const { collateralValueLamports } = await import("../services/price.js");
+    const results = await Promise.all(activeRows.map(async (r) => {
+      try {
+        const owed = await getLiveOwedLamports(r).catch(() => BigInt(r.original_loan_amount_lamports ?? "0"));
+        if (!owed || owed <= 0n) return [r.loan_id, null];
+        if (r.decimals == null) return [r.loan_id, null];
+        const cVal = await collateralValueLamports(r.collateral_mint, r.collateral_amount, r.decimals);
+        if (!cVal || cVal <= 0n) return [r.loan_id, null];
+        const ratio = Number(cVal) / Number(owed);
+        return [r.loan_id, Number.isFinite(ratio) ? Number(ratio.toFixed(3)) : null];
+      } catch {
+        return [r.loan_id, null];
+      }
+    }));
+    healthByLoanId = new Map(results);
+  } catch (err) {
+    console.warn("[loans] health enrich failed:", err.message);
+  }
+
   return {
     status: 200,
     body: {
       wallet,
-      active: rows.filter((r) => r.status === "active").map(shape),
-      history: rows.filter((r) => r.status !== "active").map(shape),
+      active: activeRows.map((r) => shape(r, healthByLoanId.get(r.loan_id) ?? null)),
+      history: historyRows.map((r) => shape(r, null)),
     },
   };
 }
