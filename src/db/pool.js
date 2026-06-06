@@ -557,6 +557,18 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS admin_notes_created_idx
        ON admin_notes(created_at DESC)`,
+    // Pip (site AI chat) per-user usage tracking. We don't want one
+    // user burning through Anthropic credits all day. Each row tracks
+    // a 24h window of message counts + an off-topic streak that triggers
+    // a polite "let's stay on-topic" redirect after 3 off-topic posts.
+    `CREATE TABLE IF NOT EXISTS ai_chat_usage (
+       user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+       messages_24h INTEGER NOT NULL DEFAULT 0,
+       window_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       offtopic_streak INTEGER NOT NULL DEFAULT 0,
+       cooldown_until TIMESTAMPTZ,
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
     // 2026-06-06: Auto-Protect default flipped from opt-in to opt-out.
     // Backfill existing users who never explicitly disabled it (i.e.,
     // their current auto_protect is the old default of false AND they

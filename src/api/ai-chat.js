@@ -22,6 +22,7 @@ import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
+import { preflightAiChat } from "../services/ai-chat-gate.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -187,6 +188,28 @@ export async function handleAiChat(req) {
       console.warn("[ai-chat] reset failed:", e.message);
     }
     return { status: 200, body: { ok: true, action: "reset" } };
+  }
+
+  // ── Cost-protection gate ──
+  // Checks per-user daily cap, off-topic streak with cooldown.
+  // Short-circuits with a canned response (no Anthropic call) on
+  // gate-fail — so abusers can't burn through credits.
+  try {
+    const gate = await preflightAiChat({ userId: linked.id, message });
+    if (!gate.ok) {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          action: "chat",
+          response: gate.response,
+          gated: gate.reason,
+        },
+      };
+    }
+  } catch (e) {
+    // Don't block legitimate users if the gate itself crashes.
+    console.warn("[ai-chat] gate error, proceeding anyway:", e.message);
   }
 
   let result;
