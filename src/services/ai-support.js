@@ -1697,6 +1697,17 @@ const TOOLS = [
     },
   },
   {
+    name: "propose_repay",
+    description: "Prepare a repay-loan action the user can sign with one tap on the site. Use this ONLY when the user clearly asks to repay (e.g. 'repay my loan', 'pay off #1780...', 'I want to close out'). DO NOT call execute — this just builds a signed proposal. The site renders a confirmation card with a Sign & Repay button; the borrower's wallet does the actual signing. After calling, your text response should be ONE short line introducing the card (e.g. 'Here's the repay for loan #X — tap Sign & Repay when you're ready.'). Do not repeat the numbers in prose; the card shows them.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to repay (the long number from /positions). If user said 'my loan' and they have only one active, you may use that one's ID after lookup." },
+      },
+      required: ["loan_id"],
+    },
+  },
+  {
     name: "list_my_loans",
     description: "Get a summary of the current user's loans (active + recent history). Use when they ask about loans generally without specifying an ID.",
     input_schema: { type: "object", properties: {} },
@@ -1910,6 +1921,66 @@ const TOOL_HANDLERS = {
       due_at_utc: dueIsoUtc,
       hours_to_due: ((dueMs - Date.now()) / 3_600_000).toFixed(1),
       past_due: dueMs < Date.now(),
+    };
+  },
+
+  propose_repay: async ({ loan_id }, { userId }) => {
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID was not found for this user. Tell them to double-check the ID or call list_my_loans.");
+    const loan = rows[0];
+    const program = getReadOnlyProgram();
+    let onChain;
+    try {
+      onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
+    } catch (err) {
+      return toolError("rpc_blip", err.message, HINT_RPC_BLIP);
+    }
+    const status =
+      "repaid" in onChain.status ? "repaid"
+      : "liquidated" in onChain.status ? "liquidated"
+      : "active";
+    if (status !== "active") {
+      return toolError(
+        "loan_not_active",
+        `status=${status}`,
+        `This loan is already ${status}. Tell the user there's nothing to repay.`,
+      );
+    }
+    const owedLamports = BigInt(onChain.repayAmount.toString()).toString();
+    const originalLamports = BigInt(loan.loan_amount_lamports ?? "0");
+    const feeLamports = BigInt(loan.original_loan_amount_lamports ?? owedLamports) - originalLamports;
+    const dueMs = Number(onChain.dueTimestamp) * 1000;
+    // The site renders an action card from this; the borrower wallet does
+    // the actual signing. This handler does NOT execute the repay.
+    return {
+      action_proposed: {
+        type: "repay",
+        loan_id: loan.loan_id,
+        loan_pda: loan.loan_pda,
+        program_id: loan.program_id,
+        collateral_mint: loan.collateral_mint,
+        collateral_symbol: loan.symbol,
+        collateral_amount_raw: loan.collateral_amount?.toString?.() ?? String(loan.collateral_amount),
+        collateral_decimals: loan.decimals ?? 0,
+        owed_lamports: owedLamports,
+        owed_sol: fmtSol(owedLamports),
+        original_lamports: originalLamports.toString(),
+        fee_lamports: (feeLamports > 0n ? feeLamports : 0n).toString(),
+        fee_sol: fmtSol(feeLamports > 0n ? feeLamports : 0n),
+        due_at_utc: new Date(dueMs).toISOString(),
+        hours_to_due: ((dueMs - Date.now()) / 3_600_000).toFixed(1),
+        past_due: dueMs < Date.now(),
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      // Hint the model on what to say back: short and to the point.
+      _agent_instruction: "Respond with ONE short line introducing the repay card (e.g. 'Here's the repay for loan #X — tap Sign & Repay when you're ready.'). Don't repeat numbers in prose; the card shows them.",
     };
   },
 
@@ -3019,6 +3090,9 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
   const usedTools = [];
   let escalatedTicketId = null;
   let escalatedReason = null;
+  // If a propose_* tool fires, we capture the action proposal here and
+  // bubble it up so the site can render an inline confirm card.
+  let proposedAction = null;
 
   // Build the per-call extra system block. Includes:
   //   - username (for sparing warmth)
@@ -3121,6 +3195,7 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
         escalated_ticket_id: escalatedTicketId,
         escalated_reason: escalatedReason,
         used_tools: usedTools,
+        proposed_action: proposedAction,
       };
     }
 
@@ -3140,6 +3215,12 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
           if (tu.name === "open_support_ticket" && result?.ticket_id) {
             escalatedTicketId = result.ticket_id;
             escalatedReason = result.reason || null;
+          }
+          // Capture any action proposal so the API response can carry it.
+          // Last one wins if the model proposes multiple — should only ever
+          // be one per turn anyway.
+          if (result?.action_proposed) {
+            proposedAction = result.action_proposed;
           }
         } catch (err) {
           result = { error: err.message?.slice(0, 200) || "Tool failed." };

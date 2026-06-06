@@ -155,6 +155,7 @@ async function runChatForUser({ signerPubkey, action, message, pageContext }) {
       blocked_reason: result.blocked_reason ?? null,
       spend_capped: result.spend_capped ?? false,
       escalated_ticket_id: result.escalated_ticket_id ?? null,
+      proposed_action: result.proposed_action ?? null,
     },
   };
 }
@@ -379,6 +380,7 @@ export async function handleAiChat(req) {
       blocked_reason: result.blocked_reason ?? null,
       spend_capped: result.spend_capped ?? false,
       escalated_ticket_id: result.escalated_ticket_id ?? null,
+      proposed_action: result.proposed_action ?? null,
     },
   };
 }
