@@ -1505,12 +1505,15 @@ Mandatory tool triggers — pattern → tool:
 - User asks "what did I do recently", "show my activity", "history" generally → \`get_my_recent_activity\`
 - User asks "what's my limit", "how much can I borrow", "why was my borrow rejected", "what tier am I", "how do I get more" → \`get_my_loan_limits\`
 - User asks "what would I get if I borrow against X", "simulate a loan", "preview a loan", "rate for Y tokens" → \`simulate_loan\`
-- User says ANY borrow intent ("I want to borrow", "can I take a loan", "lend me SOL", "borrow against my X", "I want to take out a loan", "loan?"):
-    STEP 1: Call \`get_my_eligible_collateral\` FIRST — never ask the user what they have, look it up. This returns their wallet + every eligible token they hold + max-borrow per tier + their current tier limits.
-    STEP 2: Present concisely: their wallet short-id, then a 1-liner per eligible token with the best-tier SOL estimate, plus their per-loan cap. Recommend ONE option grounded in numbers. End with "Want me to set up [token] at [tier]?"
-    STEP 3: Once they confirm collateral + tier (and amount if not implicit), call \`propose_borrow\` with the exact values. The site renders the confirm card.
-    NEVER redirect to /borrow in Telegram. NEVER ask "what do you want to borrow against" without checking first.
-- User says "repay my loan", "pay off #X", "I want to close out my loan", "settle the loan" → \`propose_repay\`. DO NOT redirect them to /repay in Telegram — repay happens here too.
+- User says ANY borrow intent ("I want to borrow", "can I take a loan", "lend me SOL", "borrow against my X", "loan?"):
+    • If the user NAMES a token + amount (and optionally tier): call \`propose_borrow\` directly. Don't make them re-confirm what they already told you.
+    • If the user is VAGUE ("what can I borrow", "show me my options"): call \`get_my_eligible_collateral\` FIRST, then present concisely with a recommendation grounded in numbers ("You have X $BONK worth ~Y SOL — Standard tier would get you ~Z SOL for 7 days"). Ask which option they want, then \`propose_borrow\`.
+    • Either way: NEVER redirect them to /borrow in Telegram. The borrow happens right here via the action card.
+- User says "repay my loan", "pay off #X", "close out my loan", "settle the loan" → \`propose_repay\` (use list_my_loans first if no ID given). DO NOT redirect to /repay in Telegram.
+- User says "topup", "add collateral", "lower my LTV", "protect from liquidation", "boost health" → \`propose_topup\` (ask for amount if not given).
+- User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
+- User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
+- ALL loan actions execute in this chat via cards. NEVER tell the user to run any of these commands in Telegram.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
 - User asks "how do I see all my loans by date", "loan calendar", "when are my loans due" → point at /calendar
@@ -1718,6 +1721,41 @@ const TOOLS = [
         tier: { type: "string", enum: ["express", "quick", "standard"], description: "Loan tier. express=30% LTV/2d/3% fee, quick=25%/3d/2%, standard=20%/7d/1.5%." },
       },
       required: ["token", "collateral_amount", "tier"],
+    },
+  },
+  {
+    name: "propose_topup",
+    description: "Prepare an ADD COLLATERAL action for an existing loan. Use when the user wants to /topup, 'add collateral', 'lower my LTV', 'protect from liquidation', 'boost my health'. Site renders an inline card with current vs new health + a single Sign & Topup button. Borrower-only signature, no co-sign needed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to top up." },
+        extra_amount: { type: "string", description: "UI-friendly amount of the SAME collateral token to add (e.g. '500' for 500 more BONK). NOT base units." },
+      },
+      required: ["loan_id", "extra_amount"],
+    },
+  },
+  {
+    name: "propose_extend",
+    description: "Prepare an EXTEND-LOAN-TERM action. Use when the user wants to /extend, 'push out the due date', 'I need more time', 'rollover my loan'. Site renders a card with the fee + new due date + Sign & Extend button. Borrower-only signature.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to extend." },
+      },
+      required: ["loan_id"],
+    },
+  },
+  {
+    name: "propose_partial_repay",
+    description: "Prepare a PAY-DOWN-PARTIAL action that pays down some of the loan without closing it (collateral stays locked). Use when the user wants to /partialrepay, 'pay down a chunk', 'reduce what I owe', 'partial repay'. Card shows new owed after the payment. Borrower-only signature.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to partial-repay." },
+        repay_sol: { type: "string", description: "Amount of SOL to repay, as a human-friendly decimal (e.g. '0.5' for 0.5 SOL)." },
+      },
+      required: ["loan_id", "repay_sol"],
     },
   },
   {
@@ -2100,6 +2138,137 @@ const TOOL_HANDLERS = {
         expires_at: Date.now() + 5 * 60 * 1000,
       },
       _agent_instruction: "Respond with ONE short line introducing the borrow card (e.g. 'Here's your ${tier} borrow against ${amount} ${symbol} — tap Sign & Borrow when you're ready.'). Do NOT repeat the numbers — the card shows everything. Never tell them to use /borrow in TG.",
+    };
+  },
+
+  propose_topup: async ({ loan_id, extra_amount }, { userId }) => {
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals
+         FROM loans l LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2 LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    const uiAmount = parseFloat(String(extra_amount));
+    if (!Number.isFinite(uiAmount) || uiAmount <= 0) return toolError("bad_amount", null, "Extra collateral amount must be a positive number.");
+    const decimals = loan.decimals ?? 0;
+    const extraRaw = BigInt(Math.floor(uiAmount * Math.pow(10, decimals))).toString();
+
+    const program = getReadOnlyProgram();
+    let onChain;
+    try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
+    catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
+    const status = "repaid" in onChain.status ? "repaid"
+      : "liquidated" in onChain.status ? "liquidated" : "active";
+    if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status} — nothing to top up.`);
+
+    return {
+      action_proposed: {
+        type: "topup",
+        loan_id: loan.loan_id,
+        loan_pda: loan.loan_pda,
+        program_id: loan.program_id,
+        collateral_mint: loan.collateral_mint,
+        collateral_symbol: loan.symbol,
+        collateral_decimals: decimals,
+        extra_amount_raw: extraRaw,
+        extra_ui_amount: String(uiAmount),
+        current_collateral_raw: loan.collateral_amount?.toString?.() ?? String(loan.collateral_amount),
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction: "Respond with ONE short line introducing the topup card. Don't repeat the numbers — the card shows them.",
+    };
+  },
+
+  propose_extend: async ({ loan_id }, { userId }) => {
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2 LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    const program = getReadOnlyProgram();
+    let onChain;
+    try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
+    catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
+    const status = "repaid" in onChain.status ? "repaid"
+      : "liquidated" in onChain.status ? "liquidated" : "active";
+    if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status} — can't extend.`);
+    const dueMs = Number(onChain.dueTimestamp) * 1000;
+    if (dueMs < Date.now()) return toolError("past_due", null, "Loan is past due — extend isn't allowed. They should /repay or /partialrepay instead.");
+
+    // Extend fee = tier fee bps × current owed. Approximate; on-chain computes exact.
+    const owed = BigInt(onChain.repayAmount.toString());
+    const tierFeeBps =
+      loan.duration_days === 2 ? 300n :
+      loan.duration_days === 3 ? 200n :
+      150n;
+    const estFee = (owed * tierFeeBps) / 10_000n;
+    const newDueMs = dueMs + (loan.duration_days * 24 * 3600 * 1000);
+
+    return {
+      action_proposed: {
+        type: "extend",
+        loan_id: loan.loan_id,
+        loan_pda: loan.loan_pda,
+        program_id: loan.program_id,
+        collateral_symbol: loan.symbol,
+        duration_days: loan.duration_days,
+        est_fee_sol: fmtSol(estFee),
+        current_due_at_utc: new Date(dueMs).toISOString(),
+        new_due_at_utc: new Date(newDueMs).toISOString(),
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction: "Respond with ONE short line introducing the extend card.",
+    };
+  },
+
+  propose_partial_repay: async ({ loan_id, repay_sol }, { userId }) => {
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2 LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    const sol = parseFloat(String(repay_sol));
+    if (!Number.isFinite(sol) || sol <= 0) return toolError("bad_amount", null, "Repay amount must be > 0 SOL.");
+
+    const program = getReadOnlyProgram();
+    let onChain;
+    try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
+    catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
+    const status = "repaid" in onChain.status ? "repaid"
+      : "liquidated" in onChain.status ? "liquidated" : "active";
+    if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status}.`);
+
+    const owedLamports = BigInt(onChain.repayAmount.toString());
+    const repayLamports = BigInt(Math.floor(sol * 1e9));
+    if (repayLamports >= owedLamports) {
+      return toolError("amount_too_high", null, `That amount is >= what's owed (${fmtSol(owedLamports)} SOL). If they want to close the loan entirely, use propose_repay instead.`);
+    }
+    const newOwed = owedLamports - repayLamports;
+
+    return {
+      action_proposed: {
+        type: "partial_repay",
+        loan_id: loan.loan_id,
+        loan_pda: loan.loan_pda,
+        program_id: loan.program_id,
+        collateral_symbol: loan.symbol,
+        repay_lamports: repayLamports.toString(),
+        repay_sol: fmtSol(repayLamports),
+        owed_lamports_before: owedLamports.toString(),
+        owed_sol_before: fmtSol(owedLamports),
+        owed_lamports_after: newOwed.toString(),
+        owed_sol_after: fmtSol(newOwed),
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction: "Respond with ONE short line introducing the partial-repay card.",
     };
   },
 
