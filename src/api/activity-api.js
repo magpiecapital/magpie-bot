@@ -52,6 +52,7 @@ export async function handleActivity(req, url) {
     { rows: withdrawRows },
     { rows: refRows },
     { rows: holderRows },
+    { rows: lockRows },
   ] = await Promise.all([
     query(
       `SELECT id, loan_id, collateral_mint, loan_amount_lamports::text AS amount,
@@ -107,6 +108,14 @@ export async function handleActivity(req, url) {
          JOIN wallets w ON w.public_key = mhr.wallet_address
         WHERE w.user_id = $1 AND mhr.status = 'paid'
         ORDER BY mhr.paid_at DESC NULLS LAST
+        LIMIT $2`,
+      [userId, limit],
+    ),
+    query(
+      `SELECT id, action, hours, set_by, created_at
+         FROM site_lock_events
+        WHERE user_id = $1
+        ORDER BY created_at DESC
         LIMIT $2`,
       [userId, limit],
     ),
@@ -174,6 +183,14 @@ export async function handleActivity(req, url) {
       at: r.paid_at || r.created_at,
       amount_lamports: r.amount,
       tx_signature: r.paid_tx_signature,
+    });
+  }
+  for (const r of lockRows) {
+    events.push({
+      kind: r.action === "set" ? "lock_set" : "lock_cleared",
+      at: r.created_at,
+      hours: r.hours ?? null,
+      set_by: r.set_by,
     });
   }
 
