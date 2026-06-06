@@ -223,6 +223,15 @@ bot.command("infrahealth", handleInfraHealth);
 bot.command("holderpool", handleHolderPool);
 bot.command("pools", handleHolderPool); // alias
 
+// Community moderation operator commands. Always registered so the
+// operator can enable it on demand; the per-chat enable check inside
+// the handlers ensures it does nothing in groups that haven't opted in.
+import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist } from "./commands/community-admin.js";
+bot.command("community_enable", handleCommunityEnable);
+bot.command("community_disable", handleCommunityDisable);
+bot.command("community_status", handleCommunityStatus);
+bot.command("community_allowlist", handleCommunityAllowlist);
+
 // Inline callback registration.
 //
 // CRITICAL ORDER: import and support are registered FIRST because
@@ -258,6 +267,15 @@ registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
+
+// Community moderation handlers — register BEFORE the message:text
+// fallback so URL deletes / quarantine kicks happen before any
+// other text-handling tries to process the message. Per-chat opt-in
+// (community_chats.enabled) means it's a no-op in any chat the
+// operator hasn't run /community_enable in.
+import { registerCommunityHandlers } from "./handlers/community-handlers.js";
+import { setBotTgId } from "./services/community-moderation.js";
+registerCommunityHandlers(bot);
 
 // Fallback: respond to any text message that isn't a command
 bot.on("message:text", handleFallback);
@@ -339,6 +357,7 @@ console.log("🏦 Magpie bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
+    setBotTgId(info.id); // community moderation needs to whitelist the bot's own messages
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.

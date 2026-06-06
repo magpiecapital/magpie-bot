@@ -600,6 +600,43 @@ export async function applyStartupPatches() {
          RAISE NOTICE 'Backfilled auto_protect=TRUE on % rows', n;
        END IF;
      END $$`,
+
+    // ── COMMUNITY MODERATION ────────────────────────────────────
+    // Tracks which TG groups have the moderation bot active. Operator
+    // enables per-chat via /community_enable. Quarantine + member
+    // state is keyed by (chat_id, user_id).
+    `CREATE TABLE IF NOT EXISTS community_chats (
+       chat_id BIGINT PRIMARY KEY,
+       title TEXT,
+       enabled BOOLEAN NOT NULL DEFAULT TRUE,
+       enabled_by_user_id BIGINT,
+       enabled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE TABLE IF NOT EXISTS community_members (
+       chat_id BIGINT NOT NULL,
+       user_id BIGINT NOT NULL,
+       joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       quarantine_until TIMESTAMPTZ,
+       captcha_passed_at TIMESTAMPTZ,
+       last_message_at TIMESTAMPTZ,
+       warned_count INT NOT NULL DEFAULT 0,
+       PRIMARY KEY (chat_id, user_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS community_members_quarantine_idx
+       ON community_members(chat_id, quarantine_until)
+       WHERE quarantine_until IS NOT NULL`,
+    `CREATE TABLE IF NOT EXISTS community_mod_actions (
+       id BIGSERIAL PRIMARY KEY,
+       chat_id BIGINT NOT NULL,
+       user_id BIGINT NOT NULL,
+       action TEXT NOT NULL,
+       reason TEXT,
+       payload TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS community_mod_actions_chat_idx
+       ON community_mod_actions(chat_id, created_at DESC)`,
   ];
   for (const sql of patches) {
     try {

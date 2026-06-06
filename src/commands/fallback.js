@@ -55,6 +55,12 @@ const HANDLER_MAP = {
 const SOLANA_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 export async function handleFallback(ctx) {
+  // Skip non-DM chats entirely — fallback is meant for 1:1 conversation
+  // with the bot. In groups, the bot replying to every text message
+  // would be obnoxious (and the community-moderation handler in
+  // src/handlers/community-handlers.js is the right surface for group
+  // behavior).
+  if (ctx.chat?.type !== "private") return;
   const text = ctx.message?.text?.trim();
   if (!text) return;
 
