@@ -32,6 +32,7 @@ import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
 import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -75,6 +76,10 @@ async function readJsonBody(req) {
 
 export async function handleSupportAsk(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
+
   if (!isAiSupportEnabled()) {
     return {
       status: 503,

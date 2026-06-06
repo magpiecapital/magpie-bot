@@ -20,6 +20,7 @@ import { query } from "../db/pool.js";
 import { getPrefs } from "../services/prefs.js";
 import { alertPrefChanged } from "../services/security-alerts.js";
 import { rejectIfLocked, getSiteLock } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -124,6 +125,9 @@ export async function handlePrefsList(req, url) {
 
 export async function handlePrefsSet(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {

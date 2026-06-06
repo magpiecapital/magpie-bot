@@ -21,6 +21,7 @@ import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { alertSetActiveWallet } from "../services/security-alerts.js";
 import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -111,6 +112,9 @@ export async function handleWalletsList(req, url) {
 
 export async function handleWalletsSetActive(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {

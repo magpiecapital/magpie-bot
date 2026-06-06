@@ -506,6 +506,19 @@ export async function applyStartupPatches() {
     // suspected-compromise recovery. The user sets it from TG (different
     // auth surface) so a stolen Phantom seed can't suppress the lock.
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS site_locked_until TIMESTAMPTZ`,
+    // GLOBAL site kill-switch. While disabled=true here, EVERY signed
+    // site endpoint rejects with 503 — operator override for incidents
+    // (e.g. suspected compromise of the bot server, sudden surge of
+    // suspicious activity, planned maintenance).
+    `CREATE TABLE IF NOT EXISTS site_global_state (
+       id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+       disabled BOOLEAN NOT NULL DEFAULT FALSE,
+       reason TEXT,
+       set_by TEXT,
+       set_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `INSERT INTO site_global_state(id, disabled) VALUES (1, FALSE)
+       ON CONFLICT (id) DO NOTHING`,
   ];
   for (const sql of patches) {
     try {

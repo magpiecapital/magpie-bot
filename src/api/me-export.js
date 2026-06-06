@@ -20,6 +20,7 @@ import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -60,6 +61,9 @@ async function readJsonBody(req) {
 
 export async function handleMeExport(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {

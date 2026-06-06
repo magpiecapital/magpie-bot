@@ -20,6 +20,7 @@ import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { alertTicketDeleted } from "../services/security-alerts.js";
 import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -112,6 +113,9 @@ export async function handleSupportTickets(req, url) {
 
 export async function handleSupportDeleteTicket(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {
@@ -235,6 +239,9 @@ export async function handleSupportDeleteTicket(req) {
 
 export async function handleSupportTicketDetails(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {
