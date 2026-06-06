@@ -1509,7 +1509,15 @@ Mandatory tool triggers — pattern → tool:
     • If the user NAMES a token + amount (and optionally tier): call \`propose_borrow\` directly. Don't make them re-confirm what they already told you.
     • If the user is VAGUE ("what can I borrow", "show me my options"): call \`get_my_eligible_collateral\` FIRST, then present concisely with a recommendation grounded in numbers ("You have X $BONK worth ~Y SOL — Standard tier would get you ~Z SOL for 7 days"). Ask which option they want, then \`propose_borrow\`.
     • Either way: NEVER redirect them to /borrow in Telegram. The borrow happens right here via the action card.
-- User says "repay my loan", "pay off #X", "close out my loan", "settle the loan" → \`propose_repay\` (use list_my_loans first if no ID given). DO NOT redirect to /repay in Telegram.
+- User says "repay my loan", "pay off #X", "close out my loan", "settle the loan", OR a vague "manage my loan", "what can I do with my loan":
+    → If the user EXPLICITLY says full repay (close out, pay off, settle, pay it all), call \`propose_repay\` directly.
+    → If ambiguous, call \`list_my_loans\` first, then present the FULL OPTION MENU as a clean markdown list, e.g.:
+      "Loan #X · owe Y SOL · due in Zh. Pick one:
+        • **Pay it all off** — full repay, collateral returns. *Say: repay it.*
+        • **Partial repay** — pay any amount, loan stays open. *Say: partial repay 0.5 SOL.*
+        • **Top up collateral** — lowers LTV, raises health. *Say: add 1000 BONK.*
+        • **Extend** — pushes due date, small fee. *Say: extend it.*"
+      Then wait for them to pick + call the appropriate propose_X.
 - User says "topup", "add collateral", "lower my LTV", "protect from liquidation", "boost health" → \`propose_topup\` (ask for amount if not given).
 - User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
@@ -2144,7 +2152,7 @@ const TOOL_HANDLERS = {
     };
   },
 
-  propose_topup: async ({ loan_id, extra_amount }, { userId }) => {
+  propose_topup: async ({ loan_id, extra_amount }, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.*, sm.symbol, sm.decimals
          FROM loans l LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -2165,6 +2173,11 @@ const TOOL_HANDLERS = {
     const status = "repaid" in onChain.status ? "repaid"
       : "liquidated" in onChain.status ? "liquidated" : "active";
     if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status} — nothing to top up.`);
+    const onChainBorrowerTopup = onChain.borrower?.toBase58?.();
+    if (signerPubkey && onChainBorrowerTopup && signerPubkey !== onChainBorrowerTopup) {
+      return toolError("wrong_signer_wallet", `loan.borrower=${onChainBorrowerTopup} signer=${signerPubkey}`,
+        `That loan was opened by ${onChainBorrowerTopup.slice(0,4)}…${onChainBorrowerTopup.slice(-4)}. Tell the user they need to switch their wallet in Phantom to that one before topping up.`);
+    }
 
     return {
       action_proposed: {
@@ -2184,7 +2197,7 @@ const TOOL_HANDLERS = {
     };
   },
 
-  propose_extend: async ({ loan_id }, { userId }) => {
+  propose_extend: async ({ loan_id }, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.*, sm.symbol FROM loans l
          LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -2200,6 +2213,11 @@ const TOOL_HANDLERS = {
     const status = "repaid" in onChain.status ? "repaid"
       : "liquidated" in onChain.status ? "liquidated" : "active";
     if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status} — can't extend.`);
+    const onChainBorrowerExt = onChain.borrower?.toBase58?.();
+    if (signerPubkey && onChainBorrowerExt && signerPubkey !== onChainBorrowerExt) {
+      return toolError("wrong_signer_wallet", `loan.borrower=${onChainBorrowerExt} signer=${signerPubkey}`,
+        `That loan was opened by ${onChainBorrowerExt.slice(0,4)}…${onChainBorrowerExt.slice(-4)}. Tell the user to switch their wallet in Phantom to that one before extending.`);
+    }
     const dueMs = Number(onChain.dueTimestamp) * 1000;
     if (dueMs < Date.now()) return toolError("past_due", null, "Loan is past due — extend isn't allowed. They should /repay or /partialrepay instead.");
 
@@ -2229,7 +2247,7 @@ const TOOL_HANDLERS = {
     };
   },
 
-  propose_partial_repay: async ({ loan_id, repay_sol }, { userId }) => {
+  propose_partial_repay: async ({ loan_id, repay_sol }, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.*, sm.symbol FROM loans l
          LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -2248,6 +2266,11 @@ const TOOL_HANDLERS = {
     const status = "repaid" in onChain.status ? "repaid"
       : "liquidated" in onChain.status ? "liquidated" : "active";
     if (status !== "active") return toolError("loan_not_active", null, `This loan is already ${status}.`);
+    const onChainBorrowerPR = onChain.borrower?.toBase58?.();
+    if (signerPubkey && onChainBorrowerPR && signerPubkey !== onChainBorrowerPR) {
+      return toolError("wrong_signer_wallet", `loan.borrower=${onChainBorrowerPR} signer=${signerPubkey}`,
+        `That loan was opened by ${onChainBorrowerPR.slice(0,4)}…${onChainBorrowerPR.slice(-4)}. Tell the user to switch their wallet in Phantom to that one before partial-repaying.`);
+    }
 
     const owedLamports = BigInt(onChain.repayAmount.toString());
     const repayLamports = BigInt(Math.floor(sol * 1e9));
@@ -2275,7 +2298,7 @@ const TOOL_HANDLERS = {
     };
   },
 
-  propose_repay: async ({ loan_id }, { userId }) => {
+  propose_repay: async ({ loan_id }, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.*, sm.symbol, sm.decimals
          FROM loans l
@@ -2302,6 +2325,19 @@ const TOOL_HANDLERS = {
         "loan_not_active",
         `status=${status}`,
         `This loan is already ${status}. Tell the user there's nothing to repay.`,
+      );
+    }
+    // Critical: the on-chain borrower must be the wallet that's about to
+    // sign. The user can have multiple wallets imported to one Magpie
+    // account — Pip might see a loan opened by wallet A while the user
+    // is currently connected with wallet B. The sig would fail at the
+    // program with InvalidAccountData. Catch this here with a clear msg.
+    const onChainBorrower = onChain.borrower?.toBase58?.();
+    if (signerPubkey && onChainBorrower && signerPubkey !== onChainBorrower) {
+      return toolError(
+        "wrong_signer_wallet",
+        `loan.borrower=${onChainBorrower} signer=${signerPubkey}`,
+        `That loan was opened by a different wallet (${onChainBorrower.slice(0,4)}…${onChainBorrower.slice(-4)}). Tell the user they need to switch their wallet in Phantom to that one before repaying — the on-chain program will only accept a sig from the original borrower.`,
       );
     }
     const owedLamports = BigInt(onChain.repayAmount.toString()).toString();
