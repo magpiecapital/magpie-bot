@@ -56,11 +56,12 @@ await check("GET /api/v1/health → 200 + checks ok", async () => {
 });
 
 // 2. site-status
-await check("GET /api/v1/site-status responds", async () => {
+await check("GET /api/v1/site-status returns {disabled, announcement}", async () => {
   const r = await fetch(`${BOT}/api/v1/site-status`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const j = await r.json();
   if (typeof j.disabled !== "boolean") throw new Error("missing disabled field");
+  if (!("announcement" in j)) throw new Error("missing announcement field");
   return true;
 });
 
@@ -134,7 +135,14 @@ if (process.env.DATABASE_URL) {
     return rows.length > 0;
   };
 
-  for (const t of ["used_nonces", "site_withdrawals", "site_global_state", "site_lock_events", "account_link_codes"]) {
+  for (const t of [
+    "used_nonces",
+    "site_withdrawals",
+    "site_global_state",
+    "site_lock_events",
+    "site_announcement",
+    "account_link_codes",
+  ]) {
     await check(`DB table ${t} exists`, async () => (await tableExists(t)) || (() => { throw new Error("missing"); })());
   }
   await check(`DB col users.site_locked_until exists`, async () => (await colExists("users", "site_locked_until")) || (() => { throw new Error("missing"); })());
