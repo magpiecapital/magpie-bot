@@ -11,7 +11,8 @@
     "backend": "node backend/src/index.js",
     "backend:dev": "node --watch backend/src/index.js",
     "eval-ai": "node scripts/eval-ai-support.js",
-    "check-site": "node scripts/check-site.js"
+    "check-site": "node scripts/check-site.js",
+    "test-signed": "node scripts/test-signed-endpoints.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
