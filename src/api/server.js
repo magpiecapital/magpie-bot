@@ -1250,7 +1250,7 @@ async function router(req, res) {
 
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "X-API-Key, Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "X-API-Key, Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
