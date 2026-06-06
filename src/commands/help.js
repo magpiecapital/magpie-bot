@@ -52,6 +52,7 @@ export async function handleHelp(ctx) {
     "",
     "*Stats*",
     "/stats — protocol-wide stats",
+    "/version — bot version + uptime",
     "",
     "*Support*",
     "/support — diagnose a loan, check a tx, or message the team",
