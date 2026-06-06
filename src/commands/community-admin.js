@@ -30,19 +30,91 @@ function isGroup(ctx) {
   return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
 }
 
+/** The pinned community guidelines. Edit GUIDELINES_MESSAGE below to
+ *  change copy; re-run /community_repost_guidelines to update the pin. */
+const GUIDELINES_MESSAGE = [
+  "👋 *Welcome to the Magpie community.*",
+  "",
+  "I'm Pip — Magpie's AI agent. I moderate this group, answer questions, and surface protocol updates. Tap `/ask` or `@magpie_capital_bot` followed by your question and I'll do my best.",
+  "",
+  "🛡 *Safety basics — please read once*",
+  "• *Never* share your seed phrase or private key. Anyone asking is a scammer. No exceptions.",
+  "• *Never* DM strangers about your wallet, even if they say they're \"Magpie support\". Real Magpie comms come ONLY through this bot in a group setting, or via the official X handle.",
+  "• Official accounts: [X · @MagpieLoans](https://x.com/MagpieLoans) · [Bot · @magpie_capital_bot](https://t.me/magpie_capital_bot) · [Site · magpie.capital](https://magpie.capital). Anything else is impersonation.",
+  "• If someone offers you \"free $MAGPIE\", \"claim your airdrop\", or wants you to send SOL to an address — it's a scam. Always.",
+  "",
+  "🤖 *What I auto-moderate*",
+  "• Links to non-official domains → deleted",
+  "• Phishing-pattern phrases → deleted",
+  "• Impersonators with `magpie/support/admin/team` in their name → flagged",
+  "• New members are quarantined for 7 days (no images / forwards / fast-posting) — this isn't personal, it's how we keep scammer bots out",
+  "",
+  "💬 *To get help*",
+  "• `/ask <question>` — ask me anything about Magpie",
+  "• Personal stuff (your loans, credit score, balance) — DM me at @magpie_capital_bot. I can't see who's asking from this group.",
+  "",
+  "_Verify any protocol claim on-chain at [solscan.io](https://solscan.io) or [magpie.capital/stats](https://magpie.capital/stats)._",
+].join("\n");
+
+async function postAndPinGuidelines(ctx) {
+  try {
+    const sent = await ctx.api.sendMessage(ctx.chat.id, GUIDELINES_MESSAGE, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+    });
+    await ctx.api.pinChatMessage(ctx.chat.id, sent.message_id, {
+      disable_notification: false, // do notify; users should see this once
+    }).catch((err) => {
+      console.warn("[community-enable] pin failed:", err.message);
+    });
+    return true;
+  } catch (err) {
+    console.warn("[community-enable] post-guidelines failed:", err.message);
+    return false;
+  }
+}
+
 export async function handleCommunityEnable(ctx) {
   if (!(await requireAdmin(ctx))) return;
   if (!isGroup(ctx)) {
     return ctx.reply("Run this *inside* the group you want to moderate, not in DM.", { parse_mode: "Markdown" });
   }
+  const alreadyOn = await isChatEnabled(ctx.chat.id);
   await enableChat(ctx.chat.id, ctx.chat.title, ctx.from.id);
   await ctx.reply(
     `✅ Community moderation *enabled* for "${ctx.chat.title}".\n\n` +
-    `Make sure the bot has *Delete Messages* + *Ban Users* permissions ` +
-    `in the group admin settings, or some rules will silently fail.\n\n` +
+    `Make sure the bot has *Delete Messages*, *Ban Users*, AND *Pin Messages* ` +
+    `permissions in the group admin settings, or some rules will silently fail.\n\n` +
     `Use \`/community_status\` for recent stats, \`/community_disable\` to turn off.`,
     { parse_mode: "Markdown" },
   );
+  // Auto-post + pin guidelines on FIRST enable. Re-runs of /community_enable
+  // don't re-pin (operator can /community_repost_guidelines to refresh).
+  if (!alreadyOn) {
+    const ok = await postAndPinGuidelines(ctx);
+    if (ok) {
+      await ctx.reply(
+        `📌 Posted + pinned the community guidelines. New members will see them at the top of the chat. ` +
+        `Edit copy in src/commands/community-admin.js and run \`/community_repost_guidelines\` to refresh.`,
+      );
+    } else {
+      await ctx.reply(
+        `⚠️ Moderation is on, but I couldn't auto-pin the guidelines (likely missing *Pin Messages* permission). ` +
+        `Grant the permission and run \`/community_repost_guidelines\`.`,
+        { parse_mode: "Markdown" },
+      );
+    }
+  }
+}
+
+export async function handleCommunityRepostGuidelines(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  if (!isGroup(ctx)) {
+    return ctx.reply("Run this inside the group.");
+  }
+  const ok = await postAndPinGuidelines(ctx);
+  if (ok) await ctx.reply("📌 Guidelines reposted + pinned.");
+  else await ctx.reply("⚠️ Failed — check Pin Messages permission.");
 }
 
 export async function handleCommunityDisable(ctx) {
