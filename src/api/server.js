@@ -70,6 +70,7 @@ import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
+import { handlePipSession } from "./pip-session.js";
 import { handleMeExport } from "./me-export.js";
 import { handleDashboardAggregate } from "./dashboard-api.js";
 
@@ -1233,8 +1234,10 @@ const PUBLIC_ROUTES = new Set([
   // Unified activity feed (borrows, repays, auto-protect, withdraws,
   // referral payouts, holder rewards). Same risk envelope as /loans.
   "/api/v1/activity",
-  // Ephemeral AI chat — signed, doesn't create tickets.
+  // Ephemeral AI chat — signed message OR Bearer session token.
   "/api/v1/ai/chat",
+  // Mint a Pip chat session — sign once, chat for 24h.
+  "/api/v1/auth/pip-session",
   // Signed JSON dump of all of the user's data — privacy / GDPR.
   "/api/v1/me/export",
   // Dashboard aggregate — single-fetch primer for the linked-user dashboard.
@@ -1445,6 +1448,9 @@ async function router(req, res) {
         break;
       case "/api/v1/ai/chat":
         result = await handleAiChat(req);
+        break;
+      case "/api/v1/auth/pip-session":
+        result = await handlePipSession(req);
         break;
       case "/api/v1/me/export":
         result = await handleMeExport(req);

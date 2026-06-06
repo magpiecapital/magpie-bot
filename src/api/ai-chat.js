@@ -23,6 +23,7 @@ import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../service
 import { rejectIfLocked } from "../services/site-lock.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { preflightAiChat } from "../services/ai-chat-gate.js";
+import { verifyChatSession } from "../services/pip-session.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -63,6 +64,81 @@ async function readJsonBody(req) {
   });
 }
 
+/**
+ * Run the chat for a pre-authenticated user (Bearer-token path).
+ * Pubkey trust comes from a verified Pip session token — no per-
+ * message signature, no nonce. Lock check + cost gate still apply.
+ */
+async function runChatForUser({ signerPubkey, action, message, pageContext }) {
+  const { rows: [linked] } = await query(
+    `SELECT u.id, u.telegram_username
+       FROM wallets w JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1 LIMIT 1`,
+    [signerPubkey],
+  );
+  if (!linked) {
+    return { status: 403, body: { error: "Session wallet is not linked to a Magpie account" } };
+  }
+
+  const lockResp = await rejectIfLocked(linked.id);
+  if (lockResp) return lockResp;
+
+  if ((action || "chat") === "reset") {
+    try {
+      await resetConversation(linked.id);
+    } catch (e) {
+      console.warn("[ai-chat] reset failed:", e.message);
+    }
+    return { status: 200, body: { ok: true, action: "reset" } };
+  }
+
+  try {
+    const gate = await preflightAiChat({ userId: linked.id, message });
+    if (!gate.ok) {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          action: "chat",
+          response: gate.response,
+          gated: gate.reason,
+        },
+      };
+    }
+  } catch (e) {
+    console.warn("[ai-chat] gate error, proceeding anyway:", e.message);
+  }
+
+  const finalMessage = pageContext
+    ? `(User is currently on the page: ${String(pageContext).slice(0, 64)})\n\n${message}`
+    : message;
+
+  let result;
+  try {
+    result = await chatWithAgent(linked.id, finalMessage, {
+      username: linked.telegram_username,
+    });
+  } catch (e) {
+    console.error("[ai-chat] agent error:", e.message);
+    return { status: 500, body: { error: "AI agent error", detail: e.message?.slice(0, 200) } };
+  }
+  if (!result?.text) {
+    return { status: 500, body: { error: "AI agent returned no response" } };
+  }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      action: "chat",
+      response: result.text,
+      blocked_reason: result.blocked_reason ?? null,
+      spend_capped: result.spend_capped ?? false,
+      escalated_ticket_id: result.escalated_ticket_id ?? null,
+    },
+  };
+}
+
 export async function handleAiChat(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
 
@@ -79,6 +155,39 @@ export async function handleAiChat(req) {
   } catch (e) {
     return { status: 400, body: { error: `Invalid body: ${e.message}` } };
   }
+
+  // Bearer-token path: if the client presents a valid Pip session
+  // token, we skip the per-message signature dance entirely. Token
+  // is bound to the wallet's pubkey, scope="chat", 24h TTL.
+  const authHeader = (req.headers["authorization"] || req.headers["Authorization"] || "").toString();
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  let signerPubkeyFromToken = null;
+
+  if (bearerToken) {
+    const verified = verifyChatSession(bearerToken);
+    if (!verified.ok) {
+      return {
+        status: 401,
+        body: { error: "Invalid or expired Pip session", reason: verified.reason },
+      };
+    }
+    signerPubkeyFromToken = verified.pubkey;
+    // Bearer mode: jump straight to per-user gates + chat. Validates
+    // action + message from body (no signature wrapper here).
+    const { action, message: bodyMessage, page_context } = body || {};
+    if ((action || "chat") === "chat") {
+      if (!bodyMessage || typeof bodyMessage !== "string" || bodyMessage.length > MAX_MESSAGE_LEN) {
+        return { status: 400, body: { error: `Message missing or too long` } };
+      }
+    }
+    return await runChatForUser({
+      signerPubkey: signerPubkeyFromToken,
+      action: action || "chat",
+      message: bodyMessage,
+      pageContext: page_context,
+    });
+  }
+
   const { signedMessageBase64, signatureBase58, signerPubkey } = body || {};
   if (!signedMessageBase64 || !signatureBase58 || !signerPubkey) {
     return {
