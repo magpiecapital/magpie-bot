@@ -204,7 +204,9 @@ async function handleGroupMessage(ctx) {
         const count = await bumpWarnedCount(ctx.chat.id, sender.id);
         await softWarn(
           sender.id,
-          `Your message was removed from the Magpie group because it contained a link outside our allowlist. Only links to magpie.capital, our bot, X, Solscan, and a few official tools are allowed.` +
+          `Your message was removed from the Magpie community group because it contained a link.\n\n` +
+          `*Only tweets from the official @MagpieLoans X account are allowed.* This is to keep scammers and phishing links out — almost every other "useful link" in a DeFi community turns out to be a scam.\n\n` +
+          `Allowed format: https://x.com/MagpieLoans/... or https://twitter.com/MagpieLoans/...` +
           (count >= 3 ? `\n\nThis is warning #${count}. Repeated removals may result in a temporary mute.` : ``),
         );
         return; // already removed; don't run other checks

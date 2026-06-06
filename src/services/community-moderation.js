@@ -21,19 +21,24 @@ import { query } from "../db/pool.js";
 
 /* ──────────────────────────── CONFIG ──────────────────────────── */
 
-// Domains we explicitly allow in group messages. Anything else =
-// auto-delete. Curated. NEVER include shorteners or third-party hosts.
+// STRICT POLICY (operator decision, 2026-06-06):
+// Regular users can post NO links in moderated groups EXCEPT tweets
+// from the official @MagpieLoans X account. Every other link — including
+// magpie.capital, solscan, jup.ag, even the bot's own t.me URL — gets
+// auto-deleted from non-admin senders. Rationale: ~every link a random
+// member posts in DeFi groups is a phishing attempt. Tighter blast
+// radius beats "convenient but accidentally allows a scammer."
+//
+// Operators, chat admins, and the bot itself are NOT subject to this
+// filter (the message handler skips them before the URL check), so
+// official links can still be posted by you, pinned messages, and
+// Pip's own responses.
+//
+// Both x.com and twitter.com variants of /MagpieLoans are honored
+// because Telegram users paste either depending on their app.
 export const URL_ALLOWLIST = new Set([
-  "magpie.capital",
-  "www.magpie.capital",
-  "t.me/magpie_capital_bot",     // the bot itself
-  "x.com/MagpieLoans",            // official X
+  "x.com/MagpieLoans",
   "twitter.com/MagpieLoans",
-  "solscan.io",                   // tx verification
-  "explorer.solana.com",
-  "jup.ag",                       // legitimate Jupiter swaps
-  "pump.fun",                     // where $MAGPIE lives
-  "github.com/magpiecapital",     // open source
 ]);
 
 // Quarantine: new members can't post links/forwards and are rate-
@@ -113,7 +118,17 @@ export function extractUrls(msg) {
   return [...urls];
 }
 
-/** Decide if a URL is on the allowlist. Path-tolerant. */
+/** Decide if a URL is on the allowlist.
+ *
+ * STRICT-MATCH semantics: every allowlist entry MUST include a path
+ * (host + "/handle"). A bare-host entry would let a scammer post
+ * x.com/RandomScammer and slip through. Each entry is matched as a
+ * path prefix at a path boundary so x.com/MagpieLoans/status/... is
+ * allowed but x.com/MagpieLoans2 (impersonation typo) is not.
+ *
+ * The host comparison strips an optional leading "www." so users
+ * pasting www.x.com/MagpieLoans don't get blocked.
+ */
 export function isAllowedUrl(rawUrl) {
   try {
     let u = rawUrl.trim();
@@ -121,17 +136,22 @@ export function isAllowedUrl(rawUrl) {
       u = "https://" + u;
     }
     const parsed = new URL(u);
-    const host = parsed.hostname.toLowerCase();
-    const pathStart = host + (parsed.pathname || "");
-    // Check both bare-host AND host+path-prefix forms in the allowlist
-    if (URL_ALLOWLIST.has(host)) return true;
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    // Twitter/X handles are case-insensitive (x.com/MagpieLoans ==
+    // x.com/magpieloans on Twitter's side). Compare both sides
+    // lowercased to avoid false rejects on case variants.
+    const path = (parsed.pathname || "/").toLowerCase();
+    const candidate = host + path;          // e.g. "x.com/magpieloans/status/123"
+    const candidateBase = host + path.replace(/\/+$/, ""); // strip trailing /
+
     for (const allowed of URL_ALLOWLIST) {
-      if (allowed === pathStart) return true;
-      if (pathStart.startsWith(allowed + "/") || pathStart.startsWith(allowed)) {
-        // Only allow if the allowlist entry matches at a path boundary
-        if (allowed.includes("/")) return true;
-      }
-      if (host.endsWith("." + allowed)) return true; // www. subdomain
+      if (!allowed.includes("/")) continue; // guard — bare hosts rejected
+      const a = allowed.toLowerCase();
+      if (candidate === a) return true;
+      if (candidateBase === a) return true;
+      // Path-boundary prefix: "x.com/magpieloans/" but NOT "x.com/magpieloans2/"
+      if (candidate.startsWith(a + "/")) return true;
+      if (candidate.startsWith(a + "?")) return true;
     }
     return false;
   } catch {
