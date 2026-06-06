@@ -1,44 +1,78 @@
 /**
- * Periodic cleanup of the used_nonces table.
+ * Periodic cleanup of bounded-lifetime tables.
  *
- * The replay-protection window is ±5 minutes (set in each signed
- * endpoint). Nonces older than that can never be reused as a valid
- * replay because the freshness check would reject them first.
+ *   used_nonces       — retain 24h. Replay window is ±5min, so anything
+ *                       older provably can't be reused.
+ *   site_lock_events  — retain 90 days. Useful history for users
+ *                       reviewing their own activity, but no value in
+ *                       keeping indefinitely.
+ *   account_link_codes — already TTL-bounded to 15 min, but expired-
+ *                       unclaimed rows accumulate forever. Purge after 7d.
  *
- * We retain 24h of history anyway — comfortable safety margin + lets
- * /siteops show "signed actions by purpose (24h)" without joining
- * against deleted rows. Beyond 24h, the rows are dead weight.
- *
- * Run hourly; deletes are fast (indexed on created_at) and bounded
- * (LIMIT 10k per cycle so a worst-case backlog can't hold a tx open).
+ * Run hourly; each delete is batched (LIMIT) so a backlog can't hold
+ * a transaction open.
  */
 import { query } from "../db/pool.js";
 
 const RUN_INTERVAL_MS = 60 * 60 * 1000; // hourly
-const RETAIN_HOURS = 24;
 const BATCH_LIMIT = 10_000;
+
+async function purgeNonces() {
+  const { rowCount } = await query(
+    `DELETE FROM used_nonces
+      WHERE nonce IN (
+        SELECT nonce FROM used_nonces
+          WHERE created_at < NOW() - INTERVAL '24 hours'
+          LIMIT $1
+      )`,
+    [BATCH_LIMIT],
+  );
+  return rowCount || 0;
+}
+
+async function purgeLockEvents() {
+  const { rowCount } = await query(
+    `DELETE FROM site_lock_events
+      WHERE id IN (
+        SELECT id FROM site_lock_events
+          WHERE created_at < NOW() - INTERVAL '90 days'
+          LIMIT $1
+      )`,
+    [BATCH_LIMIT],
+  );
+  return rowCount || 0;
+}
+
+async function purgeLinkCodes() {
+  const { rowCount } = await query(
+    `DELETE FROM account_link_codes
+      WHERE code IN (
+        SELECT code FROM account_link_codes
+          WHERE expires_at < NOW() - INTERVAL '7 days'
+          LIMIT $1
+      )`,
+    [BATCH_LIMIT],
+  );
+  return rowCount || 0;
+}
 
 async function cleanup() {
   try {
-    const { rowCount } = await query(
-      `DELETE FROM used_nonces
-        WHERE nonce IN (
-          SELECT nonce FROM used_nonces
-            WHERE created_at < NOW() - ($1 || ' hours')::interval
-            LIMIT $2
-        )`,
-      [String(RETAIN_HOURS), BATCH_LIMIT],
-    );
-    if (rowCount > 0) {
-      console.log(`[nonces-cleaner] purged ${rowCount} expired nonces`);
+    const [nonces, locks, codes] = await Promise.all([
+      purgeNonces().catch((e) => { console.warn("[cleaner] nonces failed:", e.message); return 0; }),
+      purgeLockEvents().catch((e) => { console.warn("[cleaner] lock_events failed:", e.message); return 0; }),
+      purgeLinkCodes().catch((e) => { console.warn("[cleaner] link_codes failed:", e.message); return 0; }),
+    ]);
+    if (nonces + locks + codes > 0) {
+      console.log(`[cleaner] purged ${nonces} nonces, ${locks} lock events, ${codes} link codes`);
     }
   } catch (err) {
-    console.warn("[nonces-cleaner] tick failed:", err.message);
+    console.warn("[cleaner] tick failed:", err.message);
   }
 }
 
 export function startUsedNoncesCleaner() {
-  console.log(`[nonces-cleaner] starting — purges nonces older than ${RETAIN_HOURS}h, every ${RUN_INTERVAL_MS / 60_000}min`);
+  console.log("[cleaner] starting — purges expired used_nonces (24h), site_lock_events (90d), account_link_codes (7d after expiry)");
   // First run after 10 min to let other startup tasks finish.
   setTimeout(cleanup, 10 * 60 * 1000);
   return setInterval(cleanup, RUN_INTERVAL_MS);
