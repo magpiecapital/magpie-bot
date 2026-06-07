@@ -851,6 +851,164 @@ export async function handleCommunitySupport(ctx) {
   });
 }
 
+/* ─────────────────────────── /apy ─────────────────────────── */
+
+async function fetchPoolYield() {
+  // 30d annualized: (sum of LP-share-of-fees over last 30d) / (avg LP TVL) × (365/30)
+  // We do this in one round-trip; both inputs are already on-chain
+  // facts, just aggregated through the DB.
+  const { rows: [r] } = await query(
+    `WITH last30 AS (
+       SELECT
+         COALESCE(SUM(loan_amount_lamports::numeric) * 0.02, 0)::numeric AS approx_fees_to_lps_30d
+       FROM loans
+       WHERE created_at > NOW() - INTERVAL '30 days'
+     )
+     SELECT
+       (SELECT COALESCE(SUM(shares::numeric), 0) FROM lp_positions WHERE shares > 0)::text AS tvl_lamports,
+       (SELECT approx_fees_to_lps_30d::text FROM last30) AS lp_earnings_30d_lamports`,
+  );
+  const tvlSol = Number(r.tvl_lamports) / 1e9;
+  const earn30d = Number(r.lp_earnings_30d_lamports) / 1e9;
+  // Avoid divide-by-zero. If TVL is microscopic, just say "—".
+  let apr = 0;
+  if (tvlSol > 0.01) {
+    apr = (earn30d / tvlSol) * (365 / 30) * 100;
+  }
+  return { tvlSol, earn30d, apr };
+}
+
+export async function handleCommunityApy(ctx) {
+  try {
+    const y = await fetchPoolYield();
+    const aprStr = y.apr > 0 ? `${y.apr.toFixed(1)}%` : "—";
+    const text = [
+      `📈 *Magpie LP · current yield (rough estimate)*`,
+      "```",
+      RULE,
+      row("30-DAY ROLLING APR (EST.)", aprStr),
+      RULE,
+      ``,
+      row("LP pool TVL", `${y.tvlSol.toFixed(2)} SOL`),
+      row("LP earnings (30d)", `${y.earn30d.toFixed(2)} SOL`),
+      RULE,
+      "```",
+      ``,
+      `_Rough estimate — assumes 80% of every loan fee (≈ 2% avg) flows to LPs, annualized over 30 days. Actual yield depends on borrow demand. Past performance ≠ future returns._`,
+      ``,
+      `Deposit at [magpie.capital/earn](${SITE_URL}/earn). See /lend for how it works.`,
+    ].join("\n");
+    await ctx.reply(text, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🏦 Deposit SOL", url: `${SITE_URL}/earn` },
+            { text: "📊 Live stats", url: SITE_STATS_URL },
+          ],
+        ],
+      },
+    });
+  } catch (err) {
+    console.warn("[community-apy] failed:", err.message);
+    await ctx.reply(
+      `⚠️ APR estimate briefly unavailable. Try again, or see live pool stats at ${SITE_STATS_URL}`,
+      { disable_web_page_preview: true },
+    );
+  }
+}
+
+/* ─────────────────────────── /tvl ─────────────────────────── */
+
+export async function handleCommunityTvl(ctx) {
+  try {
+    const { rows: [r] } = await query(
+      `SELECT
+         COALESCE((SELECT SUM(shares::numeric) FROM lp_positions WHERE shares > 0), 0)::text     AS lp_lamports,
+         COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans WHERE status='active'), 0)::text AS active_lamports,
+         COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans), 0)::text                      AS lifetime_lamports,
+         (SELECT COUNT(*) FROM loans WHERE status='active')::int                                        AS active_loans`,
+    );
+    const lpSol = Number(r.lp_lamports) / 1e9;
+    const activeSol = Number(r.active_lamports) / 1e9;
+    const lifetimeSol = Number(r.lifetime_lamports) / 1e9;
+    const text = [
+      `🏦 *Magpie · pool TVL*`,
+      "```",
+      RULE,
+      row("LP POOL DEPOSITED", `${lpSol.toFixed(2)} SOL`),
+      RULE,
+      ``,
+      row("Currently out on loan", `${activeSol.toFixed(2)} SOL`),
+      row("Active loans", r.active_loans),
+      row("Lifetime borrowed", `${lifetimeSol.toFixed(2)} SOL`),
+      RULE,
+      "```",
+      ``,
+      `Verify live on-chain at [magpie.capital/stats](${SITE_STATS_URL}).`,
+    ].join("\n");
+    await ctx.reply(text, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[{ text: "📊 Live stats", url: SITE_STATS_URL }]],
+      },
+    });
+  } catch (err) {
+    console.warn("[community-tvl] failed:", err.message);
+    await ctx.reply(`⚠️ TVL briefly unavailable. Try again, or see ${SITE_STATS_URL}`, { disable_web_page_preview: true });
+  }
+}
+
+/* ─────────────────────────── /liquidations ─────────────────────────── */
+
+export async function handleCommunityLiquidations(ctx) {
+  try {
+    const { rows: [r] } = await query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status='liquidated')::int AS liquidated,
+         COUNT(*) FILTER (WHERE status='repaid')::int     AS repaid,
+         COUNT(*) FILTER (WHERE status='active')::int     AS active,
+         COUNT(*)::int                                    AS total`,
+    );
+    const liqRate = r.total > 0 ? ((r.liquidated / r.total) * 100).toFixed(2) : "0.00";
+    const text = [
+      `🛡 *Magpie · liquidation history*`,
+      "```",
+      RULE,
+      row("LIQUIDATED LIFETIME", fmtInt(r.liquidated)),
+      row("LIQUIDATION RATE", `${liqRate}%`),
+      RULE,
+      ``,
+      row("Total loans ever issued", fmtInt(r.total)),
+      row("Active right now", fmtInt(r.active)),
+      row("Repaid successfully", fmtInt(r.repaid)),
+      RULE,
+      "```",
+      ``,
+      `*Why it stays this low*`,
+      `• Short loan terms (2–7 days max)`,
+      `• Conservative LTV tiers (20–30%)`,
+      `• Token-health watcher pauses high-risk tokens proactively`,
+      `• Keeper network triggers liquidation the moment health falls`,
+      `• Auto-Protect (in /security) tops up users' collateral automatically`,
+      ``,
+      `_Every liquidation is on-chain. Verify the count yourself at [magpie.capital/stats](${SITE_STATS_URL})._`,
+    ].join("\n");
+    await ctx.reply(text, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[{ text: "📊 Verify live", url: SITE_STATS_URL }]],
+      },
+    });
+  } catch (err) {
+    console.warn("[community-liquidations] failed:", err.message);
+    await ctx.reply(`⚠️ Liquidation data briefly unavailable. Try again, or see ${SITE_STATS_URL}`, { disable_web_page_preview: true });
+  }
+}
+
 /* ─────────────────────────── /phantom ─────────────────────────── */
 
 export async function handleCommunityPhantom(ctx) {
@@ -1126,6 +1284,15 @@ const COMMUNITY_CMD_HANDLERS = {
   // Protocol concepts
   credit: handleCommunityCredit,
   score: handleCommunityCredit,        // alias
+  // LP / pool metrics
+  apy: handleCommunityApy,
+  apr: handleCommunityApy,             // alias — APR is technically what we compute
+  yield: handleCommunityApy,           // alias
+  tvl: handleCommunityTvl,
+  pool: handleCommunityTvl,            // alias
+  liquidations: handleCommunityLiquidations,
+  liquidated: handleCommunityLiquidations, // alias
+  liqs: handleCommunityLiquidations,   // alias (DeFi shorthand)
   // Known issues
   phantom: handleCommunityPhantom,
   dapp: handleCommunityPhantom,        // alias — same canned status
