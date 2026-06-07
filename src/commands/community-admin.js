@@ -291,3 +291,121 @@ export async function handleCommunityAllowlist(ctx) {
     { parse_mode: "Markdown" },
   );
 }
+
+/* ──────────────── Operator ops: /unban, /strikes, /clear_strikes ──────────────── */
+
+/**
+ * Parse a user reference from a command argument. Accepts:
+ *   - numeric user_id (the Telegram API needs this for unbans)
+ *   - @username — resolves via the bot's `users` table if the user
+ *     ever DM'd the bot; otherwise fails with a helpful message
+ *   - reply-to: if the command is a reply to a message, use that
+ *     message's sender. Convenient for "unban this person right here".
+ */
+async function resolveUserRef(ctx, arg) {
+  // Reply-to wins if present
+  if (ctx.message?.reply_to_message?.from?.id) {
+    return { userId: ctx.message.reply_to_message.from.id, label: ctx.message.reply_to_message.from.username || ctx.message.reply_to_message.from.first_name };
+  }
+  if (!arg) return { error: "no user specified" };
+  const trimmed = arg.trim();
+  // Numeric user_id
+  if (/^\d{4,}$/.test(trimmed)) {
+    return { userId: Number(trimmed), label: trimmed };
+  }
+  // @username form
+  const usernameMatch = trimmed.match(/^@?([A-Za-z0-9_]{4,32})$/);
+  if (usernameMatch) {
+    const handle = usernameMatch[1].toLowerCase();
+    try {
+      const { rows } = await (await import("../db/pool.js")).query(
+        `SELECT telegram_id FROM users WHERE LOWER(telegram_username) = $1 LIMIT 1`,
+        [handle],
+      );
+      if (rows[0]?.telegram_id) {
+        return { userId: Number(rows[0].telegram_id), label: `@${handle}` };
+      }
+      return {
+        error:
+          `Couldn't resolve @${handle} from the bot's user records (they may not have ever started the wallet bot). ` +
+          `Open the group's removed-users list in TG and use the numeric user_id, OR ask the user to /start @magpie_capital_bot once and re-run this command.`,
+      };
+    } catch (err) {
+      return { error: `Lookup error: ${err.message}` };
+    }
+  }
+  return { error: "expected a numeric user_id or @username" };
+}
+
+export async function handleCommunityUnban(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  if (!isGroup(ctx)) {
+    return ctx.reply(
+      "Run `/unban` *inside* the community group whose user you want to unban (not in DM).",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  const ref = await resolveUserRef(ctx, arg);
+  if (ref.error) {
+    return ctx.reply(`❌ ${ref.error}`);
+  }
+  try {
+    // unbanChatMember will not auto-readd them — they need to rejoin
+    // via the group link. only_if_banned avoids errors when the user
+    // wasn't actually banned (e.g. they just left).
+    await ctx.api.unbanChatMember(ctx.chat.id, ref.userId, { only_if_banned: false });
+    // Optional: also clear their strike history so they truly start fresh.
+    const { clearStrikes } = await import("../services/community-strikes.js");
+    const cleared = await clearStrikes(ctx.chat.id, ref.userId);
+    await ctx.reply(
+      `✅ Unbanned ${ref.label} (user ${ref.userId}). Cleared ${cleared} prior strike(s) so they start fresh.\n\n` +
+      `They'll need to *re-join via the group invite link*. Consider sending it to them.`,
+      { parse_mode: "Markdown" },
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Unban failed: ${err.message?.slice(0, 200)}`);
+  }
+}
+
+export async function handleCommunityStrikes(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  const ref = await resolveUserRef(ctx, arg);
+  if (ref.error) return ctx.reply(`❌ ${ref.error}`);
+  const { countStrikes, listRecentStrikes, isTrustedMember } = await import("../services/community-strikes.js");
+  const inThisChat = isGroup(ctx) ? await countStrikes(ctx.chat.id, ref.userId) : null;
+  const recent = await listRecentStrikes(ref.userId, 90);
+  const trusted = await isTrustedMember(ref.userId);
+  const lines = [
+    `📋 *Strike report* for ${ref.label} (user ${ref.userId})`,
+    ``,
+    trusted ? `🦅 Trusted member (has a Magpie wallet) — gets a one-strike grace.` : `Untrusted — full strike scale applies.`,
+    inThisChat != null ? `In this chat (last 30d): *${inThisChat}* strike(s)` : null,
+    ``,
+    `*Last 90 days across all chats:*`,
+  ].filter(Boolean);
+  if (recent.length === 0) {
+    lines.push(`  (no strike history)`);
+  } else {
+    for (const r of recent.slice(0, 15)) {
+      const when = new Date(r.created_at).toISOString().slice(0, 16).replace("T", " ");
+      lines.push(`  • ${when} — ${r.action} — ${(r.reason || "").slice(0, 60)}`);
+    }
+    if (recent.length > 15) lines.push(`  • + ${recent.length - 15} more`);
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
+export async function handleCommunityClearStrikes(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  if (!isGroup(ctx)) {
+    return ctx.reply("Run inside the group whose strike history you want to clear.");
+  }
+  const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  const ref = await resolveUserRef(ctx, arg);
+  if (ref.error) return ctx.reply(`❌ ${ref.error}`);
+  const { clearStrikes } = await import("../services/community-strikes.js");
+  const n = await clearStrikes(ctx.chat.id, ref.userId);
+  await ctx.reply(`✅ Cleared ${n} strike(s) for ${ref.label}. They start fresh.`);
+}

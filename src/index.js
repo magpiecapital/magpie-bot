@@ -229,13 +229,17 @@ bot.command("pools", handleHolderPool); // alias
 // Community moderation operator commands. Always registered so the
 // operator can enable it on demand; the per-chat enable check inside
 // the handlers ensures it does nothing in groups that haven't opted in.
-import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines } from "./commands/community-admin.js";
+import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes } from "./commands/community-admin.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
 bot.command("community_allowlist", handleCommunityAllowlist);
 bot.command("community_broadcast_now", handleCommunityBroadcastNow);
 bot.command("community_repost_guidelines", handleCommunityRepostGuidelines);
+// Member-management ops (operator-only)
+bot.command("unban", handleCommunityUnban);
+bot.command("strikes", handleCommunityStrikes);
+bot.command("clear_strikes", handleCommunityClearStrikes);
 
 // Inline callback registration.
 //

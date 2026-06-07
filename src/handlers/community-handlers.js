@@ -412,15 +412,30 @@ async function maybeRunImageCheck(ctx, msg, sender) {
   const result = await classifyImage(ctx, msg);
   if (!result) return; // fail-open: classifier unavailable or returned nothing
 
-  // Pull member context so the action mapper can see prior warnings;
-  // this gates auto-mute behind "warned_count >= 1" so first-offense
-  // misreads never restrict a user.
+  // Classifier decides "is this image policy-violating" (verdict +
+  // confidence); strike policy decides the escalation level. Same
+  // pattern as the text/FUD path.
   const member = await getMember(ctx.chat.id, sender.id);
   const trusted = await isTrustedMember(sender.id);
-  let decision = actionForImageVerdict(result, {
+  const baseDecision = actionForImageVerdict(result, {
     warned_count: member?.warned_count ?? 0,
   });
-  decision = applyTrustedLeniency(decision, trusted);
+  let decision = baseDecision;
+  if (baseDecision.action !== "skip") {
+    const { applyStrike } = await import("../services/community-strikes.js");
+    const strikeAction = await applyStrike(ctx.chat.id, sender.id, result.reason || result.verdict, {
+      actionLabel: `image_${result.verdict}`,
+      trusted,
+    });
+    decision = {
+      action: baseDecision.action,
+      warn: strikeAction.warn,
+      mute_sec: strikeAction.mute_sec,
+      flag_operator: strikeAction.flag_operator,
+      _trusted_downgrade: trusted,
+      _strike: strikeAction,
+    };
+  }
   if (decision.action === "skip") {
     // Still log the inspection for audit/trend analysis
     await recordModAction(
@@ -523,29 +538,52 @@ async function maybeRunFudCheck(ctx, msg, sender) {
   );
 
   const trusted = await isTrustedMember(sender.id);
-  let action = actionForVerdict(verdictObj, {
+  // Classifier decides "should we act at all" (confidence + verdict).
+  const baseAction = actionForVerdict(verdictObj, {
     warned_count: member?.warned_count ?? 0,
   });
-  action = applyTrustedLeniency(action, trusted);
-  if (action.action === "skip") return;
+  if (baseAction.action === "skip") return;
 
-  if (action.action === "delete") {
+  // From here, the STRIKE POLICY is the single source of truth for
+  // whether to mute / warn / flag. The classifier's verdict tells us
+  // the DELETE happens; strikes tell us the escalation level.
+  if (baseAction.action === "delete") {
     await tryDelete(ctx, msg.message_id);
   }
+  const { applyStrike, strikeFooter } = await import("../services/community-strikes.js");
+  const strikeAction = await applyStrike(ctx.chat.id, sender.id, verdictObj.reason || verdictObj.verdict, {
+    actionLabel: `fud_${verdictObj.verdict}`,
+    trusted,
+  });
+  // The action object the rest of the handler reads from. We compose
+  // the strike-policy decision with the classifier's delete decision.
+  let action = {
+    action: baseAction.action,
+    warn: strikeAction.warn,
+    mute_sec: strikeAction.mute_sec,
+    flag_operator: strikeAction.flag_operator,
+    _strike_level: strikeAction.level,
+    _strike_in_window: strikeAction.strike_in_window,
+    _trusted_downgrade: trusted,
+  };
   if (action.warn) {
     await bumpWarnedCount(ctx.chat.id, sender.id);
-    // Tailor the warn text to whether we actually muted. Telling
-    // someone they've been muted when they haven't damages trust;
-    // not warning a muted user is also bad. Branch on action.mute_sec.
     const wasMuted = action.mute_sec > 0;
+    const verdictHuman = {
+      misinformation: "a factual claim about the protocol that doesn't match reality",
+      harassment: "harassment / personal attacks",
+      spam: "spam",
+      coordinated_fud: "what looks like coordinated FUD",
+      ban_worthy: "egregious behavior",
+    }[verdictObj.verdict] || "a policy violation";
+    const muteLine = wasMuted
+      ? `\n\nYou've been muted for ${Math.round(action.mute_sec / 3600)}h. After it expires you're welcome back if the conversation stays civil.`
+      : ``;
     const warnText =
-      verdictObj.verdict === "misinformation"
-        ? `Your message was removed from the Magpie community group because it contained a factual claim about the protocol that doesn't match reality. If you have a real concern, DM the team via @magpie_capital_bot — we'd rather hear it directly. Repeated removals may result in a mute.`
-        : verdictObj.verdict === "harassment"
-        ? wasMuted
-          ? `Your message was removed for harassment and you've been muted for 24h. Personal attacks aren't tolerated. After the mute expires you're welcome back if the conversation stays civil.`
-          : `Your message was removed because our moderator flagged it as harassment. If this was a misread, DM @magpie_capital_bot and an operator will review. Repeated removals may result in a mute.`
-        : `Your message was removed by the community moderator. If you think this was a mistake, DM @magpie_capital_bot.`;
+      `Your message was removed from the Magpie community — our moderator flagged it as *${verdictHuman}*.` +
+      muteLine +
+      `\n\nIf this was a misread, DM @magpie_capital_bot and an operator will review.` +
+      strikeFooter(strikeAction);
     await softWarn(sender.id, warnText);
   }
   if (action.mute_sec > 0) {
