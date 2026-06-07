@@ -52,3 +52,5 @@ scripts/withdraw-vault.js
 
 # Backup files (e.g. Cargo.lock.bak) — never ship.
 *.bak
+scripts/inspect-loan-*.js
+scripts/decode-partial-repay-tx.js
