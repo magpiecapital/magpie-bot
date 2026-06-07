@@ -53,9 +53,17 @@ export const CAPTCHA_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Display-name / username substrings that smell like impersonation.
 // Match is case-insensitive. The check runs only on non-allowlisted
-// accounts (i.e. anyone the operator hasn't whitelisted).
+// accounts (the verified-account check excludes the bot + operator).
+//
+// "magpie" intentionally has NO word boundaries because impersonator
+// usernames typically lack separators ("magpiesupport", "magpiemod",
+// "magpie_help"). The verified-account allowlist catches the legit bot
+// (@magpie_capital_bot) so this doesn't false-positive on us.
+//
+// Generic terms (support/admin/team/mod) keep word boundaries — too
+// many legit names contain "Sam" or "Adam" as substrings.
 export const IMPERSONATION_PATTERNS = [
-  /\bmagpie\b/i,
+  /magpie/i,                       // any substring — catches magpiesupport, magpiemod
   /\bsupport\b/i,
   /\badmin\b/i,
   /\bteam\b/i,
@@ -87,15 +95,124 @@ export function addVerifiedTgId(id) {
 }
 
 // Scam-pattern phrases that almost always = phishing or honeypot.
+// Tested against BOTH the raw text and a unicode-normalized version
+// (see normalizeUnicode below) so attackers can't bypass by writing
+// 𝑫𝑴 𝒎𝒆 𝒏𝒐𝒘 in mathematical-italic letters.
 export const SCAM_PHRASES = [
   /seed\s*phrase/i,
   /private\s*key/i,
   /send\s+(?:me\s+)?\d+\s*sol/i,
-  /\b(?:dm|direct\s*message)\s+(?:me|us)\s+for\b/i,
+  // DM-solicitation — broader than the original "...for" suffix. Catches
+  // "DM me now" / "message me" / "PM me" / "hit me up" patterns common
+  // in distress-scammer setups ("if you're still holding my token...
+  // message me now").
+  /\b(?:dm|direct\s*message|pm|private\s*message|message|msg|text)\s+me\b/i,
+  /\bhit\s+me\s+up\b/i,
+  /\bsend\s+me\s+a\s+(?:dm|message|pm)\b/i,
+  // Distress-scammer framing — "if you're holding my token", "still holding"
+  /\bstill\s+holding\b.*\b(?:my|the)\s+token/i,
+  /\bif\s+you(?:'re|\s+are)\s+(?:still\s+)?holding/i,
+  /\b(?:my|the)\s+token\s+(?:holder|holders)\b/i,
+  // Free/airdrop/claim scams
   /\bfree\s+(?:airdrop|magpie|sol)\b/i,
-  /\bclaim\s+(?:your\s+)?(?:airdrop|reward)\b/i,
+  /\bclaim\s+(?:your\s+)?(?:airdrop|reward|refund|compensation)\b/i,
   /\bguarantee[ds]?\s+\d+%/i,
+  // Recovery / refund scams
+  /\b(?:lost|recover|refund)\s+(?:your|my)\s+(?:funds?|sol|tokens?|wallet)\b/i,
+  /\b(?:rug(?:ged|pull)?|scammed|lost)\b.*\b(?:dm|message|pm|contact)\s+me\b/i,
 ];
+
+/**
+ * Map Unicode "fancy" letterforms back to ASCII so pattern matching can
+ * catch obfuscated scam text like 𝑫𝑴 𝒎𝒆 𝒏𝒐𝒘 (mathematical bold-italic).
+ * Covers every Latin variant Unicode defines:
+ *   - Mathematical bold / italic / bold-italic / script / bold script
+ *   - Mathematical fraktur / bold fraktur
+ *   - Mathematical double-struck / sans-serif / sans-serif bold / sans italic
+ *   - Mathematical monospace
+ *   - Fullwidth Latin
+ *   - Circled / squared / parenthesized Latin
+ *
+ * The output is the same string with each fancy letter replaced by its
+ * plain ASCII equivalent. Non-letter characters pass through unchanged.
+ */
+export function normalizeUnicode(text) {
+  if (!text) return "";
+  let out = "";
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp == null) continue;
+    // Plain ASCII passes through
+    if (cp < 0x80) { out += ch; continue; }
+
+    // Mathematical alphanumeric blocks: U+1D400..U+1D7FF
+    // Layout: each block is 26 uppercase + 26 lowercase (some have
+    // digit subblocks). We map the letter ranges by computing offsets.
+    // Bold (1D400) · Italic (1D434) · Bold-Italic (1D468) · Script (1D49C)
+    // Bold Script (1D4D0) · Fraktur (1D504) · Double-struck (1D538)
+    // Bold Fraktur (1D56C) · Sans-serif (1D5A0) · Sans-bold (1D5D4)
+    // Sans-italic (1D608) · Sans-bold-italic (1D63C) · Monospace (1D670)
+    const blocks = [
+      0x1D400, 0x1D434, 0x1D468, 0x1D49C, 0x1D4D0,
+      0x1D504, 0x1D538, 0x1D56C, 0x1D5A0, 0x1D5D4,
+      0x1D608, 0x1D63C, 0x1D670,
+    ];
+    let mapped = null;
+    for (const base of blocks) {
+      if (cp >= base && cp < base + 26) {           // uppercase A..Z
+        mapped = String.fromCharCode(65 + (cp - base));
+        break;
+      }
+      if (cp >= base + 26 && cp < base + 52) {      // lowercase a..z
+        mapped = String.fromCharCode(97 + (cp - base - 26));
+        break;
+      }
+    }
+    // Math bold/sans/monospace digit ranges (U+1D7CE..U+1D7FF)
+    if (mapped == null && cp >= 0x1D7CE && cp <= 0x1D7FF) {
+      mapped = String.fromCharCode(48 + ((cp - 0x1D7CE) % 10));
+    }
+    // Fullwidth Latin (U+FF21..U+FF3A uppercase, U+FF41..U+FF5A lowercase)
+    if (mapped == null && cp >= 0xFF21 && cp <= 0xFF3A) {
+      mapped = String.fromCharCode(65 + (cp - 0xFF21));
+    }
+    if (mapped == null && cp >= 0xFF41 && cp <= 0xFF5A) {
+      mapped = String.fromCharCode(97 + (cp - 0xFF41));
+    }
+    // Circled Latin (U+24B6..U+24E9)
+    if (mapped == null && cp >= 0x24B6 && cp <= 0x24CF) {
+      mapped = String.fromCharCode(65 + (cp - 0x24B6));
+    }
+    if (mapped == null && cp >= 0x24D0 && cp <= 0x24E9) {
+      mapped = String.fromCharCode(97 + (cp - 0x24D0));
+    }
+    out += mapped ?? ch;
+  }
+  return out;
+}
+
+/**
+ * Returns true if a message contains more than N "fancy" unicode letters
+ * (math/styled/fullwidth). Real users essentially never use these; it's
+ * a high-signal scam tell on its own.
+ */
+export function hasObfuscatedUnicode(text, threshold = 8) {
+  if (!text) return false;
+  let count = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp == null) continue;
+    if (
+      (cp >= 0x1D400 && cp <= 0x1D7FF) ||  // mathematical alphanumeric
+      (cp >= 0xFF21 && cp <= 0xFF5A) ||    // fullwidth Latin
+      (cp >= 0x24B6 && cp <= 0x24E9)       // circled Latin
+    ) {
+      count++;
+      if (count > threshold) return true;
+    }
+  }
+  return false;
+}
 
 // Handles that legitimately represent Magpie. Anything else in a
 // @MagpieXxx form is treated as impersonation.
@@ -218,10 +335,31 @@ export function isVerifiedAccount(user) {
   return getVerifiedTgIds().has(String(user.id));
 }
 
+/**
+ * Match against the scam-phrase regex set. Tests both the raw text AND
+ * a unicode-normalized version so attackers can't bypass with math-bold
+ * letters (𝑫𝑴 𝒎𝒆 𝒏𝒐𝒘 → "DM me now"). Also flags pure-obfuscation
+ * messages: if a post has >8 fancy unicode letters and the user has
+ * an impersonation-flavored name, that's basically always a scam tell.
+ */
 export function matchesScamPattern(text) {
   if (!text) return null;
+  // Try raw first — most legit hits land here
   for (const re of SCAM_PHRASES) {
     if (re.test(text)) return re.source;
+  }
+  // Then normalize and try again — catches unicode-obfuscated scams
+  const normalized = normalizeUnicode(text);
+  if (normalized !== text) {
+    for (const re of SCAM_PHRASES) {
+      if (re.test(normalized)) return `[obfuscated] ${re.source}`;
+    }
+    // Pure obfuscation with no other signal — still suspicious enough
+    // to flag on its own (real users don't write whole sentences in
+    // mathematical-italic letters).
+    if (hasObfuscatedUnicode(text, 8)) {
+      return "[obfuscated text — math/styled unicode characters]";
+    }
   }
   return null;
 }
