@@ -229,7 +229,7 @@ bot.command("pools", handleHolderPool); // alias
 // Community moderation operator commands. Always registered so the
 // operator can enable it on demand; the per-chat enable check inside
 // the handlers ensures it does nothing in groups that haven't opted in.
-import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes } from "./commands/community-admin.js";
+import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
@@ -240,6 +240,7 @@ bot.command("community_repost_guidelines", handleCommunityRepostGuidelines);
 bot.command("unban", handleCommunityUnban);
 bot.command("strikes", handleCommunityStrikes);
 bot.command("clear_strikes", handleCommunityClearStrikes);
+bot.command("crosspost", handleCommunityCrosspost);
 
 // Inline callback registration.
 //
@@ -380,6 +381,10 @@ bot.start({
     // via PIP_DAILY_PROACTIVE_MAX). Set PIP_PROACTIVE_DISABLED=1 to
     // disable entirely without redeploying.
     import("./services/community-proactive.js").then((m) => m.startCommunityProactive(bot));
+    // X (@MagpieLoans) auto-cross-post — polls every 5 min if
+    // X_BEARER_TOKEN is set. No-op without the token; operator can
+    // still manually use /crosspost <tweet-url> in either path.
+    import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.

@@ -409,3 +409,28 @@ export async function handleCommunityClearStrikes(ctx) {
   const n = await clearStrikes(ctx.chat.id, ref.userId);
   await ctx.reply(`✅ Cleared ${n} strike(s) for ${ref.label}. They start fresh.`);
 }
+
+/* ──────────────── /crosspost — operator: post a @MagpieLoans tweet to the community ──────────────── */
+
+export async function handleCommunityCrosspost(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  if (!arg) {
+    return ctx.reply(
+      "Usage: `/crosspost <tweet-url>` — must be a https://x.com/MagpieLoans/status/... URL.\n\n" +
+      "Posts the tweet to every enabled community chat with a Pip-flavored engagement prompt. " +
+      "Telegram's OG-card preview renders the tweet content inline automatically.",
+      { parse_mode: "Markdown" },
+    );
+  }
+  try {
+    const { crosspostTweet } = await import("../services/community-x-crosspost.js");
+    const result = await crosspostTweet(ctx.api, arg, "manual");
+    if (result.skipped) {
+      return ctx.reply(`ℹ️ Already cross-posted (reason: ${result.reason}). Use /clear_crosspost_cache if you need to repost.`);
+    }
+    return ctx.reply(`✅ Cross-posted to ${result.chats} community chat(s).`);
+  } catch (err) {
+    return ctx.reply(`❌ Cross-post failed: ${err.message?.slice(0, 200)}`);
+  }
+}

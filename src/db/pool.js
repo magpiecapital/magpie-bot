@@ -681,6 +681,15 @@ export async function applyStartupPatches() {
        posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        PRIMARY KEY (chat_id, milestone_key)
      )`,
+    // Tweet IDs we've already cross-posted to the community group.
+    // Prevents both the auto-poller and the manual /crosspost from
+    // posting the same tweet twice. tweet_id is X's numeric ID stored
+    // as text (Solana also stores u64 as text — same reason).
+    `CREATE TABLE IF NOT EXISTS community_x_seen (
+       tweet_id TEXT PRIMARY KEY,
+       source TEXT NOT NULL,
+       posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
   ];
   for (const sql of patches) {
     try {
