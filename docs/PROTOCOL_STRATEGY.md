@@ -164,7 +164,7 @@ switch.
 **Effort:** v3 program + audit. Multi-week.
 
 ### 3B · **No-collateral trust line** (DeFi credit card)
-After repaying N loans (e.g., 5+) with zero liquidations, your credit
+After repaying N loans (e.g., 5+) with sub-1% liquidation rate, your credit
 score unlocks an UNCOLLATERALIZED line — borrow up to N SOL,
 repayable in 24h, at higher fee (10%). Effectively a DeFi credit card.
 

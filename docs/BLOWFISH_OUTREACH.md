@@ -39,7 +39,7 @@ The consultation is positioned as sales but it's a direct line to a Blowfish tea
 **On the call, walk through:**
 1. What Magpie is (1 min)
 2. Why our cosign-borrow pattern can LOOK like a drainer to heuristics but isn't (3 min — show the 3-gate architecture from MAGPIE_SECURITY_PACKET.md)
-3. On-chain trust signals (1 min — 240+ SOL borrowed, zero LP losses, zero liquidations)
+3. On-chain trust signals (1 min — 240+ SOL borrowed, zero LP losses, sub-1% liquidation rate)
 4. The specific ask: review the flag, unflag if appropriate (1 min)
 5. Open Q&A — let them probe (the rest)
 
@@ -121,7 +121,7 @@ message — fill what's required; everything else goes in the message).
 >   - 300+ loans issued
 >   - 250+ loans repaid
 >   - 0 LP losses to date
->   - Zero liquidations (by design — short terms, conservative LTV,
+>   - Sub-1% lifetime liquidation rate (by design — short terms, conservative LTV,
 >     active token-health watcher)
 >
 > **What we're asking**
@@ -274,7 +274,7 @@ If `verify-from-image` reports a match → tag for real (`v1.0.0`), push, submit
 
 ### One-line PR description
 
-> Add Magpie Capital — permissionless Solana lending protocol. Source: `magpiecapital/magpie-bot/programs/magpie-lending`. Deployed program ID: `4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh`. 240+ SOL lifetime borrowed, zero LP losses, zero liquidations.
+> Add Magpie Capital — permissionless Solana lending protocol. Source: `magpiecapital/magpie-bot/programs/magpie-lending`. Deployed program ID: `4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh`. 240+ SOL lifetime borrowed, zero LP losses, sub-1% liquidation rate.
 
 ---
 

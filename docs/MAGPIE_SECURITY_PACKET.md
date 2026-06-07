@@ -150,7 +150,7 @@ Users on Phantom can still use `@magpie_capital_bot` directly, so the protocol c
 - Existing site users can't sign new transactions through Phantom
 - Reputational impact disproportionate to actual risk
 
-Magpie has a clean track record (zero LP losses, zero user-fund incidents, zero liquidations, $0 of user collateral lost), zero on-chain admin overrides, and fully open source. We'd appreciate the chance to walk a Blowfish reviewer through any specific concern.
+Magpie has a clean track record (zero LP losses, zero user-fund incidents, sub-1% liquidation rate, $0 of user collateral lost), zero on-chain admin overrides, and fully open source. We'd appreciate the chance to walk a Blowfish reviewer through any specific concern.
 
 ---
 

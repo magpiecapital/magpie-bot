@@ -388,6 +388,8 @@ async function fetchProtocolState() {
     `SELECT
        (SELECT COUNT(*) FROM loans WHERE status='active')::int     AS active,
        (SELECT COUNT(*) FROM loans WHERE status='repaid')::int     AS repaid,
+       (SELECT COUNT(*) FROM loans WHERE status='liquidated')::int AS liquidated,
+       (SELECT COUNT(*) FROM loans)::int                           AS total,
        (SELECT COUNT(*) FROM supported_mints WHERE enabled=TRUE)::int AS tokens,
        COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans), 0)::text AS lifetime_lamports,
        COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans WHERE status='active'), 0)::text AS active_lamports`,
@@ -395,6 +397,8 @@ async function fetchProtocolState() {
   return {
     active: r.active,
     repaid: r.repaid,
+    liquidated: r.liquidated,
+    total: r.total,
     tokens: r.tokens,
     lifetime_sol: Number(r.lifetime_lamports) / 1e9,
     active_sol: Number(r.active_lamports) / 1e9,
@@ -644,8 +648,14 @@ const VIBE_ROTATORS = [
   (s) => s.active > 0
     ? `🟢 *${s.active}* active loans right now · *${s.active_sol.toFixed(2)} SOL* out across the book.`
     : null,
-  // 3. Zero liquidations brag (skip if no longer zero)
-  (s) => `🛡 Still zero liquidations to date. Short terms + low LTV + active token-health watcher. The design holds.`,
+  // 3. Liquidation rate — always pulled live from DB so it stays
+  //     truthful as the rate evolves. Reads s.liquidated and s.total
+  //     (both populated in fetchProtocolState).
+  (s) => {
+    const rate = s.total > 0 ? (s.liquidated / s.total) * 100 : 0;
+    const rateStr = rate < 0.01 ? "<0.01%" : `${rate.toFixed(2)}%`;
+    return `🛡 *${rateStr}* lifetime liquidation rate (${s.liquidated} of ${s.total} loans). Short terms + low LTV + active token-health watcher.`;
+  },
   // 4. Token coverage
   (s) => `🪙 *${s.tokens}* approved collateral tokens. Run \`/tokens\` to see the full list.`,
   // 5. Command nudge — /ca rotation

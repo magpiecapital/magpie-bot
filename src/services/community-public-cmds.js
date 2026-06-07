@@ -248,7 +248,7 @@ export async function handleCommunityTiers(ctx) {
     ``,
     `*Liquidation triggers* — health <1.1× *or* term expires without repayment.`,
     ``,
-    `_Zero liquidations to date by design — short terms + low LTV + a token-health watcher that pauses risky tokens before users get hurt._`,
+    `_Sub-1% lifetime liquidation rate by design — short terms + low LTV + a token-health watcher that pauses risky tokens before users get hurt. Run \`/liquidations\` for the live count._`,
   ].join("\n");
   await ctx.reply(text, {
     parse_mode: "Markdown",
@@ -753,7 +753,7 @@ export async function handleCommunityAudit(ctx) {
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
     `• *Short loan terms* — 2–7 day max bounds the protocol's risk window vs. perpetual lending.`,
     `• *Low LTV (20–30%)* — conservative collateralization absorbs price swings.`,
-    `• *Zero liquidations to date* — the design has held in practice, not just in theory.`,
+    `• *Sub-1% lifetime liquidation rate* — the design has held in practice, not just in theory. Live count: /liquidations`,
     `• *No admin override* — there's no privileged key that can drain user collateral.`,
     `• *Bug bounty* — see /security to report findings.`,
     ``,
@@ -1221,7 +1221,7 @@ export async function handleCommunityFaq(ctx) {
     `Yes — zero penalty. You only pay the upfront tier fee (Express 3% / Quick 2% / Standard 1.5%).`,
     ``,
     `*"Why are the terms so short?"*`,
-    `Short terms + low LTV are why we've had zero liquidations to date. Memecoin volatility is high; long terms would mean way more liquidations.`,
+    `Short terms + low LTV are why our lifetime liquidation rate stays under 1% across 299+ loans. Memecoin volatility is high; long terms would mean way more liquidations. Live count: /liquidations`,
     ``,
     `*"Can I switch tiers mid-loan?"*`,
     `No — close the loan with /repay, then open a new one in the tier you want.`,
