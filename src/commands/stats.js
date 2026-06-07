@@ -17,11 +17,14 @@ import { query } from "../db/pool.js";
  * on every TG client (iOS / Android / desktop).
  */
 
-const COL_WIDTH = 36;
+// Mobile-first widths. iOS Telegram's monospace code block fits ~26
+// chars before wrapping; using 24 + 2-space left padding gives us a
+// safe 26-char total that holds together on every device.
+const COL_WIDTH = 24;
 function row(label, value) {
   const l = String(label);
   const v = String(value);
-  const gap = Math.max(2, COL_WIDTH - l.length - v.length);
+  const gap = Math.max(1, COL_WIDTH - l.length - v.length);
   return `  ${l}${" ".repeat(gap)}${v}`;
 }
 const RULE = "─".repeat(COL_WIDTH + 2);
@@ -66,33 +69,38 @@ export async function handleStats(ctx) {
     const activeOutSol = fmtSol(r.active_lamports);
     const currentlyLentSolOnchain = fmtSol(pool.totalBorrowed.toNumber());
 
+    // Vault wSOL: keep 2-decimal precision so the line fits in 26 chars
+    const vaultSol = vault ? Number(vault.value.uiAmount).toFixed(2) : null;
+
     const codeLines = [
       RULE,
-      row("TOTAL BORROWED (LIFETIME)", `${lifetimeBorrowedSol} SOL`),
-      RULE,
-      ``,
-      `LOAN BOOK — RIGHT NOW`,
-      row("Currently out on loan", `${activeOutSol} SOL`),
+      `LOAN BOOK`,
+      row("Currently out", `${activeOutSol} SOL`),
       row("Active loans", String(r.active)),
-      row("Lifetime loans issued", pool.totalLoansIssued.toString()),
-      row("Lifetime repaid", String(r.repaid)),
-      row("Lifetime liquidated", pool.totalLiquidations.toString()),
+      row("Issued lifetime", pool.totalLoansIssued.toString()),
+      row("Repaid", String(r.repaid)),
+      row("Liquidated", pool.totalLiquidations.toString()),
       ``,
       `POOL`,
-      row("LP deposited (on-chain)", `${totalDepositsSol} SOL`),
-      row("Lifetime fees earned", `${totalFeesSol} SOL`),
-      vault ? row("Vault balance", `${Number(vault.value.uiAmount).toFixed(4)} wSOL`) : row("Vault balance", "—"),
+      row("LP deposited", `${totalDepositsSol} SOL`),
+      row("Fees earned", `${totalFeesSol} SOL`),
+      vaultSol ? row("Vault", `${vaultSol} wSOL`) : row("Vault", "—"),
       RULE,
     ];
 
+    // Headline sits OUTSIDE the monospace block so the big lifetime
+    // number renders at full bold weight, not constrained to mono pitch.
+    // This makes 240.64 SOL pop visually as the headline story.
     const lines = [
-      "📊 *Magpie — live protocol stats*",
+      `📊 *Magpie — live protocol stats*`,
+      ``,
+      `🦅 *${lifetimeBorrowedSol} SOL* lent out, lifetime`,
+      `   _The protocol's full borrowing volume._`,
+      ``,
       "```",
       ...codeLines,
       "```",
-      `_All numbers on-chain. Verify any line at_ [solscan.io](https://solscan.io) _or_ [magpie.capital/stats](https://www.magpie.capital/stats)_._`,
-      ``,
-      `_Program:_ \`${PROGRAM_ID.toBase58()}\``,
+      `_All numbers on-chain. Verify at_ [magpie.capital/stats](https://www.magpie.capital/stats)`,
     ];
 
     await ctx.reply(lines.join("\n"), {

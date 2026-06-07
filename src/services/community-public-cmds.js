@@ -57,11 +57,13 @@ function fmtInt(n) {
  * mobile. Width of 36 cols was picked by hand to avoid wrap on iOS TG
  * at 14pt code-block size with the longest expected labels.
  */
-const COL_WIDTH = 36;
+// Mobile-first: iOS Telegram's monospace block fits ~26 chars before
+// wrapping. 24 + 2-space padding = safe 26-char total.
+const COL_WIDTH = 24;
 function row(label, value) {
   const l = String(label);
   const v = String(value);
-  const gap = Math.max(2, COL_WIDTH - l.length - v.length);
+  const gap = Math.max(1, COL_WIDTH - l.length - v.length);
   return `  ${l}${" ".repeat(gap)}${v}`;
 }
 const RULE = "─".repeat(COL_WIDTH + 2);
@@ -146,45 +148,49 @@ async function fetchStats() {
 export async function handleCommunityStats(ctx) {
   try {
     const s = await fetchStats();
-    // All numeric data lives in a single monospaced code block so the
-    // value column lines up cleanly on every device. The headline
-    // total sits inside the block at the top, separated by a horizontal
-    // rule so it visually anchors the read. The headline + footer outside
-    // the block keep markdown formatting (bold + link).
+    const lifetimeSol = fmtSol(s.book.lifetime_lamports);
+
+    // Mobile-tight tabular block: 24-char content column + 2-char left
+    // padding = 26-char total, the safe cap before iOS TG mono-block
+    // wraps. Every label/value pair sits on ONE line, value flush right.
     const codeLines = [
       RULE,
-      row("TOTAL BORROWED (LIFETIME)", `${fmtSol(s.book.lifetime_lamports)} SOL`),
-      RULE,
-      ``,
-      `LOAN BOOK — RIGHT NOW`,
-      row("Currently out on loan", `${fmtSol(s.book.active_lamports)} SOL`),
+      `LOAN BOOK`,
+      row("Currently out", `${fmtSol(s.book.active_lamports)} SOL`),
       row("Active loans", fmtInt(s.book.active)),
-      row("Lifetime repaid", fmtInt(s.book.repaid)),
-      row("Lifetime liquidated", fmtInt(s.book.liquidated)),
+      row("Repaid", fmtInt(s.book.repaid)),
+      row("Liquidated", fmtInt(s.book.liquidated)),
       ``,
-      `LAST 24 HOURS`,
-      row("New loans", `${fmtInt(s.loans24h.n)} (${fmtSol(s.loans24h.sol_lamports)} SOL)`),
+      `LAST 24H`,
+      row("New loans", fmtInt(s.loans24h.n)),
+      row("Volume", `${fmtSol(s.loans24h.sol_lamports)} SOL`),
       row("New users", fmtInt(s.users.new_24h)),
       ``,
-      `LP POOL`,
-      row("Total deposited", `${fmtSol(s.pool.total_shares)} SOL`),
+      `POOL`,
+      row("LP deposited", `${fmtSol(s.pool.total_shares)} SOL`),
       ``,
       `COVERAGE`,
-      row("Tokens approved", fmtInt(s.mints.n)),
-      row("Total users", fmtInt(s.users.total)),
+      row("Tokens", fmtInt(s.mints.n)),
+      row("Users", fmtInt(s.users.total)),
     ];
     if (s.top.length > 0) {
-      codeLines.push(``, `MOST BORROWED AGAINST (ACTIVE)`);
-      for (const t of s.top) {
-        const left = `$${t.symbol}`;
-        const right = `${fmtInt(t.active_loans)} · ${fmtSol(t.active_sol_lamports)} SOL`;
-        codeLines.push(row(left, right));
+      codeLines.push(``, `TOP COLLATERAL`);
+      for (const t of s.top.slice(0, 3)) {
+        const symbol = `$${(t.symbol || "?").slice(0, 10)}`;
+        codeLines.push(row(symbol, `${fmtSol(t.active_sol_lamports)} SOL`));
       }
     }
     codeLines.push(RULE);
 
+    // Headline OUTSIDE the code block — bold + big, not constrained by
+    // mono pitch. This is the single most important number; gets visual
+    // primacy as the first thing the eye lands on.
     const lines = [
       `📊 *Magpie — live protocol stats*`,
+      ``,
+      `🦅 *${lifetimeSol} SOL* lent out, lifetime`,
+      `   _The protocol's full borrowing volume._`,
+      ``,
       "```",
       ...codeLines,
       "```",

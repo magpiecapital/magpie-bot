@@ -118,5 +118,74 @@ export async function handlePositions(ctx) {
     );
   }
 
+  // Pip-as-coach: surface ONE actionable suggestion if we see a clear
+  // opportunity in the user's book. Read-only — Pip only suggests, never
+  // takes action. Keeps the output concise (1 line max).
+  const coachLine = pipCoachSuggestion(rows, healthResults, liveAmounts);
+  if (coachLine) {
+    lines.push("", `🦅 *Pip:* ${coachLine}`);
+  }
+
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
+/**
+ * Returns ONE coaching suggestion based on the user's active loan book,
+ * or null if nothing actionable. Ordered by urgency — most urgent wins.
+ * Pure read-only; no action taken. The user has to actually run the
+ * suggested command themselves.
+ *
+ * Priority order:
+ *   1. Past-due loans (most urgent — liquidation imminent)
+ *   2. Health <1.15 (one move from liquidation)
+ *   3. Due within 24h (clock pressure)
+ *   4. Health <1.30 (mild buffer suggestion)
+ *   5. Healthy book → reinforce the good behavior (rare suggestion path)
+ */
+function pipCoachSuggestion(loans, healthResults, liveAmounts) {
+  if (!loans || loans.length === 0) return null;
+  let minHealth = Infinity;
+  let minHealthLoan = null;
+  let earliestDueMs = Infinity;
+  let earliestDueLoan = null;
+  let pastDueLoan = null;
+  for (let i = 0; i < loans.length; i++) {
+    const loan = loans[i];
+    const dueMs = new Date(loan.due_timestamp).getTime();
+    const msLeft = dueMs - Date.now();
+    if (msLeft <= 0 && !pastDueLoan) pastDueLoan = loan;
+    if (msLeft > 0 && dueMs < earliestDueMs) {
+      earliestDueMs = dueMs;
+      earliestDueLoan = loan;
+    }
+    const h = healthResults[i];
+    if (h && Number.isFinite(h.ratio) && h.ratio < minHealth) {
+      minHealth = h.ratio;
+      minHealthLoan = loan;
+    }
+  }
+  // 1. Past due — liquidation imminent
+  if (pastDueLoan) {
+    return `Loan #${pastDueLoan.loan_id} (${pastDueLoan.symbol ?? "?"}) is *past due*. /repay now or it'll be liquidated.`;
+  }
+  // 2. Health critical
+  if (minHealthLoan && minHealth < 1.15) {
+    return `Loan #${minHealthLoan.loan_id} (${minHealthLoan.symbol ?? "?"}) health is *${minHealth.toFixed(2)}×* — one bad candle from liquidation. Consider /topup to add collateral.`;
+  }
+  // 3. Due within 24h
+  if (earliestDueLoan) {
+    const hoursLeft = (earliestDueMs - Date.now()) / 3_600_000;
+    if (hoursLeft < 24) {
+      return `Loan #${earliestDueLoan.loan_id} (${earliestDueLoan.symbol ?? "?"}) due in *${Math.floor(hoursLeft)}h*. /repay early (zero penalty) or /extend if you need more time.`;
+    }
+  }
+  // 4. Mild health concern
+  if (minHealthLoan && minHealth < 1.30) {
+    return `Loan #${minHealthLoan.loan_id} health is ${minHealth.toFixed(2)}× — comfy but not flush. /topup adds buffer with no fee.`;
+  }
+  // 5. Reinforce — only if multiple loans and all healthy
+  if (loans.length >= 2 && minHealth >= 1.50) {
+    return `All ${loans.length} positions healthy. Keep an eye on token volatility — /health any time for a snapshot.`;
+  }
+  return null;
 }
