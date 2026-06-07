@@ -139,6 +139,7 @@ export async function handleStart(ctx) {
     "/me — your wallet, tier, and referral code",
     "/magpie — official $MAGPIE token info",
     "/support — chat with our AI agent or open a ticket",
+    "/community — join the public Magpie group (@magpietalk)",
     "/help — full command list",
   ].join("\n");
 

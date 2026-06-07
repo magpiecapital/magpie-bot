@@ -223,23 +223,52 @@ export async function classifyImage(ctx, msg) {
 /**
  * Action mapping for image verdicts. Same conservative bar as the
  * text classifier — 0.75 confidence floor, never auto-permaban.
+ *
+ * Leniency rules (operator directive — good members can be misread):
+ *   - Delete requires 0.75 confidence.
+ *   - Mute requires 0.90 confidence AND a prior warning. First offense
+ *     never auto-mutes; we delete + warn + flag operator. The phishing
+ *     screenshot path is the one exception — those CAN harm other
+ *     users immediately, so we still allow a short mute on first
+ *     offense IF confidence is very high (>= 0.95).
+ *   - Trusted-member downgrade (handler-side) further blocks mutes
+ *     against users with a Magpie wallet.
  */
-export function actionForImageVerdict({ verdict, confidence }) {
-  const HIGH_CONFIDENCE = 0.75;
-  if (confidence < HIGH_CONFIDENCE) {
+export function actionForImageVerdict({ verdict, confidence }, context = {}) {
+  const DELETE_CONFIDENCE = 0.75;
+  const RESTRICT_CONFIDENCE = 0.90;
+  const URGENT_CONFIDENCE = 0.95;
+  const warnedCount = Number(context.warned_count) || 0;
+
+  if (confidence < DELETE_CONFIDENCE) {
     return { action: "skip", warn: false, mute_sec: 0, flag_operator: false };
   }
+
+  const allowMute = confidence >= RESTRICT_CONFIDENCE && warnedCount >= 1;
+  const allowUrgentMute = confidence >= URGENT_CONFIDENCE; // phishing only
+
   switch (verdict) {
     case "scam_screenshot":
-      // Phishing screenshots are the most dangerous image attacks — these
-      // route users to seed-stealing landing pages. Delete + flag.
-      return { action: "delete", warn: true, mute_sec: 60 * 60, flag_operator: true };
+      // Phishing screenshots can harm other readers in real time. We
+      // still allow a short first-offense mute IF confidence is very
+      // high (>= 0.95). Otherwise: delete + warn + flag operator.
+      return {
+        action: "delete",
+        warn: true,
+        mute_sec: allowMute ? 60 * 60 : (allowUrgentMute ? 60 * 60 : 0),
+        flag_operator: true,
+      };
     case "impersonation_screenshot":
       return { action: "delete", warn: true, mute_sec: 0, flag_operator: true };
     case "fud_screenshot":
       return { action: "delete", warn: false, mute_sec: 0, flag_operator: true };
     case "nsfw_or_violence":
-      return { action: "delete", warn: false, mute_sec: 24 * 3600, flag_operator: true };
+      return {
+        action: "delete",
+        warn: false,
+        mute_sec: allowMute ? 24 * 3600 : 0,
+        flag_operator: true,
+      };
     case "none":
     default:
       return { action: "skip", warn: false, mute_sec: 0, flag_operator: false };

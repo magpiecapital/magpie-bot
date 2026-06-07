@@ -167,14 +167,29 @@ export async function classifyMessage(text, context = {}) {
 
 /** Map a classifier verdict to a concrete moderation action. The
  *  conservative half of the design lives here — auto-ban is never
- *  returned; the highest tier flags the operator for a human call. */
-export function actionForVerdict({ verdict, confidence }) {
-  // Confidence threshold — require at least 0.75 to act on anything
-  // beyond "none". Lower confidence = no action, classification is
-  // still logged for audit.
-  const HIGH_CONFIDENCE = 0.75;
+ *  returned; the highest tier flags the operator for a human call.
+ *
+ *  Leniency rules (operator directive — good members can be misread):
+ *    1. Delete actions require 0.75 confidence.
+ *    2. Restrict/mute actions require 0.90 confidence AND prior warnings.
+ *       First offense never auto-mutes; we delete + warn + flag operator
+ *       and let a human decide. A second offense from the same user is
+ *       what unlocks an auto-mute.
+ *    3. Trusted-member downgrade (handler-side) further protects users
+ *       who already have a Magpie wallet — they'll never auto-mute.
+ */
+export function actionForVerdict({ verdict, confidence }, context = {}) {
+  const DELETE_CONFIDENCE = 0.75;
+  const RESTRICT_CONFIDENCE = 0.90;
+  const warnedCount = Number(context.warned_count) || 0;
 
-  if (confidence < HIGH_CONFIDENCE) return { action: "skip", warn: false, mute_sec: 0, flag_operator: false };
+  if (confidence < DELETE_CONFIDENCE) {
+    return { action: "skip", warn: false, mute_sec: 0, flag_operator: false };
+  }
+
+  // Only allow a mute when BOTH the model is very confident AND the
+  // user has been auto-warned before. First offense is always delete-only.
+  const allowMute = confidence >= RESTRICT_CONFIDENCE && warnedCount >= 1;
 
   switch (verdict) {
     case "spam":
@@ -182,12 +197,24 @@ export function actionForVerdict({ verdict, confidence }) {
     case "misinformation":
       return { action: "delete", warn: true, mute_sec: 0, flag_operator: false };
     case "harassment":
-      return { action: "delete", warn: true, mute_sec: 24 * 3600, flag_operator: true };
+      return {
+        action: "delete",
+        warn: true,
+        mute_sec: allowMute ? 24 * 3600 : 0,
+        flag_operator: true,
+      };
     case "coordinated_fud":
       return { action: "delete", warn: false, mute_sec: 0, flag_operator: true };
     case "ban_worthy":
       // We don't auto-ban. Flag for operator review, delete the msg.
-      return { action: "delete", warn: false, mute_sec: 60 * 60, flag_operator: true };
+      // Mute only on repeat AND high confidence — first offense flags
+      // the operator for a human call instead.
+      return {
+        action: "delete",
+        warn: false,
+        mute_sec: allowMute ? 60 * 60 : 0,
+        flag_operator: true,
+      };
     case "none":
     default:
       return { action: "skip", warn: false, mute_sec: 0, flag_operator: false };

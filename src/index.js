@@ -33,6 +33,7 @@ import {
 } from "./commands/announcement.js";
 import { handleExport, registerExportCallbacks } from "./commands/export.js";
 import { handleHelp } from "./commands/help.js";
+import { handleCommunity } from "./commands/community.js";
 import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleHistory } from "./commands/history.js";
@@ -168,6 +169,7 @@ bot.command("reborrow", handleReborrow);
 bot.command("home", handleHome);
 bot.command("submit", handleSubmit);
 bot.command("help", handleHelp);
+bot.command("community", handleCommunity);
 bot.command("magpie", handleMagpie);
 bot.command("token", handleMagpie); // alias — users might guess this
 bot.command("support", handleSupport);
@@ -340,6 +342,7 @@ async function registerBotCommands() {
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "support", description: "🛟 Self-serve help / message the team" },
       { command: "mytickets", description: "🎫 Your support tickets + status" },
+      { command: "community", description: "💬 Join the public @magpietalk group" },
       { command: "site", description: "🌐 Open magpie.capital" },
       { command: "security", description: "🔐 Account security view + lock buttons" },
       { command: "privacy", description: "🔒 What we store + your controls" },

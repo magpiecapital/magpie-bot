@@ -36,6 +36,52 @@ import {
   CAPTCHA_TIMEOUT_MS,
 } from "../services/community-moderation.js";
 import { classifyImage, actionForImageVerdict } from "../services/community-image-ocr.js";
+import { findUserByTelegramId } from "../services/users.js";
+
+/**
+ * Trusted members are TG users who already have a Magpie wallet through
+ * the bot. They're known good actors — auto-muting them on a misread is
+ * the worst outcome. We DOWNGRADE any mute action against a trusted
+ * member to a delete + warn + operator flag, and leave the human call
+ * to the operator. Deletion of the offending message still happens —
+ * it's mute / restrict that we skip.
+ *
+ * Op directive: "use your best judgement when removing members.
+ * Sometimes a good member's post may be misinterpreted. I don't want
+ * Pip to penalize them." This is the leniency tier that implements
+ * that judgement.
+ */
+async function isTrustedMember(telegramId) {
+  if (!telegramId) return false;
+  try {
+    const user = await findUserByTelegramId(telegramId);
+    // Any row in `users` means they've /start'd the bot and have a
+    // wallet. That's the bar — a real Magpie user, not a drive-by.
+    return !!user;
+  } catch (err) {
+    console.warn("[community] trusted-member lookup failed (default: not trusted):", err.message);
+    return false;
+  }
+}
+
+/**
+ * Apply the trusted-member leniency override to a decision returned
+ * by the FUD or image classifier. If the user is trusted, any mute is
+ * stripped — we still delete + warn + flag the operator, but we never
+ * auto-restrict them.
+ */
+function applyTrustedLeniency(decision, trusted) {
+  if (!trusted) return decision;
+  if (decision.mute_sec > 0) {
+    return {
+      ...decision,
+      mute_sec: 0,
+      flag_operator: true, // always alert operator on trusted-member edge cases
+      _trusted_downgrade: true,
+    };
+  }
+  return decision;
+}
 
 function isGroupChat(ctx) {
   return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
@@ -313,7 +359,15 @@ async function maybeRunImageCheck(ctx, msg, sender) {
   const result = await classifyImage(ctx, msg);
   if (!result) return; // fail-open: classifier unavailable or returned nothing
 
-  const decision = actionForImageVerdict(result);
+  // Pull member context so the action mapper can see prior warnings;
+  // this gates auto-mute behind "warned_count >= 1" so first-offense
+  // misreads never restrict a user.
+  const member = await getMember(ctx.chat.id, sender.id);
+  const trusted = await isTrustedMember(sender.id);
+  let decision = actionForImageVerdict(result, {
+    warned_count: member?.warned_count ?? 0,
+  });
+  decision = applyTrustedLeniency(decision, trusted);
   if (decision.action === "skip") {
     // Still log the inspection for audit/trend analysis
     await recordModAction(
@@ -369,7 +423,7 @@ async function maybeRunImageCheck(ctx, msg, sender) {
         `🖼 *Community image flagged*\n\n` +
         `*Verdict:* ${result.verdict} (conf ${result.confidence.toFixed(2)})\n` +
         `*From:* @${sender.username || sender.first_name || sender.id}\n` +
-        `*Reason:* ${result.reason}\n\n` +
+        `*Reason:* ${result.reason}${decision._trusted_downgrade ? "\n\n⚠️ User has a Magpie wallet — auto-mute SKIPPED. Your call." : ""}\n\n` +
         `*Extracted text (first 200 chars):*\n${(result.extractedText || "(none)").slice(0, 200)}`,
         { parse_mode: "Markdown" },
       );
@@ -415,7 +469,11 @@ async function maybeRunFudCheck(ctx, msg, sender) {
     text.slice(0, 500),
   );
 
-  const action = actionForVerdict(verdictObj);
+  const trusted = await isTrustedMember(sender.id);
+  let action = actionForVerdict(verdictObj, {
+    warned_count: member?.warned_count ?? 0,
+  });
+  action = applyTrustedLeniency(action, trusted);
   if (action.action === "skip") return;
 
   if (action.action === "delete") {
@@ -423,11 +481,17 @@ async function maybeRunFudCheck(ctx, msg, sender) {
   }
   if (action.warn) {
     await bumpWarnedCount(ctx.chat.id, sender.id);
+    // Tailor the warn text to whether we actually muted. Telling
+    // someone they've been muted when they haven't damages trust;
+    // not warning a muted user is also bad. Branch on action.mute_sec.
+    const wasMuted = action.mute_sec > 0;
     const warnText =
       verdictObj.verdict === "misinformation"
         ? `Your message was removed from the Magpie community group because it contained a factual claim about the protocol that doesn't match reality. If you have a real concern, DM the team via @magpie_capital_bot — we'd rather hear it directly. Repeated removals may result in a mute.`
         : verdictObj.verdict === "harassment"
-        ? `Your message was removed for harassment. Personal attacks aren't tolerated, even when the criticism is valid. You've been temporarily muted (24h). After that, you're welcome back if the conversation stays civil.`
+        ? wasMuted
+          ? `Your message was removed for harassment and you've been muted for 24h. Personal attacks aren't tolerated. After the mute expires you're welcome back if the conversation stays civil.`
+          : `Your message was removed because our moderator flagged it as harassment. If this was a misread, DM @magpie_capital_bot and an operator will review. Repeated removals may result in a mute.`
         : `Your message was removed by the community moderator. If you think this was a mistake, DM @magpie_capital_bot.`;
     await softWarn(sender.id, warnText);
   }
@@ -460,7 +524,8 @@ async function maybeRunFudCheck(ctx, msg, sender) {
           text.slice(0, 800),
           "```",
           ``,
-          `Auto-action taken: ${action.action}${action.mute_sec ? ` + ${Math.round(action.mute_sec/3600)}h mute` : ""}`,
+          `Auto-action taken: ${action.action}${action.mute_sec ? ` + ${Math.round(action.mute_sec/3600)}h mute` : ""}${action._trusted_downgrade ? " (mute SKIPPED — user has a Magpie wallet)" : ""}`,
+          trusted ? `\n⚠️ This user has a Magpie wallet — Pip skipped the auto-mute. Your call on whether this is a real issue.` : "",
           ``,
           `If you want to ban this user, do it via the group's admin UI (Telegram → group → user → Ban). I will not auto-ban.`,
         ].join("\n"),
