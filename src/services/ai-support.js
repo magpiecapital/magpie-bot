@@ -3357,7 +3357,7 @@ const RETRY_DELAYS_MS = [250, 1000, 4000];
  * account before answering. Keep this short (~10 lines max) and prose-y
  * so it doesn't dominate the prompt.
  */
-async function buildUserSnapshot(userId) {
+async function buildUserSnapshot(userId, signerPubkey = null) {
   try {
     // Single-query pull of the high-signal facts. Joining loans on user.
     const { rows: [u] } = await query(
@@ -3374,18 +3374,39 @@ async function buildUserSnapshot(userId) {
     );
     if (!u) return null;
 
-    // Their active loans, with live health if pricing is available
-    const { rows: activeLoans } = await query(
-      `SELECT l.loan_id, l.original_loan_amount_lamports, l.due_timestamp,
+    // Their active loans, with live health if pricing is available.
+    // Wallet-scoping: pulled loans get filtered to ONLY those opened
+    // by the user's current wallet (site signerPubkey, or the TG
+    // active wallet). Without this, the snapshot tells Pip the user
+    // has loans they aren't currently signed-in for, which leads to
+    // the $TROLL-style false-positive the operator flagged. Bump
+    // LIMIT 5→20 to leave headroom after filtering; we still only
+    // include the top 5 in the snapshot.
+    const { rows: rawLoans } = await query(
+      `SELECT l.loan_id, l.loan_pda, l.original_loan_amount_lamports, l.due_timestamp,
               l.collateral_mint, l.collateral_amount, l.ltv_percentage,
               sm.symbol, sm.decimals
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
        WHERE l.user_id = $1 AND l.status = 'active'
        ORDER BY l.due_timestamp ASC
-       LIMIT 5`,
+       LIMIT 20`,
       [userId],
     );
+    let scopedWallet;
+    let otherWalletActive = 0;
+    let activeLoansFiltered;
+    if (signerPubkey) {
+      activeLoansFiltered = filterLoansForWallet(rawLoans, signerPubkey);
+      scopedWallet = signerPubkey;
+      otherWalletActive = rawLoans.length - activeLoansFiltered.length;
+    } else {
+      const scoped = await scopeLoansToActiveWallet(userId, rawLoans);
+      activeLoansFiltered = scoped.filtered;
+      scopedWallet = scoped.activeWallet;
+      otherWalletActive = scoped.otherWalletCount;
+    }
+    const activeLoans = activeLoansFiltered.slice(0, 5);
 
     // Compute health per loan (best-effort, skip on price-feed blip)
     const { collateralValueLamports } = await import("./price.js");
@@ -3439,7 +3460,8 @@ async function buildUserSnapshot(userId) {
     }
 
     if (loanLines.length > 0) {
-      lines.push("Active loans (most-urgent first):");
+      const walletNote = scopedWallet ? ` (on current wallet ${scopedWallet.slice(0, 4)}…${scopedWallet.slice(-4)})` : "";
+      lines.push(`Active loans${walletNote} — most-urgent first:`);
       for (const ll of loanLines) lines.push(`  • ${ll}`);
 
       // Flag at-risk loans for proactive mention
@@ -3449,6 +3471,19 @@ async function buildUserSnapshot(userId) {
       }
     } else if (u.repaid_loans === 0 && u.liquidated_loans === 0) {
       lines.push(`No loans yet. If asked about borrowing, you can suggest /unlock to show their bag's borrow potential.`);
+    } else if (otherWalletActive === 0) {
+      lines.push(`No active loans on the user's current wallet.`);
+    }
+
+    // Multi-wallet visibility: tell Pip about loans on OTHER linked
+    // wallets explicitly, so it never describes them as "yours" when
+    // the user is signed in on a different wallet.
+    if (otherWalletActive > 0) {
+      lines.push(
+        `${otherWalletActive} active loan(s) on OTHER linked wallets — NOT shown above. ` +
+        `Don't describe these as "your loans" unless the user switches wallets. ` +
+        `If asked about loans on other wallets, tell them to switch via /wallets.`,
+      );
     }
 
     if (t.open_tix > 0 || t.awaiting_tix > 0) {
@@ -3707,7 +3742,7 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
   // context so the agent can naturally reference their loans without
   // calling tools first ("btw your loan #X is tight on health…").
   try {
-    const snapshot = await buildUserSnapshot(userId);
+    const snapshot = await buildUserSnapshot(userId, signerPubkey);
     if (snapshot) {
       contextParts.push(`\n\nUSER YOU'RE TALKING TO (auto-fetched — use naturally, don't recite as a list):\n${snapshot}`);
     }
