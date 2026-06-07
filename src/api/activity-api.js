@@ -46,16 +46,19 @@ export async function handleActivity(req, url) {
   // worst given the table sizes, and the indexes on user_id make them
   // fast. We merge + sort in JS — simpler than a big SQL UNION.
   const [
-    { rows: borrowsRows },
-    { rows: closedRows },
-    { rows: protectRows },
+    { rows: borrowsRowsRaw },
+    { rows: closedRowsRaw },
+    { rows: protectRowsRaw },
     { rows: withdrawRows },
     { rows: refRows },
     { rows: holderRows },
     { rows: lockRows },
   ] = await Promise.all([
+    // Add loan_pda + program_id so we can scope to THIS WALLET via PDA-
+    // derivation. Multi-wallet users were seeing borrows from ALL their
+    // linked wallets in this stream.
     query(
-      `SELECT id, loan_id, collateral_mint, loan_amount_lamports::text AS amount,
+      `SELECT id, loan_id, loan_pda, program_id, collateral_mint, loan_amount_lamports::text AS amount,
               ltv_percentage, duration_days, start_timestamp, tx_signature
          FROM loans
         WHERE user_id = $1
@@ -64,7 +67,7 @@ export async function handleActivity(req, url) {
       [userId, limit],
     ),
     query(
-      `SELECT id, loan_id, collateral_mint,
+      `SELECT id, loan_id, loan_pda, program_id, collateral_mint,
               original_loan_amount_lamports::text AS amount,
               status, updated_at, tx_signature
          FROM loans
@@ -73,23 +76,29 @@ export async function handleActivity(req, url) {
         LIMIT $2`,
       [userId, limit],
     ),
+    // auto_protect_actions doesn't have wallet info — join with loans
+    // so we can filter the same way (by loan's borrower wallet).
     query(
-      `SELECT id, loan_id, action_type, amount_lamports::text AS amount,
-              health_before, health_after, signature, created_at
-         FROM auto_protect_actions
-        WHERE user_id = $1
-        ORDER BY created_at DESC
+      `SELECT ap.id, ap.loan_id, ap.action_type, ap.amount_lamports::text AS amount,
+              ap.health_before, ap.health_after, ap.signature, ap.created_at,
+              l.loan_pda, l.program_id, l.loan_id AS chain_loan_id
+         FROM auto_protect_actions ap
+         JOIN loans l ON l.id = ap.loan_id
+        WHERE ap.user_id = $1
+        ORDER BY ap.created_at DESC
         LIMIT $2`,
       [userId, limit],
     ),
+    // Site withdraws have an explicit from_pubkey — filter directly to
+    // the requesting wallet without any PDA derivation.
     query(
       `SELECT id, from_pubkey, to_pubkey, asset, raw_amount::text AS amount,
               decimals, tx_signature, status, created_at
          FROM site_withdrawals
-        WHERE user_id = $1
+        WHERE user_id = $1 AND from_pubkey = $3
         ORDER BY created_at DESC
         LIMIT $2`,
-      [userId, limit],
+      [userId, limit, wallet],
     ),
     query(
       `SELECT id, reward_lamports::text AS amount, paid_tx_signature, paid_at, created_at
@@ -120,6 +129,27 @@ export async function handleActivity(req, url) {
       [userId, limit],
     ),
   ]);
+
+  // ── Wallet-scope the loan-derived events ──────────────────────
+  // borrows/repays/liquidations come from `loans` table (user-scoped).
+  // auto_protect comes from auto_protect_actions joined with loans.
+  // Filter all three down to events whose underlying loan was
+  // actually opened by THIS WALLET.
+  //
+  // Referrals / holder rewards / lock events remain user-scoped
+  // (intentional — credit & rewards consolidate across linked wallets;
+  // locks affect the whole account).
+  const { filterLoansForWallet } = await import("../services/wallet-scoped-loans.js");
+  const borrowsRows = filterLoansForWallet(borrowsRowsRaw, wallet);
+  const closedRows  = filterLoansForWallet(closedRowsRaw, wallet);
+
+  // For auto-protect: build a set of THIS WALLET's loan db-ids first,
+  // then keep only auto_protect actions on those loans.
+  const allLoanRows = [...borrowsRowsRaw, ...closedRowsRaw];
+  const walletLoanIds = new Set(
+    filterLoansForWallet(allLoanRows, wallet).map((r) => String(r.id)),
+  );
+  const protectRows = protectRowsRaw.filter((r) => walletLoanIds.has(String(r.loan_id)));
 
   const events = [];
   for (const r of borrowsRows) {
