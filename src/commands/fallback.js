@@ -64,6 +64,16 @@ export async function handleFallback(ctx) {
   const text = ctx.message?.text?.trim();
   if (!text) return;
 
+  // ── Operator @MagpieLoans tweet auto-cross-post ─────────────
+  // When the operator DMs the bot a tweet URL from @MagpieLoans, auto
+  // cross-post it to all enabled community chats — no need to type
+  // /crosspost first. Replaces the X-API-poller path for operators
+  // who don't have a paid X bearer token.
+  //
+  // Gated on isAdmin (operator-only) so a random user pasting a
+  // tweet URL doesn't trigger this.
+  if (await maybeAutoCrosspostTweet(ctx, text)) return;
+
   // Ignore messages that start with / (those are unrecognized commands)
   if (text.startsWith("/")) {
     await ctx.reply(
@@ -149,4 +159,40 @@ export function registerFallbackCallbacks(bot) {
     const { handleHelp } = await import("./help.js");
     await handleHelp(ctx);
   });
+}
+
+/**
+ * Detect a @MagpieLoans tweet URL DM'd by the operator and auto
+ * cross-post it to all enabled community chats. Returns true if we
+ * handled it (caller should short-circuit normal fallback flow).
+ *
+ * Match shape: any standalone x.com/MagpieLoans/status/<id> or
+ * twitter.com/MagpieLoans/status/<id> URL in the message. URL can be
+ * the whole message or embedded; we extract the first match.
+ *
+ * Gated on isAdmin so only operators trigger this — a regular user
+ * pasting a tweet URL gets normal fallback behavior.
+ */
+const TWEET_URL_RE = /https?:\/\/(?:www\.)?(?:x|twitter)\.com\/MagpieLoans\/status\/\d+(?:\?[^\s]*)?/i;
+
+async function maybeAutoCrosspostTweet(ctx, text) {
+  if (!text) return false;
+  const url = (text.match(TWEET_URL_RE) || [])[0];
+  if (!url) return false;
+  // Operator-only — don't auto-trigger for regular users
+  const { isAdmin } = await import("../services/admin.js");
+  if (!isAdmin(ctx.from?.id)) return false;
+  try {
+    const { crosspostTweet } = await import("../services/community-x-crosspost.js");
+    const result = await crosspostTweet(ctx.api, url, "manual-dm");
+    if (result.skipped) {
+      await ctx.reply(`ℹ️ Already cross-posted this tweet (reason: ${result.reason}).`);
+    } else {
+      await ctx.reply(`✅ Cross-posted to ${result.chats} community chat(s).`);
+    }
+    return true;
+  } catch (err) {
+    await ctx.reply(`❌ Cross-post failed: ${err.message?.slice(0, 200)}`);
+    return true; // we still handled it (with an error reply)
+  }
 }
