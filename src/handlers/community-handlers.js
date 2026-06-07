@@ -309,6 +309,16 @@ async function handleGroupMessage(ctx) {
         `name="${sender.username || sender.first_name || sender.id}"`,
         msg.text || msg.caption || null,
       );
+      // Educational moment — turn every ban into a teachable post in
+      // the group so members see Pip actively defending them. Templated
+      // (zero LLM cost), throttled per chat so we don't spam during a
+      // bot-driven scam wave.
+      try {
+        const { maybePostScamBanEducation } = await import("../services/community-proactive.js");
+        await maybePostScamBanEducation(ctx.api, ctx.chat.id);
+      } catch (err) {
+        console.warn("[community] scam-ban education post failed:", err.message);
+      }
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
         await notifyAdmin(

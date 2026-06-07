@@ -40,12 +40,17 @@ import { listEnabledChats } from "./community-moderation.js";
 import { answerGroupQuestion } from "./community-pip.js";
 
 const PROACTIVE_DISABLED = process.env.PIP_PROACTIVE_DISABLED === "1";
-const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 5);
-const QUESTION_PICKUP_INTERVAL_MS = 5 * 60 * 1000;
+// Operator directive 2026-06-07: "Pip should be more active in the TG."
+// Bumped daily cap 5 → 12 + dropped wait threshold 10min → 4min + tightened
+// per-chat pickup gap 1h → 20min so Pip steps in faster on unanswered
+// Magpie questions. Sonnet cost at the new ceiling: ~12 × $0.005 =
+// $0.06/day/chat worst-case — still well under any meaningful budget.
+const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 12);
+const QUESTION_PICKUP_INTERVAL_MS = 3 * 60 * 1000;   // sweep more often
 const MILESTONE_INTERVAL_MS = 30 * 60 * 1000;
-const QUESTION_MIN_AGE_MS = 10 * 60 * 1000;          // wait 10min before stepping in
+const QUESTION_MIN_AGE_MS = 4 * 60 * 1000;           // step in faster
 const QUESTION_MAX_AGE_MS = 60 * 60 * 1000;          // ignore older than 1h
-const PICKUP_GAP_MS = 60 * 60 * 1000;                // 1h gap between pickups in a chat
+const PICKUP_GAP_MS = 20 * 60 * 1000;                // 20min between pickups in a chat (was 1h)
 const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;         // 3h between milestone posts
 
 // Command-cheatsheet reminder cadence.
@@ -125,23 +130,39 @@ const QUESTION_KEYWORDS = [
   "ltv", "tier", "fee", "deposit", "withdraw", "lp", "earn", "yield",
   "credit", "credit score", "$magpie", "magpie token", "holder",
   "extend", "topup", "top-up", "refer", "referral", "pool",
+  "keeper", "vault", "auto-protect", "autoprotect", "wallet",
+  "stake", "swap", "claim", "audit", "rugged", "scam",
   // common how-to verbs
-  "how do i", "how does", "what happens", "what's the", "can i ",
-  "is it safe", "is there", "do i need", "what tier", "how long",
+  "how do i", "how does", "how can", "what happens", "what's the",
+  "what is", "can i ", "is it safe", "is it possible", "is there",
+  "do i need", "what tier", "how long", "when does", "when will",
+  "why does", "anyone know", "anyone using",
 ];
+
+// Short keywords (lp, fee, ltv) match inside common words ("help" →
+// "lp", "coffee" → "fee", etc.), causing false positives. Pre-build
+// a single boundary-aware regex from the keyword list — anything ≤4
+// chars gets \b boundaries, longer phrases match anywhere.
+const QUESTION_KEYWORD_RE = (() => {
+  const parts = QUESTION_KEYWORDS.map((k) => {
+    const esc = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return k.length <= 4 ? `\\b${esc}\\b` : esc;
+  });
+  return new RegExp(parts.join("|"), "i");
+})();
 
 function isCandidateQuestion(text) {
   if (!text) return false;
   const trimmed = text.trim();
   if (trimmed.length < 8 || trimmed.length > 300) return false;
-  if (!trimmed.endsWith("?")) return false;
-  const lower = trimmed.toLowerCase();
-  // command messages aren't questions (already routed elsewhere)
-  if (lower.startsWith("/")) return false;
-  for (const kw of QUESTION_KEYWORDS) {
-    if (lower.includes(kw)) return true;
-  }
-  return false;
+  // Accept "?" OR question-shaped openers without explicit punctuation
+  // ("anyone here borrowed", "wondering if...", etc.) — community users
+  // often skip the question mark on TG.
+  const endsWithQ = trimmed.endsWith("?");
+  const startsWithQVerb = /^(anyone|can\s+(?:i|we|you)|how\s+(?:do|does|can)|what(?:'s|\s+is)|why\s+(?:does|is)|when\s+(?:will|does)|where\s+(?:do|is)|wondering|curious|is\s+it)/i.test(trimmed);
+  if (!endsWithQ && !startsWithQVerb) return false;
+  if (trimmed.startsWith("/")) return false;
+  return QUESTION_KEYWORD_RE.test(trimmed);
 }
 
 /**
@@ -458,6 +479,40 @@ async function sweepMilestones(botApi) {
     } catch (err) {
       console.warn(`[proactive] milestone sweep ${chatId} failed:`, err.message);
     }
+  }
+}
+
+/* ────────────────── SCAM-BAN EDUCATIONAL MOMENT ────────────────── */
+
+// When the bot bans an impersonator, Pip turns the action into a
+// teachable post in the group. Templated (no LLM cost), throttled so
+// a scam-wave doesn't trigger 10 of these in a row.
+const SCAM_BAN_TEMPLATES = [
+  `🛡 Just removed a Magpie impersonator from the group. *Reminder:* no one from Magpie will ever DM you first. The only official accounts are *@magpie\\_capital\\_bot* (wallet) and *@magpietalk* (this group). Anything else with "Magpie" in the name is a scam.`,
+  `🛡 Banned an account pretending to be Magpie. *Heads up:* Magpie doesn't DM users, doesn't run airdrops, doesn't ask anyone to "verify" their wallet. Full canonical handle list: magpie.capital/links.`,
+  `🛡 Removed a scammer impersonating the Magpie team. If anyone reaches out claiming to be Magpie staff offering "help" or "refunds" — block, report, and double-check at magpie.capital/links. We will *never* DM you first.`,
+  `🛡 One less scammer in the chat. *Pattern to know:* impersonators use Magpie-flavored names and ask users to DM them or click recovery links. If you see it, just \`/scam\` for the full pattern list — or flag it and a mod will handle it.`,
+];
+
+// Per-chat throttle so a scam wave doesn't spam the group with 10
+// nearly-identical "banned a scammer" posts in a row. 20 min between
+// educational posts; the bans themselves still all execute.
+const SCAM_BAN_POST_GAP_MS = 20 * 60 * 1000;
+const lastScamBanPostAt = new Map(); // chatId → timestamp
+
+export async function maybePostScamBanEducation(botApi, chatId) {
+  if (PROACTIVE_DISABLED) return;
+  const last = lastScamBanPostAt.get(Number(chatId)) || 0;
+  if (Date.now() - last < SCAM_BAN_POST_GAP_MS) return; // throttled
+  const text = SCAM_BAN_TEMPLATES[Math.floor(Math.random() * SCAM_BAN_TEMPLATES.length)];
+  try {
+    await botApi.sendMessage(Number(chatId), text, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+    });
+    lastScamBanPostAt.set(Number(chatId), Date.now());
+  } catch (err) {
+    console.warn(`[proactive] scam-ban education post to ${chatId} failed:`, err.message);
   }
 }
 
