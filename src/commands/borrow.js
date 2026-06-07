@@ -139,7 +139,7 @@ export function registerBorrowCallbacks(bot) {
       .text("25%", "borrow:pct:25").text("50%", "borrow:pct:50")
       .text("75%", "borrow:pct:75").text("100%", "borrow:pct:100")
       .row()
-      .text("✏️ Custom amount", "borrow:custom")
+      .text("✏️ Custom %", "borrow:custom")
       .row().text("✕ Cancel", "borrow:cancel");
 
     await ctx.answerCallbackQuery();
@@ -163,34 +163,43 @@ export function registerBorrowCallbacks(bot) {
         `Selected: *${state.selected.symbol}*`,
         `Balance: ${state.selected.humanAmount.toLocaleString()}`,
         "",
-        `Type the amount of ${state.selected.symbol} you want to use as collateral:`,
+        `Type the *%* of your ${state.selected.symbol} balance to use as collateral.`,
+        `e.g. \`42\` for 42% or \`82.5\` for 82.5%`,
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
   });
 
-  // Middleware to catch custom amount input.
+  // Middleware to catch custom percentage input.
   bot.on("message:text", async (ctx, next) => {
     const state = pending.get(ctx.chat.id);
     if (!state || state.stage !== "await_custom") return next();
 
-    const input = ctx.message.text.trim().replace(/,/g, "");
-    const amount = Number(input);
+    // Accept "42", "42%", "42.5", "42.5%" — strip any % sign + commas.
+    const input = ctx.message.text.trim().replace(/,/g, "").replace(/%$/, "").trim();
+    const pct = Number(input);
 
-    if (isNaN(amount) || amount <= 0) {
-      return ctx.reply("Please enter a valid number.");
+    if (!Number.isFinite(pct) || pct <= 0) {
+      return ctx.reply("Please enter a positive percentage (e.g. `42`).", { parse_mode: "Markdown" });
     }
-
-    if (amount > state.selected.humanAmount) {
+    if (pct > 100) {
       return ctx.reply(
-        `That's more than your balance of ${state.selected.humanAmount.toLocaleString()} ${state.selected.symbol}. Try a smaller amount.`,
+        "Can't pledge more than 100% of your balance. Try a smaller %.",
       );
     }
 
-    const rawBig = BigInt(Math.floor(amount * 10 ** state.selected.decimals));
+    // BigInt-safe math: matches the quick-button math when pct is a
+    // whole number (rawAmount * pct / 100) but supports fractional %s.
+    const bps = BigInt(Math.round(pct * 100));
+    const rawBig = (BigInt(state.selected.rawAmount) * bps) / 10_000n;
+    if (rawBig === 0n) {
+      return ctx.reply("That % rounds to zero at the token's decimals — try a larger %.");
+    }
+    // Human form for display + downstream math (preserves prior shape).
+    const decimals = state.selected.decimals;
+    const amount = Number(rawBig) / Math.pow(10, decimals);
     state.collateralRaw = rawBig;
     state.humanAmount = amount;
-    state.stage = "tier";
     delete state.stage;
     pending.set(ctx.chat.id, state);
 
