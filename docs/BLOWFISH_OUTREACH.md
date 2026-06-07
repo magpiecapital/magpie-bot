@@ -178,3 +178,70 @@ to keep the tone professional.)*
 
 Everything in this doc uses *only* public info. Nothing here exposes
 operator identity, internal numbers, or unpublished plans.
+
+---
+
+## Channel 4 — Solana Program Registry (verified-build listing)
+
+**URL:** https://github.com/DeployDAO/solana-program-registry
+
+This is the canonical *"is this on-chain program what its source code claims to be"* registry. Submitting Magpie adds an automated build-verification run that proves the deployed program at `4FEFPeMH…6wmh` is exactly what's in `magpiecapital/magpie-bot/programs/magpie-lending`. This is the strongest legitimacy signal a Solana project can carry — and it's free.
+
+**Why it matters for Blowfish:** Registries like this often feed into heuristic detectors as "known-legit" lists, OR are referenced by reviewers checking "is this project real or a scam?" Even if Blowfish doesn't auto-consume it, having a registry entry to point at in the appeal is concrete evidence.
+
+### Concrete next steps (3 small things, ~30 min total)
+
+1. **Tag a release on `magpiecapital/magpie-bot`** so the registry has a stable build target:
+   ```bash
+   cd /Users/[redacted]/bagbank-bot
+   git tag v1.0.0
+   git push --tags
+   ```
+
+2. **Open a PR against `DeployDAO/solana-program-registry`** adding Magpie to `programs.yml`. The diff is literally three lines — append at the end of the file (alphabetical by org isn't strictly enforced; recent entries are mostly grouped at bottom):
+   ```yaml
+   "magpiecapital/magpie-bot":
+     - v1.0.0
+   ```
+
+3. **(Optional) Message `ianm` on Keybase** to flag the PR — per the registry's README, this can speed review.
+
+### One-line PR description
+
+> Add Magpie Capital — permissionless Solana lending protocol. Source: `magpiecapital/magpie-bot/programs/magpie-lending`. Deployed program ID: `4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh`. 240+ SOL lifetime borrowed, zero LP losses, zero liquidations.
+
+---
+
+## Channel 5 — Solana Ecosystem Directory (official Solana Foundation listing)
+
+**URL:** https://solanaecosystem.com/directory
+
+The Solana Foundation's official ecosystem directory. Adds Magpie to "the list of legitimate projects on Solana" — a low-effort reputational signal that other parts of the ecosystem (including blocklist reviewers) check.
+
+### Submission
+
+Look for a "Submit your project" / "Add to directory" CTA on the page. Typical fields:
+
+- **Name:** Magpie Capital
+- **Category:** DeFi · Lending
+- **Description:** Permissionless lending on Solana. Borrow SOL against approved memecoins and tokenized stocks, repay on your own schedule. Custodial-by-export — users can self-custody any time. Telegram-native UX.
+- **Website:** https://magpie.capital
+- **X / Twitter:** @MagpieLoans
+- **GitHub:** https://github.com/magpiecapital
+- **Blockchain:** Solana mainnet
+
+---
+
+## Updated priority order
+
+Same 10-day cadence as above, with the registry submissions slotted in as parallel work:
+
+| Day | Channel | Why |
+|-----|---------|-----|
+| 0 (today) | Blowfish Typeform + X tweet | Primary appeal path |
+| 0 (today, parallel) | Solana Program Registry PR | Strongest legitimacy signal we can self-serve |
+| 0 (today, parallel) | Solana Ecosystem Directory | Low-effort reputational add |
+| 3 | Phantom dApp Developer Discord | Escalation backup |
+| 5 | @0xMert_ DM (Helius CEO) | Personal-network nudge if still stuck |
+| 7 | Polite public @brandonmillman | Last-resort visibility |
+| 10+ | Budget audit (Sec3 / Otter / Halborn) | Resolves underlying detection upstream |
