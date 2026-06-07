@@ -2,6 +2,7 @@ import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLiveOwedLamports } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 
 function formatSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -49,7 +50,7 @@ export async function handlePositions(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
-  const { rows } = await query(
+  const { rows: rawRows } = await query(
     `SELECT l.*, sm.symbol
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -58,8 +59,25 @@ export async function handlePositions(ctx) {
     [user.id],
   );
 
-  if (rows.length === 0) {
+  if (rawRows.length === 0) {
     return ctx.reply("📭 No active loans.\n\nUse /borrow to take one out.");
+  }
+
+  // Wallet-scope: only show loans owned by the user's currently-active
+  // wallet. Per the multi-wallet design principle ("only credit + points
+  // aggregate across linked wallets; holdings stay separate"), showing
+  // every wallet's loans here would be confusing — the user runs /repay
+  // and gets a CONSTRAINT_HAS_ONE because the active wallet didn't open
+  // the loan. Scope here, surface a hint at the bottom for cross-wallet
+  // visibility.
+  const { filtered: rows, otherWalletCount } = await scopeLoansToActiveWallet(user.id, rawRows);
+
+  if (rows.length === 0) {
+    return ctx.reply(
+      otherWalletCount > 0
+        ? `📭 No active loans on your current wallet.\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch.`
+        : "📭 No active loans.\n\nUse /borrow to take one out.",
+    );
   }
 
   // Fetch live on-chain amount first, then use it for health calc.
@@ -93,6 +111,12 @@ export async function handlePositions(ctx) {
     "",
     "Actions: /repay · /partialrepay · /topup · /extend",
   );
+  if (otherWalletCount > 0) {
+    lines.push(
+      "",
+      `_+${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch._`,
+    );
+  }
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }

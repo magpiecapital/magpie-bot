@@ -9,6 +9,7 @@ import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLiveOwedLamports } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -37,7 +38,7 @@ export async function handleCalendar(ctx) {
   if (!tgUser) return;
   const user = await upsertUser(tgUser.id, tgUser.username);
 
-  const { rows } = await query(
+  const { rows: rawRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
             l.original_loan_amount_lamports, l.due_timestamp,
             sm.symbol, sm.decimals
@@ -47,13 +48,18 @@ export async function handleCalendar(ctx) {
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
+  // Scope to active wallet — calendar of every linked wallet's loans
+  // would mix in things the user can't act on from the current signer.
+  const { filtered: rows, otherWalletCount } = await scopeLoansToActiveWallet(user.id, rawRows);
 
   if (rows.length === 0) {
     return ctx.reply(
       [
         "📅 *Loan Calendar*",
         "",
-        "No active loans. Use /borrow to take one out.",
+        otherWalletCount > 0
+          ? `No active loans on your current wallet.\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch.`
+          : "No active loans. Use /borrow to take one out.",
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
@@ -105,6 +111,9 @@ export async function handleCalendar(ctx) {
   }
   if (enriched.length > 0) {
     lines.push("_Pick a loan below to repay / topup / extend, or use /repay /topup /extend directly._");
+  }
+  if (otherWalletCount > 0) {
+    lines.push("", `_+${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch._`);
   }
 
   await ctx.reply(lines.join("\n"), {

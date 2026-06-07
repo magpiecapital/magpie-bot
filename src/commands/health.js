@@ -12,6 +12,7 @@ import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLiveOwedLamports } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -86,8 +87,10 @@ export async function handleHealth(ctx) {
       );
     }
   } else {
-    // Lowest-health loan first
-    const { rows } = await query(
+    // Lowest-health loan first — scoped to the active wallet so a
+    // multi-wallet user doesn't get freaked out by a "low health"
+    // loan they can't actually act on from their current wallet.
+    const { rows: rawRows } = await query(
       `SELECT l.*, sm.symbol, sm.decimals
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -95,8 +98,13 @@ export async function handleHealth(ctx) {
        ORDER BY l.due_timestamp ASC`,
       [user.id],
     );
+    const { filtered: rows, otherWalletCount } = await scopeLoansToActiveWallet(user.id, rawRows);
     if (rows.length === 0) {
-      return ctx.reply("No active loans. Use /borrow to take one out.");
+      return ctx.reply(
+        otherWalletCount > 0
+          ? `No active loans on your current wallet.\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch.`
+          : "No active loans. Use /borrow to take one out.",
+      );
     }
     // Compute health of all in parallel, pick lowest
     const withRatios = await Promise.all(rows.map(async (r) => ({
@@ -106,14 +114,14 @@ export async function handleHealth(ctx) {
     withRatios.sort((a, b) => (a.snap.ratio ?? Infinity) - (b.snap.ratio ?? Infinity));
     loan = withRatios[0].row;
     // Reuse the snapshot we already computed
-    return renderHealth(ctx, loan, withRatios[0].snap, rows.length > 1);
+    return renderHealth(ctx, loan, withRatios[0].snap, rows.length > 1, otherWalletCount);
   }
 
   const snap = await snapshotLoan(loan);
   return renderHealth(ctx, loan, snap, false);
 }
 
-async function renderHealth(ctx, loan, snap, multiple) {
+async function renderHealth(ctx, loan, snap, multiple, otherWalletCount = 0) {
   const ratio = snap.ratio;
   const badge = ratio != null ? healthBadge(ratio) : { emoji: "⚪", label: "Unknown" };
 
@@ -131,6 +139,9 @@ async function renderHealth(ctx, loan, snap, multiple) {
 
   if (multiple) {
     lines.push("", "_Showing your lowest-health loan. Use `/health <loan_id>` for a specific one, or /calendar for all._");
+  }
+  if (otherWalletCount > 0) {
+    lines.push("", `_+${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch._`);
   }
 
   const kb = new InlineKeyboard()
