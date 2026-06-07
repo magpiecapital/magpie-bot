@@ -11,8 +11,21 @@ const JUP_BATCH_SIZE = 50;
 /**
  * Fetch price of `mint` denominated in SOL (token value in SOL).
  * Returns a float — multiply by token amount (human units) for total SOL value.
+ *
+ * Resilience model:
+ *   1. Hit Jupiter (primary). If 429 / 5xx / network error → retry once
+ *      after a short jittered delay (most rate limits are bursty).
+ *   2. If still failing, fall back to DexScreener. Single-source result
+ *      with a log line so we know we're degraded — better than letting
+ *      /borrow fail outright for every user the moment Jupiter throttles.
+ *   3. Throw only if both sources fail.
+ *
+ * Note: high-stakes valuation (e.g. actual /borrow LTV check) still goes
+ * through getPriceInSolCrossSourced — that one REQUIRES both sources
+ * to agree. This function is the low-stakes "just give me a price"
+ * path used by the on-chain price-feed attestor.
  */
-export async function getPriceInSol(mint) {
+async function jupiterPriceInSol(mint) {
   const resp = await axios.get(JUPITER_API, {
     params: { ids: `${mint},${SOL_MINT}` },
     timeout: 10_000,
@@ -23,6 +36,48 @@ export async function getPriceInSol(mint) {
     throw new Error(`No price data for mint ${mint}`);
   }
   return tokenUsd / solUsd;
+}
+
+function isTransientPriceError(err) {
+  const status = err?.response?.status;
+  if (status === 429) return true;
+  if (status >= 500 && status < 600) return true;
+  // Network-level (no response): ECONNRESET, ETIMEDOUT, etc.
+  if (!err?.response && err?.code) return true;
+  return false;
+}
+
+export async function getPriceInSol(mint) {
+  // Attempt 1: Jupiter
+  try {
+    return await jupiterPriceInSol(mint);
+  } catch (err1) {
+    if (!isTransientPriceError(err1)) {
+      // Non-transient (e.g. mint not on Jupiter). Skip retry, try DexScreener.
+      try {
+        const dex = await dexscreenerPriceInSol(mint);
+        console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter: ${err1.message})`);
+        return dex;
+      } catch (err2) {
+        throw new Error(`No price data for ${mint} (Jupiter: ${err1.message}; DexScreener: ${err2.message})`);
+      }
+    }
+
+    // Transient — wait 200-700ms with jitter, retry Jupiter once.
+    await new Promise((r) => setTimeout(r, 200 + Math.random() * 500));
+    try {
+      return await jupiterPriceInSol(mint);
+    } catch (err2) {
+      // Retry failed too. Fall back to DexScreener.
+      try {
+        const dex = await dexscreenerPriceInSol(mint);
+        console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter still failing after retry: ${err2.message})`);
+        return dex;
+      } catch (err3) {
+        throw new Error(`No price data for ${mint} (Jupiter: ${err2.message}; DexScreener: ${err3.message})`);
+      }
+    }
+  }
 }
 
 /**
