@@ -116,7 +116,7 @@ export async function handleStart(ctx) {
   const msg = [
     "🏦 *Welcome to Magpie*",
     "",
-    "_Where your memecoin bags unlock SOL._",
+    "_I'm Pip — Magpie's AI agent. I'll help you borrow SOL against your memecoin bags, manage loans, and answer questions along the way._",
     "",
     ...walletSection,
     "",

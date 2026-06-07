@@ -44,7 +44,7 @@ export async function handleVersion(ctx) {
   const startedAt = getStartedAt();
   const uptime = Date.now() - startedAt;
   const lines = [
-    "🤖 *Magpie bot*",
+    "🤖 *Pip · Magpie's AI agent*",
     "",
     `Version: ${pkgVersion}`,
     `Commit:  \`${gitSha}\``,

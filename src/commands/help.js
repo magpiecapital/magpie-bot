@@ -5,6 +5,8 @@ export async function handleHelp(ctx) {
   const lines = [
     "🏦 *Magpie Help*",
     "",
+    "_I'm Pip — your AI agent. Tap any command below, or just talk to me in plain English._",
+    "",
     "*Navigation*",
     "/home — main menu",
     "/help — this page",
