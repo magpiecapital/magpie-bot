@@ -1292,6 +1292,12 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/me/export",
   // Dashboard aggregate — single-fetch primer for the linked-user dashboard.
   "/api/v1/dashboard",
+  // Helius webhook for lender-wallet outflow alarms. NOT api-key gated
+  // because Helius can't easily pass an x-api-key header. Auth is done
+  // INSIDE the handler via a separate shared secret (Authorization
+  // header, LENDER_ALARM_WEBHOOK_SECRET on Railway). The handler is
+  // fail-closed: returns 503 if the env var isn't set.
+  "/api/v1/lender-alarm-webhook",
 ]);
 
 async function router(req, res) {
