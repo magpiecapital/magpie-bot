@@ -18,12 +18,85 @@ import {
   listEnabledChats,
 } from "../services/community-moderation.js";
 
+/**
+ * Operator-command gate. Non-admins hit this when they try
+ * /community_enable, /community_repost_guidelines, etc. — usually because
+ * they saw the command in another user's message or in autocomplete.
+ *
+ * Curt "Not authorized" replies make Pip feel hostile and confuse new
+ * members. Instead: silently remove the command from the public chat
+ * (operator commands shouldn't clutter the feed), DM the user a friendly
+ * explainer with what they CAN do, and only fall back to a brief in-group
+ * reply if the DM bounces.
+ */
 async function requireAdmin(ctx) {
-  if (!isAdmin(ctx.from?.id)) {
-    await ctx.reply("Not authorized.");
-    return false;
+  if (isAdmin(ctx.from?.id)) return true;
+
+  const commandText = (ctx.message?.text || "").split(/\s+/)[0] || "an operator command";
+  const inGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+
+  // 1. Best-effort: delete the original command message from the group
+  //    so the public chat isn't filled with admin-command attempts.
+  if (inGroup) {
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+    } catch { /* fail-open — bot may lack perms; not critical */ }
   }
-  return true;
+
+  // 2. DM the user a warm, useful explainer.
+  const friendlyDm = [
+    `Hey 👋 — \`${commandText}\` is an *operator-only* command (used by the Magpie team to configure moderation). It's not something the community uses directly, so I didn't run it.`,
+    ``,
+    `*Here's what you can do in the community group (@magpietalk):*`,
+    `• \`/ask <question>\` — ask me anything about Magpie, the protocol, your loans, fees, tiers, etc.`,
+    `• Chat with other Magpie users — discussion, questions, memes are all welcome`,
+    `• React to / reply to others' messages normally`,
+    ``,
+    `*And here in your private bot (@magpie\\_capital\\_bot):*`,
+    `• \`/borrow\` — take a loan against your tokens`,
+    `• \`/positions\` — see your active loans + health`,
+    `• \`/repay\` — close out a loan and get your collateral back`,
+    `• \`/help\` — full command list`,
+    ``,
+    `If you have feedback or noticed something off in the community group, just \`/support\` and the team will see it. 🙏`,
+  ].join("\n");
+
+  let dmDelivered = true;
+  try {
+    await ctx.api.sendMessage(ctx.from.id, friendlyDm, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+    });
+  } catch (err) {
+    // User probably hasn't /start'd the bot yet; we can't DM them.
+    dmDelivered = false;
+    console.warn(`[community-admin] could not DM user ${ctx.from?.id}: ${err.message}`);
+  }
+
+  // 3. Brief fallback reply if we couldn't DM and we're in a group.
+  if (!dmDelivered && inGroup) {
+    try {
+      await ctx.api.sendMessage(
+        ctx.chat.id,
+        `Hey @${ctx.from.username || ctx.from.first_name || "there"} — \`${commandText}\` is operator-only. ` +
+        `Open me in DM and tap *Start* to get your wallet + the full command list. Or use \`/ask <question>\` here in the group anytime. 🙏`,
+        {
+          parse_mode: "Markdown",
+          reply_to_message_id: ctx.message?.message_id,
+        },
+      );
+    } catch { /* group post may fail; non-critical */ }
+  }
+
+  // 4. Direct invocation (operator command tried in DM by a non-admin)
+  //    — they're already in a 1:1 with the bot, just answer there too.
+  if (!inGroup && dmDelivered === false) {
+    try {
+      await ctx.reply(friendlyDm, { parse_mode: "Markdown", disable_web_page_preview: true });
+    } catch { /* nothing more we can do */ }
+  }
+
+  return false;
 }
 
 function isGroup(ctx) {
