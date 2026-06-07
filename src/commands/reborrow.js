@@ -12,6 +12,7 @@ import { checkLoanLimits } from "../services/loan-limits.js";
 import { isBorrowingPaused } from "../services/admin.js";
 import { incrementBorrowed } from "../services/reputation.js";
 import { query } from "../db/pool.js";
+import { filterLoansForWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 
 const LTV_TIERS = [
@@ -35,17 +36,28 @@ export async function handleReborrow(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const { publicKey } = await ensureWallet(user.id);
 
-  // Find last completed loan
-  const { rows: [lastLoan] } = await query(
-    `SELECT collateral_mint, ltv_percentage, collateral_amount
+  // Find last completed loan ON THE CURRENT WALLET. Pulling globally
+  // across linked wallets would suggest the wrong "recipe" — if the
+  // user did $WIF Express on wallet A, then $BONK Standard on wallet
+  // B, opening /reborrow on wallet A should reborrow $WIF Express
+  // (not $BONK), matching the wallet-scoped-holdings principle.
+  // Bump LIMIT to 20 so we keep options after filtering.
+  const { rows: rawLast } = await query(
+    `SELECT loan_id, loan_pda, program_id, collateral_mint, ltv_percentage, collateral_amount
      FROM loans
      WHERE user_id = $1 AND status IN ('repaid', 'active')
-     ORDER BY created_at DESC LIMIT 1`,
+     ORDER BY created_at DESC LIMIT 20`,
     [user.id],
   );
+  const scopedLast = filterLoansForWallet(rawLast, publicKey);
+  const lastLoan = scopedLast[0];
 
   if (!lastLoan) {
-    return ctx.reply("No previous loans found. Use /borrow for your first loan.");
+    return ctx.reply(
+      rawLast.length > 0
+        ? "No previous loans on this wallet — /wallets to switch, or use /borrow to start fresh here."
+        : "No previous loans found. Use /borrow for your first loan.",
+    );
   }
 
   // Check if they have a balance of the same token
