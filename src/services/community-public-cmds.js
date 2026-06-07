@@ -66,10 +66,15 @@ async function fetchStats() {
        FROM loans WHERE created_at > NOW() - INTERVAL '24 hours'`,
     ),
     query(
+      // Headline number is total_borrowed_lifetime — sum across ALL loans
+      // ever issued (active + repaid + liquidated). This is the protocol's
+      // cumulative lending volume, the "229.2 SOL" headline figure.
+      // active_lamports is the much smaller "currently out on loan" number.
       `SELECT
          COUNT(*) FILTER (WHERE status='active')::int     AS active,
          COUNT(*) FILTER (WHERE status='repaid')::int     AS repaid,
          COUNT(*) FILTER (WHERE status='liquidated')::int AS liquidated,
+         COALESCE(SUM(loan_amount_lamports::numeric), 0)::text AS lifetime_lamports,
          COALESCE(SUM(loan_amount_lamports::numeric)
                   FILTER (WHERE status='active'), 0)::text AS active_lamports`,
     ),
@@ -111,14 +116,17 @@ export async function handleCommunityStats(ctx) {
     const lines = [
       `📊 *Magpie · live protocol stats*`,
       ``,
+      `🦅 *Total borrowed (lifetime):* *${fmtSol(s.book.lifetime_lamports)} SOL*`,
+      `  _Cumulative SOL the protocol has ever lent out._`,
+      ``,
+      `*Loan book — right now*`,
+      `  • Currently out on loan: *${fmtSol(s.book.active_lamports)} SOL* across *${fmtInt(s.book.active)}* active`,
+      `  • Lifetime repaid:       *${fmtInt(s.book.repaid)}*`,
+      `  • Lifetime liquidated:   *${fmtInt(s.book.liquidated)}*`,
+      ``,
       `*Last 24 hours*`,
       `  • New loans: *${fmtInt(s.loans24h.n)}* · *${fmtSol(s.loans24h.sol_lamports)} SOL* borrowed`,
       `  • New users: *${fmtInt(s.users.new_24h)}*`,
-      ``,
-      `*Lending book*`,
-      `  • Active loans: *${fmtInt(s.book.active)}* · *${fmtSol(s.book.active_lamports)} SOL* out`,
-      `  • Lifetime repaid: *${fmtInt(s.book.repaid)}*`,
-      `  • Lifetime liquidated: *${fmtInt(s.book.liquidated)}*`,
       ``,
       `*LP pool*`,
       `  • Total deposited: *${fmtSol(s.pool.total_shares)} SOL*`,
@@ -334,6 +342,85 @@ export async function handleCommunityTokens(ctx) {
   }
 }
 
+/* ─────────────────────────── /faq ─────────────────────────── */
+
+export async function handleCommunityFaq(ctx) {
+  const text = [
+    `❓ *Magpie · frequently asked*`,
+    ``,
+    `*"Is Magpie custodial?"*`,
+    `Your Magpie wallet IS the bot wallet — that's what lets us co-sign repayments in one click. Encrypted at rest with AES-256-GCM, per-user IV. You can /export the private key any time and self-custody.`,
+    ``,
+    `*"What happens if my token's price tanks?"*`,
+    `If health factor drops below 1.1× of LTV, the loan is liquidated and the collateral is sold to repay the SOL. /topup to add more collateral and avoid this. Auto-Protect (in /security) can do this automatically.`,
+    ``,
+    `*"Can I repay early?"*`,
+    `Yes — zero penalty. You only pay the upfront tier fee (Express 3% / Quick 2% / Standard 1.5%).`,
+    ``,
+    `*"Why are the terms so short?"*`,
+    `Short terms + low LTV are why we've had zero liquidations to date. Memecoin volatility is high; long terms would mean way more liquidations.`,
+    ``,
+    `*"Can I switch tiers mid-loan?"*`,
+    `No — close the loan with /repay, then open a new one in the tier you want.`,
+    ``,
+    `*"What's $MAGPIE?"*`,
+    `The protocol token. $MAGPIE holders earn 10% of all loan fees pro-rata. Distributions are randomized (every 5–10 days).`,
+    ``,
+    `*"How is this not a scam?"*`,
+    `Everything is on-chain and verifiable. Pool TVL, every loan, every repayment, every liquidation — read it on solscan or magpie.capital/stats. Both repos are public on github.com/magpiecapital.`,
+    ``,
+    `*"Will Magpie ever DM me?"*`,
+    `*Never.* We do not initiate DMs. Anyone DMing you claiming to be Magpie support is a scammer. Our only two TG accounts are @magpie\\_capital\\_bot (this private chat) and @magpietalk (this group).`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📚 Full docs", url: `${SITE_URL}/docs` },
+          { text: "🔒 Security", url: `${SITE_URL}/security` },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /scam ─────────────────────────── */
+
+export async function handleCommunityScam(ctx) {
+  const text = [
+    `🚨 *Common Magpie-themed scams — know the patterns*`,
+    ``,
+    `*"Magpie Support" DMs you first*`,
+    `→ Magpie never DMs anyone first. There is no support DM account. Block and report.`,
+    ``,
+    `*"Free $MAGPIE airdrop — claim here"*`,
+    `→ No airdrop exists. Any "claim" page is a wallet-drainer. Don't click.`,
+    ``,
+    `*"Send 1 SOL to receive 10 SOL"*`,
+    `→ Classic doubler scam. Magpie does not run promotions. Anyone offering this is stealing your SOL.`,
+    ``,
+    `*"@MagpieLoansSupport" / "@MagpieCapitalOfficial" etc.*`,
+    `→ Only *@MagpieLoans* on X is real. Only *@magpie\\_capital\\_bot* and *@magpietalk* on TG are real. Anything else with "Magpie" in the name is impersonation.`,
+    ``,
+    `*"I'll help you recover your wallet — just share your seed phrase"*`,
+    `→ Never. Anyone asking for your seed phrase is robbing you. There is no recovery service. Even Magpie cannot ask for it.`,
+    ``,
+    `*A "Magpie team member" DM asking you to test a new feature on a custom URL*`,
+    `→ Real features ship inside @magpie\\_capital\\_bot or at magpie.capital. Custom URLs are phishing.`,
+    ``,
+    `*"Magpie is being hacked — withdraw immediately to this address"*`,
+    `→ Panic-induce scam. Verify any incident at magpie.capital/security before acting. The protocol won't ever ask you to send SOL anywhere.`,
+    ``,
+    `_When in doubt: do nothing, ask in this group with /ask, and verify on-chain at solscan.io._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
+
 /* ─────────────────────────── ROUTER ─────────────────────────── */
 
 /**
@@ -351,6 +438,8 @@ const COMMUNITY_CMD_HANDLERS = {
   fees: handleCommunityFees,
   how: handleCommunityHow,
   tokens: handleCommunityTokens,
+  faq: handleCommunityFaq,
+  scam: handleCommunityScam,
 };
 
 export async function maybeHandlePublicCommand(ctx, msg) {

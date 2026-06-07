@@ -39,6 +39,22 @@ import { classifyImage, actionForImageVerdict } from "../services/community-imag
 import { findUserByTelegramId } from "../services/users.js";
 
 /**
+ * Escape Telegram legacy-Markdown control chars before injecting any
+ * user-controlled string (username, first_name, message body) into an
+ * operator alert that uses parse_mode: "Markdown". A username like
+ * `@user_with_underscores` would otherwise render as italic, and a
+ * malicious first_name with backticks could smuggle code blocks. The
+ * operator is the only audience here, but ugly DMs are annoying and
+ * a hostile actor could exploit Markdown parsing edge cases to hide
+ * parts of a flag message from the operator's eye. Defensive escape
+ * fixes all of that.
+ */
+function escMd(s) {
+  if (s == null) return "";
+  return String(s).replace(/([_*`\[\]()])/g, "\\$1");
+}
+
+/**
  * Trusted members are TG users who already have a Magpie wallet through
  * the bot. They're known good actors — auto-muting them on a misread is
  * the worst outcome. We DOWNGRADE any mute action against a trusted
@@ -458,10 +474,10 @@ async function maybeRunImageCheck(ctx, msg, sender) {
       await notifyAdmin(
         ctx.api,
         `🖼 *Community image flagged*\n\n` +
-        `*Verdict:* ${result.verdict} (conf ${result.confidence.toFixed(2)})\n` +
-        `*From:* @${sender.username || sender.first_name || sender.id}\n` +
-        `*Reason:* ${result.reason}${decision._trusted_downgrade ? "\n\n⚠️ User has a Magpie wallet — auto-mute SKIPPED. Your call." : ""}\n\n` +
-        `*Extracted text (first 200 chars):*\n${(result.extractedText || "(none)").slice(0, 200)}`,
+        `*Verdict:* ${escMd(result.verdict)} (conf ${result.confidence.toFixed(2)})\n` +
+        `*From:* ${sender.username ? `@${escMd(sender.username)}` : escMd(sender.first_name || sender.id)}\n` +
+        `*Reason:* ${escMd(result.reason)}${decision._trusted_downgrade ? "\n\n⚠️ User has a Magpie wallet — auto-mute SKIPPED. Your call." : ""}\n\n` +
+        `*Extracted text (first 200 chars):*\n${escMd((result.extractedText || "(none)").slice(0, 200))}`,
         { parse_mode: "Markdown" },
       );
     } catch (err) {
@@ -546,19 +562,23 @@ async function maybeRunFudCheck(ctx, msg, sender) {
   if (action.flag_operator) {
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
+      // Strip triple-backticks from the user's message so it can't
+      // break out of the code-block fence below. Other Markdown chars
+      // inside ``` blocks are inert, so they don't need escaping.
+      const safeBody = text.slice(0, 800).replace(/```/g, "'''");
       await notifyAdmin(
         { api: ctx.api },
         [
           `🚨 *FUD-classifier flag* — needs your judgment`,
           ``,
-          `Chat: \`${ctx.chat.title || ctx.chat.id}\``,
-          `From: ${sender.username ? `@${sender.username}` : `user ${sender.id}`}`,
-          `Verdict: *${verdictObj.verdict}* (confidence ${verdictObj.confidence.toFixed(2)})`,
-          `Reason: ${verdictObj.reason}`,
+          `Chat: \`${escMd(ctx.chat.title || String(ctx.chat.id))}\``,
+          `From: ${sender.username ? `@${escMd(sender.username)}` : `user ${escMd(String(sender.id))}`}`,
+          `Verdict: *${escMd(verdictObj.verdict)}* (confidence ${verdictObj.confidence.toFixed(2)})`,
+          `Reason: ${escMd(verdictObj.reason)}`,
           ``,
           `Message:`,
           "```",
-          text.slice(0, 800),
+          safeBody,
           "```",
           ``,
           `Auto-action taken: ${action.action}${action.mute_sec ? ` + ${Math.round(action.mute_sec/3600)}h mute` : ""}${action._trusted_downgrade ? " (mute SKIPPED — user has a Magpie wallet)" : ""}`,

@@ -49,7 +49,10 @@ async function buildDigest() {
       `SELECT
          COUNT(*) FILTER (WHERE status='active')::int     AS active,
          COUNT(*) FILTER (WHERE status='repaid')::int     AS repaid,
-         COUNT(*) FILTER (WHERE status='liquidated')::int AS liquidated`,
+         COUNT(*) FILTER (WHERE status='liquidated')::int AS liquidated,
+         COALESCE(SUM(loan_amount_lamports::numeric), 0)::text AS lifetime_lamports,
+         COALESCE(SUM(loan_amount_lamports::numeric)
+                  FILTER (WHERE status='active'), 0)::text     AS active_lamports`,
     ),
     query(
       `SELECT sm.symbol,
@@ -79,6 +82,8 @@ async function buildDigest() {
     loans_24h_count: loans24h.n,
     loans_24h_sol: fmtSol(loans24h.sol_lamports),
     active_loans: loansLifetime.active,
+    active_sol: fmtSol(loansLifetime.active_lamports),
+    lifetime_sol: fmtSol(loansLifetime.lifetime_lamports),
     repaid_loans: loansLifetime.repaid,
     liquidated_loans: loansLifetime.liquidated,
     top_collateral: topCollateral.map(t => ({
@@ -95,8 +100,10 @@ function formatMessage(d) {
   const lines = [
     `📊 *Magpie · daily snapshot*`,
     ``,
+    `🦅 *Total borrowed (lifetime):* *${d.lifetime_sol} SOL*`,
+    ``,
     `🔓 Last 24h: *${d.loans_24h_count}* new loans · *${d.loans_24h_sol} SOL* borrowed`,
-    `🟢 Active loans right now: *${d.active_loans}*`,
+    `🟢 Currently out on loan: *${d.active_sol} SOL* across *${d.active_loans}* active`,
     `✅ Lifetime repaid: *${d.repaid_loans}* · Liquidated: *${d.liquidated_loans}*`,
     `👥 New users today: *${d.new_users_24h}* · Total: *${d.total_users}*`,
     `🏦 LP pool: *${d.lp_shares_total} SOL* deposited`,
