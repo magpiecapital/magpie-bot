@@ -58,6 +58,35 @@ const ALLOWED_DISCRIMINATORS = [
   Buffer.from([21, 217, 199, 183, 6, 96, 200, 52]),
 ];
 
+// CRITICAL — drain-exploit prevention (2026-06-07):
+//
+// An attacker crafted a borrow tx that included a System.transfer at
+// the OUTER instruction level, source = LENDER, draining 0.71 SOL per
+// tx. The previous gates only validated magpie-program instructions —
+// every non-magpie instruction passed through unchecked. The attacker
+// abused this by including the magpie.request_and_fund_loan to pass
+// gate 1, then attaching SystemProgram.transfer { source: LENDER }
+// to drain SOL on the same tx the lender co-signed.
+//
+// Fix: program allowlist. Every outer instruction's programId must
+// be in this set. SystemProgram is INTENTIONALLY excluded — borrow.ts
+// never emits a System instruction at the outer level (System CPIs
+// happen INSIDE the magpie program / ATA program, not outer).
+//
+// If you ever change borrow.ts to emit a System instruction at the
+// outer level (e.g. a tip / fee transfer), add SystemProgram here AND
+// add an instruction-level check that source !== LENDER_PUBKEY.
+const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
+  V1_PROGRAM_ID.toBase58(),
+  ...(V2_PROGRAM_ID ? [V2_PROGRAM_ID.toBase58()] : []),
+  "ComputeBudget111111111111111111111111111111",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // Token-2022
+]);
+
+const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+
 function loadLenderKeypair() {
   const b58 = process.env.LENDER_PRIVATE_KEY;
   if (b58) {
@@ -130,6 +159,51 @@ export async function handleCosignBorrow(req) {
   }
 
   // ── SECURITY GATES ──────────────────────────────────────────────
+
+  // Gate 0 (NEW, post-2026-06-07 exploit): outer-program allowlist.
+  // Every outer instruction's program must be on the allowlist. This is
+  // the drain-prevention gate: SystemProgram is intentionally NOT on
+  // the list, so an attacker cannot attach a SystemProgram.transfer
+  // { source: LENDER } to a tx the lender co-signs.
+  //
+  // Belt-and-suspenders: even if we add SystemProgram to the allowlist
+  // in the future, the immediate-rejection check below catches any
+  // System.transfer where source === LENDER, regardless of allowlist.
+  for (let i = 0; i < tx.instructions.length; i++) {
+    const ix = tx.instructions[i];
+    const programIdStr = ix.programId.toBase58();
+
+    if (!OUTER_INSTRUCTION_PROGRAM_ALLOWLIST.has(programIdStr)) {
+      console.error(`[cosign-borrow] DRAIN-ATTEMPT BLOCKED: outer ix[${i}] program ${programIdStr} not on allowlist`);
+      return {
+        status: 403,
+        body: {
+          error: "instruction program not allowed in co-signed tx",
+          detail: `outer instruction ${i} targets program ${programIdStr}; allowed: ${[...OUTER_INSTRUCTION_PROGRAM_ALLOWLIST].join(", ")}`,
+        },
+      };
+    }
+
+    // Defense-in-depth — if System ever gets re-added to the allowlist,
+    // still reject any System.transfer where the lender is the source.
+    if (programIdStr === SYSTEM_PROGRAM_ID) {
+      // System.transfer = u32 discriminator [2,0,0,0] then u64 lamports.
+      // Account 0 is the source. We don't deserialize amount here — the
+      // mere fact that LENDER is account 0 of a System ix on the outer
+      // tx is enough to reject.
+      const sourceAccountIdx = ix.keys?.[0]?.pubkey;
+      if (sourceAccountIdx && sourceAccountIdx.equals(LENDER_PUBKEY)) {
+        console.error(`[cosign-borrow] DRAIN-ATTEMPT BLOCKED: outer System ix[${i}] sources from LENDER`);
+        return {
+          status: 403,
+          body: {
+            error: "System instruction with LENDER as source is not allowed",
+            detail: `outer instruction ${i} is a System call where account[0] = lender authority — would drain SOL`,
+          },
+        };
+      }
+    }
+  }
 
   // Gate 1: at least one magpie-program instruction must be present,
   //          and ALL magpie-program instructions must be allowed.
