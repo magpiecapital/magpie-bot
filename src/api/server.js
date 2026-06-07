@@ -538,12 +538,12 @@ async function handleLoans(req, url) {
     return { status: 200, body: { wallet, active: [], history: [] } };
   }
 
-  const { rows } = await query(
+  const { rows: allUserRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
             l.loan_amount_lamports, l.original_loan_amount_lamports,
             l.ltv_percentage, l.duration_days,
             l.start_timestamp, l.due_timestamp,
-            l.status, l.tx_signature, l.updated_at,
+            l.status, l.tx_signature, l.updated_at, l.program_id,
             sm.symbol, sm.name, sm.decimals, sm.image_url, sm.category
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
@@ -552,6 +552,21 @@ async function handleLoans(req, url) {
       LIMIT 100`,
     [w.user_id],
   );
+
+  // Scope to JUST the requesting wallet's loans. Multi-wallet users
+  // had loans from sibling wallets bleeding through because the query
+  // was scoped to user_id. Now we filter to those whose on-chain PDA
+  // matches what would be derived if `wallet` were the borrower.
+  // Credit / points / holder rewards remain shared across wallets
+  // (intentional) — only loan + collateral display is per-wallet.
+  let rows;
+  try {
+    const { filterLoansForWallet } = await import("../services/wallet-scoped-loans.js");
+    rows = filterLoansForWallet(allUserRows, wallet);
+  } catch (err) {
+    console.warn("[handleLoans] wallet-scope filter failed; returning user-wide:", err.message);
+    rows = allUserRows;
+  }
 
   const shape = (l, healthRatio) => ({
     loan_id: l.loan_id?.toString?.() ?? null,

@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getTokenBalance } from "../services/deposits.js";
 import { executeAddCollateral, recordAddCollateral, checkLoanOwnership } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 
 const pending = new Map();
@@ -31,8 +32,23 @@ export async function handleTopup(ctx) {
     return ctx.reply("📭 No active loans. Use /borrow to open one.");
   }
 
+  // Scope to active wallet (multi-wallet users were seeing loans they
+  // couldn't sign for).
+  const { filtered: scopedRows, otherWalletCount } =
+    await scopeLoansToActiveWallet(user.id, rows);
+
+  if (scopedRows.length === 0) {
+    return ctx.reply(
+      `📭 No active loans on your *current* wallet.\n\n` +
+      (otherWalletCount > 0
+        ? `You have *${otherWalletCount}* loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets. Use /wallets to switch first.`
+        : `Use /borrow to open one.`),
+      { parse_mode: "Markdown" },
+    );
+  }
+
   const kb = new InlineKeyboard();
-  for (const loan of rows) {
+  for (const loan of scopedRows) {
     const human = fmtAmount(loan.collateral_amount, loan.decimals ?? 9);
     kb.text(
       `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${human.toLocaleString()}`,
@@ -41,10 +57,11 @@ export async function handleTopup(ctx) {
   }
   kb.text("✕ Cancel", "topup:cancel");
 
-  await ctx.reply(
-    "*Add collateral* (improves health ratio, no fee)\n\nPick a loan:",
-    { parse_mode: "Markdown", reply_markup: kb },
-  );
+  const header = `*Add collateral* (improves health ratio, no fee)\n\nPick a loan:` +
+    (otherWalletCount > 0
+      ? `\n_Showing loans on your active wallet. ${otherWalletCount} more on other wallets — /wallets to switch._`
+      : "");
+  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerTopupCallbacks(bot) {

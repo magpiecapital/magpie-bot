@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
 import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 
 const pending = new Map();
@@ -38,12 +39,27 @@ export async function handleExtend(ctx) {
     return ctx.reply("📭 No active loans.");
   }
 
+  // Scope to active wallet — multi-wallet users were seeing every loan
+  // including ones their current Phantom can't sign for.
+  const { filtered: scopedRows, otherWalletCount } =
+    await scopeLoansToActiveWallet(user.id, rows);
+
+  if (scopedRows.length === 0) {
+    return ctx.reply(
+      `📭 No active loans on your *current* wallet.` +
+      (otherWalletCount > 0
+        ? `\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets — /wallets to switch.`
+        : ""),
+      { parse_mode: "Markdown" },
+    );
+  }
+
   // Live on-chain owed amount per loan — fee = bps × current_owed,
   // not bps × original. Using stale DB would overcharge after partial repays.
-  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+  const liveAmounts = await Promise.all(scopedRows.map(getLiveOwedLamports));
 
   const kb = new InlineKeyboard();
-  rows.forEach((loan, i) => {
+  scopedRows.forEach((loan, i) => {
     const bps = feeBpsForLtv(loan.ltv_percentage);
     const fee = (liveAmounts[i] * bps) / 10_000n;
     kb.text(
@@ -53,10 +69,11 @@ export async function handleExtend(ctx) {
   });
   kb.text("✕ Cancel", "extend:cancel");
 
-  await ctx.reply(
-    "*Extend loan* — adds the original duration for the tier fee.\n\nPick a loan:",
-    { parse_mode: "Markdown", reply_markup: kb },
-  );
+  const header = `*Extend loan* — adds the original duration for the tier fee.\n\nPick a loan:` +
+    (otherWalletCount > 0
+      ? `\n_${otherWalletCount} more on other wallets — /wallets to switch._`
+      : "");
+  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerExtendCallbacks(bot) {

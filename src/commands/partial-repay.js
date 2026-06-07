@@ -4,6 +4,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getSolBalance } from "../services/deposits.js";
 import { executePartialRepay, recordPartialRepay, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 
 const pending = new Map();
@@ -31,11 +32,24 @@ export async function handlePartialRepay(ctx) {
     return ctx.reply("📭 No active loans.");
   }
 
-  // Live on-chain owed amount per loan, so display matches reality after partial repays
-  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+  const { filtered: scopedRows, otherWalletCount } =
+    await scopeLoansToActiveWallet(user.id, rows);
+
+  if (scopedRows.length === 0) {
+    return ctx.reply(
+      `📭 No active loans on your *current* wallet.` +
+      (otherWalletCount > 0
+        ? `\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets — /wallets to switch.`
+        : ""),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // Live on-chain owed amount per scoped loan, so display matches reality
+  const liveAmounts = await Promise.all(scopedRows.map(getLiveOwedLamports));
 
   const kb = new InlineKeyboard();
-  rows.forEach((loan, i) => {
+  scopedRows.forEach((loan, i) => {
     kb.text(
       `#${loan.loan_id} · ${loan.symbol ?? "?"} · owe ${fmtSol(liveAmounts[i])} SOL`,
       `prepay:loan:${loan.id}`,
@@ -43,10 +57,11 @@ export async function handlePartialRepay(ctx) {
   });
   kb.text("✕ Cancel", "prepay:cancel");
 
-  await ctx.reply(
-    "*Partial repay* (collateral stays locked until full payoff)\n\nPick a loan:",
-    { parse_mode: "Markdown", reply_markup: kb },
-  );
+  const header = "*Partial repay* (collateral stays locked until full payoff)\n\nPick a loan:" +
+    (otherWalletCount > 0
+      ? `\n_${otherWalletCount} more on other wallets — /wallets to switch._`
+      : "");
+  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerPartialRepayCallbacks(bot) {

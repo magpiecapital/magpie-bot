@@ -3,6 +3,7 @@ import { PublicKey } from "@solana/web3.js";
 import { upsertUser } from "../services/users.js";
 import { query } from "../db/pool.js";
 import { executeRepay, markLoanRepaid, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
+import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { ensureWallet } from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
@@ -35,11 +36,28 @@ export async function handleRepay(ctx) {
     return ctx.reply("📭 No active loans to repay.");
   }
 
-  // Read live on-chain amount for each loan in parallel
-  const liveAmounts = await Promise.all(rows.map(getLiveOwedLamports));
+  // Scope to the user's CURRENTLY ACTIVE wallet — multi-wallet users
+  // were seeing every loan across every wallet and (a) being confused
+  // about which were theirs to sign for, (b) hitting InvalidAccountData
+  // signing errors when they picked a loan from a non-active wallet.
+  const { filtered: scopedRows, otherWalletCount } =
+    await scopeLoansToActiveWallet(user.id, rows);
+
+  if (scopedRows.length === 0) {
+    return ctx.reply(
+      `📭 No active loans on your *current* wallet.\n\n` +
+      (otherWalletCount > 0
+        ? `You have *${otherWalletCount}* loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets. Use /wallets to switch, then /repay.`
+        : `Nothing to repay anywhere on this account.`),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // Read live on-chain amount for each scoped loan in parallel
+  const liveAmounts = await Promise.all(scopedRows.map(getLiveOwedLamports));
 
   const kb = new InlineKeyboard();
-  rows.forEach((loan, i) => {
+  scopedRows.forEach((loan, i) => {
     kb.text(
       `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${fmtSol(liveAmounts[i])} SOL`,
       `repay:loan:${loan.id}`,
@@ -47,7 +65,11 @@ export async function handleRepay(ctx) {
   });
   kb.text("✕ Cancel", "repay:cancel");
 
-  await ctx.reply("*Pick a loan to repay:*", {
+  const header = `*Pick a loan to repay:*` +
+    (otherWalletCount > 0
+      ? `\n_Showing loans on your active wallet. ${otherWalletCount} more on other linked wallets — switch with /wallets to see them._`
+      : "");
+  await ctx.reply(header, {
     parse_mode: "Markdown",
     reply_markup: kb,
   });
