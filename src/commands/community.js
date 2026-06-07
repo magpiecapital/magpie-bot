@@ -22,6 +22,8 @@ export async function handleCommunity(ctx) {
     "",
     "⚠️ *Anyone else is a scammer*",
     "We will *never* DM you first. There is no \"Magpie Support\" DM account. We do not give out airdrops. If a stranger DMs you offering to help with your wallet — block and report them.",
+    "",
+    "🔗 *Full canonical list:* [magpie.capital/links](https://magpie.capital/links) — share this URL, not screenshots.",
   ].join("\n");
 
   const kb = new InlineKeyboard()

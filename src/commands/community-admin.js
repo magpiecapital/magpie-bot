@@ -113,7 +113,7 @@ const GUIDELINES_MESSAGE = [
   "🛡 *Safety basics — please read once*",
   "• *Never* share your seed phrase or private key. Anyone asking is a scammer. No exceptions.",
   "• *Never* DM strangers about your wallet, even if they say they're \"Magpie support\". Real Magpie comms come ONLY through this bot in a group setting, or via the official X handle.",
-  "• Official accounts: [X · @MagpieLoans](https://x.com/MagpieLoans) · [Bot · @magpie_capital_bot](https://t.me/magpie_capital_bot) · [Site · magpie.capital](https://magpie.capital). Anything else is impersonation.",
+  "• Official accounts: [X · @MagpieLoans](https://x.com/MagpieLoans) · [Bot · @magpie_capital_bot](https://t.me/magpie_capital_bot) · [Community · @magpietalk](https://t.me/magpietalk) · [Site · magpie.capital](https://magpie.capital). Anything else is impersonation. *Full canonical list:* [magpie.capital/links](https://magpie.capital/links)",
   "• If someone offers you \"free $MAGPIE\", \"claim your airdrop\", or wants you to send SOL to an address — it's a scam. Always.",
   "",
   "🔗 *No links — period. One exception only.*",
