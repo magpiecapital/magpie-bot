@@ -22,6 +22,7 @@ import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { getReadOnlyProgram } from "../solana/program.js";
 import { getLiveOwedLamports } from "./loans.js";
+import { scopeLoansToActiveWallet, filterLoansForWallet } from "./wallet-scoped-loans.js";
 
 // ──────────────────────────── CONFIG ────────────────────────────
 
@@ -690,6 +691,27 @@ If ZERO: pivot to /unlock or /borrow.
   "You don't have any active loans right now. Were you thinking
    about taking one out, or did you have a question about a past
    one? I can pull /history if useful."
+
+═══ MULTI-WALLET LOAN SCOPING — CRITICAL ═══
+\`list_my_loans\` returns ONLY loans on the user's currently-active
+wallet (or the wallet they're signed-in with on the site), NOT every
+loan across every linked wallet. This is intentional — Magpie users
+link multiple wallets for credit/points aggregation, but each loan
+belongs to ONE specific wallet and only that wallet can sign for it.
+
+Always read the tool response carefully:
+- \`scoped_to_wallet\`: the wallet whose loans were returned
+- \`other_wallets_loan_count\`: how many MORE loans live on other linked
+  wallets. If >0, tell the user something like:
+    "On your current wallet \`<short>\` you have 1 active loan (\$BUTTCOIN).
+     You also have 1 loan on another linked wallet — switch wallets
+     with /wallets if you want to manage that one."
+
+NEVER claim a user has a loan unless that loan came back in the
+scoped list. The user reporting this conversation in 2026 saw Pip
+say they had a \`\$TROLL\` loan they didn't actually have on that
+wallet — exactly the kind of trust-breaking error this scoping
+prevents.
 
 ═══ PLAYBOOK 2: "I want to repay" ═══
 Step 1: confirm which loan if multiple actives.
@@ -1969,7 +1991,7 @@ const HINT_NOT_FOUND = "That record was not found. Confirm the user is signed in
 const HINT_NO_WALLET = "The user has no Magpie wallet yet. Suggest they run /start first.";
 
 const TOOL_HANDLERS = {
-  lookup_loan: async ({ loan_id }, { userId }) => {
+  lookup_loan: async ({ loan_id }, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.*, sm.symbol
          FROM loans l
@@ -1995,6 +2017,11 @@ const TOOL_HANDLERS = {
     const original = BigInt(loan.loan_amount_lamports ?? "0");
     const dueMs = Number(onChain.dueTimestamp) * 1000;
     const dueIsoUtc = new Date(dueMs).toISOString();
+    // Borrower wallet (the wallet that signed the original /borrow).
+    // Critical for multi-wallet users: a loan is "on" a specific wallet,
+    // and only that wallet can sign repay/topup/extend for it.
+    const borrowerWallet = onChain.borrower?.toBase58?.() ?? null;
+    const onDifferentWallet = signerPubkey && borrowerWallet && signerPubkey !== borrowerWallet;
     return {
       loan_id: loan.loan_id,
       symbol: loan.symbol,
@@ -2008,6 +2035,11 @@ const TOOL_HANDLERS = {
       due_at_utc: dueIsoUtc,
       hours_to_due: ((dueMs - Date.now()) / 3_600_000).toFixed(1),
       past_due: dueMs < Date.now(),
+      borrower_wallet: borrowerWallet,
+      on_different_wallet: onDifferentWallet,
+      _agent_instruction: onDifferentWallet
+        ? `IMPORTANT: This loan is on wallet ${borrowerWallet}, NOT the user's current wallet (${signerPubkey}). Tell them they'll need to switch to that wallet before they can repay/extend/top up this loan.`
+        : undefined,
     };
   },
 
@@ -2410,7 +2442,7 @@ const TOOL_HANDLERS = {
     };
   },
 
-  list_my_loans: async (_args, { userId }) => {
+  list_my_loans: async (_args, { userId, signerPubkey }) => {
     const { rows } = await query(
       `SELECT l.id, l.loan_id, l.loan_pda, l.status, l.loan_amount_lamports,
               l.original_loan_amount_lamports, l.due_timestamp, sm.symbol
@@ -2424,9 +2456,44 @@ const TOOL_HANDLERS = {
     if (rows.length === 0) {
       return { total: 0, loans: [], note: "User has no loans on record. They may need to /borrow to take one out." };
     }
+
+    // CRITICAL: scope to the wallet the user is currently using —
+    // either the browser-connected wallet (site Pip) or their active
+    // wallet (TG Pip). Multi-wallet Magpie users have ONE user_id
+    // spanning multiple wallets; without this filter Pip would tell
+    // the user about loans on OTHER linked wallets they aren't
+    // currently signing for, which is exactly the commingling we
+    // already fixed on the dashboard.
+    let scopedRows;
+    let scopedWallet;
+    let otherWalletCount = 0;
+    if (signerPubkey) {
+      scopedRows = filterLoansForWallet(rows, signerPubkey);
+      scopedWallet = signerPubkey;
+      otherWalletCount = rows.length - scopedRows.length;
+    } else {
+      const scoped = await scopeLoansToActiveWallet(userId, rows);
+      scopedRows = scoped.filtered;
+      scopedWallet = scoped.activeWallet;
+      otherWalletCount = scoped.otherWalletCount;
+    }
+
+    if (scopedRows.length === 0) {
+      return {
+        total: 0,
+        active_count: 0,
+        loans: [],
+        scoped_to_wallet: scopedWallet,
+        other_wallets_loan_count: otherWalletCount,
+        note: otherWalletCount > 0
+          ? `User has 0 loans on the currently-active wallet (${scopedWallet}). ${otherWalletCount} loan(s) live on OTHER linked wallets — tell them to switch wallets if they want those.`
+          : "User has no loans on record. They may need to /borrow to take one out.",
+      };
+    }
+
     // For active loans, fetch live on-chain owed amount (heals DB drift).
     // For repaid/liquidated, use stored values.
-    const loans = await Promise.all(rows.map(async (l) => {
+    const loans = await Promise.all(scopedRows.map(async (l) => {
       const isActive = l.status === "active";
       let liveOwed = null;
       if (isActive) {
@@ -2452,6 +2519,11 @@ const TOOL_HANDLERS = {
       total: loans.length,
       active_count: active,
       loans,
+      scoped_to_wallet: scopedWallet,
+      other_wallets_loan_count: otherWalletCount,
+      _agent_instruction: otherWalletCount > 0
+        ? `These loans are on the user's CURRENT wallet (${scopedWallet}). They have ${otherWalletCount} additional loan(s) on OTHER linked wallets — mention this so they know to switch wallets if needed.`
+        : undefined,
     };
   },
 
