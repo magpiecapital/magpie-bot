@@ -4,6 +4,32 @@ import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 
+/**
+ * /stats — unified protocol-stats readout (works in DM and groups).
+ *
+ * The HEADLINE is the lifetime total SOL borrowed, pulled from the
+ * on-chain `pool.totalBorrowed` counter — that's the cumulative number
+ * the protocol has ever lent out, the "229.2 SOL" story. It's the
+ * single most important number for the community to see.
+ *
+ * Below the headline, a monospace block lays out the rest of the
+ * numbers in a clean two-column tabular format that reads identically
+ * on every TG client (iOS / Android / desktop).
+ */
+
+const COL_WIDTH = 36;
+function row(label, value) {
+  const l = String(label);
+  const v = String(value);
+  const gap = Math.max(2, COL_WIDTH - l.length - v.length);
+  return `  ${l}${" ".repeat(gap)}${v}`;
+}
+const RULE = "─".repeat(COL_WIDTH + 2);
+function fmtSol(lamports) {
+  const n = Number(lamports) / 1e9;
+  return Number.isFinite(n) ? n.toFixed(2) : "—";
+}
+
 export async function handleStats(ctx) {
   const lenderPubkey = process.env.LENDER_PUBKEY;
   if (!lenderPubkey) return ctx.reply("Stats not configured (LENDER_PUBKEY missing).");
@@ -18,36 +44,53 @@ export async function handleStats(ctx) {
 
     const { rows: counts } = await query(
       `SELECT
-         COUNT(*) FILTER (WHERE status = 'active') AS active,
-         COUNT(*) FILTER (WHERE status = 'repaid') AS repaid,
-         COUNT(*) FILTER (WHERE status = 'liquidated') AS liquidated,
-         COALESCE(SUM(original_loan_amount_lamports) FILTER (WHERE status = 'active'), 0) AS active_lamports
+         COUNT(*) FILTER (WHERE status = 'active')::int     AS active,
+         COUNT(*) FILTER (WHERE status = 'repaid')::int     AS repaid,
+         COUNT(*) FILTER (WHERE status = 'liquidated')::int AS liquidated,
+         COALESCE(SUM(original_loan_amount_lamports) FILTER (WHERE status = 'active'), 0)::text AS active_lamports
        FROM loans`,
     );
-    const row = counts[0];
+    const r = counts[0];
 
-    const lines = [
-      "📊 *Magpie Stats*",
-      "",
-      `Program: \`${PROGRAM_ID.toBase58()}\``,
-      "",
-      "*On-chain:*",
-      `• Total deposits:    ${(pool.totalDeposits.toNumber() / 1e9).toFixed(4)} SOL`,
-      `• Total borrowed:    ${(pool.totalBorrowed.toNumber() / 1e9).toFixed(4)} SOL`,
-      `• Total shares:      ${pool.totalShares.toString()}`,
-      `• Loans issued:      ${pool.totalLoansIssued.toString()}`,
-      `• Liquidations:      ${pool.totalLiquidations.toString()}`,
-      `• Fees earned:       ${(pool.totalFeesEarned.toNumber() / 1e9).toFixed(4)} SOL`,
-      vault ? `• Vault balance:     ${vault.value.uiAmount} wSOL` : "• Vault balance:     unknown",
-      "",
-      "*Active book:*",
-      `• Active loans:      ${row.active}`,
-      `• Repaid loans:      ${row.repaid}`,
-      `• Liquidated loans:  ${row.liquidated}`,
-      `• Outstanding debt:  ${(Number(row.active_lamports) / 1e9).toFixed(4)} SOL`,
+    // Headline number — authoritative on-chain cumulative
+    const lifetimeBorrowedSol = fmtSol(pool.totalBorrowed.toNumber());
+    const totalDepositsSol = fmtSol(pool.totalDeposits.toNumber());
+    const totalFeesSol = fmtSol(pool.totalFeesEarned.toNumber());
+    const activeOutSol = fmtSol(r.active_lamports);
+
+    const codeLines = [
+      RULE,
+      row("TOTAL BORROWED (LIFETIME)", `${lifetimeBorrowedSol} SOL`),
+      RULE,
+      ``,
+      `LOAN BOOK — RIGHT NOW`,
+      row("Currently out on loan", `${activeOutSol} SOL`),
+      row("Active loans", String(r.active)),
+      row("Lifetime loans issued", pool.totalLoansIssued.toString()),
+      row("Lifetime repaid", String(r.repaid)),
+      row("Lifetime liquidated", pool.totalLiquidations.toString()),
+      ``,
+      `POOL`,
+      row("LP deposited (on-chain)", `${totalDepositsSol} SOL`),
+      row("Lifetime fees earned", `${totalFeesSol} SOL`),
+      vault ? row("Vault balance", `${Number(vault.value.uiAmount).toFixed(4)} wSOL`) : row("Vault balance", "—"),
+      RULE,
     ];
 
-    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+    const lines = [
+      "📊 *Magpie — live protocol stats*",
+      "```",
+      ...codeLines,
+      "```",
+      `_All numbers on-chain. Verify any line at_ [solscan.io](https://solscan.io) _or_ [magpie.capital/stats](https://www.magpie.capital/stats)_._`,
+      ``,
+      `_Program:_ \`${PROGRAM_ID.toBase58()}\``,
+    ];
+
+    await ctx.reply(lines.join("\n"), {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+    });
   } catch (err) {
     console.error("stats failed:", err);
     await ctx.reply(
@@ -56,9 +99,9 @@ export async function handleStats(ctx) {
         "",
         "Couldn't fetch live protocol stats right now. Usually clears within a minute.",
         "",
-        "Try /stats again, or check magpie.capital/dashboard directly.",
+        "Try /stats again, or check magpie.capital/stats directly.",
       ].join("\n"),
-      { parse_mode: "Markdown" },
+      { parse_mode: "Markdown", disable_web_page_preview: true },
     );
   }
 }

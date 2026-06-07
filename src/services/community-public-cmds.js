@@ -73,6 +73,35 @@ function tsFooter() {
 
 /* ─────────────────────────── /stats ─────────────────────────── */
 
+/**
+ * Pull the authoritative on-chain pool counter for total-borrowed. This
+ * is what powers the headline number — matches what the wallet-bot
+ * /stats command shows. Falls back to a DB SUM if the RPC fails so the
+ * command still renders something useful.
+ */
+async function fetchOnchainTotals() {
+  try {
+    const lenderPubkey = process.env.LENDER_PUBKEY;
+    if (!lenderPubkey) return null;
+    const { PublicKey } = await import("@solana/web3.js");
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const { lendingPoolPda } = await import("../solana/pdas.js");
+    const program = getReadOnlyProgram();
+    const [poolPda] = lendingPoolPda(new PublicKey(lenderPubkey));
+    const pool = await program.account.lendingPool.fetch(poolPda);
+    return {
+      lifetime_borrowed_lamports: pool.totalBorrowed.toString(),
+      total_deposits_lamports: pool.totalDeposits.toString(),
+      total_fees_lamports: pool.totalFeesEarned.toString(),
+      total_loans_issued: pool.totalLoansIssued.toString(),
+      total_liquidations: pool.totalLiquidations.toString(),
+    };
+  } catch (err) {
+    console.warn("[community-stats] on-chain pool fetch failed, falling back to DB sum:", err.message);
+    return null;
+  }
+}
+
 async function fetchStats() {
   const [
     { rows: [users] },
@@ -81,6 +110,7 @@ async function fetchStats() {
     { rows: top },
     { rows: [pool] },
     { rows: [mints] },
+    onchain,
   ] = await Promise.all([
     query(
       `SELECT
@@ -127,7 +157,15 @@ async function fetchStats() {
     query(
       `SELECT COUNT(*)::int AS n FROM supported_mints WHERE enabled = TRUE`,
     ),
+    fetchOnchainTotals(),
   ]);
+  // If on-chain pool fetch succeeded, prefer those numbers for the
+  // headline — they're the authoritative cumulative counters and
+  // match exactly what the wallet-bot /stats shows. Falls back to DB
+  // sum (which may slightly differ if the bot missed a loan event).
+  if (onchain) {
+    book.lifetime_lamports = onchain.lifetime_borrowed_lamports;
+  }
   return {
     users,
     loans24h,
@@ -135,6 +173,7 @@ async function fetchStats() {
     top,
     pool,
     mints,
+    onchain,
   };
 }
 
