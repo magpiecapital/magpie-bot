@@ -181,30 +181,54 @@ operator identity, internal numbers, or unpublished plans.
 
 ---
 
-## Channel 4 — Solana Program Registry (verified-build listing)
+## Channel 4 — Solana Program Registry (verified-build listing) ⚠️ HOLD
 
 **URL:** https://github.com/DeployDAO/solana-program-registry
 
-This is the canonical *"is this on-chain program what its source code claims to be"* registry. Submitting Magpie adds an automated build-verification run that proves the deployed program at `4FEFPeMH…6wmh` is exactly what's in `magpiecapital/magpie-bot/programs/magpie-lending`. This is the strongest legitimacy signal a Solana project can carry — and it's free.
+This is the canonical *"is this on-chain program what its source code claims to be"* registry. Submitting Magpie adds an automated build-verification run that compares the source-built binary against what's deployed at `4FEFPeMH…6wmh`. **Massive legitimacy signal if it passes — but a public mismatch publishes worse-than-nothing if it fails.**
 
-**Why it matters for Blowfish:** Registries like this often feed into heuristic detectors as "known-legit" lists, OR are referenced by reviewers checking "is this project real or a scam?" Even if Blowfish doesn't auto-consume it, having a registry entry to point at in the appeal is concrete evidence.
+### Why we're holding before submitting (verified 2026-06-07)
 
-### Concrete next steps (3 small things, ~30 min total)
+Pre-submission audit found the repo is *probably* fine to submit — but not *certainly*:
+- ✅ `lender-keypair.json` properly gitignored, never committed
+- ✅ `Cargo.lock` present (required for reproducible builds)
+- ✅ Anchor `0.30.1` pinned in workspace + all programs
+- ✅ Program IDs consistent across localnet/devnet/mainnet config
+- ❓ But — was the original mainnet deploy done with Anchor 0.30.1 or an older version?
+- ❓ Was `Cargo.lock` identical at deploy time vs now?
+- ❓ Was the deploy a stock `anchor build` or `anchor build --verifiable`?
 
-1. **Tag a release on `magpiecapital/magpie-bot`** so the registry has a stable build target:
-   ```bash
-   cd /Users/[redacted]/bagbank-bot
-   git tag v1.0.0
-   git push --tags
-   ```
+If any of those don't match, the registry's auto-build produces a different binary hash than the deployed program — and that mismatch is **publicly visible on their dashboard**. Reviewers reading a Blowfish appeal that points at a *failed* registry build would be a worse signal than no registry entry.
 
-2. **Open a PR against `DeployDAO/solana-program-registry`** adding Magpie to `programs.yml`. The diff is literally three lines — append at the end of the file (alphabetical by org isn't strictly enforced; recent entries are mostly grouped at bottom):
-   ```yaml
-   "magpiecapital/magpie-bot":
-     - v1.0.0
-   ```
+### Action required to unblock submission
 
-3. **(Optional) Message `ianm` on Keybase** to flag the PR — per the registry's README, this can speed review.
+Run locally on the tagged commit (~15 min):
+
+```bash
+cd /Users/[redacted]/bagbank-bot
+# Tag a candidate release
+git tag v1.0.0-candidate
+
+# Build verifiably
+solana-verify build --library-name magpie_lending
+
+# Compare against deployed
+solana-verify verify-from-image \
+  --image $(realpath ./target/deploy/magpie_lending.so) \
+  --program-id 4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh \
+  --url https://api.mainnet-beta.solana.com
+```
+
+If `verify-from-image` reports a match → tag for real (`v1.0.0`), push, submit the PR below. If it reports a mismatch → don't submit. The mismatch tells you the deployed binary was built differently than the current source produces; resolving that is its own (separate) project and may require finding the exact build environment used at the time of the May/June deploy.
+
+### Submission diff (use only after verify-from-image passes)
+
+```yaml
+# Append to programs.yml at the bottom (recent entries are grouped there;
+# strict alphabetical-by-org isn't enforced):
+"magpiecapital/magpie-bot":
+  - v1.0.0
+```
 
 ### One-line PR description
 
@@ -232,16 +256,17 @@ Look for a "Submit your project" / "Add to directory" CTA on the page. Typical f
 
 ---
 
-## Updated priority order
+## Final action plan (decision made 2026-06-07 after audit)
 
-Same 10-day cadence as above, with the registry submissions slotted in as parallel work:
+| Day | Channel | Status |
+|-----|---------|--------|
+| 0 (today) | **Blowfish Typeform** — primary appeal | **GO** — drafted, paste + send |
+| 0 (today) | **X tweet via @MagpieLoans** | **GO** — drafted, send when posting Typeform |
+| 0 (today) | **Solana Ecosystem Directory** listing | **GO** — zero risk, low effort |
+| 0 (today) | Solana Program Registry PR | **HOLD** — need local verified-build check first (~15 min) |
+| +3 | Phantom dApp Developer Discord | Escalation backup if no Blowfish response |
+| +5 | @0xMert_ DM (Helius CEO) | Personal-network nudge if still stuck |
+| +7 | Polite public @brandonmillman | Last-resort visibility |
+| +10 | Budget audit (Sec3 / Otter / Halborn) | Resolves underlying detection upstream |
 
-| Day | Channel | Why |
-|-----|---------|-----|
-| 0 (today) | Blowfish Typeform + X tweet | Primary appeal path |
-| 0 (today, parallel) | Solana Program Registry PR | Strongest legitimacy signal we can self-serve |
-| 0 (today, parallel) | Solana Ecosystem Directory | Low-effort reputational add |
-| 3 | Phantom dApp Developer Discord | Escalation backup |
-| 5 | @0xMert_ DM (Helius CEO) | Personal-network nudge if still stuck |
-| 7 | Polite public @brandonmillman | Last-resort visibility |
-| 10+ | Budget audit (Sec3 / Otter / Halborn) | Resolves underlying detection upstream |
+**Why the Program Registry is HOLD:** a public verified-build mismatch is a *worse* signal than no registry entry. Run the `solana-verify verify-from-image` check locally first; once it passes, the registry submission is a 3-line PR. Until then, the other three Day-0 channels carry the appeal.
