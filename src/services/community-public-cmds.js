@@ -24,6 +24,18 @@ const SITE_STATS_URL = "https://www.magpie.capital/stats";
 const SITE_URL = "https://www.magpie.capital";
 const WALLET_BOT_URL = "https://t.me/magpie_capital_bot";
 
+// $MAGPIE token constants — single source of truth for community-side
+// references. The mint NEVER changes; if it ever did we'd be a
+// different protocol. Keeping these literal so a corrupted import
+// can't redirect users to a fake mint.
+const MAGPIE_MINT = "9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump";
+const MAGPIE_PUMP_URL = `https://pump.fun/coin/${MAGPIE_MINT}`;
+const MAGPIE_DEXSCREENER_URL = `https://dexscreener.com/solana/${MAGPIE_MINT}`;
+const MAGPIE_BIRDEYE_URL = `https://birdeye.so/token/${MAGPIE_MINT}?chain=solana`;
+const MAGPIE_SOLSCAN_URL = `https://solscan.io/token/${MAGPIE_MINT}`;
+const MAGPIE_JUPITER_URL = `https://jup.ag/swap/SOL-${MAGPIE_MINT}`;
+const X_URL = "https://x.com/MagpieLoans";
+
 /* ─────────────────────────── HELPERS ─────────────────────────── */
 
 function fmtSol(lamports) {
@@ -373,6 +385,284 @@ export async function handleCommunityTokens(ctx) {
   }
 }
 
+/* ─────────────────────────── /ca ─────────────────────────── */
+
+/**
+ * Contract address shortcut — the most-requested command in any DeFi
+ * TG. Returns the $MAGPIE mint as a copyable monospace string PLUS
+ * one-tap links to every major Solana explorer/chart/swap surface so
+ * users can verify and trade without leaving the chat.
+ */
+export async function handleCommunityCa(ctx) {
+  const text = [
+    `🪙 *$MAGPIE · contract address*`,
+    ``,
+    `\`${MAGPIE_MINT}\``,
+    `_(tap to copy)_`,
+    ``,
+    `*Standard:* Token-2022 · 6 decimals`,
+    `*Network:* Solana mainnet`,
+    ``,
+    `⚠️ This is the *only* official $MAGPIE mint. Always copy it from this group, the bot, or magpie.capital — never from a DM.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📊 Chart (DEXScreener)", url: MAGPIE_DEXSCREENER_URL },
+          { text: "🦅 Pump.fun", url: MAGPIE_PUMP_URL },
+        ],
+        [
+          { text: "🔄 Buy on Jupiter", url: MAGPIE_JUPITER_URL },
+          { text: "🔍 Solscan", url: MAGPIE_SOLSCAN_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /magpie ─────────────────────────── */
+
+export async function handleCommunityMagpie(ctx) {
+  const text = [
+    `✨ *$MAGPIE · the protocol token*`,
+    ``,
+    `*What it is*`,
+    `$MAGPIE is the Magpie Capital token. Holders earn *10% of all protocol loan fees* pro-rata to their share of the supply.`,
+    ``,
+    `*Details*`,
+    "```",
+    row("Mint", MAGPIE_MINT.slice(0, 4) + "…" + MAGPIE_MINT.slice(-4)),
+    row("Standard", "Token-2022"),
+    row("Decimals", "6"),
+    row("Network", "Solana mainnet"),
+    "```",
+    ``,
+    `*Holder rewards*`,
+    `• 10% of every loan fee goes to holders`,
+    `• Distributed in SOL, randomized every 5–10 days`,
+    `• Snapshot is on-chain — no claim, no signing, just hold`,
+    `• Threshold + exact mechanics: /holders`,
+    ``,
+    `*Where to get it*`,
+    `• Pump.fun (primary)`,
+    `• Jupiter aggregator (any DEX)`,
+    ``,
+    `Full contract address: /ca`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📊 Chart", url: MAGPIE_DEXSCREENER_URL },
+          { text: "🔄 Buy on Jupiter", url: MAGPIE_JUPITER_URL },
+        ],
+        [
+          { text: "💎 Holder program", url: `${SITE_URL}/holders` },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /buy ─────────────────────────── */
+
+export async function handleCommunityBuy(ctx) {
+  const text = [
+    `🛒 *How to buy $MAGPIE*`,
+    ``,
+    `*1. Pump.fun* (simplest, recommended)`,
+    `Connect Phantom → swap SOL for $MAGPIE in one click.`,
+    ``,
+    `*2. Jupiter* (best price across all DEXes)`,
+    `Aggregates every Solana DEX automatically. Pick this for larger size.`,
+    ``,
+    `*Always verify the mint before buying:*`,
+    `\`${MAGPIE_MINT}\``,
+    ``,
+    `_Copy from this group or magpie.capital, never from a DM. Fake $MAGPIE tokens exist — this is the only real one._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🦅 Pump.fun", url: MAGPIE_PUMP_URL },
+          { text: "🔄 Jupiter", url: MAGPIE_JUPITER_URL },
+        ],
+        [
+          { text: "📊 Chart first", url: MAGPIE_DEXSCREENER_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /chart ─────────────────────────── */
+
+export async function handleCommunityChart(ctx) {
+  const text = [
+    `📊 *$MAGPIE · charts*`,
+    ``,
+    `Pick the chart you prefer. All show the same on-chain data.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "DEXScreener", url: MAGPIE_DEXSCREENER_URL },
+          { text: "Birdeye", url: MAGPIE_BIRDEYE_URL },
+        ],
+        [
+          { text: "Pump.fun", url: MAGPIE_PUMP_URL },
+          { text: "Solscan", url: MAGPIE_SOLSCAN_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /x  and  /twitter ─────────────────────────── */
+
+export async function handleCommunityX(ctx) {
+  const text = [
+    `🐦 *Magpie on X*`,
+    ``,
+    `Follow [@MagpieLoans](${X_URL}) for protocol announcements, new approved tokens, and milestones.`,
+    ``,
+    `_This is the only official Magpie X account. Anything else with "Magpie" in the handle is impersonation._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: false,
+    reply_markup: {
+      inline_keyboard: [[{ text: "🐦 Follow @MagpieLoans", url: X_URL }]],
+    },
+  });
+}
+
+/* ─────────────────────────── /holders ─────────────────────────── */
+
+export async function handleCommunityHolders(ctx) {
+  const text = [
+    `💎 *$MAGPIE holder program*`,
+    ``,
+    `Hold $MAGPIE → earn *10% of all protocol loan fees* in SOL, pro-rata to your share of the supply.`,
+    ``,
+    `*How it works*`,
+    `• Every loan fee feeds the holder pool (10% of the fee)`,
+    `• Snapshot is on-chain — your balance counts as long as you hold`,
+    `• Distributions in SOL, randomized cadence (every 5–10 days) to prevent gaming`,
+    `• Auto-airdropped to your wallet — no claim transaction needed`,
+    ``,
+    `*Why randomized cadence?*`,
+    `If we paid out on a fixed schedule, traders would buy 5 minutes before snapshot and dump after. Random timing means continuous holders win.`,
+    ``,
+    `Get your share: /buy or /ca`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "💎 Full details", url: `${SITE_URL}/holders` },
+          { text: "🔄 Buy $MAGPIE", url: MAGPIE_JUPITER_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /refer ─────────────────────────── */
+
+export async function handleCommunityRefer(ctx) {
+  const text = [
+    `🤝 *Magpie referral program*`,
+    ``,
+    `Refer a friend → earn *5% of every loan fee they ever pay*. Lifetime. Paid in SOL.`,
+    ``,
+    `*How it works*`,
+    `• DM @magpie\\_capital\\_bot and run /refer`,
+    `• You get a unique link — share it`,
+    `• Anyone who starts the bot through your link is linked to you forever`,
+    `• 5% of every fee they pay is airdropped to your wallet automatically`,
+    ``,
+    `*No cap, no claim, no signup* — just hold the wallet that originated the link.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[{ text: "🤝 Get your referral link", url: WALLET_BOT_URL }]],
+    },
+  });
+}
+
+/* ─────────────────────────── /docs ─────────────────────────── */
+
+export async function handleCommunityDocs(ctx) {
+  const text = [
+    `📚 *Magpie · documentation*`,
+    ``,
+    `[magpie.capital/docs](${SITE_URL}/docs) — every feature explained, every flow walked through.`,
+    ``,
+    `Also useful:`,
+    `• [Whitepaper](${SITE_URL}/whitepaper) — design + mechanics`,
+    `• [Security](${SITE_URL}/security) — architecture + responsible disclosure`,
+    `• [Changelog](${SITE_URL}/changelog) — what shipped recently`,
+    `• [GitHub](https://github.com/magpiecapital) — source code, both repos public`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📚 Docs", url: `${SITE_URL}/docs` },
+          { text: "📄 Whitepaper", url: `${SITE_URL}/whitepaper` },
+        ],
+        [
+          { text: "🔒 Security", url: `${SITE_URL}/security` },
+          { text: "📝 Changelog", url: `${SITE_URL}/changelog` },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /links ─────────────────────────── */
+
+export async function handleCommunityLinks(ctx) {
+  const text = [
+    `🔗 *Magpie · all official links*`,
+    ``,
+    `Bookmark this URL and verify against it: [magpie.capital/links](${SITE_URL}/links)`,
+    ``,
+    `*The four official surfaces — only these:*`,
+    `• Wallet bot — @magpie\\_capital\\_bot (private 1:1)`,
+    `• Community — @magpietalk (this group)`,
+    `• X — @MagpieLoans`,
+    `• Site — magpie.capital`,
+    ``,
+    `_Anything else claiming to be Magpie is impersonation. We will never DM you first._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: false,
+    reply_markup: {
+      inline_keyboard: [[{ text: "🔗 Open the linktree", url: `${SITE_URL}/links` }]],
+    },
+  });
+}
+
 /* ─────────────────────────── /website ─────────────────────────── */
 
 export async function handleCommunityWebsite(ctx) {
@@ -493,15 +783,34 @@ export async function handleCommunityScam(ctx) {
  * appends the suffix in groups (it does when multiple bots are present).
  */
 const COMMUNITY_CMD_HANDLERS = {
+  // Core utility
   stats: handleCommunityStats,
   tiers: handleCommunityTiers,
   fees: handleCommunityFees,
   how: handleCommunityHow,
   tokens: handleCommunityTokens,
+  // Token
+  ca: handleCommunityCa,
+  contract: handleCommunityCa,         // alias — same thing, different muscle memory
+  magpie: handleCommunityMagpie,
+  buy: handleCommunityBuy,
+  chart: handleCommunityChart,
+  charts: handleCommunityChart,        // alias
+  price: handleCommunityChart,         // alias — common ask, route to charts
+  // Programs
+  holders: handleCommunityHolders,
+  refer: handleCommunityRefer,
+  referral: handleCommunityRefer,      // alias
+  // Reference
   faq: handleCommunityFaq,
   scam: handleCommunityScam,
+  scams: handleCommunityScam,          // alias
   website: handleCommunityWebsite,
-  site: handleCommunityWebsite, // alias — wallet bot uses /site, parity here too
+  site: handleCommunityWebsite,        // alias
+  docs: handleCommunityDocs,
+  links: handleCommunityLinks,
+  x: handleCommunityX,
+  twitter: handleCommunityX,           // alias
 };
 
 export async function maybeHandlePublicCommand(ctx, msg) {
