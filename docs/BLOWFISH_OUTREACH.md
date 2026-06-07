@@ -11,10 +11,52 @@ Phantom dev-Discord intro as the backup.
 
 ---
 
-## Channel 1 — Blowfish Typeform (primary submission)
+## ⚠️ Update 2026-06-07 — Typeform is CLOSED
 
-**URL:** https://form.typeform.com/to/BHue5Hg0
-(Linked from the "Contact Us" CTA on blowfish.xyz)
+When the user tried the Typeform on 2026-06-07, it returned *"Hey :) This typeform is now closed."* Their primary public contact form is gone. The blowfish.xyz site still links to it but it no longer accepts submissions.
+
+**New primary path → Calendly with Blake at Blowfish (30-min consultation):**
+- URL: https://calendly.com/blake-at-blowfish/discovery
+- Surfaced from the "Get Consultation" CTA on blowfish.xyz/pricing
+- Labeled as "sales discovery" but it's a real call with a human on the Blowfish team
+- 30-min direct conversation > weeks of async waiting on a Typeform
+
+**Secondary new path → Blowfish developer portal (free signup):**
+- URL: https://portal.blowfish.xyz/user
+- Sign up gets you API access AND likely access to the in-portal false-positive reporting flow (the docs pages for `report` and `download-blocklist` are auth-walled, suggesting the actual appeal mechanism lives behind login)
+- Also lets you check via API whether magpie.capital is actually on the blocklist
+
+## Channel 1 — Calendly with Blake (30-min consult, primary)
+
+**Book here:** https://calendly.com/blake-at-blowfish/discovery
+
+The consultation is positioned as sales but it's a direct line to a Blowfish team member. Bring the security packet + the appeal context. 30 minutes of synchronous talk-through is MUCH higher leverage than any async channel.
+
+**What to say in the booking notes / first 60 seconds of the call:**
+
+> Hi Blake — we're Magpie Capital, a permissionless Solana lending protocol. magpie.capital is currently being false-positive flagged by Blowfish on Phantom, which is breaking the dApp flow for new users. We've prepared a full security architecture packet (verifiable at magpie.capital/.well-known/security.txt + both repos public at github.com/magpiecapital) and would love 15 of the 30 minutes to walk through why this is a false positive and the other 15 on any other questions you have. Thanks for taking the time.
+
+**On the call, walk through:**
+1. What Magpie is (1 min)
+2. Why our cosign-borrow pattern can LOOK like a drainer to heuristics but isn't (3 min — show the 3-gate architecture from MAGPIE_SECURITY_PACKET.md)
+3. On-chain trust signals (1 min — 240+ SOL borrowed, zero LP losses, zero liquidations)
+4. The specific ask: review the flag, unflag if appropriate (1 min)
+5. Open Q&A — let them probe (the rest)
+
+## Channel 1b — Blowfish developer portal signup (parallel, ~5 min)
+
+**Sign up:** https://portal.blowfish.xyz/user
+
+Free signup gets you a developer account. From inside the portal, look for:
+- "Report" or "Submit dApp" forms
+- A "false-positive appeal" section
+- API key generation (lets you query whether magpie.capital is actually on the blocklist — `docs.blowfish.xyz/reference/download-blocklist` requires this auth)
+
+Even if there's no formal appeal flow inside, having an account creates a tracked identity that any subsequent support contact can reference.
+
+## ~~Channel 1 (LEGACY) — Blowfish Typeform~~ — CLOSED
+
+**URL:** https://form.typeform.com/to/BHue5Hg0 *(returns "this typeform is now closed")*
 
 Use the message template below. Paste each section into the
 corresponding field (Typeform usually asks: name, email, company, role,
