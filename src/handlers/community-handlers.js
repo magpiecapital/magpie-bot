@@ -452,9 +452,11 @@ async function handleGroupMessage(ctx) {
     //       chat" so Pip doesn't double-up. Reply tracking is what
     //       prevents Pip from talking over a human who already helped.
     try {
-      const { trackInboundForProactivePip, noteCommunityActivity } = await import("../services/community-proactive.js");
+      const { trackInboundForProactivePip, noteCommunityActivity, noteHumanActivity } = await import("../services/community-proactive.js");
       await trackInboundForProactivePip(ctx.chat.id, msg, sender);
       noteCommunityActivity(ctx.chat.id);
+      // Vibe poster reads this to back off when humans are chatting
+      noteHumanActivity(ctx.chat.id);
     } catch (err) {
       console.warn("[community] proactive-track failed (non-critical):", err.message);
     }

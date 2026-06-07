@@ -585,11 +585,148 @@ async function sweepCommandHints(botApi) {
   }
 }
 
+/* ────────────────── VIBE POSTER ────────────────── */
+
+// Operator directive 2026-06-07: "Pip should be posting AT LEAST
+// every 5-10 minutes. Keeping the vibes going."
+//
+// We post rotating templated content on a fast cadence — fully
+// zero-cost (no LLM) — and back off ANY of:
+//   • Humans are actively talking (last human msg <2min ago)
+//   • Pip already posted something else in the last 3min
+//   • A pickup / milestone / hint just fired (handled via lastVibeAt
+//     updated by ANY proactive post, see noteProactivePost)
+//
+// 8 content rotators so 8 consecutive posts are all different. Each
+// pulls live data where applicable so the chat sees changing numbers
+// not static slogans.
+const VIBE_BASE_GAP_MS = Math.max(
+  3 * 60 * 1000,
+  Number(process.env.PIP_VIBE_GAP_MIN) * 60 * 1000 || 7 * 60 * 1000, // default ~7min
+);
+const VIBE_JITTER_MS = 3 * 60 * 1000;          // ±3min so posts don't feel robotic
+const VIBE_HUMAN_QUIET_MS = 2 * 60 * 1000;     // skip if humans posted <2min ago
+const VIBE_PIP_GAP_MS = 3 * 60 * 1000;         // never within 3min of another Pip post
+const vibeChatState = new Map();               // chatId → { lastVibeAt, lastHumanAt, idx }
+const lastAnyPipPostAt = new Map();            // chatId → ms timestamp
+
+function vibeChat(chatId) {
+  let s = vibeChatState.get(Number(chatId));
+  if (!s) {
+    s = { lastVibeAt: 0, idx: Math.floor(Math.random() * 1000) };
+    vibeChatState.set(Number(chatId), s);
+  }
+  return s;
+}
+
+/** Called from message handler on every inbound non-bot message —
+ *  tracks "humans are active" so vibe poster knows to stay quiet. */
+export function noteHumanActivity(chatId) {
+  const s = vibeChat(chatId);
+  s.lastHumanAt = Date.now();
+}
+
+/** Called whenever ANY proactive Pip post lands (vibe, question pickup,
+ *  milestone, hint, scam-ban education) — prevents Pip stacking posts
+ *  back-to-back across different rotators. */
+function noteProactivePost(chatId) {
+  lastAnyPipPostAt.set(Number(chatId), Date.now());
+}
+
+// Templated content rotators. Each is a function (state) → string.
+// state = { active, repaid, lifetime_sol, active_sol, tokens } from
+// fetchProtocolState(). Functions can return null to skip themselves
+// (e.g. liquidations rotator skips if liquidations > 0).
+const VIBE_ROTATORS = [
+  // 1. Lifetime borrowed (the operator's favorite number)
+  (s) => `🦅 *${s.lifetime_sol.toFixed(2)} SOL* lent out, lifetime. Verify on-chain at magpie.capital/stats.`,
+  // 2. Currently active
+  (s) => s.active > 0
+    ? `🟢 *${s.active}* active loans right now · *${s.active_sol.toFixed(2)} SOL* out across the book.`
+    : null,
+  // 3. Zero liquidations brag (skip if no longer zero)
+  (s) => `🛡 Still zero liquidations to date. Short terms + low LTV + active token-health watcher. The design holds.`,
+  // 4. Token coverage
+  (s) => `🪙 *${s.tokens}* approved collateral tokens. Run \`/tokens\` to see the full list.`,
+  // 5. Command nudge — /ca rotation
+  () => `💡 \`/ca\` drops the \$MAGPIE contract address (Token-2022, 6 decimals). Copy-safe.`,
+  // 6. Command nudge — /how rotation
+  () => `📚 New to Magpie? \`/how\` walks through the borrow → repay flow in 5 steps.`,
+  // 7. Holder rewards reminder
+  () => `💎 \$MAGPIE holders earn *10%* of all protocol loan fees, distributed in SOL on a randomized 5-10 day cadence. \`/holders\` for the full mechanic.`,
+  // 8. Safety reminder (rotates with the four-handle trust line)
+  () => `🛡 Quick reminder: Magpie has *exactly four* official accounts. Anyone else claiming to be us is a scammer. Verify at magpie.capital/links.`,
+  // 9. Two-surface reminder
+  () => `📲 Two Magpies: *@magpie\\_capital\\_bot* (your private wallet) and *@magpietalk* (this community). No DM support. No airdrops. No surprises.`,
+  // 10. Lifetime repaid milestone
+  (s) => `✅ *${s.repaid}* loans repaid lifetime. Zero LP losses. Every flow on-chain.`,
+];
+
+const VIBE_INTERVAL_MS = 60_000; // check every minute; gate logic decides if we actually post
+
+async function sweepVibePosts(botApi) {
+  if (PROACTIVE_DISABLED) return;
+  let chats;
+  try {
+    chats = await listEnabledChats();
+  } catch {
+    return;
+  }
+  if (chats.length === 0) return;
+
+  let state = null;
+  try {
+    state = await fetchProtocolState();
+  } catch (err) {
+    console.warn("[proactive] vibe state fetch failed:", err.message);
+    return;
+  }
+
+  for (const c of chats) {
+    const chatId = Number(c.chat_id);
+    const s = vibeChat(chatId);
+    const now = Date.now();
+    // Jittered gap so posts don't all happen at minute-multiples
+    const jitter = (Math.random() * 2 - 1) * VIBE_JITTER_MS;
+    if (now - s.lastVibeAt < (VIBE_BASE_GAP_MS + jitter)) continue;
+    // Don't talk over humans
+    if (s.lastHumanAt && now - s.lastHumanAt < VIBE_HUMAN_QUIET_MS) continue;
+    // Don't stack on another Pip post
+    const lastAny = lastAnyPipPostAt.get(chatId) || 0;
+    if (now - lastAny < VIBE_PIP_GAP_MS) continue;
+
+    // Pick the next rotator that returns non-null content
+    let text = null;
+    for (let tries = 0; tries < VIBE_ROTATORS.length; tries++) {
+      const fn = VIBE_ROTATORS[(s.idx + tries) % VIBE_ROTATORS.length];
+      const candidate = fn(state);
+      if (candidate) {
+        text = candidate;
+        s.idx = (s.idx + tries + 1) % VIBE_ROTATORS.length;
+        break;
+      }
+    }
+    if (!text) continue;
+
+    try {
+      await botApi.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      });
+      s.lastVibeAt = now;
+      noteProactivePost(chatId);
+    } catch (err) {
+      console.warn(`[proactive] vibe post to ${chatId} failed:`, err.message);
+    }
+  }
+}
+
 /* ────────────────────────── STARTUP ─────────────────────────── */
 
 let questionTimer = null;
 let milestoneTimer = null;
 let hintTimer = null;
+let vibeTimer = null;
 
 export function startCommunityProactive(bot) {
   if (PROACTIVE_DISABLED) {
@@ -616,12 +753,21 @@ export function startCommunityProactive(bot) {
       console.error("[proactive] command hint sweep failed:", err.message),
     );
   }, COMMAND_HINT_INTERVAL_MS);
+  // Vibe poster — checks every minute, posts only when gap + quiet-chat
+  // + no-recent-Pip-post conditions all met. Default cadence ~7min,
+  // configurable via PIP_VIBE_GAP_MIN env var (minimum 3).
+  vibeTimer = setInterval(() => {
+    sweepVibePosts(bot.api).catch((err) =>
+      console.error("[proactive] vibe sweep failed:", err.message),
+    );
+  }, VIBE_INTERVAL_MS);
 }
 
 export function stopCommunityProactive() {
   if (questionTimer) clearInterval(questionTimer);
   if (milestoneTimer) clearInterval(milestoneTimer);
   if (hintTimer) clearInterval(hintTimer);
+  if (vibeTimer) clearInterval(vibeTimer);
   questionTimer = null;
   milestoneTimer = null;
   hintTimer = null;

@@ -109,9 +109,14 @@ export const SCAM_PHRASES = [
   /\b(?:dm|direct\s*message|pm|private\s*message|message|msg|text)\s+me\b/i,
   /\bhit\s+me\s+up\b/i,
   /\bsend\s+me\s+a\s+(?:dm|message|pm)\b/i,
-  // Distress-scammer framing — "if you're holding my token", "still holding"
-  /\bstill\s+holding\b.*\b(?:my|the)\s+token/i,
-  /\bif\s+you(?:'re|\s+are)\s+(?:still\s+)?holding/i,
+  // Distress-scammer framing — VERY narrow now: requires "holding MY"
+  // (not "the") + a specific noun (token/coin/project/nft, NOT "bag"
+  // since "holding the bag" / "holding my bag" are common crypto
+  // idioms). This catches the canonical "if you are still holding
+  // my token message me now" scammer pattern without false-positiving
+  // on normal hodl culture.
+  /\bstill\s+holding\s+my\s+(?:token|coin|project|nft)\b/i,
+  /\bif\s+you(?:'re|\s+are)\s+(?:still\s+)?holding\s+my\s+(?:token|coin|project|nft)\b/i,
   /\b(?:my|the)\s+token\s+(?:holder|holders)\b/i,
   // Free/airdrop/claim scams
   /\bfree\s+(?:airdrop|magpie|sol)\b/i,
