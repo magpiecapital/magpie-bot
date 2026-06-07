@@ -58,6 +58,7 @@ async function writeJson(req, res, status, headers, body) {
 }
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
+import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
 import {
@@ -1458,6 +1459,9 @@ async function router(req, res) {
         break;
       case "/api/v1/cosign-borrow":
         result = await handleCosignBorrow(req);
+        break;
+      case "/api/v1/lender-alarm-webhook":
+        result = await handleLenderAlarmWebhook(req);
         break;
       case "/api/v1/link/request":
         result = await handleLinkRequest(req);

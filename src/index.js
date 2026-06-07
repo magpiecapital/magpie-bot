@@ -92,6 +92,7 @@ import { startTokenHealth } from "./services/token-health.js";
 import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { setSecurityAlertBot } from "./services/security-alerts.js";
+import { setLenderAlarmBot } from "./api/lender-alarm-webhook.js";
 import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
@@ -370,6 +371,7 @@ bot.start({
     // Deposit watcher disabled: free public RPC can't handle background polling.
     // Re-enable when a dedicated RPC endpoint is available.
     setSecurityAlertBot(bot);
+    setLenderAlarmBot(bot);
     startApiServer();
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();
