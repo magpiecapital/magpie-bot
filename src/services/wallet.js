@@ -342,31 +342,19 @@ export async function removeWallet(userId, walletId) {
   const wallet = rows[0];
   if (wallet.is_active) throw new CannotRemoveActiveWalletError();
 
-  // 2. Cross-reference active loans against this wallet's pubkey.
-  // The loans table only stores user_id + loan_pda, not the on-chain
-  // borrower. So we fetch the borrower field from each loan PDA and
-  // check if any match the wallet we're trying to remove.
+  // 2. Cross-reference active loans against this wallet's pubkey —
+  // LOCALLY, via PDA derivation. The loan PDA is deterministically
+  // derived from (borrower, loan_id, program_id), so we re-derive
+  // what each loan's PDA WOULD be if THIS wallet were the borrower
+  // and check for a match. No on-chain RPC needed, immune to
+  // transient RPC blips that previously fail-closed the whole flow.
   const { rows: activeLoans } = await query(
-    `SELECT id, loan_pda FROM loans WHERE user_id = $1 AND status = 'active'`,
+    `SELECT id, loan_id, loan_pda, program_id FROM loans WHERE user_id = $1 AND status = 'active'`,
     [userId],
   );
   if (activeLoans.length > 0) {
-    const { getReadOnlyProgram } = await import("../solana/program.js");
-    const program = getReadOnlyProgram();
-    const tiedLoans = [];
-    for (const l of activeLoans) {
-      try {
-        const onChain = await program.account.loan.fetch(new PublicKey(l.loan_pda));
-        if (onChain.borrower?.toBase58?.() === wallet.public_key) {
-          tiedLoans.push(l.loan_pda);
-        }
-      } catch (err) {
-        // Couldn't fetch — fail safe: assume it might be tied, refuse removal.
-        // This is rare (RPC blip) and the user can retry after a moment.
-        console.warn(`[wallet-remove] couldn't verify loan ${l.loan_pda}: ${err.message}`);
-        throw new Error(`Couldn't verify all active loans right now. Try again in a moment.`);
-      }
-    }
+    const { filterLoansForWallet } = await import("./wallet-scoped-loans.js");
+    const tiedLoans = filterLoansForWallet(activeLoans, wallet.public_key).map((l) => l.loan_pda);
     if (tiedLoans.length > 0) {
       throw new WalletHasActiveLoansError(tiedLoans);
     }
