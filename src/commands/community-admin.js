@@ -128,6 +128,13 @@ const GUIDELINES_MESSAGE = [
   "• `/ask <question>` — ask me anything about Magpie",
   "• Personal stuff (your loans, credit score, balance) — DM me at @magpie_capital_bot. I can't see who's asking from this group.",
   "",
+  "🛠 *Public commands in this chat* (no LLM cost, instant)",
+  "• `/stats`  — live protocol numbers",
+  "• `/tiers`  — the three loan tiers and their trade-offs",
+  "• `/fees`   — fee breakdown + where every basis point goes",
+  "• `/how`    — how Magpie works in 5 steps",
+  "• `/tokens` — approved collateral list",
+  "",
   "_Verify any protocol claim on-chain at [solscan.io](https://solscan.io) or [magpie.capital/stats](https://magpie.capital/stats)._",
 ].join("\n");
 

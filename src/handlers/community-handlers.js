@@ -242,6 +242,15 @@ async function handleGroupMessage(ctx) {
     // Skip the bot itself
     if (sender.id === ctx.me?.id) return;
 
+    // ── Public utility commands (ZERO LLM cost) ────────────────
+    // /stats /tiers /fees /how /tokens — templated or DB-driven.
+    // Runs BEFORE Pip Q&A so the cheap path always wins. Returning
+    // true short-circuits everything below including the LLM call.
+    {
+      const { maybeHandlePublicCommand } = await import("../services/community-public-cmds.js");
+      if (await maybeHandlePublicCommand(ctx, msg)) return;
+    }
+
     // ── Pip Q&A trigger ────────────────────────────────────────
     // Triggers (any one):
     //   1. Message starts with /ask
@@ -366,8 +375,9 @@ async function handleGroupMessage(ctx) {
     //       chat" so Pip doesn't double-up. Reply tracking is what
     //       prevents Pip from talking over a human who already helped.
     try {
-      const { trackInboundForProactivePip } = await import("../services/community-proactive.js");
+      const { trackInboundForProactivePip, noteCommunityActivity } = await import("../services/community-proactive.js");
       await trackInboundForProactivePip(ctx.chat.id, msg, sender);
+      noteCommunityActivity(ctx.chat.id);
     } catch (err) {
       console.warn("[community] proactive-track failed (non-critical):", err.message);
     }
@@ -590,13 +600,34 @@ async function maybeAnswerPipQuestion(ctx, msg, sender) {
   }
   if (!question) return false;
 
-  // Rate limit per user per chat
-  const { checkRateLimit, answerGroupQuestion } = await import("../services/community-pip.js");
-  const rl = checkRateLimit(ctx.chat.id, sender.id);
-  if (!rl.allowed) {
+  // Rate limit + safety gate
+  const { checkRateLimit, answerGroupQuestion, looksLikePromptInjection } =
+    await import("../services/community-pip.js");
+
+  // Short-circuit obvious prompt-injection attempts BEFORE the LLM call.
+  // Saves Anthropic credits AND avoids accidentally engaging with an
+  // attacker's framing even briefly.
+  if (looksLikePromptInjection(question)) {
     await ctx.api.sendMessage(
       ctx.chat.id,
-      `⏳ Easy — you've asked me a lot already. Try again in ~${rl.retry_in_min}m.`,
+      `I just answer Magpie questions in here — what would you like to know about the protocol?`,
+      { reply_to_message_id: msg.message_id, allow_sending_without_reply: true },
+    ).catch(() => {});
+    await recordModAction(ctx.chat.id, sender.id, "pip_injection_blocked", null, question.slice(0, 200));
+    return true;
+  }
+
+  const rl = checkRateLimit(ctx.chat.id, sender.id);
+  if (!rl.allowed) {
+    const reasonText = {
+      disabled:    `Pip's taking a quick break. Try /stats or /how for now.`,
+      daily_cap:   `I've answered a lot today — try again tomorrow, or check /stats now.`,
+      chat_hourly: `Pip's getting flooded right now. Try again in ~${rl.retry_in_min}m, or run /stats for live numbers.`,
+      user_hourly: `⏳ Easy — you've asked me a lot already. Try again in ~${rl.retry_in_min}m.`,
+    }[rl.reason] || `⏳ Try again in ~${rl.retry_in_min}m.`;
+    await ctx.api.sendMessage(
+      ctx.chat.id,
+      reasonText,
       { reply_to_message_id: msg.message_id, allow_sending_without_reply: true },
     ).catch(() => {});
     return true;

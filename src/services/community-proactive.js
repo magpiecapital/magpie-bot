@@ -48,6 +48,25 @@ const QUESTION_MAX_AGE_MS = 60 * 60 * 1000;          // ignore older than 1h
 const PICKUP_GAP_MS = 60 * 60 * 1000;                // 1h gap between pickups in a chat
 const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;         // 3h between milestone posts
 
+// Command-cheatsheet reminder cadence.
+//   - Checked every 15min (cheap)
+//   - Posts only if BOTH:
+//     • >= COMMAND_HINT_GAP_MS since the last hint in this chat, AND
+//     • >= COMMAND_HINT_MIN_MESSAGES new messages since the last hint
+//   - Both conditions ensure: dead chats don't see hints, very active
+//     chats see more (but not spammy). Defaults: 2h and 20 messages.
+// Operator can tighten to "every 30min" via env if desired, but the
+// default protects UX from feeling like a billboard.
+const COMMAND_HINT_INTERVAL_MS = 15 * 60 * 1000;
+const COMMAND_HINT_GAP_MS = Math.max(
+  10 * 60 * 1000,
+  Number(process.env.PIP_COMMAND_HINT_GAP_MIN) * 60 * 1000 || 120 * 60 * 1000,
+);
+const COMMAND_HINT_MIN_MESSAGES = Math.max(
+  0,
+  Number(process.env.PIP_COMMAND_HINT_MIN_MESSAGES) || 20,
+);
+
 /* ────────────────────────── WELCOME ─────────────────────────── */
 
 const WELCOME_TEMPLATES = [
@@ -396,10 +415,80 @@ async function sweepMilestones(botApi) {
   }
 }
 
+/* ────────────────── COMMAND-CHEATSHEET HINTS ────────────────── */
+
+// Rotating one-liners so the reminder never feels like the same canned
+// post. Each highlights ONE command + ONE benefit so it reads like a
+// helpful nudge, not an ad.
+const COMMAND_HINTS = [
+  `💡 *Tip* — run \`/stats\` for live protocol numbers (no LLM call, instant).`,
+  `💡 *Tip* — \`/tiers\` shows the three loan tiers and which one fits your trade-off.`,
+  `💡 *Tip* — curious where loan fees go? \`/fees\` shows the full split.`,
+  `💡 *Tip* — new here? \`/how\` walks through how Magpie works in 5 steps.`,
+  `💡 *Tip* — \`/tokens\` lists every approved collateral token, by category.`,
+  `💡 *Tip* — got a question? Try \`/ask <your question>\` and Pip will answer in chat.`,
+  `💡 *Reminder* — Magpie has *only* two TG accounts: this group (@magpietalk) and the wallet bot (@magpie\\_capital\\_bot). Anyone else is a scammer.`,
+];
+
+// Per-chat hint state: last-posted timestamp + message count since then.
+// Stored in memory; surviving a restart isn't important here (worst case
+// the chat gets one extra hint after a redeploy, not the end of the world).
+const hintState = new Map(); // chatId → { lastAt:Date, msgsSince:number, idx:number }
+function getHintState(chatId) {
+  let st = hintState.get(chatId);
+  if (!st) {
+    st = { lastAt: 0, msgsSince: 0, idx: Math.floor(Math.random() * COMMAND_HINTS.length) };
+    hintState.set(chatId, st);
+  }
+  return st;
+}
+
+/** Called by the message handler on every inbound non-bot message in a
+ *  moderated chat. Just increments the counter — the sweep decides when
+ *  the hint is due. */
+export function noteCommunityActivity(chatId) {
+  if (PROACTIVE_DISABLED) return;
+  const st = getHintState(Number(chatId));
+  st.msgsSince += 1;
+}
+
+async function sweepCommandHints(botApi) {
+  if (PROACTIVE_DISABLED) return;
+  let chats;
+  try {
+    chats = await listEnabledChats();
+  } catch {
+    return;
+  }
+  for (const c of chats) {
+    const chatId = Number(c.chat_id);
+    const st = getHintState(chatId);
+    const now = Date.now();
+    const enoughGap = now - st.lastAt >= COMMAND_HINT_GAP_MS;
+    const enoughActivity = st.msgsSince >= COMMAND_HINT_MIN_MESSAGES;
+    if (!enoughGap || !enoughActivity) continue;
+
+    const text = COMMAND_HINTS[st.idx % COMMAND_HINTS.length];
+    try {
+      await botApi.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      });
+      st.lastAt = now;
+      st.msgsSince = 0;
+      st.idx = (st.idx + 1) % COMMAND_HINTS.length;
+      console.log(`[proactive] posted command hint to ${chatId}`);
+    } catch (err) {
+      console.warn(`[proactive] command hint to ${chatId} failed:`, err.message);
+    }
+  }
+}
+
 /* ────────────────────────── STARTUP ─────────────────────────── */
 
 let questionTimer = null;
 let milestoneTimer = null;
+let hintTimer = null;
 
 export function startCommunityProactive(bot) {
   if (PROACTIVE_DISABLED) {
@@ -407,26 +496,32 @@ export function startCommunityProactive(bot) {
     return;
   }
   console.log(
-    `[proactive] starting — question pickup every ${Math.round(QUESTION_PICKUP_INTERVAL_MS/60000)}min ` +
-    `(max ${DAILY_PROACTIVE_MAX}/chat/day), milestones every ${Math.round(MILESTONE_INTERVAL_MS/60000)}min`,
+    `[proactive] starting — pickup ${Math.round(QUESTION_PICKUP_INTERVAL_MS/60000)}min (max ${DAILY_PROACTIVE_MAX}/chat/day), ` +
+    `milestones ${Math.round(MILESTONE_INTERVAL_MS/60000)}min, ` +
+    `cmd hints ${Math.round(COMMAND_HINT_GAP_MS/60000)}min + ${COMMAND_HINT_MIN_MESSAGES} msgs`,
   );
-  // Question sweeper
   questionTimer = setInterval(() => {
     sweepProactiveQuestions(bot.api).catch((err) =>
       console.error("[proactive] question sweep failed:", err.message),
     );
   }, QUESTION_PICKUP_INTERVAL_MS);
-  // Milestone sweeper
   milestoneTimer = setInterval(() => {
     sweepMilestones(bot.api).catch((err) =>
       console.error("[proactive] milestone sweep failed:", err.message),
     );
   }, MILESTONE_INTERVAL_MS);
+  hintTimer = setInterval(() => {
+    sweepCommandHints(bot.api).catch((err) =>
+      console.error("[proactive] command hint sweep failed:", err.message),
+    );
+  }, COMMAND_HINT_INTERVAL_MS);
 }
 
 export function stopCommunityProactive() {
   if (questionTimer) clearInterval(questionTimer);
   if (milestoneTimer) clearInterval(milestoneTimer);
+  if (hintTimer) clearInterval(hintTimer);
   questionTimer = null;
   milestoneTimer = null;
+  hintTimer = null;
 }
