@@ -373,6 +373,35 @@ export async function handleCommunityTokens(ctx) {
   }
 }
 
+/* ─────────────────────────── /website ─────────────────────────── */
+
+export async function handleCommunityWebsite(ctx) {
+  const text = [
+    `🌐 *Magpie · official site*`,
+    ``,
+    `[magpie.capital](${SITE_URL})`,
+    ``,
+    `Dashboard, live stats, calculator, docs, the works. Same on-chain protocol as the bot — pick whichever surface fits the moment.`,
+    ``,
+    `_Only ever visit this exact URL. Lookalikes like magpie\\.capltal, magpie-capital\\.io, etc. are scams._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: false, // we WANT the OG card preview here
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🌐 Open magpie.capital", url: SITE_URL },
+          { text: "📊 Live stats", url: `${SITE_URL}/stats` },
+        ],
+        [
+          { text: "🔗 All official links", url: `${SITE_URL}/links` },
+        ],
+      ],
+    },
+  });
+}
+
 /* ─────────────────────────── /faq ─────────────────────────── */
 
 export async function handleCommunityFaq(ctx) {
@@ -471,6 +500,8 @@ const COMMUNITY_CMD_HANDLERS = {
   tokens: handleCommunityTokens,
   faq: handleCommunityFaq,
   scam: handleCommunityScam,
+  website: handleCommunityWebsite,
+  site: handleCommunityWebsite, // alias — wallet bot uses /site, parity here too
 };
 
 export async function maybeHandlePublicCommand(ctx, msg) {
