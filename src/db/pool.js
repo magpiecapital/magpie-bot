@@ -655,6 +655,32 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS community_anomaly_alerts_lookup_idx
        ON community_anomaly_alerts(chat_id, rule_key, created_at DESC)`,
+    // Pending public questions that the sweeper considers picking up if
+    // they go unanswered. We record candidate questions on arrival, mark
+    // them answered when a reply arrives, and mark them picked-up when
+    // Pip auto-answers. The sweep selects WHERE both timestamps are NULL
+    // AND created_at < NOW() - 10min.
+    `CREATE TABLE IF NOT EXISTS community_pending_questions (
+       chat_id BIGINT NOT NULL,
+       message_id BIGINT NOT NULL,
+       sender_id BIGINT NOT NULL,
+       text TEXT NOT NULL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       answered_in_chat_at TIMESTAMPTZ,
+       pip_picked_up_at TIMESTAMPTZ,
+       PRIMARY KEY (chat_id, message_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS community_pending_questions_sweep_idx
+       ON community_pending_questions (chat_id, created_at)
+       WHERE pip_picked_up_at IS NULL AND answered_in_chat_at IS NULL`,
+    // Snapshot of which milestones we've already announced so the
+    // milestone-poller doesn't re-announce the same one after a restart.
+    `CREATE TABLE IF NOT EXISTS community_milestones_seen (
+       chat_id BIGINT NOT NULL,
+       milestone_key TEXT NOT NULL,
+       posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (chat_id, milestone_key)
+     )`,
   ];
   for (const sql of patches) {
     try {

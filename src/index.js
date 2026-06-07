@@ -371,6 +371,11 @@ bot.start({
     import("./services/community-anomaly.js").then((m) => m.startCommunityAnomalyWatcher(bot));
     // Daily operator digest — once-per-day DM summarizing 24h mod activity.
     import("./services/community-operator-digest.js").then((m) => m.startCommunityOperatorDigest(bot));
+    // Proactive Pip — captcha welcomes (zero cost), milestone auto-posts
+    // (zero cost), and unanswered-question pickup (capped Anthropic spend
+    // via PIP_DAILY_PROACTIVE_MAX). Set PIP_PROACTIVE_DISABLED=1 to
+    // disable entirely without redeploying.
+    import("./services/community-proactive.js").then((m) => m.startCommunityProactive(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.

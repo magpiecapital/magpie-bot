@@ -210,6 +210,18 @@ async function handleCaptchaCallback(ctx) {
       await ctx.editMessageText("✅ You're verified. Head back to the Magpie group to chat.");
     } catch { /* edit might fail if msg was deleted — silent */ }
     await recordModAction(chatId, userId, "captcha_pass", null, null);
+
+    // Post a warm in-group welcome. Static template, no LLM cost.
+    // The captcha message above lives in the user's DM with the bot —
+    // they need to see something IN the group too so the rest of the
+    // community knows someone new is here, and so the new member feels
+    // greeted rather than "you passed a test, now figure it out".
+    try {
+      const { postCaptchaWelcome } = await import("../services/community-proactive.js");
+      await postCaptchaWelcome(ctx.api, chatId, ctx.callbackQuery.from);
+    } catch (err) {
+      console.warn("[community] welcome post failed (non-critical):", err.message);
+    }
   } catch (err) {
     console.warn("[community] captcha callback failed:", err.message);
     try { await ctx.answerCallbackQuery({ text: "Something went wrong — try again.", show_alert: true }); } catch { /* silent */ }
@@ -344,6 +356,21 @@ async function handleGroupMessage(ctx) {
     // of group messages instead of 100%. Conservative by design:
     // confidence below 0.75 → no action. "criticism" → never acted on.
     await maybeRunFudCheck(ctx, msg, sender);
+
+    // ── Proactive Pip: track public questions ───────────────────
+    // Two flows, both cheap (no LLM cost here):
+    //   (a) If this message looks like a Magpie-relevant question,
+    //       record it as a candidate for proactive answering later.
+    //   (b) If it's a reply to a previous message that's in our
+    //       pending-questions table, mark that question "answered by
+    //       chat" so Pip doesn't double-up. Reply tracking is what
+    //       prevents Pip from talking over a human who already helped.
+    try {
+      const { trackInboundForProactivePip } = await import("../services/community-proactive.js");
+      await trackInboundForProactivePip(ctx.chat.id, msg, sender);
+    } catch (err) {
+      console.warn("[community] proactive-track failed (non-critical):", err.message);
+    }
 
     // Touch last_message_at for rate-limit tracking
     await touchLastMessage(ctx.chat.id, sender.id);

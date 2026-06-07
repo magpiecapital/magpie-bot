@@ -79,10 +79,22 @@ async function build24hDigest() {
       LIMIT 5`,
   );
 
-  return { actionsByType, byChat, memberStats, seriousFlags };
+  // 5. Proactive Pip activity — pickups (Anthropic cost) and milestones
+  // (no cost). Lets the operator see exactly how much we spent today.
+  const { rows: [proactive] } = await query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM community_pending_questions
+          WHERE pip_picked_up_at > NOW() - INTERVAL '24 hours')   AS pickups,
+       (SELECT COUNT(*)::int FROM community_pending_questions
+          WHERE created_at > NOW() - INTERVAL '24 hours')         AS pending_seen,
+       (SELECT COUNT(*)::int FROM community_milestones_seen
+          WHERE posted_at > NOW() - INTERVAL '24 hours')          AS milestones`,
+  );
+
+  return { actionsByType, byChat, memberStats, seriousFlags, proactive };
 }
 
-function formatDigest({ actionsByType, byChat, memberStats, seriousFlags }) {
+function formatDigest({ actionsByType, byChat, memberStats, seriousFlags, proactive }) {
   const totalActions = actionsByType.reduce((s, r) => s + r.n, 0);
   if (totalActions === 0 && memberStats.joined === 0) {
     return null; // silent — nothing to report
@@ -123,6 +135,21 @@ function formatDigest({ actionsByType, byChat, memberStats, seriousFlags }) {
     }
   } else {
     lines.push(``, `_No high-severity flags in the last 24h._`);
+  }
+
+  if (proactive) {
+    const pickups = proactive.pickups ?? 0;
+    const pending = proactive.pending_seen ?? 0;
+    const milestones = proactive.milestones ?? 0;
+    // Sonnet estimate: ~$0.005 per pickup. Surface so the cost is visible.
+    const estCost = (pickups * 0.005).toFixed(3);
+    lines.push(
+      ``,
+      `*🧠 Proactive Pip (24h)*`,
+      `  • Questions Pip auto-answered: *${pickups}* (≈ \$${estCost} Anthropic spend)`,
+      `  • Pending questions tracked but resolved by chat: ${Math.max(0, pending - pickups)}`,
+      `  • Milestone posts: ${milestones}`,
+    );
   }
 
   lines.push(
