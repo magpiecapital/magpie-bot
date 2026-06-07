@@ -130,6 +130,21 @@ export async function handleCosignBorrow(req) {
     return { status: 405, body: { error: "POST only" } };
   }
 
+  // KILL SWITCH — set COSIGN_BORROW_DISABLED=true on Railway to disable
+  // all site-borrow co-signing without redeploying. Useful if we ever
+  // detect another anomaly: flip the env var, the next request returns
+  // 503, the drain stops in seconds.
+  if (process.env.COSIGN_BORROW_DISABLED === "true") {
+    console.warn("[cosign-borrow] disabled via COSIGN_BORROW_DISABLED env var");
+    return {
+      status: 503,
+      body: {
+        error: "Site-borrow co-signing is temporarily disabled",
+        detail: "Use the Telegram bot for borrows while this is paused.",
+      },
+    };
+  }
+
   let body;
   try {
     body = await readJsonBody(req);
