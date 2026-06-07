@@ -280,6 +280,54 @@ async function handleGroupMessage(ctx) {
     if (isVerifiedAccount(sender)) return;
     if (await isChatAdmin(ctx, sender.id)) return;
 
+    // ── IMPERSONATOR AUTO-BAN ───────────────────────────────
+    // Operator-approved policy 2026-06-07: any user whose display name
+    // or username impersonates Magpie (contains "magpie" anywhere, or
+    // is named "Support"/"Admin"/"Team"/"Moderator"/etc.) gets their
+    // message deleted AND they get banned from the group. No grace,
+    // no strike ladder.
+    //
+    // Why this overrides the "never auto-ban" rule in
+    // project_magpie_strike_policy.md: impersonation IS the entire
+    // attack. Anyone naming themselves "Magpie Matt" in @magpietalk
+    // is doing it to deceive — there's no legitimate use case. The
+    // operator (verified-account) and existing admins are exempt
+    // above, so this rule cannot accidentally hit Magpie's own team.
+    //
+    // Operator gets paged so they can /unban if it's a false positive
+    // (e.g., a real user named "MagpieFan42"). False-positive recovery
+    // is one tap; the cost of letting a scammer linger is much higher.
+    if (isImpersonationName(sender)) {
+      await tryDelete(ctx, msg.message_id);
+      try {
+        await ctx.api.banChatMember(ctx.chat.id, sender.id);
+      } catch (err) {
+        console.warn("[community] impersonator ban failed:", err.message);
+      }
+      await recordModAction(
+        ctx.chat.id, sender.id, "ban_impersonator",
+        `name="${sender.username || sender.first_name || sender.id}"`,
+        msg.text || msg.caption || null,
+      );
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(
+          ctx.api,
+          `🛡 *Magpie impersonator banned*\n\n` +
+          `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
+          `*ID:* \`${sender.id}\`\n` +
+          `*Their message:* ${(msg.text || msg.caption || "(no text)").slice(0, 300)}\n\n` +
+          `Auto-deleted + auto-banned. If this is a false positive ` +
+          `(real user named something like "MagpieFan"), run ` +
+          `\`/unban ${sender.id}\` in the group.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch (err) {
+        console.warn("[community] impersonator alert failed:", err.message);
+      }
+      return;
+    }
+
     // ── URL allowlist ───────────────────────────────────────
     const urls = extractUrls(msg);
     for (const u of urls) {
@@ -298,53 +346,18 @@ async function handleGroupMessage(ctx) {
       }
     }
 
-    // ── Scam pattern ────────────────────────────────────────
+    // ── Scam pattern (non-impersonator users) ──────────────
+    // Impersonators are already banned above, so anyone reaching here
+    // is a regular user posting a phishing-shaped phrase. Delete +
+    // warn via the strike ladder.
     const scam = matchesScamPattern(msg.text || msg.caption || "");
     if (scam) {
       await tryDelete(ctx, msg.message_id);
       await recordModAction(ctx.chat.id, sender.id, "delete_scam_pattern", scam, msg.text || msg.caption);
       const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-
-      // COMBO RULE: impersonation-named user + scam pattern is the
-      // classic "Magpie Matt posts 'DM me, I lost on your token'"
-      // attack. Bypass the gradual strike ladder — this combo gets a
-      // 24h mute on first offense + immediate operator alert. The
-      // operator's strike policy still applies for non-combo scam
-      // hits (delete + warn, no auto-mute on first offense).
-      const senderImpersonates = isImpersonationName(sender);
-      if (senderImpersonates) {
-        try {
-          const until = Math.floor(Date.now() / 1000) + 86_400; // 24h
-          await ctx.api.restrictChatMember(ctx.chat.id, sender.id, {
-            until_date: until,
-            permissions: { can_send_messages: false },
-          });
-        } catch (err) {
-          console.warn("[community] combo-rule mute failed:", err.message);
-        }
-        // Alert operator with urgency — this is the most-actionable signal
-        try {
-          const { notifyAdmin } = await import("../services/admin-notify.js");
-          await notifyAdmin(
-            ctx.api,
-            `🚨 *Magpie-impersonator scam combo detected*\n\n` +
-            `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
-            `*Pattern matched:* ${scam}\n` +
-            `*Action taken:* deleted + 24h muted (auto)\n\n` +
-            `Recommend immediate ban via the group's admin UI. ` +
-            `This is a name-impersonator + scam-text combo — the highest-confidence scam signal we have.`,
-            { parse_mode: "Markdown" },
-          );
-        } catch (err) {
-          console.warn("[community] operator alert failed:", err.message);
-        }
-        return;
-      }
-
-      // Non-combo: gradual strike ladder via existing softWarn flow
       await softWarn(
         sender.id,
-        `Your message was removed from the Magpie group — it matched a pattern we automatically flag (asking for seed phrases, "send X SOL", "DM me for free airdrop", etc.). If this was a misunderstanding, just rephrase.` +
+        `Your message was removed from the Magpie group — it matched a pattern we automatically flag (seed phrase requests, "send X SOL", "DM me", "claim airdrop", etc.). If this was a misunderstanding, just rephrase.` +
         (count >= 3 ? `\n\n#${count} warning. Repeated matches may result in a mute.` : ``),
       );
       return;
