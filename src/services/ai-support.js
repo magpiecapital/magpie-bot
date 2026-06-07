@@ -3018,16 +3018,26 @@ const TOOL_HANDLERS = {
     }
   },
 
-  get_my_recent_activity: async (_args, { userId }) => {
+  get_my_recent_activity: async (_args, { userId, signerPubkey }) => {
     try {
+      // Pull the most-recent activity, then scope to the user's current
+      // wallet (same as list_my_loans — see [[MULTI-WALLET LOAN
+      // SCOPING]] section in the prompt). Without scoping, this commingles
+      // activity from every linked wallet and Pip can claim the user
+      // "recently took out a $TROLL loan" when that's on a different
+      // wallet they aren't signed in on.
+      //
+      // Note: we need loan_pda for the PDA-derivation scoping check.
+      // Bump LIMIT to 20 so we have headroom after filtering — caller
+      // only renders 5.
       const { rows } = await query(
-        `SELECT loan_id, status, start_timestamp, due_timestamp,
+        `SELECT loan_id, loan_pda, status, start_timestamp, due_timestamp,
                 loan_amount_lamports, original_loan_amount_lamports,
                 (SELECT symbol FROM supported_mints sm WHERE sm.mint = loans.collateral_mint) AS symbol
          FROM loans
          WHERE user_id = $1
          ORDER BY start_timestamp DESC
-         LIMIT 5`,
+         LIMIT 20`,
         [userId],
       );
       if (rows.length === 0) {
@@ -3036,8 +3046,34 @@ const TOOL_HANDLERS = {
           user_friendly_hint: "Tell the user we don't see any loan activity on their account yet. If they want to borrow, /borrow walks them through it.",
         };
       }
+
+      let scopedRows;
+      let scopedWallet;
+      let otherWalletCount = 0;
+      if (signerPubkey) {
+        scopedRows = filterLoansForWallet(rows, signerPubkey);
+        scopedWallet = signerPubkey;
+        otherWalletCount = rows.length - scopedRows.length;
+      } else {
+        const scoped = await scopeLoansToActiveWallet(userId, rows);
+        scopedRows = scoped.filtered;
+        scopedWallet = scoped.activeWallet;
+        otherWalletCount = scoped.otherWalletCount;
+      }
+
+      if (scopedRows.length === 0) {
+        return {
+          activity: [],
+          scoped_to_wallet: scopedWallet,
+          other_wallets_activity_count: otherWalletCount,
+          user_friendly_hint: otherWalletCount > 0
+            ? `No recent activity on the user's CURRENT wallet (${scopedWallet}). They have ${otherWalletCount} loan record(s) on OTHER linked wallets — mention this so they can switch wallets to see that history.`
+            : "Tell the user we don't see any loan activity on their account yet.",
+        };
+      }
+
       return {
-        activity: rows.map((r) => ({
+        activity: scopedRows.slice(0, 5).map((r) => ({
           type: "loan",
           loan_id: r.loan_id,
           symbol: r.symbol,
@@ -3047,6 +3083,11 @@ const TOOL_HANDLERS = {
           started_at: r.start_timestamp,
           due_at: r.due_timestamp,
         })),
+        scoped_to_wallet: scopedWallet,
+        other_wallets_activity_count: otherWalletCount,
+        _agent_instruction: otherWalletCount > 0
+          ? `Activity shown is for the user's CURRENT wallet (${scopedWallet}). They have ${otherWalletCount} more loan record(s) on OTHER linked wallets — mention this if relevant.`
+          : undefined,
       };
     } catch (err) {
       return toolError("activity_lookup_failed", err.message, HINT_RPC_BLIP);
