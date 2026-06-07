@@ -692,6 +692,165 @@ export async function handleCommunityWebsite(ctx) {
   });
 }
 
+/* ─────────────────────────── /whitepaper ─────────────────────────── */
+
+export async function handleCommunityWhitepaper(ctx) {
+  const text = [
+    `📄 *Magpie · whitepaper*`,
+    ``,
+    `Full design + mechanics: [magpie.capital/whitepaper](${SITE_URL}/whitepaper)`,
+    ``,
+    `Covers: the three-tier loan structure, fee economics, LP math, credit-score formula, liquidation engine, keeper network, and the design rationale for each choice.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[{ text: "📄 Read the whitepaper", url: `${SITE_URL}/whitepaper` }]],
+    },
+  });
+}
+
+/* ─────────────────────────── /audit ─────────────────────────── */
+
+export async function handleCommunityAudit(ctx) {
+  // Honest answer — there is no formal third-party audit yet.
+  // Saying "audited" when we're not would be misrepresentation,
+  // and the community will eventually find out. Instead: explain
+  // what compensates for the missing audit + what's planned.
+  const text = [
+    `🔍 *Audit status — honest answer*`,
+    ``,
+    `Magpie has *not* yet undergone a formal third-party audit. The community deserves transparency on this rather than a misleading "audited" claim.`,
+    ``,
+    `*What compensates in the meantime*`,
+    `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
+    `• *Short loan terms* — 2–7 day max bounds the protocol's risk window vs. perpetual lending.`,
+    `• *Low LTV (20–30%)* — conservative collateralization absorbs price swings.`,
+    `• *Zero liquidations to date* — the design has held in practice, not just in theory.`,
+    `• *No admin override* — there's no privileged key that can drain user collateral.`,
+    `• *Bug bounty* — see /security to report findings.`,
+    ``,
+    `Treat Magpie as you would any unaudited protocol: deposit only what you can afford to lose, and verify everything on-chain.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔒 Security page", url: `${SITE_URL}/security` },
+          { text: "📂 Source code", url: "https://github.com/magpiecapital" },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /risk ─────────────────────────── */
+
+export async function handleCommunityRisk(ctx) {
+  const text = [
+    `⚠️ *Magpie · what could go wrong*`,
+    ``,
+    `Real talk on the risks. Read before depositing serious size.`,
+    ``,
+    `*1. Liquidation risk* (borrower-side)`,
+    `If your collateral token's price drops enough that health < 1.1×, the loan liquidates. You lose the collateral, keep the SOL. Mitigations: /topup to add more, /extend to buy time, Auto-Protect (in /security).`,
+    ``,
+    `*2. Token-volatility risk* (LP-side)`,
+    `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
+    ``,
+    `*3. Smart-contract risk*`,
+    `Magpie is *not yet formally audited* (see /audit). Source is open. A bug anywhere in the program could result in loss of funds.`,
+    ``,
+    `*4. Custodial risk*`,
+    `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
+    ``,
+    `*5. Oracle risk*`,
+    `Token prices come from on-chain DEX oracles. Manipulated thin-liquidity pools can briefly skew prices. Token-health watcher pauses risky tokens proactively.`,
+    ``,
+    `*6. Operator risk*`,
+    `The on-chain program runs autonomously, but the bot/site front-end depends on the team operating it. If front-end services were ever unavailable, loans + the protocol itself would keep running on-chain — but new UI features would pause. Self-custody (/export your key) protects you from this entirely.`,
+    ``,
+    `_Deposit only what you can afford to lose. Verify everything on-chain. We optimize for honesty over hype._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
+
+/* ─────────────────────────── /team ─────────────────────────── */
+
+export async function handleCommunityTeam(ctx) {
+  // Operator privacy: never reveal the operator's real name or
+  // personal handles. Talk about the project's values instead.
+  const text = [
+    `👥 *Who's behind Magpie?*`,
+    ``,
+    `Magpie operates pseudonymously by design. Crypto has a long history of doxxed teams losing optionality the moment they're public — pseudonymity protects the project's ability to keep building without becoming a target.`,
+    ``,
+    `*What you CAN verify*`,
+    `• Every line of code: github.com/magpiecapital`,
+    `• Every transaction: on-chain at solscan.io / magpie.capital/stats`,
+    `• Every fee taken: tracked in the protocol, allocated transparently (see /fees)`,
+    `• Every protocol change: github commit history + /changelog`,
+    ``,
+    `*What the team is building toward*`,
+    `Permissionless, on-chain, custodial-by-design lending that works in a Telegram chat. The thesis: most "DeFi" is too clunky for normal users. Magpie reduces "I want SOL against my bag" to a 30-second flow.`,
+    ``,
+    `*How to reach us*`,
+    `• Public discussion: this group (@magpietalk)`,
+    `• Private support: /support in the wallet bot`,
+    `• Security disclosure: /security on the site`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📂 GitHub", url: "https://github.com/magpiecapital" },
+          { text: "📊 On-chain stats", url: SITE_STATS_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /support ─────────────────────────── */
+
+export async function handleCommunitySupport(ctx) {
+  // Community groups should NEVER be where personal support
+  // happens. Always redirect to the private bot for anything
+  // wallet/loan/account-specific.
+  const text = [
+    `🛟 *Need help with something?*`,
+    ``,
+    `For *anything personal* (your wallet, loans, balance, missing tx, account questions) — DM the bot and use \`/support\`:`,
+    `→ [@magpie\\_capital\\_bot](${WALLET_BOT_URL})`,
+    ``,
+    `Pip can read your account context there and either solve it instantly or open a ticket for the team. _I can't see who's asking from this public group — that's why personal support has to happen in DM._`,
+    ``,
+    `*For general questions* (how does X work, what's the tier for Y) — just ask here with \`/ask <question>\`.`,
+    ``,
+    `*Found a security issue?* — see [/security](${SITE_URL}/security) for the responsible-disclosure process.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🛟 Open the bot for /support", url: WALLET_BOT_URL },
+          { text: "🔒 Security", url: `${SITE_URL}/security` },
+        ],
+      ],
+    },
+  });
+}
+
 /* ─────────────────────────── /faq ─────────────────────────── */
 
 export async function handleCommunityFaq(ctx) {
@@ -808,9 +967,20 @@ const COMMUNITY_CMD_HANDLERS = {
   website: handleCommunityWebsite,
   site: handleCommunityWebsite,        // alias
   docs: handleCommunityDocs,
+  whitepaper: handleCommunityWhitepaper,
+  wp: handleCommunityWhitepaper,       // alias — common abbreviation
   links: handleCommunityLinks,
   x: handleCommunityX,
   twitter: handleCommunityX,           // alias
+  // Transparency
+  audit: handleCommunityAudit,
+  risk: handleCommunityRisk,
+  risks: handleCommunityRisk,          // alias
+  team: handleCommunityTeam,
+  about: handleCommunityTeam,          // alias — same content
+  // Support handoff
+  support: handleCommunitySupport,
+  help: handleCommunitySupport,        // alias — common ask
 };
 
 export async function maybeHandlePublicCommand(ctx, msg) {
