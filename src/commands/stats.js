@@ -47,16 +47,24 @@ export async function handleStats(ctx) {
          COUNT(*) FILTER (WHERE status = 'active')::int     AS active,
          COUNT(*) FILTER (WHERE status = 'repaid')::int     AS repaid,
          COUNT(*) FILTER (WHERE status = 'liquidated')::int AS liquidated,
-         COALESCE(SUM(original_loan_amount_lamports) FILTER (WHERE status = 'active'), 0)::text AS active_lamports
+         COALESCE(SUM(loan_amount_lamports), 0)::text AS lifetime_lamports,
+         COALESCE(SUM(loan_amount_lamports) FILTER (WHERE status = 'active'), 0)::text AS active_lamports
        FROM loans`,
     );
     const r = counts[0];
 
-    // Headline number — authoritative on-chain cumulative
-    const lifetimeBorrowedSol = fmtSol(pool.totalBorrowed.toNumber());
+    // HEADLINE: lifetime cumulative SOL ever borrowed.
+    //
+    // IMPORTANT: this is the DB SUM across all loan rows, NOT
+    // `pool.totalBorrowed` from on-chain. The on-chain field is
+    // documented as "Total wSOL currently lent out" — it decrements
+    // on repayment, so it's the OUTSTANDING balance, not lifetime.
+    // The DB sum is the only authoritative source for "total ever lent."
+    const lifetimeBorrowedSol = fmtSol(r.lifetime_lamports);
     const totalDepositsSol = fmtSol(pool.totalDeposits.toNumber());
     const totalFeesSol = fmtSol(pool.totalFeesEarned.toNumber());
     const activeOutSol = fmtSol(r.active_lamports);
+    const currentlyLentSolOnchain = fmtSol(pool.totalBorrowed.toNumber());
 
     const codeLines = [
       RULE,
