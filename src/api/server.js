@@ -773,6 +773,12 @@ async function handlePublicPoolStats() {
       utilization: totalDeposits > 0 ? totalBorrowed / totalDeposits : 0,
       total_fees_earned_sol: Number(p.totalFeesEarned) / 1e9,
       total_loans_issued: p.totalLoansIssued.toString(),
+      // On-chain liquidation counter. Was missing from this endpoint,
+      // which caused the landing page to silently default to 0 even
+      // when /stats (DB-derived) correctly showed 1. Source of truth
+      // is the on-chain pool counter — DB count from loans.status
+      // should agree but the pool counter wins on disagreement.
+      total_liquidations: p.totalLiquidations?.toString?.() ?? "0",
       paused: p.paused,
     };
   } catch { /* fall through */ }
