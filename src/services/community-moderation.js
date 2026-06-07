@@ -97,6 +97,43 @@ export const SCAM_PHRASES = [
   /\bguarantee[ds]?\s+\d+%/i,
 ];
 
+// Handles that legitimately represent Magpie. Anything else in a
+// @MagpieXxx form is treated as impersonation.
+const OFFICIAL_MAGPIE_HANDLES = new Set([
+  "magpieloans",         // official X
+  "magpie_capital_bot",  // official TG bot
+  "magpiecapital",       // org GitHub + reserved
+  "magpietalk",          // the community group itself
+]);
+
+/**
+ * Find @handles in text that LOOK Magpie-related but aren't on the
+ * official list. Catches verbal impersonation that bypasses the URL
+ * filter (someone posting "DM @MagpieSupport for help" — no link, just
+ * a handle reference, but routes the user to a scammer).
+ *
+ * Returns the array of offending handles, or [] if none. The handle
+ * does NOT need to be on Telegram specifically — we flag ANY @ token
+ * because X and TG impersonators are equally dangerous.
+ *
+ * Case-insensitive. The official list is lowercased above.
+ */
+export function findImpersonatingHandles(text) {
+  if (!text) return [];
+  const found = [];
+  // Match @ followed by 4-32 word chars (TG + X handle constraints).
+  const handlePattern = /@([a-zA-Z0-9_]{4,32})/g;
+  for (const m of text.matchAll(handlePattern)) {
+    const handle = m[1].toLowerCase();
+    // Only flag if it CONTAINS "magpie" (otherwise we'd false-positive
+    // on every legit cross-mention of other projects/people).
+    if (!handle.includes("magpie")) continue;
+    if (OFFICIAL_MAGPIE_HANDLES.has(handle)) continue;
+    found.push(m[0]); // include the leading @ for clarity
+  }
+  return found;
+}
+
 /* ───────────────────────── URL HANDLING ──────────────────────── */
 
 /** Extract every URL the user sent — both via TG entities + plain text */

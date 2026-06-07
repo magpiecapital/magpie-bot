@@ -22,6 +22,7 @@ import {
   isVerifiedAccount,
   isImpersonationName,
   matchesScamPattern,
+  findImpersonatingHandles,
   extractUrls,
   isAllowedUrl,
   recordNewMember,
@@ -34,6 +35,7 @@ import {
   recordModAction,
   CAPTCHA_TIMEOUT_MS,
 } from "../services/community-moderation.js";
+import { classifyImage, actionForImageVerdict } from "../services/community-image-ocr.js";
 
 function isGroupChat(ctx) {
   return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
@@ -227,6 +229,27 @@ async function handleGroupMessage(ctx) {
       return;
     }
 
+    // ── Verbal handle impersonation ──────────────────────────
+    // Catches "DM @MagpieSupport for help" — no link, just text, but
+    // routes the user to a scammer. URL filter doesn't see it because
+    // it's a bare handle. Strict on Magpie-flavored handles only —
+    // legit cross-mentions like "@MagpieLoans posted X" pass.
+    const impersonators = findImpersonatingHandles(msg.text || msg.caption || "");
+    if (impersonators.length > 0) {
+      await tryDelete(ctx, msg.message_id);
+      await recordModAction(
+        ctx.chat.id, sender.id, "delete_handle_impersonation",
+        impersonators.join(","), msg.text || msg.caption,
+      );
+      const count = await bumpWarnedCount(ctx.chat.id, sender.id);
+      await softWarn(
+        sender.id,
+        `Your message was removed because it referenced an unofficial Magpie-related handle (${impersonators.join(", ")}). The ONLY official Magpie accounts are *@MagpieLoans* on X and *@magpie_capital_bot* on Telegram. Anyone else claiming to be Magpie support is a scammer.` +
+        (count >= 3 ? `\n\n#${count} warning. Repeated removals may result in a mute.` : ``),
+      );
+      return;
+    }
+
     // ── Impersonation (re-check per-message in case they rename) ─
     if (isImpersonationName(sender)) {
       await recordModAction(ctx.chat.id, sender.id, "flag_impersonation_msg", "name pattern", sender.username || sender.first_name || "");
@@ -255,6 +278,20 @@ async function handleGroupMessage(ctx) {
       }
     }
 
+    // ── Image vision classifier ─────────────────────────────────
+    // If the message includes a photo (or image-document), run it
+    // through Haiku vision to catch screenshot-based scams,
+    // impersonation, and FUD that the text pipeline would miss.
+    // Same conservative bar as the text classifier (0.75 confidence,
+    // never auto-bans). Skips silently on any failure (fail-open).
+    if (msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || ""))) {
+      await maybeRunImageCheck(ctx, msg, sender);
+      // maybeRunImageCheck deletes the message if it took action,
+      // so if we reach the next line, the image was either OK or the
+      // classifier failed. Either way, run subsequent checks normally
+      // (text caption may still trigger the FUD classifier below).
+    }
+
     // ── FUD / bad-intent classifier ─────────────────────────────
     // Runs ONLY when the message contains a negative-sentiment marker
     // (scam/rug/fake/etc) — that pre-filter keeps LLM cost on ~5-10%
@@ -266,6 +303,79 @@ async function handleGroupMessage(ctx) {
     await touchLastMessage(ctx.chat.id, sender.id);
   } catch (err) {
     console.warn("[community] message handler failed (fail-open):", err.message);
+  }
+}
+
+/** Conservative image classifier — runs Haiku vision on photos /
+ *  image-documents to catch screenshot scams that the text pipeline
+ *  would miss. Same 0.75 confidence floor and never auto-permabans. */
+async function maybeRunImageCheck(ctx, msg, sender) {
+  const result = await classifyImage(ctx, msg);
+  if (!result) return; // fail-open: classifier unavailable or returned nothing
+
+  const decision = actionForImageVerdict(result);
+  if (decision.action === "skip") {
+    // Still log the inspection for audit/trend analysis
+    await recordModAction(
+      ctx.chat.id, sender.id,
+      `image_inspected:${result.verdict}`,
+      `confidence=${result.confidence.toFixed(2)} reason=${result.reason}`,
+      result.extractedText?.slice(0, 200) || null,
+    );
+    return;
+  }
+
+  // Take the action
+  if (decision.action === "delete") {
+    await tryDelete(ctx, msg.message_id);
+  }
+  await recordModAction(
+    ctx.chat.id, sender.id,
+    `image_${result.verdict}`,
+    `confidence=${result.confidence.toFixed(2)} reason=${result.reason}`,
+    result.extractedText?.slice(0, 500) || null,
+  );
+
+  if (decision.mute_sec > 0) {
+    try {
+      await ctx.api.restrictChatMember(ctx.chat.id, sender.id, {
+        until_date: Math.floor(Date.now() / 1000) + decision.mute_sec,
+        permissions: { can_send_messages: false },
+      });
+    } catch (err) {
+      console.warn("[image-mod] mute failed (fail-open):", err.message);
+    }
+  }
+
+  if (decision.warn) {
+    const verdictLabel = {
+      scam_screenshot: "phishing screenshot",
+      impersonation_screenshot: "Magpie impersonation",
+      fud_screenshot: "coordinated FUD",
+      nsfw_or_violence: "NSFW or violent imagery",
+    }[result.verdict] || "policy violation";
+
+    await softWarn(
+      sender.id,
+      `Your image was removed from the Magpie community — our vision moderator flagged it as a *${verdictLabel}*. If this was a mistake, post a plain-text follow-up explaining and someone will review.`,
+    );
+  }
+
+  if (decision.flag_operator) {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        ctx.api,
+        `🖼 *Community image flagged*\n\n` +
+        `*Verdict:* ${result.verdict} (conf ${result.confidence.toFixed(2)})\n` +
+        `*From:* @${sender.username || sender.first_name || sender.id}\n` +
+        `*Reason:* ${result.reason}\n\n` +
+        `*Extracted text (first 200 chars):*\n${(result.extractedText || "(none)").slice(0, 200)}`,
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      console.warn("[image-mod] operator DM failed:", err.message);
+    }
   }
 }
 

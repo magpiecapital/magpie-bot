@@ -366,6 +366,8 @@ bot.start({
     import("./services/community-broadcast.js").then((m) => m.startCommunityBroadcast(bot));
     // Community anomaly watcher — DMs operator on suspicious mod-action volume.
     import("./services/community-anomaly.js").then((m) => m.startCommunityAnomalyWatcher(bot));
+    // Daily operator digest — once-per-day DM summarizing 24h mod activity.
+    import("./services/community-operator-digest.js").then((m) => m.startCommunityOperatorDigest(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.
