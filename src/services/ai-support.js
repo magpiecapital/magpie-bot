@@ -2238,7 +2238,7 @@ const TOOL_HANDLERS = {
         due_at_utc: dueAt.toISOString(),
         expires_at: Date.now() + 5 * 60 * 1000,
       },
-      _agent_instruction: "Respond with ONE short line introducing the borrow card (e.g. 'Here's your ${tier} borrow against ${amount} ${symbol} — tap Sign & Borrow when you're ready.'). Do NOT repeat the numbers — the card shows everything. Never tell them to use /borrow in TG.",
+      _agent_instruction: "Respond with ONE short line introducing the borrow card. The card carries every number (collateral, SOL received, fee, LTV, due date), so do NOT echo any of them. Example: 'Here's your " + tier.label + " against " + mintRow.symbol + " — tap Sign & Borrow.' Never tell them to use /borrow in TG.",
     };
   },
 
@@ -2283,7 +2283,7 @@ const TOOL_HANDLERS = {
         current_collateral_raw: loan.collateral_amount?.toString?.() ?? String(loan.collateral_amount),
         expires_at: Date.now() + 5 * 60 * 1000,
       },
-      _agent_instruction: "Respond with ONE short line introducing the topup card. Don't repeat the numbers — the card shows them.",
+      _agent_instruction: "Respond with ONE short line introducing the top-up card. Refer to the loan as `#" + String(loan.loan_id).slice(-6) + "` (matches the card title). Do NOT echo the SOL amount, token total, or any other number — the card shows everything.",
     };
   },
 
@@ -2333,7 +2333,7 @@ const TOOL_HANDLERS = {
         new_due_at_utc: new Date(newDueMs).toISOString(),
         expires_at: Date.now() + 5 * 60 * 1000,
       },
-      _agent_instruction: "Respond with ONE short line introducing the extend card.",
+      _agent_instruction: "Respond with ONE short line introducing the extend card. Refer to the loan as `#" + String(loan.loan_id).slice(-6) + "` (matches the card title). Do NOT echo the fee, new due date, or days added — the card shows everything.",
     };
   },
 
@@ -2384,7 +2384,7 @@ const TOOL_HANDLERS = {
         owed_sol_after: fmtSol(newOwed),
         expires_at: Date.now() + 5 * 60 * 1000,
       },
-      _agent_instruction: "Respond with ONE short line introducing the partial-repay card.",
+      _agent_instruction: "Respond with ONE short line introducing the partial-repay card. Refer to the loan as `#" + String(loan.loan_id).slice(-6) + "` (matches the card title). Do NOT echo the SOL amount being paid down or the owed-after — the card shows everything. The card also carries the collateral-locked warning, so don't repeat that in prose.",
     };
   },
 
@@ -2457,7 +2457,10 @@ const TOOL_HANDLERS = {
         expires_at: Date.now() + 5 * 60 * 1000,
       },
       // Hint the model on what to say back: short and to the point.
-      _agent_instruction: "Respond with ONE short line introducing the repay card (e.g. 'Here's the repay for loan #X — tap Sign & Repay when you're ready.'). Don't repeat numbers in prose; the card shows them.",
+      // Use the last-6 abbreviation that matches the card title — full
+      // 13-digit IDs look clunky in prose and visually disagree with
+      // the card. Never re-state numbers the card already renders.
+      _agent_instruction: "Respond with ONE short line introducing the repay card. Refer to the loan as `#" + String(loan.loan_id).slice(-6) + "` (matches the card title). Example: 'Here's the repay for `#" + String(loan.loan_id).slice(-6) + "` — tap Sign & Repay when you're ready.' Do NOT echo any SOL amount, fee, due time, or collateral total in your prose — the card already shows all of that.",
     };
   },
 
