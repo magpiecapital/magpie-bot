@@ -161,6 +161,7 @@ const GUIDELINES_MESSAGE = [
   "• `/faq`     — common questions answered",
   "• `/scam`    — Magpie-themed scam patterns",
   "• `/support` — personal help (redirects to DM)",
+  "• `/phantom` — Phantom dApp known-issue status",
   "",
   "_Verify any protocol claim on-chain at [solscan.io](https://solscan.io) or [magpie.capital/stats](https://magpie.capital/stats)._",
 ].join("\n");

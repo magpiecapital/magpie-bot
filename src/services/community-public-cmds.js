@@ -851,6 +851,34 @@ export async function handleCommunitySupport(ctx) {
   });
 }
 
+/* ─────────────────────────── /phantom ─────────────────────────── */
+
+export async function handleCommunityPhantom(ctx) {
+  const text = [
+    `🟣 *Phantom dApp — known issue*`,
+    ``,
+    `We're aware some users are seeing issues with the Magpie dApp inside Phantom's mobile browser. We're working closely with the Phantom team to resolve it and hope to have it sorted soon.`,
+    ``,
+    `*Workarounds in the meantime*`,
+    `• Use the *Telegram wallet bot* — same protocol, same features, fully working: [@magpie\\_capital\\_bot](${WALLET_BOT_URL})`,
+    `• Open magpie.capital in a regular browser (Safari, Chrome, Brave) and connect Phantom from there — usually works.`,
+    ``,
+    `_Updates will go out via [@MagpieLoans](${X_URL}) once it's resolved._`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📲 Use the TG bot instead", url: WALLET_BOT_URL },
+          { text: "🌐 Try magpie.capital", url: SITE_URL },
+        ],
+      ],
+    },
+  });
+}
+
 /* ─────────────────────────── /credit ─────────────────────────── */
 
 export async function handleCommunityCredit(ctx) {
@@ -1098,6 +1126,9 @@ const COMMUNITY_CMD_HANDLERS = {
   // Protocol concepts
   credit: handleCommunityCredit,
   score: handleCommunityCredit,        // alias
+  // Known issues
+  phantom: handleCommunityPhantom,
+  dapp: handleCommunityPhantom,        // alias — same canned status
   lend: handleCommunityLend,
   earn: handleCommunityLend,           // alias — what /earn does on the site
   keeper: handleCommunityKeeper,
