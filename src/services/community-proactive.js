@@ -81,11 +81,20 @@ function pickWelcome(name) {
   return tpl(name);
 }
 
+// Escape Telegram legacy-Markdown control chars so usernames with
+// underscores (very common in TG handles, e.g. @magpie_capital_bot)
+// don't accidentally trigger italic / bold rendering and break the
+// whole message. Belt-and-suspenders: we ALSO defang any backticks
+// and brackets that could be smuggled in via a hostile first_name.
+function escapeMdName(s) {
+  return String(s).replace(/([_*`\[\]()])/g, "\\$1");
+}
+
 function displayName(tgUser) {
   if (!tgUser) return "friend";
-  if (tgUser.username) return `@${tgUser.username}`;
+  if (tgUser.username) return `@${escapeMdName(tgUser.username)}`;
   const first = (tgUser.first_name || "").trim();
-  return first || "friend";
+  return first ? escapeMdName(first) : "friend";
 }
 
 /** Post an in-group welcome after a member passes the captcha.
