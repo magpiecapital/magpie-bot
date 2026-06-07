@@ -11,6 +11,7 @@ const DEFAULTS = {
   notify_loan_warnings: true,
   notify_liquidations: true,
   notify_health: true,
+  notify_pump: true,
   auto_repay: false,
   // Auto-Protect was opt-in until 2026-06-06; users had to discover
   // and enable it to get the protocol's main anti-liquidation lever.
@@ -23,7 +24,7 @@ const DEFAULTS = {
 export async function getPrefs(userId) {
   const { rows } = await query(
     `SELECT notify_deposits, notify_loan_warnings, notify_liquidations,
-            notify_health, auto_repay, auto_protect
+            notify_health, notify_pump, auto_repay, auto_protect
      FROM user_prefs WHERE user_id = $1`,
     [userId],
   );

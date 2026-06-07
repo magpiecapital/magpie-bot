@@ -13,11 +13,15 @@ import { getPrefs } from "./prefs.js";
 
 const POLL_INTERVAL_MS = Number(process.env.PUMP_WATCH_MS) || 300_000; // 5 min
 
-// Multipliers at which we notify (ascending)
+// Multipliers at which we notify (ascending).
+// Tightened 2026-06-06: was 2x / 3x / 5x — too noisy for memecoin
+// volatility, where 2x can happen multiple times a day on a low-LTV
+// loan. New floor at 3x cuts ~80% of pump alerts while still catching
+// the moments worth surfacing.
 const PUMP_THRESHOLDS = [
-  { multiple: 2.0, emoji: "📈", label: "Your collateral is now worth *2x* what you owe!" },
-  { multiple: 3.0, emoji: "🚀", label: "Your collateral is now worth *3x* what you owe!" },
-  { multiple: 5.0, emoji: "🔥", label: "Your collateral is now worth *5x* what you owe!" },
+  { multiple: 3.0,  emoji: "🚀", label: "Your collateral is now worth *3x* what you owe!" },
+  { multiple: 5.0,  emoji: "🔥", label: "Your collateral is now worth *5x* what you owe!" },
+  { multiple: 10.0, emoji: "💎", label: "Your collateral is now worth *10x* what you owe!" },
 ];
 
 async function checkLoan(bot, row) {
@@ -51,7 +55,10 @@ async function checkLoan(bot, row) {
   if (!bestThreshold) return;
 
   const prefs = await getPrefs(row.user_id);
-  if (!prefs.notify_health) {
+  // notify_pump = dedicated toggle for celebration-style pump DMs.
+  // Separate from notify_health (which covers risk warnings). Users
+  // who want loss-warnings but not pump confetti can mute just this.
+  if (!prefs.notify_pump) {
     await query(
       `UPDATE loans SET last_pump_alert_value = $2 WHERE id = $1`,
       [row.id, bestThreshold.multiple],
@@ -70,11 +77,15 @@ async function checkLoan(bot, row) {
     `You owe: *${owedSol} SOL*`,
     "",
     "Repay now to reclaim your tokens while they're up, or take out another loan against a different bag.",
+    "",
+    "_Find these annoying? Tap 🔕 below._",
   ].join("\n");
 
   const kb = new InlineKeyboard()
     .text("🔧 Repay now", `repay:loan:${row.id}`)
-    .text("💰 Borrow more", "start:borrow");
+    .text("💰 Borrow more", "start:borrow")
+    .row()
+    .text("🔕 Mute pump alerts", "pump:mute");
 
   try {
     await bot.api.sendMessage(row.telegram_id, msg, {

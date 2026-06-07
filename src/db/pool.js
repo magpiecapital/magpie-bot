@@ -601,6 +601,13 @@ export async function applyStartupPatches() {
        END IF;
      END $$`,
 
+    // ── PUMP ALERT OPT-OUT (2026-06-06) ─────────────────────────
+    // Separates pump-celebration alerts ("Your bag is pumping!") from
+    // health/risk alerts. Users who want risk warnings but find pump
+    // confetti annoying can mute just this with /notify or a one-tap
+    // button on the alert itself.
+    `ALTER TABLE user_prefs ADD COLUMN IF NOT EXISTS notify_pump BOOLEAN NOT NULL DEFAULT TRUE`,
+
     // ── COMMUNITY MODERATION ────────────────────────────────────
     // Tracks which TG groups have the moderation bot active. Operator
     // enables per-chat via /community_enable. Quarantine + member
