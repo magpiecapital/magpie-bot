@@ -851,6 +851,141 @@ export async function handleCommunitySupport(ctx) {
   });
 }
 
+/* ─────────────────────────── /credit ─────────────────────────── */
+
+export async function handleCommunityCredit(ctx) {
+  const text = [
+    `⭐ *Magpie · credit score*`,
+    ``,
+    `A 300–850 on-chain credit score, tracked by your wallet. Your repayment history shows up here over time.`,
+    ``,
+    `*What moves it*`,
+    `  +  Repaying loans on time`,
+    `  +  Closing loans early`,
+    `  +  Long history of healthy positions`,
+    `  −  Missing a deadline`,
+    `  −  Getting liquidated`,
+    ``,
+    `*Why it matters*`,
+    `Higher scores unlock better terms over time as the protocol grows. Today it's a public proof of repayment behavior — tomorrow it gates better tiers and reduced fees.`,
+    ``,
+    `*How to check yours*`,
+    `• In the bot: \`/credit\` (DM @magpie\\_capital\\_bot)`,
+    `• On the site: [magpie.capital/credit](${SITE_URL}/credit)`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "⭐ See your score", url: WALLET_BOT_URL },
+          { text: "📖 Read more", url: `${SITE_URL}/credit` },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /lend ─────────────────────────── */
+
+export async function handleCommunityLend(ctx) {
+  const text = [
+    `🏦 *Lending into the Magpie pool*`,
+    ``,
+    `Deposit SOL → earn *80% of all protocol loan fees*, pro-rata to your share of the pool.`,
+    ``,
+    `*How it works*`,
+    `• You deposit SOL → receive pool shares`,
+    `• Borrowers pay fees on every loan (Express 3% / Quick 2% / Standard 1.5%)`,
+    `• 80% of every fee flows back to the LP pool, distributed pro-rata`,
+    `• Withdraw your share + earnings any time`,
+    ``,
+    `*The trade-off*`,
+    `Your SOL backs the loan book. In a flash crash, liquidations might lag price moves — LPs can absorb losses in extreme markets. Short terms + low LTV + the keeper network are designed to keep this rare. Zero LP losses to date.`,
+    ``,
+    `*Get started*`,
+    `[magpie.capital/earn](${SITE_URL}/earn) or \`/lend\` in the bot.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🏦 Deposit", url: `${SITE_URL}/earn` },
+          { text: "📊 Live LP stats", url: SITE_STATS_URL },
+        ],
+      ],
+    },
+  });
+}
+
+/* ─────────────────────────── /keeper ─────────────────────────── */
+
+export async function handleCommunityKeeper(ctx) {
+  const text = [
+    `⚡ *Magpie keeper network*`,
+    ``,
+    `The keeper network is the off-chain swarm that watches every loan in real time and triggers liquidation the moment a position drops below the health threshold.`,
+    ``,
+    `*Why it exists*`,
+    `Solana's on-chain program can't poll prices itself — it needs an outside actor to call \`liquidate\` when conditions are met. Keepers run that watchdog loop.`,
+    ``,
+    `*Who can run a keeper?*`,
+    `Anyone. The keeper that triggers a successful liquidation earns a small reward in SOL out of the liquidated collateral. Open-source code, permissionless to participate.`,
+    ``,
+    `*Why this matters for users*`,
+    `Multiple independent keepers means no single point of failure. Even if the protocol's reference keeper goes offline, others step in. Liquidations stay timely → LPs and borrowers both protected.`,
+    ``,
+    `Full details: [magpie.capital/earn#keeper](${SITE_URL}/earn#keeper)`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[{ text: "⚡ Keeper details", url: `${SITE_URL}/earn#keeper` }]],
+    },
+  });
+}
+
+/* ─────────────────────────── /wallet ─────────────────────────── */
+
+export async function handleCommunityWallet(ctx) {
+  const text = [
+    `💼 *Your Magpie wallet*`,
+    ``,
+    `When you /start the bot in DM, Magpie creates a fresh Solana wallet just for you. This is YOUR wallet — and the key to one-click loans.`,
+    ``,
+    `*What's special about it*`,
+    `Magpie's bot can co-sign transactions for you. That's why /borrow lands in seconds with no Phantom popup per step. The trade-off: the bot holds the encrypted private key.`,
+    ``,
+    `*How it's protected*`,
+    `• Encrypted at rest with AES-256-GCM`,
+    `• Per-user initialization vector`,
+    `• Encryption key separate from the database`,
+    `• You can \`/export\` the private key any time to self-custody`,
+    ``,
+    `*Want to use your existing wallet instead?*`,
+    `\`/import\` lets you bring in a Solana wallet you already own. Same flows, same one-click experience.`,
+    ``,
+    `*Want to connect on the site?*`,
+    `Phantom / Solflare / Backpack all work at [magpie.capital](${SITE_URL}). Site-side actions are signed per-transaction in your existing wallet — no co-signing.`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "💼 Get your wallet", url: WALLET_BOT_URL },
+          { text: "🌐 Connect on site", url: SITE_URL },
+        ],
+      ],
+    },
+  });
+}
+
 /* ─────────────────────────── /faq ─────────────────────────── */
 
 export async function handleCommunityFaq(ctx) {
@@ -960,6 +1095,14 @@ const COMMUNITY_CMD_HANDLERS = {
   holders: handleCommunityHolders,
   refer: handleCommunityRefer,
   referral: handleCommunityRefer,      // alias
+  // Protocol concepts
+  credit: handleCommunityCredit,
+  score: handleCommunityCredit,        // alias
+  lend: handleCommunityLend,
+  earn: handleCommunityLend,           // alias — what /earn does on the site
+  keeper: handleCommunityKeeper,
+  keepers: handleCommunityKeeper,      // alias
+  wallet: handleCommunityWallet,
   // Reference
   faq: handleCommunityFaq,
   scam: handleCommunityScam,

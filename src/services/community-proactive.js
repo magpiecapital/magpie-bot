@@ -319,8 +319,15 @@ async function sweepProactiveQuestions(botApi) {
 
 // Define which thresholds we celebrate. Sparse on purpose — we don't
 // want Pip going "10 loans!" "11 loans!" "12 loans!" That's annoying.
-// Each entry: { key, label, check(state) → boolean, message(state) → text }
-const MILESTONES = [
+// Each entry: { thr, key, matches(state), message(state) }.
+//
+// Two families now:
+//   - Active-loan count (the "right now" gauge — community feels
+//     momentum here)
+//   - Lifetime SOL borrowed (the headline number — bigger story arc)
+// Both deduped via community_milestones_seen so a milestone fires
+// exactly once across the protocol's history.
+const ACTIVE_LOAN_MILESTONES = [
   { thr: 50,   key: "active_loans_50" },
   { thr: 100,  key: "active_loans_100" },
   { thr: 250,  key: "active_loans_250" },
@@ -328,20 +335,49 @@ const MILESTONES = [
   { thr: 1000, key: "active_loans_1000" },
 ].map((m) => ({
   ...m,
-  matches: (active) => active >= m.thr,
-  message: (active, repaid) =>
+  matches: (state) => state.active >= m.thr,
+  message: (state) =>
     `🎉 *Milestone* — Magpie just crossed *${m.thr} active loans*. ` +
-    `Total repaid lifetime: ${repaid}. Thanks for being part of it.`,
+    `Total repaid lifetime: ${state.repaid}. Thanks for being part of it.`,
 }));
+
+const LIFETIME_SOL_MILESTONES = [
+  { thr: 100,   key: "lifetime_sol_100" },
+  { thr: 250,   key: "lifetime_sol_250" },
+  { thr: 500,   key: "lifetime_sol_500" },
+  { thr: 1000,  key: "lifetime_sol_1000" },
+  { thr: 2500,  key: "lifetime_sol_2500" },
+  { thr: 5000,  key: "lifetime_sol_5000" },
+  { thr: 10000, key: "lifetime_sol_10000" },
+].map((m) => ({
+  ...m,
+  matches: (state) => state.lifetime_sol >= m.thr,
+  message: (state) =>
+    `🦅 *Milestone* — Magpie just crossed *${m.thr.toLocaleString()} SOL* in total lifetime borrowed. ` +
+    `Currently out on loan: ${state.active_sol.toFixed(2)} SOL across ${state.active} active.`,
+}));
+
+// Highest-threshold first so the picker grabs the biggest unannounced
+// one (otherwise we'd post "100 SOL!" after already being at 5000).
+const MILESTONES = [...ACTIVE_LOAN_MILESTONES, ...LIFETIME_SOL_MILESTONES]
+  .sort((a, b) => b.thr - a.thr);
 
 async function fetchProtocolState() {
   const { rows: [r] } = await query(
     `SELECT
        (SELECT COUNT(*) FROM loans WHERE status='active')::int     AS active,
        (SELECT COUNT(*) FROM loans WHERE status='repaid')::int     AS repaid,
-       (SELECT COUNT(*) FROM supported_mints WHERE enabled=TRUE)::int AS tokens`,
+       (SELECT COUNT(*) FROM supported_mints WHERE enabled=TRUE)::int AS tokens,
+       COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans), 0)::text AS lifetime_lamports,
+       COALESCE((SELECT SUM(loan_amount_lamports::numeric) FROM loans WHERE status='active'), 0)::text AS active_lamports`,
   );
-  return r;
+  return {
+    active: r.active,
+    repaid: r.repaid,
+    tokens: r.tokens,
+    lifetime_sol: Number(r.lifetime_lamports) / 1e9,
+    active_sol: Number(r.active_lamports) / 1e9,
+  };
 }
 
 async function unseen(chatId, key) {
@@ -397,12 +433,13 @@ async function sweepMilestones(botApi) {
       const last = await lastMilestoneAt(chatId);
       if (last && Date.now() - last.getTime() < MILESTONE_GAP_MS) continue;
 
-      // Pick the HIGHEST milestone we've crossed but haven't announced
-      // yet. We only post one at a time.
+      // MILESTONES is already sorted highest-threshold first; pick the
+      // first one that's been crossed AND hasn't been announced yet.
+      // Post at most one per sweep so we don't dump "100 SOL! 250 SOL!
+      // 500 SOL!" all in a row on a hot day.
       let toPost = null;
-      for (let i = MILESTONES.length - 1; i >= 0; i--) {
-        const m = MILESTONES[i];
-        if (!m.matches(state.active)) continue;
+      for (const m of MILESTONES) {
+        if (!m.matches(state)) continue;
         if (await unseen(chatId, m.key)) {
           toPost = m;
           break;
@@ -410,7 +447,7 @@ async function sweepMilestones(botApi) {
       }
       if (!toPost) continue;
 
-      const text = toPost.message(state.active, state.repaid);
+      const text = toPost.message(state);
       try {
         await botApi.sendMessage(chatId, text, { parse_mode: "Markdown" });
         await markSeen(chatId, toPost.key);
