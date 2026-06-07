@@ -104,7 +104,7 @@ export function registerTopupCallbacks(bot) {
     const kb = new InlineKeyboard()
       .text("25%", "topup:pct:25").text("50%", "topup:pct:50")
       .text("75%", "topup:pct:75").text("100%", "topup:pct:100")
-      .row().text(`✏️ Custom ${loan.symbol ?? ""} amount`.trim(), "topup:custom")
+      .row().text("✏️ Custom %", "topup:custom")
       .row().text("✕ Cancel", "topup:cancel");
 
     await ctx.answerCallbackQuery();
@@ -120,8 +120,10 @@ export function registerTopupCallbacks(bot) {
     );
   });
 
-  // Custom amount entry — user taps "Custom amount" → types a token
-  // amount (e.g. 1500 BONK). Same text-middleware pattern /borrow uses.
+  // Custom-percentage entry — user taps "Custom %" → types a percentage
+  // of their wallet balance (e.g. "42" or "42.5"). Mirrors the % quick-
+  // buttons so the input matches what the buttons offer. Same text-
+  // middleware pattern /borrow uses.
   bot.callbackQuery("topup:custom", async (ctx) => {
     const state = pending.get(ctx.chat.id);
     if (!state) { await ctx.answerCallbackQuery("Session expired"); return; }
@@ -133,7 +135,8 @@ export function registerTopupCallbacks(bot) {
         `Loan #${state.loan.loan_id} · ${state.loan.symbol ?? "?"}`,
         `Wallet balance: ${state.balance.humanAmount.toLocaleString()} ${state.loan.symbol ?? ""}`,
         "",
-        `Type the amount of ${state.loan.symbol ?? "tokens"} to add as collateral:`,
+        `Type the *%* of your wallet balance to add as collateral.`,
+        `e.g. \`42\` for 42% or \`82.5\` for 82.5%`,
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
@@ -142,20 +145,24 @@ export function registerTopupCallbacks(bot) {
   bot.on("message:text", async (ctx, next) => {
     const state = pending.get(ctx.chat.id);
     if (!state || state.stage !== "await_custom") return next();
-    const raw = ctx.message.text.trim().replace(/,/g, "");
-    const amount = Number(raw);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return ctx.reply("Please enter a positive number.");
+    // Accept "42", "42%", "42.5", "42.5%" — strip any % sign + commas.
+    const raw = ctx.message.text.trim().replace(/,/g, "").replace(/%$/, "").trim();
+    const pct = Number(raw);
+    if (!Number.isFinite(pct) || pct <= 0) {
+      return ctx.reply("Please enter a positive percentage (e.g. `42`).", { parse_mode: "Markdown" });
     }
-    if (amount > state.balance.humanAmount) {
+    if (pct > 100) {
       return ctx.reply(
-        `That's more than your wallet balance of ${state.balance.humanAmount.toLocaleString()} ${state.loan.symbol ?? ""}. Try a smaller amount.`,
+        "Can't add more than 100% of your wallet balance. Try a smaller %.",
       );
     }
-    const decimals = state.loan.decimals ?? 9;
-    const rawBig = BigInt(Math.floor(amount * Math.pow(10, decimals)));
+    // BigInt-safe math: multiply by 100 first so 42.5% becomes 4250
+    // basis-points, then divide by 10_000. Matches the quick-button
+    // math (`raw * pct / 100`) when pct is a whole number.
+    const bps = BigInt(Math.round(pct * 100));
+    const rawBig = (BigInt(state.balance.rawAmount) * bps) / 10_000n;
     if (rawBig === 0n) {
-      return ctx.reply("Amount rounds to zero at the token's decimals — try a larger amount.");
+      return ctx.reply("That % rounds to zero at the token's decimals — try a larger %.");
     }
     delete state.stage;
     pending.set(ctx.chat.id, state);

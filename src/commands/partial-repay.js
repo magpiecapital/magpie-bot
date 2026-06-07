@@ -109,7 +109,7 @@ export function registerPartialRepayCallbacks(bot) {
     const kb = new InlineKeyboard()
       .text("25%", "prepay:pct:25").text("50%", "prepay:pct:50")
       .text("75%", "prepay:pct:75")
-      .row().text("✏️ Custom SOL amount", "prepay:custom")
+      .row().text("✏️ Custom %", "prepay:custom")
       .row().text("✕ Cancel", "prepay:cancel");
 
     await ctx.answerCallbackQuery();
@@ -126,8 +126,11 @@ export function registerPartialRepayCallbacks(bot) {
     );
   });
 
-  // Custom-amount input. User taps "Custom SOL amount" → bot asks them
-  // to type a SOL number → text-middleware below captures it.
+  // Custom-percentage input. User taps "Custom %" → bot asks them to
+  // type a percentage of the loan to pay down → text-middleware below
+  // captures it. Mirrors the % quick-buttons so the input matches what
+  // the buttons offer (e.g. 25/50/75 quick-picks + any custom % in
+  // between).
   bot.callbackQuery("prepay:custom", async (ctx) => {
     const state = pending.get(ctx.chat.id);
     if (!state) { await ctx.answerCallbackQuery("Session expired"); return; }
@@ -140,37 +143,49 @@ export function registerPartialRepayCallbacks(bot) {
         `Owed: ${fmtSol(state.owed)} SOL`,
         `Wallet usable: ~${fmtSol(state.available)} SOL`,
         "",
-        `Type how much SOL you want to repay (e.g. \`0.5\` or \`1.234\`):`,
+        `Type the *%* of the loan you want to pay down.`,
+        `e.g. \`42\` for 42% or \`82.5\` for 82.5%`,
+        "",
+        `_(must be less than 100% — use /repay to fully close out)_`,
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
   });
 
-  // Text-middleware: capture the typed SOL amount. Uses ctx.next() so
+  // Text-middleware: capture the typed percentage. Uses ctx.next() so
   // other text handlers still get a turn if this session isn't ours.
   bot.on("message:text", async (ctx, next) => {
     const state = pending.get(ctx.chat.id);
     if (!state || state.stage !== "await_custom") return next();
-    const raw = ctx.message.text.trim().replace(/,/g, "");
-    const sol = Number(raw);
-    if (!Number.isFinite(sol) || sol <= 0) {
-      return ctx.reply("Please enter a positive number (SOL).");
+    // Accept "42", "42%", "42.5", "42.5%" — strip any % sign + commas.
+    const raw = ctx.message.text.trim().replace(/,/g, "").replace(/%$/, "").trim();
+    const pct = Number(raw);
+    if (!Number.isFinite(pct) || pct <= 0) {
+      return ctx.reply("Please enter a positive percentage (e.g. `42`).", { parse_mode: "Markdown" });
     }
-    const lamports = BigInt(Math.floor(sol * 1e9));
-    const cap = state.owed - 1n;
-    if (lamports > cap) {
+    if (pct >= 100) {
       return ctx.reply(
-        `That's too much — partial repay must be less than the full owed ${fmtSol(state.owed)} SOL. ` +
-        `Try a smaller amount or run /repay to fully close the loan.`,
+        `Partial repay must be less than 100% (it has to leave at least 1 lamport on the loan). ` +
+        `Use /repay to fully close the loan.`,
       );
+    }
+    // BigInt-safe math: multiply by 100 first so 42.5% becomes 4250
+    // basis-points, then divide by 10_000. Matches the quick-button
+    // math (`owed * pct / 100`) when pct is a whole number.
+    const bps = BigInt(Math.round(pct * 100));
+    let lamports = (state.owed * bps) / 10_000n;
+    // Defensive cap: program requires repay amount < original. Already
+    // guaranteed by pct < 100, but defend against rounding.
+    const cap = state.owed - 1n;
+    if (lamports > cap) lamports = cap;
+    if (lamports <= 0n) {
+      return ctx.reply("That % rounds to zero — try a larger one.");
     }
     if (lamports > BigInt(state.available)) {
       return ctx.reply(
-        `Not enough usable SOL in wallet. You have ~${fmtSol(state.available)} SOL available (after gas reserve).`,
+        `That works out to ${fmtSol(lamports)} SOL, but you only have ~${fmtSol(state.available)} SOL usable in this wallet (after gas reserve). Try a smaller %.`,
       );
     }
-    // Stash + reuse the existing post-pct submit flow by signalling via
-    // a synthetic pct-like state entry. Cleaner: just inline the submit.
     delete state.stage;
     state.customRepayLamports = lamports;
     pending.set(ctx.chat.id, state);
