@@ -75,14 +75,21 @@ export async function handleLenderAlarmWebhook(req) {
     return { status: 405, body: { error: "POST only" } };
   }
 
-  // Verify the shared secret. Helius passes it in the Authorization
-  // header, exactly as we configured at webhook-creation time.
-  if (WEBHOOK_SECRET) {
-    const got = req.headers["authorization"] || req.headers["Authorization"];
-    if (got !== WEBHOOK_SECRET) {
-      console.warn("[lender-alarm-webhook] bad auth header");
-      return { status: 401, body: { error: "auth" } };
-    }
+  // REQUIRE the shared secret env var. If unset, the endpoint refuses
+  // every request — safer than skipping auth and letting any attacker
+  // POST forged alarm events at us. Set LENDER_ALARM_WEBHOOK_SECRET in
+  // Railway BEFORE creating the Helius webhook, in that order.
+  if (!WEBHOOK_SECRET) {
+    console.warn("[lender-alarm-webhook] LENDER_ALARM_WEBHOOK_SECRET not set — refusing all events");
+    return {
+      status: 503,
+      body: { error: "alarm not configured — operator: set LENDER_ALARM_WEBHOOK_SECRET on Railway" },
+    };
+  }
+  const got = req.headers["authorization"] || req.headers["Authorization"];
+  if (got !== WEBHOOK_SECRET) {
+    console.warn("[lender-alarm-webhook] bad auth header");
+    return { status: 401, body: { error: "auth" } };
   }
 
   let body;
