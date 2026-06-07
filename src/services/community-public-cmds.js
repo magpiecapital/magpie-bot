@@ -38,6 +38,22 @@ function fmtInt(n) {
   return Number(n).toLocaleString("en-US");
 }
 
+/**
+ * Right-align a value column to a fixed total line width. Inside a
+ * Telegram code block (which uses a monospace font), this produces a
+ * clean two-column "label … value" layout that reads consistently on
+ * mobile. Width of 36 cols was picked by hand to avoid wrap on iOS TG
+ * at 14pt code-block size with the longest expected labels.
+ */
+const COL_WIDTH = 36;
+function row(label, value) {
+  const l = String(label);
+  const v = String(value);
+  const gap = Math.max(2, COL_WIDTH - l.length - v.length);
+  return `  ${l}${" ".repeat(gap)}${v}`;
+}
+const RULE = "─".repeat(COL_WIDTH + 2);
+
 function tsFooter() {
   const t = new Date().toISOString().replace("T", " ").slice(0, 16);
   return `_Updated ${t} UTC · verify on-chain at_ [solscan.io](https://solscan.io) _or_ [${SITE_STATS_URL.replace(/^https?:\/\//, "")}](${SITE_STATS_URL})`;
@@ -113,35 +129,50 @@ async function fetchStats() {
 export async function handleCommunityStats(ctx) {
   try {
     const s = await fetchStats();
-    const lines = [
-      `📊 *Magpie · live protocol stats*`,
+    // All numeric data lives in a single monospaced code block so the
+    // value column lines up cleanly on every device. The headline
+    // total sits inside the block at the top, separated by a horizontal
+    // rule so it visually anchors the read. The headline + footer outside
+    // the block keep markdown formatting (bold + link).
+    const codeLines = [
+      RULE,
+      row("TOTAL BORROWED (LIFETIME)", `${fmtSol(s.book.lifetime_lamports)} SOL`),
+      RULE,
       ``,
-      `🦅 *Total borrowed (lifetime):* *${fmtSol(s.book.lifetime_lamports)} SOL*`,
-      `  _Cumulative SOL the protocol has ever lent out._`,
+      `LOAN BOOK — RIGHT NOW`,
+      row("Currently out on loan", `${fmtSol(s.book.active_lamports)} SOL`),
+      row("Active loans", fmtInt(s.book.active)),
+      row("Lifetime repaid", fmtInt(s.book.repaid)),
+      row("Lifetime liquidated", fmtInt(s.book.liquidated)),
       ``,
-      `*Loan book — right now*`,
-      `  • Currently out on loan: *${fmtSol(s.book.active_lamports)} SOL* across *${fmtInt(s.book.active)}* active`,
-      `  • Lifetime repaid:       *${fmtInt(s.book.repaid)}*`,
-      `  • Lifetime liquidated:   *${fmtInt(s.book.liquidated)}*`,
+      `LAST 24 HOURS`,
+      row("New loans", `${fmtInt(s.loans24h.n)} (${fmtSol(s.loans24h.sol_lamports)} SOL)`),
+      row("New users", fmtInt(s.users.new_24h)),
       ``,
-      `*Last 24 hours*`,
-      `  • New loans: *${fmtInt(s.loans24h.n)}* · *${fmtSol(s.loans24h.sol_lamports)} SOL* borrowed`,
-      `  • New users: *${fmtInt(s.users.new_24h)}*`,
+      `LP POOL`,
+      row("Total deposited", `${fmtSol(s.pool.total_shares)} SOL`),
       ``,
-      `*LP pool*`,
-      `  • Total deposited: *${fmtSol(s.pool.total_shares)} SOL*`,
-      ``,
-      `*Coverage*`,
-      `  • Approved collateral tokens: *${fmtInt(s.mints.n)}*`,
-      `  • Total users: *${fmtInt(s.users.total)}*`,
+      `COVERAGE`,
+      row("Tokens approved", fmtInt(s.mints.n)),
+      row("Total users", fmtInt(s.users.total)),
     ];
     if (s.top.length > 0) {
-      lines.push(``, `*Most-borrowed against (active)*`);
+      codeLines.push(``, `MOST BORROWED AGAINST (ACTIVE)`);
       for (const t of s.top) {
-        lines.push(`  • *$${escapeMd(t.symbol)}* — ${fmtInt(t.active_loans)} loan${t.active_loans === 1 ? "" : "s"} · ${fmtSol(t.active_sol_lamports)} SOL`);
+        const left = `$${t.symbol}`;
+        const right = `${fmtInt(t.active_loans)} · ${fmtSol(t.active_sol_lamports)} SOL`;
+        codeLines.push(row(left, right));
       }
     }
-    lines.push(``, tsFooter());
+    codeLines.push(RULE);
+
+    const lines = [
+      `📊 *Magpie — live protocol stats*`,
+      "```",
+      ...codeLines,
+      "```",
+      tsFooter(),
+    ];
 
     await ctx.reply(lines.join("\n"), {
       parse_mode: "Markdown",
