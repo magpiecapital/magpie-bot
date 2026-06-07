@@ -23,6 +23,45 @@ function tierLabel(tier) {
   return `${TIER_EMOJI[tier] || ""} ${tier.charAt(0).toUpperCase() + tier.slice(1)}`;
 }
 
+/**
+ * Pip-as-coach: one warm, contextual line above the score that reads the
+ * user's number and reacts. Picks tone from the score band and the
+ * trend direction. Pure prose — doesn't reveal any internal score
+ * formula, just speaks to what the user has done.
+ */
+function creditCoachLine(score, trendStr) {
+  const s = score.score;
+  const trendingUp = trendStr.includes("+");
+  const trendingDown = trendStr.includes("📉");
+  if (s >= 800) {
+    return trendingDown
+      ? `Elite tier, but trending down — one liquidation can move you fast at this level. Stay defensive.`
+      : `Elite tier. You've earned the lowest fees in the protocol. Keep the streak.`;
+  }
+  if (s >= 700) {
+    return trendingUp
+      ? `Strong score, still climbing. Each on-time repay edges you toward Platinum benefits.`
+      : `Strong score — you're getting better rates than most users on the protocol.`;
+  }
+  if (s >= 600) {
+    return trendingUp
+      ? `Building momentum. Repay your next 2 on time and you'll cross into the next tier.`
+      : `Solid baseline. Quickest path up: repay your active loans on time and pick up diverse collateral.`;
+  }
+  if (s >= 500) {
+    return trendingDown
+      ? `Score slipped — a missed deadline or liquidation hit you. Open a small loan and repay it cleanly to recover.`
+      : `Mid-range. You're trusted, but the upside (Gold/Platinum) requires consistent repayment.`;
+  }
+  if (s >= 400) {
+    return `Early days. One clean cycle (borrow → repay on time) is worth ~15 points. Start small to compound.`;
+  }
+  // Below 400
+  return trendingDown
+    ? `Score is low and trending down. Pause new loans until existing ones are squared away — protect the recovery.`
+    : `Low score, but every clean repayment from here adds up. The fastest rebuild: small loan + early repay.`;
+}
+
 export async function handleCredit(ctx) {
   const user = await findUserByTelegramId(ctx.from.id);
   if (!user) {
@@ -49,10 +88,16 @@ export async function handleCredit(ctx) {
       trend = diff > 0 ? `📈 +${diff}` : diff < 0 ? `📉 ${diff}` : "➡️ stable";
     }
 
+    // Pip's read of the score — short, warm, scored to the actual number.
+    // Surfaces above the technical breakdown so the user gets the
+    // *story* before the data.
+    const coachLine = creditCoachLine(score, trend);
+
     const msg = [
       `📊 <b>Magpie Credit Score</b>`,
       ``,
       `<b>${score.score}</b> / 850  ${tierLabel(score.tier)}  ${trend}`,
+      coachLine ? `<i>🦅 ${coachLine}</i>` : null,
       ``,
       `<b>Factor Breakdown:</b>`,
       `Repayment History (35%)`,

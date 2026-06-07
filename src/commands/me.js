@@ -19,6 +19,62 @@ function shortPubkey(pk) {
   return pk ? `${pk.slice(0, 6)}…${pk.slice(-4)}` : "?";
 }
 
+/**
+ * Pip-as-coach for /me — surface the single most useful next move based
+ * on the user's account state. Priority ordered: liquidations need
+ * recovery > active loans need attention > new user needs first action
+ * > healthy user gets a forward-looking nudge.
+ */
+function mePipCoachLine({
+  activeLoans, solBalance, repaidCount, liquidatedCount,
+  availableToBorrow, streak, bestStreak, referredCount,
+}) {
+  const lamports = (sol) => sol * 1e9;
+
+  // Brand-new user (never borrowed)
+  if (repaidCount === 0 && liquidatedCount === 0 && activeLoans === 0) {
+    if (solBalance < lamports(0.01)) {
+      return `Your wallet's empty. Send ~0.01 SOL for gas + your collateral tokens to get started — see /deposit for the address.`;
+    }
+    return `Ready when you are. Start small: /borrow → pick a token, pick a tier, get SOL in seconds. Your first clean repay = ~15 credit points.`;
+  }
+
+  // Active loans waiting on action
+  if (activeLoans > 0) {
+    if (streak >= 5) {
+      return `${activeLoans} active. ${streak}-loan streak — keep it tight. Run /positions for live health on each.`;
+    }
+    return `${activeLoans} active loan${activeLoans === 1 ? "" : "s"} — /positions for live health on each.`;
+  }
+
+  // Just had a liquidation
+  if (liquidatedCount > 0 && repaidCount === 0) {
+    return `Liquidation behind you. Quickest credit recovery: open a small loan and repay it cleanly. One clean cycle ≈ +15 points.`;
+  }
+  if (liquidatedCount > repaidCount * 0.5) {
+    return `Liquidation rate is heavy on the score. A few clean repays in a row will rebuild fast — start small, pay early.`;
+  }
+
+  // Active streak
+  if (streak >= 3) {
+    return `🔥 ${streak} on-time repays in a row. You're racking up credit. Available to borrow: ${(availableToBorrow/1e9).toFixed(2)} SOL if you want to extend the run.`;
+  }
+
+  // Healthy idle user
+  if (repaidCount >= 1 && activeLoans === 0) {
+    if (solBalance > lamports(0.5)) {
+      return `${(solBalance/1e9).toFixed(2)} SOL idle. Consider /lend for ~80% of fees pro-rata, or /borrow if you have a bag to put to work.`;
+    }
+    return `Track record looks clean. /borrow when you're ready, or /refer to earn 5% of friends' loan fees lifetime.`;
+  }
+
+  // Default: healthy general
+  if (referredCount === 0 && repaidCount > 0) {
+    return `You've got the playbook down. /refer earns you 5% of every loan fee your friends pay, in SOL, lifetime.`;
+  }
+  return null;
+}
+
 export async function handleMe(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
@@ -107,6 +163,23 @@ export async function handleMe(ctx) {
       "",
       `🔒 *Site actions locked until ${until} UTC* — run \`/lock 0\` to clear.`,
     );
+  }
+
+  // Pip-as-coach: one warm line at the bottom that reads the account
+  // and surfaces ONE clear next-best-action. Pure prose; no data the
+  // user can't already see above.
+  const coachLine = mePipCoachLine({
+    activeLoans: activeRow.rows[0].n,
+    solBalance: Number(sol),
+    repaidCount: stats.repaid_count,
+    liquidatedCount: stats.liquidated_count,
+    availableToBorrow: Number(limits.availableToBorrow),
+    streak: streak.current_streak,
+    bestStreak: streak.best_streak,
+    referredCount: refs.total,
+  });
+  if (coachLine) {
+    lines.push("", `🦅 *Pip:* _${coachLine}_`);
   }
 
   const { InlineKeyboard } = await import("grammy");
