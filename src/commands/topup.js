@@ -104,6 +104,7 @@ export function registerTopupCallbacks(bot) {
     const kb = new InlineKeyboard()
       .text("25%", "topup:pct:25").text("50%", "topup:pct:50")
       .text("75%", "topup:pct:75").text("100%", "topup:pct:100")
+      .row().text(`✏️ Custom ${loan.symbol ?? ""} amount`.trim(), "topup:custom")
       .row().text("✕ Cancel", "topup:cancel");
 
     await ctx.answerCallbackQuery();
@@ -117,6 +118,48 @@ export function registerTopupCallbacks(bot) {
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
+  });
+
+  // Custom amount entry — user taps "Custom amount" → types a token
+  // amount (e.g. 1500 BONK). Same text-middleware pattern /borrow uses.
+  bot.callbackQuery("topup:custom", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) { await ctx.answerCallbackQuery("Session expired"); return; }
+    state.stage = "await_custom";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `Loan #${state.loan.loan_id} · ${state.loan.symbol ?? "?"}`,
+        `Wallet balance: ${state.balance.humanAmount.toLocaleString()} ${state.loan.symbol ?? ""}`,
+        "",
+        `Type the amount of ${state.loan.symbol ?? "tokens"} to add as collateral:`,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  bot.on("message:text", async (ctx, next) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || state.stage !== "await_custom") return next();
+    const raw = ctx.message.text.trim().replace(/,/g, "");
+    const amount = Number(raw);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return ctx.reply("Please enter a positive number.");
+    }
+    if (amount > state.balance.humanAmount) {
+      return ctx.reply(
+        `That's more than your wallet balance of ${state.balance.humanAmount.toLocaleString()} ${state.loan.symbol ?? ""}. Try a smaller amount.`,
+      );
+    }
+    const decimals = state.loan.decimals ?? 9;
+    const rawBig = BigInt(Math.floor(amount * Math.pow(10, decimals)));
+    if (rawBig === 0n) {
+      return ctx.reply("Amount rounds to zero at the token's decimals — try a larger amount.");
+    }
+    delete state.stage;
+    pending.set(ctx.chat.id, state);
+    await submitTopup(ctx, state, rawBig);
   });
 
   bot.callbackQuery(/^topup:pct:(\d+)$/, async (ctx) => {
@@ -134,51 +177,64 @@ export function registerTopupCallbacks(bot) {
     }
 
     await ctx.answerCallbackQuery();
-
-    // Pre-flight wallet ownership check.
-    const ownership = await checkLoanOwnership(state.userId, state.loan);
-    if (!ownership.ok && ownership.reason === "wallet_mismatch") {
-      pending.delete(ctx.chat.id);
-      await ctx.editMessageText(
-        renderWalletMismatchMessage(ownership, "topup"),
-        { parse_mode: "Markdown" },
-      );
-      return;
-    }
-
-    await ctx.editMessageText("⏳ Adding collateral on-chain...");
-
-    try {
-      const result = await executeAddCollateral({
-        userId: state.userId,
-        loanDbRow: state.loan,
-        extraRawAmount: rawBig,
-      });
-      await recordAddCollateral(state.loan.id, rawBig);
-
-      pending.delete(ctx.chat.id);
-
-      const addedHuman = Number(rawBig) / Math.pow(10, state.loan.decimals ?? 9);
-      await ctx.editMessageText(
-        [
-          "✅ *Collateral added*",
-          "",
-          `Added: ${addedHuman.toLocaleString()} ${state.loan.symbol ?? ""}`,
-          `Loan #${state.loan.loan_id} health improved.`,
-          "",
-          `[View tx](https://solscan.io/tx/${result.signature})`,
-          "",
-          "Use /positions to check status.",
-        ].join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true },
-      );
-    } catch (err) {
-      console.error("Top-up failed:", err);
-      const friendly = translateTxError(err, { flow: "topup" });
-      await ctx.editMessageText(friendly, {
-        parse_mode: "Markdown",
-        reply_markup: errorActionKeyboard({ flow: "topup", errorKind: "tx_error" }),
-      });
-    }
+    await submitTopup(ctx, state, rawBig);
   });
+}
+
+/**
+ * Shared execute path — used by both the pct quick-buttons and the
+ * custom-amount entry. Centralizing the financial-critical code so the
+ * two entry paths can't diverge. Caller must clamp to wallet balance.
+ */
+async function submitTopup(ctx, state, rawBig) {
+  if (rawBig <= 0n) return ctx.reply("Amount too small.");
+
+  // Re-clamp defensively against wallet balance.
+  const balanceRaw = BigInt(state.balance.rawAmount);
+  if (rawBig > balanceRaw) rawBig = balanceRaw;
+  if (rawBig <= 0n) return ctx.reply("Amount too small.");
+
+  // Pre-flight wallet ownership check.
+  const ownership = await checkLoanOwnership(state.userId, state.loan);
+  if (!ownership.ok && ownership.reason === "wallet_mismatch") {
+    pending.delete(ctx.chat.id);
+    return ctx.reply(
+      renderWalletMismatchMessage(ownership, "topup"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  await ctx.reply("⏳ Adding collateral on-chain...");
+
+  try {
+    const result = await executeAddCollateral({
+      userId: state.userId,
+      loanDbRow: state.loan,
+      extraRawAmount: rawBig,
+    });
+    await recordAddCollateral(state.loan.id, rawBig);
+    pending.delete(ctx.chat.id);
+
+    const addedHuman = Number(rawBig) / Math.pow(10, state.loan.decimals ?? 9);
+    await ctx.reply(
+      [
+        "✅ *Collateral added*",
+        "",
+        `Added: ${addedHuman.toLocaleString()} ${state.loan.symbol ?? ""}`,
+        `Loan #${state.loan.loan_id} health improved.`,
+        "",
+        `[View tx](https://solscan.io/tx/${result.signature})`,
+        "",
+        "Use /positions to check status.",
+      ].join("\n"),
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  } catch (err) {
+    console.error("Top-up failed:", err);
+    const friendly = translateTxError(err, { flow: "topup" });
+    await ctx.reply(friendly, {
+      parse_mode: "Markdown",
+      reply_markup: errorActionKeyboard({ flow: "topup", errorKind: "tx_error" }),
+    });
+  }
 }

@@ -109,6 +109,7 @@ export function registerPartialRepayCallbacks(bot) {
     const kb = new InlineKeyboard()
       .text("25%", "prepay:pct:25").text("50%", "prepay:pct:50")
       .text("75%", "prepay:pct:75")
+      .row().text("✏️ Custom SOL amount", "prepay:custom")
       .row().text("✕ Cancel", "prepay:cancel");
 
     await ctx.answerCallbackQuery();
@@ -123,6 +124,57 @@ export function registerPartialRepayCallbacks(bot) {
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
+  });
+
+  // Custom-amount input. User taps "Custom SOL amount" → bot asks them
+  // to type a SOL number → text-middleware below captures it.
+  bot.callbackQuery("prepay:custom", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) { await ctx.answerCallbackQuery("Session expired"); return; }
+    state.stage = "await_custom";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `Loan #${state.loan.loan_id} · ${state.loan.symbol ?? "?"}`,
+        `Owed: ${fmtSol(state.owed)} SOL`,
+        `Wallet usable: ~${fmtSol(state.available)} SOL`,
+        "",
+        `Type how much SOL you want to repay (e.g. \`0.5\` or \`1.234\`):`,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  // Text-middleware: capture the typed SOL amount. Uses ctx.next() so
+  // other text handlers still get a turn if this session isn't ours.
+  bot.on("message:text", async (ctx, next) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || state.stage !== "await_custom") return next();
+    const raw = ctx.message.text.trim().replace(/,/g, "");
+    const sol = Number(raw);
+    if (!Number.isFinite(sol) || sol <= 0) {
+      return ctx.reply("Please enter a positive number (SOL).");
+    }
+    const lamports = BigInt(Math.floor(sol * 1e9));
+    const cap = state.owed - 1n;
+    if (lamports > cap) {
+      return ctx.reply(
+        `That's too much — partial repay must be less than the full owed ${fmtSol(state.owed)} SOL. ` +
+        `Try a smaller amount or run /repay to fully close the loan.`,
+      );
+    }
+    if (lamports > BigInt(state.available)) {
+      return ctx.reply(
+        `Not enough usable SOL in wallet. You have ~${fmtSol(state.available)} SOL available (after gas reserve).`,
+      );
+    }
+    // Stash + reuse the existing post-pct submit flow by signalling via
+    // a synthetic pct-like state entry. Cleaner: just inline the submit.
+    delete state.stage;
+    state.customRepayLamports = lamports;
+    pending.set(ctx.chat.id, state);
+    await submitPartialRepay(ctx, state, lamports);
   });
 
   bot.callbackQuery(/^prepay:pct:(\d+)$/, async (ctx) => {
@@ -145,51 +197,72 @@ export function registerPartialRepayCallbacks(bot) {
     }
 
     await ctx.answerCallbackQuery();
-
-    // Pre-flight wallet ownership check — catches the /import-switched-
-    // wallets case BEFORE the tx so users see a clean explanation.
-    const ownership = await checkLoanOwnership(state.userId, state.loan);
-    if (!ownership.ok && ownership.reason === "wallet_mismatch") {
-      pending.delete(ctx.chat.id);
-      await ctx.editMessageText(
-        renderWalletMismatchMessage(ownership, "partialrepay"),
-        { parse_mode: "Markdown" },
-      );
-      return;
-    }
-
-    await ctx.editMessageText("⏳ Submitting partial repay on-chain...");
-
-    try {
-      const result = await executePartialRepay({
-        userId: state.userId,
-        loanDbRow: state.loan,
-        repayLamports,
-      });
-      await recordPartialRepay(state.loan.id, repayLamports);
-
-      pending.delete(ctx.chat.id);
-
-      const remaining = state.owed - repayLamports;
-      await ctx.editMessageText(
-        [
-          "✅ *Partial repay submitted*",
-          "",
-          `Paid: ${fmtSol(repayLamports)} SOL`,
-          `Remaining: ${fmtSol(remaining)} SOL`,
-          "Collateral remains locked until full payoff.",
-          "",
-          `[View tx](https://solscan.io/tx/${result.signature})`,
-        ].join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true },
-      );
-    } catch (err) {
-      console.error("Partial repay failed:", err);
-      const friendly = translateTxError(err, { flow: "partialrepay" });
-      await ctx.editMessageText(friendly, {
-        parse_mode: "Markdown",
-        reply_markup: errorActionKeyboard({ flow: "partialrepay", errorKind: "tx_error" }),
-      });
-    }
+    await submitPartialRepay(ctx, state, repayLamports);
   });
+}
+
+/**
+ * Shared execute path — used by both the pct quick-buttons and the
+ * custom-SOL-amount entry. Single code path = single failure surface;
+ * any caller-side validation should clamp `repayLamports` before
+ * calling this. This function re-validates the wallet-ownership
+ * pre-flight then runs the on-chain partial repay.
+ */
+async function submitPartialRepay(ctx, state, repayLamports) {
+  if (repayLamports <= 0n) {
+    return ctx.reply("Amount too small.");
+  }
+  // Defensive: even though callers should have clamped already,
+  // we re-clamp here so a bug upstream can't accidentally pay MORE
+  // than owed - 1 (would fail the on-chain check anyway, but a
+  // clean ctx.reply is friendlier).
+  const cap = state.owed - 1n;
+  if (repayLamports > cap) repayLamports = cap;
+  if (repayLamports > BigInt(state.available)) repayLamports = BigInt(state.available);
+  if (repayLamports <= 0n) {
+    return ctx.reply("Amount too small after gas reserve.");
+  }
+
+  // Wallet-ownership pre-flight — same as the pct path used to do inline.
+  const ownership = await checkLoanOwnership(state.userId, state.loan);
+  if (!ownership.ok && ownership.reason === "wallet_mismatch") {
+    pending.delete(ctx.chat.id);
+    return ctx.reply(
+      renderWalletMismatchMessage(ownership, "partialrepay"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  await ctx.reply("⏳ Submitting partial repay on-chain...");
+
+  try {
+    const result = await executePartialRepay({
+      userId: state.userId,
+      loanDbRow: state.loan,
+      repayLamports,
+    });
+    await recordPartialRepay(state.loan.id, repayLamports);
+    pending.delete(ctx.chat.id);
+
+    const remaining = state.owed - repayLamports;
+    await ctx.reply(
+      [
+        "✅ *Partial repay submitted*",
+        "",
+        `Paid: ${fmtSol(repayLamports)} SOL`,
+        `Remaining: ${fmtSol(remaining)} SOL`,
+        "Collateral remains locked until full payoff.",
+        "",
+        `[View tx](https://solscan.io/tx/${result.signature})`,
+      ].join("\n"),
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  } catch (err) {
+    console.error("Partial repay failed:", err);
+    const friendly = translateTxError(err, { flow: "partialrepay" });
+    await ctx.reply(friendly, {
+      parse_mode: "Markdown",
+      reply_markup: errorActionKeyboard({ flow: "partialrepay", errorKind: "tx_error" }),
+    });
+  }
 }
