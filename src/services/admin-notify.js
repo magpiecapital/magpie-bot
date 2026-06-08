@@ -13,6 +13,15 @@
  */
 
 let cachedId = null;
+let cachedBot = null;
+
+/**
+ * Register the bot instance so API handlers (which don't have direct
+ * access to `bot`) can fire admin notifications without threading the
+ * reference through every layer. Called once at boot from index.js.
+ */
+export function setNotifyBot(bot) { cachedBot = bot; }
+export function getNotifyBot() { return cachedBot; }
 
 export function getAdminId() {
   if (cachedId !== null) return cachedId;
@@ -33,6 +42,14 @@ export function getAdminId() {
  * — passed through to grammy sendMessage.
  */
 export async function notifyAdmin(bot, text, opts = {}) {
+  // Accept (bot, text, opts) OR (text, opts) — the latter form uses the
+  // cached bot registered via setNotifyBot, which lets API handlers
+  // notify without needing the bot threaded through.
+  if (typeof bot === "string") {
+    opts = text || {};
+    text = bot;
+    bot = cachedBot;
+  }
   if (!bot) return false;
   const id = getAdminId();
   if (!id) return false;

@@ -37,6 +37,8 @@ import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { chooseProgramIdForLoan, getProgramForSigner } from "../solana/program.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 import {
   lendingPoolPda,
   loanTokenVaultPda,
@@ -81,6 +83,12 @@ async function commonPreflight(req, requiredFields = []) {
   if (process.env.AGENT_API_DISABLED === "true") {
     return { error: { status: 503, body: { error: "Agent API temporarily disabled" } } };
   }
+  // Protocol-wide pause check (defense-in-depth alongside the
+  // AGENT_API_DISABLED env var). If the operator pauses the whole
+  // site during an incident, agent endpoints pause too — otherwise
+  // an exploit could continue draining via the agent path.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return { error: globalReject };
   if (!INTERNAL_API_TOKEN) {
     return { error: { status: 500, body: { error: "Agent API not configured (server-side)" } } };
   }
@@ -127,6 +135,21 @@ async function commonPreflight(req, requiredFields = []) {
   }
   if (loan.borrower_wallet && loan.borrower_wallet !== body.borrower_wallet) {
     return { error: { status: 403, body: { error: "not_loan_borrower" } } };
+  }
+
+  // Per-user lock check (defense-in-depth). If the operator locked
+  // this user during an investigation (via /lock_user), they
+  // shouldn't be able to extend/topup/partial-repay via the agent
+  // path either. Mirrors what cosign-borrow does.
+  if (loan.borrower_wallet) {
+    const { rows: [walletRow] } = await query(
+      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+      [loan.borrower_wallet],
+    );
+    if (walletRow?.user_id) {
+      const lockReject = await rejectIfLocked(walletRow.user_id);
+      if (lockReject) return { error: lockReject };
+    }
   }
 
   const programId = chooseProgramIdForLoan(loan);

@@ -126,6 +126,7 @@ import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
 import { setSecurityAlertBot } from "./services/security-alerts.js";
 import { setLenderAlarmBot } from "./api/lender-alarm-webhook.js";
+import { setNotifyBot } from "./services/admin-notify.js";
 import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
@@ -443,6 +444,10 @@ bot.start({
     // Re-enable when a dedicated RPC endpoint is available.
     setSecurityAlertBot(bot);
     setLenderAlarmBot(bot);
+    // Register bot for module-level notifyAdmin() calls from API
+    // handlers (e.g. support-ask, cosign-borrow) that don't otherwise
+    // have access to a bot ref.
+    setNotifyBot(bot);
     startApiServer();
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();

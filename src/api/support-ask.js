@@ -33,6 +33,7 @@ import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "../services/ai-support.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
+import { notifyAdmin } from "../services/admin-notify.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -274,7 +275,15 @@ export async function handleSupportAsk(req) {
     });
   } catch (e) {
     console.error("[support-ask] AI error:", e.message);
-    // Leave the ticket open so admin can pick it up; surface a soft error.
+    // Leave the ticket open so admin can pick it up; surface a soft
+    // error to the user. AI agent down is an operator-critical event —
+    // notify so we don't sit silent while users hit it.
+    notifyAdmin(
+      `🚨 Site support: AI agent failed on ticket #${ticketRow.id} (${action})\n` +
+      `User: ${signerPubkey.slice(0, 4)}…${signerPubkey.slice(-4)}\n` +
+      `Error: ${e.message.slice(0, 200)}\n` +
+      `Ticket is open — needs manual reply.`,
+    ).catch(() => {});
     return {
       status: 200,
       body: {
@@ -288,6 +297,11 @@ export async function handleSupportAsk(req) {
   }
 
   if (!aiResult?.text) {
+    notifyAdmin(
+      `⚠️ Site support: AI returned empty for ticket #${ticketRow.id} (${action})\n` +
+      `User: ${signerPubkey.slice(0, 4)}…${signerPubkey.slice(-4)}\n` +
+      `Needs manual reply.`,
+    ).catch(() => {});
     return {
       status: 200,
       body: {

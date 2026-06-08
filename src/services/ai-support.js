@@ -3397,14 +3397,31 @@ const TOOL_HANDLERS = {
     // first; the AI follow-up DM lands seconds later via the resolver's
     // own send. Critical-reason tickets (security_incident, bug_report,
     // refund_request) are SKIP_REASONS in the resolver so admin still
-    // gets primacy on those.
-    if (botRef) {
-      const SKIP_REASONS = ["security_incident", "bug_report", "refund_request"];
-      if (!SKIP_REASONS.includes(escalation_reason)) {
-        import("./auto-ticket-resolver.js")
-          .then(({ resolveTicketImmediate }) => resolveTicketImmediate(botRef, t.id))
-          .catch((err) => console.warn(`[ai-support] immediate-resolve fire for #${t.id} failed:`, err.message));
-      }
+    // gets primacy on those — for those we DM the operator directly
+    // since the resolver won't, and they explicitly need a human.
+    const SKIP_REASONS = ["security_incident", "bug_report", "refund_request"];
+    if (botRef && !SKIP_REASONS.includes(escalation_reason)) {
+      import("./auto-ticket-resolver.js")
+        .then(({ resolveTicketImmediate }) => resolveTicketImmediate(botRef, t.id))
+        .catch((err) => console.warn(`[ai-support] immediate-resolve fire for #${t.id} failed:`, err.message));
+    } else if (SKIP_REASONS.includes(escalation_reason)) {
+      // Critical-reason escalation — DM operator directly. These
+      // categories explicitly bypass auto-resolution because they
+      // need human judgment (potential exploit reports, money
+      // movement disputes, bug reports affecting users). Without
+      // this DM the ticket would silently sit until /mytickets is
+      // checked.
+      import("./admin-notify.js")
+        .then(({ notifyAdmin }) =>
+          notifyAdmin(
+            `🚨 CRITICAL ticket #${t.id} (${escalation_reason})\n\n` +
+            `User: ${userId}\n` +
+            `Summary: ${(summary || "").slice(0, 400)}\n` +
+            (what_i_tried ? `AI tried: ${what_i_tried.slice(0, 400)}\n` : "") +
+            `\nReply via /mytickets or DM the user directly.`,
+          ),
+        )
+        .catch((err) => console.warn(`[ai-support] critical-ticket DM failed for #${t.id}:`, err.message));
     }
     return { ticket_id: t.id, status: "open", reason: escalation_reason };
   },
