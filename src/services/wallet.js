@@ -131,7 +131,7 @@ export async function ensureWallet(userId) {
  */
 export async function loadKeypair(userId) {
   const { rows } = await query(
-    `SELECT encrypted_secret, nonce, auth_tag
+    `SELECT encrypted_secret, nonce, auth_tag, source
        FROM wallets
       WHERE user_id = $1 AND is_active = TRUE
       LIMIT 1`,
@@ -139,6 +139,21 @@ export async function loadKeypair(userId) {
   );
   if (rows.length === 0) throw new Error("No active wallet found");
   const row = rows[0];
+  // Defense in depth — agent wallets (source='agent_x402') exist
+  // only as a beneficiary-registry stub; their `encrypted_secret`
+  // is intentionally empty because the agent custodies its own
+  // key. Refuse to "decrypt" emptiness; if a future code path
+  // accidentally tries to sign-as-agent, fail loud rather than
+  // silently producing garbage.
+  if (row.source === "agent_x402") {
+    throw new Error(
+      "loadKeypair refused: user is an agent_x402 wallet (no custodial key). " +
+        "Agent-initiated flows must sign client-side; bot does not custody agent funds.",
+    );
+  }
+  if (!row.encrypted_secret) {
+    throw new Error("loadKeypair refused: encrypted_secret is empty");
+  }
   const secret = decrypt(row.encrypted_secret, row.nonce, row.auth_tag);
   return Keypair.fromSecretKey(new Uint8Array(secret));
 }

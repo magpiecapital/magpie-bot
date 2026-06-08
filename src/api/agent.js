@@ -75,9 +75,6 @@ import { collateralValueLamports as fetchValueLamports } from "../services/price
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { Keypair } from "@solana/web3.js";
-import fs from "node:fs";
-import path from "node:path";
-import bs58 from "bs58";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
@@ -301,9 +298,13 @@ export async function handleAgentBuildBorrow(req) {
   // ── Build the tx (does NOT sign; agent signs with their wallet) ──
   let txB64, loanIdStr, loanAccountStr;
   try {
-    // Use a dummy provider — we only need to construct the ix
-    const lender = loadLenderKeypair();
-    const program = getProgramForSigner(lender, programId);
+    // Use a THROWAWAY keypair for Anchor's provider — we only need
+    // .instruction() (NOT .rpc()), so no signing happens. Don't load
+    // the lender keypair here; reduces the lender-key's memory
+    // exposure surface to just the cosign endpoint where it's
+    // actually used.
+    const dummySigner = Keypair.generate();
+    const program = getProgramForSigner(dummySigner, programId);
 
     const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
     const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
@@ -311,7 +312,13 @@ export async function handleAgentBuildBorrow(req) {
     const collateralTokenProgram = await getMintTokenProgram(collateral_mint);
     const loanTokenProgram = TOKEN_PROGRAM_ID;
 
-    const loanId = new BN(Date.now());
+    // loan_id is u64 baked into the PDA. Two agent borrows hitting the
+    // SAME millisecond would derive the same PDA → second tx fails with
+    // AccountAlreadyInitialized. Add 16 bits of entropy so the
+    // collision space is 2^16=65536× larger. Still strictly less than
+    // u64 max, and Date.now() dominates so ordering is preserved.
+    const randomSuffix = Math.floor(Math.random() * 0x10000);
+    const loanId = new BN(Date.now()).muln(0x10000).addn(randomSuffix);
     const [loanAccount] = loanPda(borrowerPk, loanId, programId);
     const [collateralVault] = collateralVaultPda(loanAccount, programId);
 
@@ -412,13 +419,6 @@ export async function handleAgentBuildBorrow(req) {
   };
 }
 
-function loadLenderKeypair() {
-  const b58 = process.env.LENDER_PRIVATE_KEY;
-  if (b58) {
-    const decode = bs58.decode || (bs58.default && bs58.default.decode);
-    return Keypair.fromSecretKey(decode(b58));
-  }
-  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
-  const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
-  return Keypair.fromSecretKey(new Uint8Array(raw));
-}
+// (Lender keypair is NOT loaded here. Only the cosign endpoint at
+// /api/v1/cosign-borrow touches it. Keeping the agent build path
+// keypair-free reduces the lender-key's memory exposure surface.)
