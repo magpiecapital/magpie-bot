@@ -186,6 +186,63 @@ export async function getPriceInSolCrossSourced(mint) {
 }
 
 /**
+ * USD price helpers — used by conditional-borrow trigger evaluation.
+ * Same cross-source resiliency model: prefer Jupiter, fall back to
+ * DexScreener, agree-or-throw when both respond. Returns USD per token.
+ */
+async function jupiterPriceInUsd(mint) {
+  const resp = await axios.get(JUPITER_API, {
+    params: { ids: mint },
+    timeout: 10_000,
+  });
+  const tokenUsd = resp.data?.[mint]?.usdPrice;
+  if (!tokenUsd) throw new Error(`Jupiter has no USD price for ${mint}`);
+  return tokenUsd;
+}
+
+async function dexscreenerPriceInUsd(mint) {
+  const resp = await axios.get(
+    `https://api.dexscreener.com/tokens/v1/solana/${mint}`,
+    { timeout: 10_000 },
+  );
+  const pairs = Array.isArray(resp.data) ? resp.data : [];
+  let best = null;
+  for (const p of pairs) {
+    const addr = p?.baseToken?.address;
+    const liq = p?.liquidity?.usd ?? 0;
+    const priceUsd = parseFloat(p?.priceUsd ?? 0);
+    if (addr === mint && priceUsd && (!best || liq > best.liq)) {
+      best = { priceUsd, liq };
+    }
+  }
+  if (!best) throw new Error("DexScreener missing USD price for mint");
+  return best.priceUsd;
+}
+
+export async function getPriceInUsdCrossSourced(mint) {
+  const [jupRes, dexRes] = await Promise.allSettled([
+    jupiterPriceInUsd(mint),
+    dexscreenerPriceInUsd(mint),
+  ]);
+  const jup = jupRes.status === "fulfilled" ? jupRes.value : null;
+  const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
+
+  if (jup && !dex) return jup;
+  if (!jup && dex) return dex;
+  if (!jup && !dex) throw new Error(`No USD price data for ${mint}`);
+
+  const divergence = Math.abs(jup - dex) / Math.min(jup, dex);
+  if (divergence > MAX_DIVERGENCE) {
+    throw new Error(
+      `USD price sources disagree for ${mint.slice(0, 8)}: Jupiter=$${jup.toFixed(6)} vs DexScreener=$${dex.toFixed(6)}`,
+    );
+  }
+  // Take the more conservative (lower) value — caller may use this
+  // for trigger evaluation, where "go conservative" is the right bias.
+  return Math.min(jup, dex);
+}
+
+/**
  * Given an amount of collateral tokens (raw, with decimals), return its
  * equivalent value in lamports. Cross-sourced (Jupiter + DexScreener)
  * to defend against single-source price manipulation.

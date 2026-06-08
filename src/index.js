@@ -477,6 +477,14 @@ bot.start({
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
+    // Conditional-borrow watcher — fires agent intents when their
+    // trigger condition (price/time/liquidity) matches. Postgres
+    // advisory lock ensures single-instance even across replicas.
+    setTimeout(() => {
+      import("./services/intent-watcher.js")
+        .then((m) => m.startIntentWatcher())
+        .catch((err) => console.error("[bot] intent-watcher failed to start:", err.message));
+    }, 100_000);
     // Daily AI conversation digest — disabled per admin preference.
     // To re-enable, uncomment the next line. Admin can pull stats on
     // their own schedule via /aistats instead.

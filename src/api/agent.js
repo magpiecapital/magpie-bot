@@ -81,7 +81,7 @@ const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
 // Tier index → (LTV%, duration days, fee bps). Matches the on-chain
 // program's TIER_LTV_BPS / TIER_DURATION_DAYS / TIER_FEE_BPS.
-const TIERS = {
+export const TIERS = {
   0: { ltv: 30, days: 2, feeBps: 300 }, // express
   1: { ltv: 25, days: 3, feeBps: 200 }, // quick
   2: { ltv: 20, days: 7, feeBps: 150 }, // standard
@@ -100,7 +100,7 @@ function syntheticTelegramId(walletPubkey) {
   return -(low48 + 1); // +1 so we never produce 0
 }
 
-async function findOrCreateAgentUser(walletPubkey) {
+export async function findOrCreateAgentUser(walletPubkey) {
   const synthTg = syntheticTelegramId(walletPubkey);
   // Try insert; on conflict (already exists for this wallet), select.
   const { rows } = await query(
@@ -120,6 +120,180 @@ async function findOrCreateAgentUser(walletPubkey) {
     [userId, walletPubkey],
   );
   return userId;
+}
+
+/**
+ * Run the full borrow gauntlet (ban → valuation → anti-exploit) and
+ * build the unsigned tx. Used by both /agent/build-borrow (direct
+ * agent flow) and the conditional-borrow watcher (when an intent
+ * matches its trigger).
+ *
+ * On block: returns { blocked: true, status, body }.
+ * On success: returns { blocked: false, txB64, loanIdStr, loanAccountStr,
+ *                        collateralValLamports, principalLamports, feeLamports, tierCfg, mint }.
+ *
+ * The same security model applies: no keypair loaded, no signing,
+ * no submission. Caller assembles the response or stores the result.
+ */
+export async function buildBorrowTx({
+  borrowerPk,
+  collateralMintPk,
+  collateralAmountRaw,   // string
+  tier,                  // 0 | 1 | 2
+  userId,                // already resolved
+  mintRow,               // already resolved from supported_mints
+}) {
+  const tierCfg = TIERS[Number(tier)];
+  const collateralMintStr = collateralMintPk.toBase58();
+  const borrowerWalletStr = borrowerPk.toBase58();
+
+  // Ban check
+  const banCheck = await preBorrowBanCheck({
+    userId, telegramId: null, walletPubkey: borrowerWalletStr,
+  });
+  if (banCheck?.blocked) {
+    return { blocked: true, status: 403, body: { error: "banned", reason: banCheck.reason } };
+  }
+
+  // Cross-sourced valuation
+  let collateralValLamports;
+  try {
+    collateralValLamports = await fetchValueLamports(
+      collateralMintStr,
+      BigInt(collateralAmountRaw),
+      Number(mintRow.decimals),
+    );
+  } catch (err) {
+    return {
+      blocked: true, status: 502,
+      body: { error: "price_oracle_failed", detail: err.message?.slice(0, 200) },
+    };
+  }
+  if (!collateralValLamports || collateralValLamports <= 0) {
+    return { blocked: true, status: 400, body: { error: "collateral_value_zero" } };
+  }
+
+  const proposedLoanLamports = Math.floor((collateralValLamports * tierCfg.ltv) / 100);
+  const exploitCheck = await preBorrowAntiExploitCheck({
+    userId,
+    collateralMint: collateralMintStr,
+    proposedLoanLamports,
+    walletPubkey: borrowerWalletStr,
+  });
+  if (exploitCheck?.blocked) {
+    return {
+      blocked: true, status: 403,
+      body: { error: "refused", reason: exploitCheck.reason, message: exploitCheck.message },
+    };
+  }
+
+  const programId = chooseProgramIdForCategory(mintRow.category);
+  try {
+    assertProgramMatchesCategory(programId, mintRow.category);
+  } catch (err) {
+    return { blocked: true, status: 500, body: { error: "program_routing", detail: err.message } };
+  }
+
+  let txB64, loanIdStr, loanAccountStr;
+  try {
+    const dummySigner = Keypair.generate();
+    const program = getProgramForSigner(dummySigner, programId);
+    const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
+    const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
+
+    const collateralTokenProgram = await getMintTokenProgram(collateralMintStr);
+    const loanTokenProgram = TOKEN_PROGRAM_ID;
+
+    const randomSuffix = Math.floor(Math.random() * 0x10000);
+    const loanId = new BN(Date.now()).muln(0x10000).addn(randomSuffix);
+    const [loanAccount] = loanPda(borrowerPk, loanId, programId);
+    const [collateralVault] = collateralVaultPda(loanAccount, programId);
+
+    const borrowerCollateralAta = getAssociatedTokenAddressSync(
+      collateralMintPk, borrowerPk, false, collateralTokenProgram,
+    );
+    const borrowerWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, borrowerPk, false, loanTokenProgram,
+    );
+    const feeWalletWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, LENDER_PUBKEY, false, loanTokenProgram,
+    );
+
+    const preIxs = [
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+      createAssociatedTokenAccountIdempotentInstruction(
+        borrowerPk, borrowerWsolAta, borrowerPk, NATIVE_MINT, loanTokenProgram,
+      ),
+      createAssociatedTokenAccountIdempotentInstruction(
+        borrowerPk, feeWalletWsolAta, LENDER_PUBKEY, NATIVE_MINT, loanTokenProgram,
+      ),
+    ];
+    const postIxs = [
+      createCloseAccountInstruction(
+        borrowerWsolAta, borrowerPk, borrowerPk, [], loanTokenProgram,
+      ),
+    ];
+
+    const ix = await program.methods
+      .requestAndFundLoan(
+        new BN(collateralAmountRaw),
+        Number(tier),
+        new BN(collateralValLamports.toString()),
+        loanId,
+      )
+      .accounts({
+        pool: lendingPool,
+        loanTokenVault,
+        loan: loanAccount,
+        collateralVault,
+        collateralMint: collateralMintPk,
+        borrowerCollateralAccount: borrowerCollateralAta,
+        borrowerLoanTokenAccount: borrowerWsolAta,
+        feeWalletTokenAccount: feeWalletWsolAta,
+        borrower: borrowerPk,
+        authority: LENDER_PUBKEY,
+        priceFeed: priceFeedPda(collateralMintPk, lendingPool, programId)[0],
+        systemProgram: SystemProgram.programId,
+        tokenProgram: collateralTokenProgram,
+        loanTokenProgram,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .preInstructions(preIxs)
+      .postInstructions(postIxs)
+      .instruction();
+
+    const tx = new Transaction();
+    tx.add(...preIxs, ix, ...postIxs);
+    tx.feePayer = borrowerPk;
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash;
+
+    txB64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
+    loanIdStr = loanId.toString();
+    loanAccountStr = loanAccount.toBase58();
+  } catch (err) {
+    console.error("[buildBorrowTx] tx build failed:", err);
+    return {
+      blocked: true, status: 500,
+      body: { error: "tx_build_failed", detail: err.message?.slice(0, 200) },
+    };
+  }
+
+  const feeLamports = Math.floor((proposedLoanLamports * tierCfg.feeBps) / 10_000);
+  const principalLamports = proposedLoanLamports - feeLamports;
+
+  return {
+    blocked: false,
+    txB64,
+    loanIdStr,
+    loanAccountStr,
+    collateralValLamports,
+    principalLamports,
+    feeLamports,
+    tierCfg,
+    programId,
+  };
 }
 
 async function getMintTokenProgram(mintStr) {
@@ -249,169 +423,38 @@ export async function handleAgentBuildBorrow(req) {
     return { status: 500, body: { error: "user_create_failed", detail: err.message?.slice(0, 200) } };
   }
 
-  const banCheck = await preBorrowBanCheck({ userId, telegramId: null, walletPubkey: borrower_wallet });
-  if (banCheck?.blocked) {
-    return { status: 403, body: { error: "banned", reason: banCheck.reason } };
-  }
-
-  // Live collateral valuation via cross-sourced oracle (Jupiter ↔ DexScreener)
-  let collateralValLamports;
-  try {
-    collateralValLamports = await fetchValueLamports(
-      collateral_mint,
-      BigInt(collateral_amount),
-      Number(mint.decimals),
-    );
-  } catch (err) {
-    return {
-      status: 502,
-      body: { error: "price_oracle_failed", detail: err.message?.slice(0, 200) },
-    };
-  }
-  if (!collateralValLamports || collateralValLamports <= 0) {
-    return { status: 400, body: { error: "collateral_value_zero" } };
-  }
-
-  // Anti-exploit gauntlet — exactly the same as the human borrow flow.
-  const proposedLoanLamports = Math.floor((collateralValLamports * tierCfg.ltv) / 100);
-  const exploitCheck = await preBorrowAntiExploitCheck({
+  const built = await buildBorrowTx({
+    borrowerPk,
+    collateralMintPk,
+    collateralAmountRaw: String(collateral_amount),
+    tier: Number(tier),
     userId,
-    collateralMint: collateral_mint,
-    proposedLoanLamports,
-    walletPubkey: borrower_wallet,
+    mintRow: mint,
   });
-  if (exploitCheck?.blocked) {
-    return {
-      status: 403,
-      body: { error: "refused", reason: exploitCheck.reason, message: exploitCheck.message },
-    };
+  if (built.blocked) {
+    return { status: built.status, body: built.body };
   }
 
-  // ── Program routing + safety guard ──
-  const programId = chooseProgramIdForCategory(mint.category);
-  try {
-    assertProgramMatchesCategory(programId, mint.category);
-  } catch (err) {
-    return { status: 500, body: { error: "program_routing", detail: err.message } };
-  }
-
-  // ── Build the tx (does NOT sign; agent signs with their wallet) ──
-  let txB64, loanIdStr, loanAccountStr;
-  try {
-    // Use a THROWAWAY keypair for Anchor's provider — we only need
-    // .instruction() (NOT .rpc()), so no signing happens. Don't load
-    // the lender keypair here; reduces the lender-key's memory
-    // exposure surface to just the cosign endpoint where it's
-    // actually used.
-    const dummySigner = Keypair.generate();
-    const program = getProgramForSigner(dummySigner, programId);
-
-    const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
-    const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
-
-    const collateralTokenProgram = await getMintTokenProgram(collateral_mint);
-    const loanTokenProgram = TOKEN_PROGRAM_ID;
-
-    // loan_id is u64 baked into the PDA. Two agent borrows hitting the
-    // SAME millisecond would derive the same PDA → second tx fails with
-    // AccountAlreadyInitialized. Add 16 bits of entropy so the
-    // collision space is 2^16=65536× larger. Still strictly less than
-    // u64 max, and Date.now() dominates so ordering is preserved.
-    const randomSuffix = Math.floor(Math.random() * 0x10000);
-    const loanId = new BN(Date.now()).muln(0x10000).addn(randomSuffix);
-    const [loanAccount] = loanPda(borrowerPk, loanId, programId);
-    const [collateralVault] = collateralVaultPda(loanAccount, programId);
-
-    const borrowerCollateralAta = getAssociatedTokenAddressSync(
-      collateralMintPk, borrowerPk, false, collateralTokenProgram,
-    );
-    const borrowerWsolAta = getAssociatedTokenAddressSync(
-      NATIVE_MINT, borrowerPk, false, loanTokenProgram,
-    );
-    const feeWalletWsolAta = getAssociatedTokenAddressSync(
-      NATIVE_MINT, LENDER_PUBKEY, false, loanTokenProgram,
-    );
-
-    const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
-      createAssociatedTokenAccountIdempotentInstruction(
-        borrowerPk, borrowerWsolAta, borrowerPk, NATIVE_MINT, loanTokenProgram,
-      ),
-      createAssociatedTokenAccountIdempotentInstruction(
-        borrowerPk, feeWalletWsolAta, LENDER_PUBKEY, NATIVE_MINT, loanTokenProgram,
-      ),
-    ];
-    const postIxs = [
-      createCloseAccountInstruction(
-        borrowerWsolAta, borrowerPk, borrowerPk, [], loanTokenProgram,
-      ),
-    ];
-
-    const ix = await program.methods
-      .requestAndFundLoan(
-        new BN(collateral_amount),
-        Number(tier),
-        new BN(collateralValLamports.toString()),
-        loanId,
-      )
-      .accounts({
-        pool: lendingPool,
-        loanTokenVault,
-        loan: loanAccount,
-        collateralVault,
-        collateralMint: collateralMintPk,
-        borrowerCollateralAccount: borrowerCollateralAta,
-        borrowerLoanTokenAccount: borrowerWsolAta,
-        feeWalletTokenAccount: feeWalletWsolAta,
-        borrower: borrowerPk,
-        authority: LENDER_PUBKEY,
-        priceFeed: priceFeedPda(collateralMintPk, lendingPool, programId)[0],
-        systemProgram: SystemProgram.programId,
-        tokenProgram: collateralTokenProgram,
-        loanTokenProgram,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .preInstructions(preIxs)
-      .postInstructions(postIxs)
-      .instruction();
-
-    const tx = new Transaction();
-    tx.add(...preIxs, ix, ...postIxs);
-    tx.feePayer = borrowerPk;
-    const { blockhash } = await connection.getLatestBlockhash("confirmed");
-    tx.recentBlockhash = blockhash;
-
-    txB64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
-    loanIdStr = loanId.toString();
-    loanAccountStr = loanAccount.toBase58();
-  } catch (err) {
-    console.error("[agent/build-borrow] tx build failed:", err);
-    return { status: 500, body: { error: "tx_build_failed", detail: err.message?.slice(0, 200) } };
-  }
-
-  const collateralValueSol = Number(collateralValLamports) / 1e9;
-  const feeLamports = Math.floor((proposedLoanLamports * tierCfg.feeBps) / 10_000);
-  const principalLamports = proposedLoanLamports - feeLamports;
+  const collateralValueSol = Number(built.collateralValLamports) / 1e9;
 
   return {
     status: 200,
     body: {
       ok: true,
-      partial_signed_tx_b64: txB64,
+      partial_signed_tx_b64: built.txB64,
       summary: {
-        program_id: programId.toBase58(),
-        loan_id: loanIdStr,
-        loan_pda: loanAccountStr,
+        program_id: built.programId.toBase58(),
+        loan_id: built.loanIdStr,
+        loan_pda: built.loanAccountStr,
         collateral_mint: collateral_mint,
         collateral_symbol: mint.symbol,
         collateral_amount_raw: String(collateral_amount),
         collateral_value_sol: collateralValueSol,
-        principal_sol: principalLamports / 1e9,
-        fee_sol: feeLamports / 1e9,
-        ltv_pct: tierCfg.ltv,
-        duration_days: tierCfg.days,
-        due_unix: Math.floor(Date.now() / 1000) + tierCfg.days * 86400,
+        principal_sol: built.principalLamports / 1e9,
+        fee_sol: built.feeLamports / 1e9,
+        ltv_pct: built.tierCfg.ltv,
+        duration_days: built.tierCfg.days,
+        due_unix: Math.floor(Date.now() / 1000) + built.tierCfg.days * 86400,
       },
       next_step:
         "Sign partial_signed_tx_b64 with borrower_wallet's private key, then POST it to /api/v1/cosign-borrow as { partialSignedTxBase64 }. That endpoint runs final validation, adds the lender authority signature, and submits to chain.",

@@ -66,6 +66,11 @@ import {
   handleAgentBuildPartialRepay,
 } from "./agent-manage.js";
 import { handleCreditAttest } from "./credit-attest.js";
+import {
+  handleAgentCreateIntent,
+  handleAgentIntent,
+  handleAgentListIntents,
+} from "./agent-intents.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
@@ -1315,7 +1320,7 @@ async function router(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "X-API-Key, Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     return res.end();
@@ -1491,6 +1496,19 @@ async function router(req, res) {
         break;
       case "/api/v1/agent/credit-attest":
         result = await handleCreditAttest(req, url);
+        break;
+      case "/api/v1/agent/intent":
+        // POST creates a conditional borrow intent.
+        // GET ?id=... reads its state.
+        // DELETE ?id=... cancels a pending intent.
+        if (req.method === "POST") {
+          result = await handleAgentCreateIntent(req);
+        } else {
+          result = await handleAgentIntent(req, Object.fromEntries(url.searchParams));
+        }
+        break;
+      case "/api/v1/agent/intents":
+        result = await handleAgentListIntents(req, Object.fromEntries(url.searchParams));
         break;
       case "/api/v1/lender-alarm-webhook":
         result = await handleLenderAlarmWebhook(req);

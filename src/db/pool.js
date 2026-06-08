@@ -766,6 +766,52 @@ export async function applyStartupPatches() {
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS borrower_wallet TEXT`,
     `CREATE INDEX IF NOT EXISTS loans_borrower_wallet_idx ON loans(borrower_wallet) WHERE borrower_wallet IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS loans_suspended_idx ON loans(suspended) WHERE suspended = TRUE`,
+    // Conditional borrow intents — "limit orders for borrows". Agent
+    // posts an intent specifying collateral + tier + a trigger
+    // condition. Background watcher fires the borrow tx when the
+    // condition matches. Agent then signs + submits.
+    //
+    // First permissionless lending protocol on Solana with this. The
+    // wedge for agent-native finance: an agent doesn't need to be
+    // online to capture an opportunity — just to sign + submit when
+    // the conditions hit.
+    //
+    // Condition shapes (condition_type / condition_params):
+    //   'price_above'   { mint, usd }       — token price rises ABOVE
+    //   'price_below'   { mint, usd }       — token price drops BELOW
+    //   'time_after'    { unix }            — wall-clock trigger
+    //   'pool_liq_above'{ usd }             — protocol pool TVL grows
+    //
+    // Status lifecycle:
+    //   pending  → conditions not met yet
+    //   matched  → conditions met, server built the tx, awaiting agent sign
+    //   executed → agent confirmed on-chain submission, intent done
+    //   expired  → intent's expires_at passed without match
+    //   cancelled → agent explicitly cancelled
+    `CREATE TABLE IF NOT EXISTS borrow_intents (
+       id BIGSERIAL PRIMARY KEY,
+       intent_id TEXT UNIQUE NOT NULL,
+       borrower_wallet TEXT NOT NULL,
+       collateral_mint TEXT NOT NULL,
+       collateral_amount NUMERIC(40,0) NOT NULL,
+       tier SMALLINT NOT NULL CHECK (tier IN (0, 1, 2)),
+       condition_type TEXT NOT NULL,
+       condition_params JSONB NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending'
+         CHECK (status IN ('pending', 'matched', 'executed', 'expired', 'cancelled')),
+       partial_signed_tx_b64 TEXT,
+       summary JSONB,
+       executed_tx TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       expires_at TIMESTAMPTZ NOT NULL,
+       matched_at TIMESTAMPTZ,
+       executed_at TIMESTAMPTZ,
+       last_checked_at TIMESTAMPTZ
+     )`,
+    `CREATE INDEX IF NOT EXISTS borrow_intents_pending_idx
+       ON borrow_intents(status, last_checked_at) WHERE status = 'pending'`,
+    `CREATE INDEX IF NOT EXISTS borrow_intents_wallet_idx
+       ON borrow_intents(borrower_wallet, created_at DESC)`,
     // Borrow-exempt wallet allowlist. Operator-controlled. Bypasses the
     // wallet/account profile gates in preBorrowAntiExploitCheck (imported-
     // wallet cooldown, new-account cap). All systemic gates (TWAP, pool
