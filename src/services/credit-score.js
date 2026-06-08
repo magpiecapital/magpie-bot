@@ -308,11 +308,21 @@ export async function getScoreHistory(userId, limit = 30) {
  * Get top credit scores (leaderboard).
  */
 export async function getLeaderboard(limit = 20) {
+  // Resolve the user's currently-active wallet pubkey (preferred) or
+  // any wallet they have. The leaderboard handler uses this in place
+  // of telegram_username for public display — keeps competitive
+  // recognition without leaking TG identities.
   const { rows } = await query(
     `SELECT cs.user_id, cs.score, cs.tier, cs.loans_scored,
-            u.telegram_username
+            COALESCE(
+              (SELECT w.public_key FROM wallets w
+                 WHERE w.user_id = cs.user_id AND w.is_active = TRUE
+                 ORDER BY w.created_at ASC LIMIT 1),
+              (SELECT w.public_key FROM wallets w
+                 WHERE w.user_id = cs.user_id
+                 ORDER BY w.created_at ASC LIMIT 1)
+            ) AS public_key
      FROM credit_scores cs
-     JOIN users u ON u.id = cs.user_id
      ORDER BY cs.score DESC LIMIT $1`,
     [limit],
   );

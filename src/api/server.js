@@ -1234,7 +1234,16 @@ async function handleLeaderboard() {
         score: l.score,
         tier: l.tier,
         loans_scored: l.loans_scored,
-        username: l.telegram_username ? `@${l.telegram_username}` : "anonymous",
+        // PRIVACY: never publish Telegram handles on the public
+        // leaderboard. Display the user's currently-active wallet
+        // pubkey, truncated to a short prefix+suffix — keeps the
+        // competitive surface (people can recognize their own
+        // entry, others can verify on-chain) without leaking TG
+        // identities. Fall back to "anonymous" if for some reason
+        // there's no wallet on file.
+        username: l.public_key
+          ? `${l.public_key.slice(0, 4)}…${l.public_key.slice(-4)}`
+          : "anonymous",
       })),
     },
   };
