@@ -59,6 +59,8 @@ import {
   loanTokenVaultPda,
   collateralVaultPda,
 } from "../solana/pdas.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
@@ -92,6 +94,10 @@ export async function handleAgentBuildRepay(req) {
   if (process.env.AGENT_API_DISABLED === "true") {
     return { status: 503, body: { error: "Agent API temporarily disabled" } };
   }
+  // Protocol-wide pause check — if the operator paused the site
+  // during an incident, agent endpoints should pause too.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   if (!INTERNAL_API_TOKEN) {
     console.error("[agent/build-repay] INTERNAL_API_TOKEN not configured");
     return { status: 500, body: { error: "Agent API not configured (server-side)" } };
@@ -155,6 +161,19 @@ export async function handleAgentBuildRepay(req) {
       status: 403,
       body: { error: "not_loan_borrower", detail: "borrower_wallet does not match this loan's borrower" },
     };
+  }
+
+  // Per-user lock check (defense-in-depth). Mirrors cosign-borrow +
+  // agent-manage. Skip silently if we can't resolve a user_id.
+  if (loan.borrower_wallet) {
+    const { rows: [walletRow] } = await query(
+      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+      [loan.borrower_wallet],
+    );
+    if (walletRow?.user_id) {
+      const lockReject = await rejectIfLocked(walletRow.user_id);
+      if (lockReject) return lockReject;
+    }
   }
 
   // ── Build the tx (does NOT sign; agent signs with their wallet) ──

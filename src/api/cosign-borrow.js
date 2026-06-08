@@ -44,6 +44,8 @@ import { isWalletBanned } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
 import { query } from "../db/pool.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
+import { rejectIfLocked } from "../services/site-lock.js";
 
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
@@ -169,6 +171,14 @@ export async function handleCosignBorrow(req) {
       },
     };
   }
+
+  // Protocol-wide pause check (set via /pause_site command). The borrow
+  // kill switch above is borrow-specific; this is a global circuit
+  // breaker that also disables withdraw/repay/etc. Defense-in-depth so
+  // we don't have to remember to flip every per-endpoint switch in an
+  // incident.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
 
   let body;
   try {
@@ -432,6 +442,18 @@ export async function handleCosignBorrow(req) {
             `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
             [borrowerPubkeyStr],
           );
+          // Per-user soft-lock check (operator can lock individual
+          // users via /lock_user during investigations). Fires only if
+          // we resolved a user_id — unlinked wallets can't be locked
+          // by definition. Defense-in-depth around the existing
+          // ban-registry check at gate 4.
+          if (walletRow?.user_id) {
+            const lockReject = await rejectIfLocked(walletRow.user_id);
+            if (lockReject) {
+              console.warn(`[cosign-borrow] refused — user ${walletRow.user_id} is locked`);
+              return lockReject;
+            }
+          }
           const exploitCheck = await preBorrowAntiExploitCheck({
             userId: walletRow?.user_id ?? null,
             collateralMint: collateralMintStr,
