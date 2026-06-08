@@ -196,7 +196,10 @@ export async function handleDashboardAggregate(req, url) {
     status: 200,
     body: {
       linked: true,
-      telegram_username: linked.telegram_username ? `@${linked.telegram_username}` : null,
+      // PRIVACY: telegram_username deliberately omitted. This endpoint
+      // is in PUBLIC_ROUTES and anyone with the wallet pubkey can read
+      // it — exposing the TG handle here was a real leak. The site
+      // doesn't display the handle anyway; matches link/status policy.
       active_custodial_wallet: activeCustodial?.public_key ?? null,
       prefs: {
         auto_protect: !!prefs.auto_protect,

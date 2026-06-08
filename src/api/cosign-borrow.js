@@ -87,6 +87,23 @@ const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
   "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // Token-2022
+  // Lighthouse — Phantom's transaction-integrity assertion program.
+  // Modern Phantom (Standard Wallet path) injects assertion guards
+  // BEFORE signing to defend users against rugs / sandwich attacks
+  // / unexpected state mutations. These instructions are read-only:
+  // they only check on-chain state and abort the tx if assertions
+  // fail. They CANNOT move funds, sign anything, or alter the
+  // outcome — they're purely a safety wrapper.
+  //
+  // SAFE to allowlist:
+  //   - Lighthouse never holds privileged signers
+  //   - Its instructions cannot CPI into other programs
+  //   - Failure mode is "tx aborts with assertion error" — never
+  //     "tx succeeds with extra effect"
+  //
+  // Without this, every Phantom-signed borrow fails Gate 0 with
+  // "instruction program not allowed in co-signed tx".
+  "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95",
 ]);
 
 const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
