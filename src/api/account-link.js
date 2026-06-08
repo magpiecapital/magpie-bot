@@ -58,17 +58,30 @@ function syntheticTelegramIdForWallet(walletPubkey) {
 
 export async function findOrCreateSiteUser(walletPubkey) {
   const synthTg = syntheticTelegramIdForWallet(walletPubkey);
-  // Upsert the user row. ON CONFLICT (telegram_id) ensures we get
-  // the same user every time for the same wallet.
-  const { rows } = await query(
-    `INSERT INTO users (telegram_id, telegram_username)
-       VALUES ($1, $2)
-       ON CONFLICT (telegram_id) DO UPDATE
-         SET telegram_username = EXCLUDED.telegram_username
-       RETURNING id`,
-    [synthTg, `site_${walletPubkey.slice(0, 8)}`],
+  // SELECT-then-INSERT instead of ON CONFLICT — the production DB
+  // has no unique constraint on users.telegram_id, so the upsert
+  // syntax fails with "no unique or exclusion constraint matching
+  // the ON CONFLICT specification". This pattern is race-tolerant
+  // because of the wallets.public_key UNIQUE constraint below: if
+  // two requests for the same wallet race, both create user rows
+  // but only one wallet bond succeeds. The other user row is
+  // harmless (orphaned, never referenced).
+  let userId;
+  const { rows: existing } = await query(
+    `SELECT id FROM users WHERE telegram_id = $1 LIMIT 1`,
+    [synthTg],
   );
-  const userId = rows[0].id;
+  if (existing[0]) {
+    userId = existing[0].id;
+  } else {
+    const { rows: inserted } = await query(
+      `INSERT INTO users (telegram_id, telegram_username)
+         VALUES ($1, $2)
+         RETURNING id`,
+      [synthTg, `site_${walletPubkey.slice(0, 8)}`],
+    );
+    userId = inserted[0].id;
+  }
   // Bond the wallet. ON CONFLICT (public_key) DO NOTHING means if
   // the wallet was already linked to a different user (real TG
   // account), we leave that bond untouched.
