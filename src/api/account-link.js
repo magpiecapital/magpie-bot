@@ -82,15 +82,28 @@ export async function findOrCreateSiteUser(walletPubkey) {
     );
     userId = inserted[0].id;
   }
-  // Bond the wallet. ON CONFLICT (public_key) DO NOTHING means if
-  // the wallet was already linked to a different user (real TG
-  // account), we leave that bond untouched.
-  await query(
-    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
-     VALUES ($1, $2, '', '', '', 'site_native', TRUE)
-     ON CONFLICT (public_key) DO NOTHING`,
-    [userId, walletPubkey],
+  // Bond the wallet. SELECT-then-INSERT (the wallets.public_key
+  // column doesn't have a unique constraint either, so the previous
+  // ON CONFLICT (public_key) syntax was failing the same way the
+  // users one did). If the wallet is already linked to some user
+  // (real TG or another site-native), we leave that bond untouched.
+  const { rows: walletExists } = await query(
+    `SELECT 1 FROM wallets WHERE public_key = $1 LIMIT 1`,
+    [walletPubkey],
   );
+  if (!walletExists[0]) {
+    try {
+      await query(
+        `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
+         VALUES ($1, $2, '', '', '', 'site_native', TRUE)`,
+        [userId, walletPubkey],
+      );
+    } catch (err) {
+      // Concurrent insert from a parallel request — safe to ignore;
+      // both end up pointing at a wallet row that exists.
+      if (!/duplicate|unique|already exists/i.test(err.message)) throw err;
+    }
+  }
   return userId;
 }
 
@@ -245,11 +258,15 @@ export async function handleLinkStatus(req, url) {
        LIMIT 1`,
     [u.id],
   );
+  // PRIVACY: never expose the user's telegram_username in this
+  // endpoint. The site only needs to know whether the wallet has a
+  // Magpie identity; the TG handle (if any) is private and would
+  // otherwise leak to anyone who knows the wallet pubkey. The chat
+  // panel reads `linked` only, so dropping this field is safe.
   return {
     status: 200,
     body: {
       linked: true,
-      telegram_username: u.telegram_username ? `@${u.telegram_username}` : null,
       active_custodial_wallet: activeRows[0]?.public_key ?? null,
     },
   };
