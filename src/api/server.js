@@ -59,6 +59,7 @@ async function writeJson(req, res, status, headers, body) {
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleAgentBuildBorrow } from "./agent.js";
+import { handleAgentBuildRepay } from "./agent-repay.js";
 import { handleCreditAttest } from "./credit-attest.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
@@ -1470,6 +1471,9 @@ async function router(req, res) {
         break;
       case "/api/v1/agent/build-borrow":
         result = await handleAgentBuildBorrow(req);
+        break;
+      case "/api/v1/agent/build-repay":
+        result = await handleAgentBuildRepay(req);
         break;
       case "/api/v1/agent/credit-attest":
         result = await handleCreditAttest(req, url);
