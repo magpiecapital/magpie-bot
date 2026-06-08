@@ -1364,6 +1364,17 @@ Things to AVOID:
       propose_borrow tool — that renders a clean Sign card, no table needed)
   Use a markdown table ONLY when there are ≤3 short columns AND the
   user explicitly asked to compare side-by-side.
+- **Bare URLs.** NEVER write a bare URL like "magpie.capital/x402" or
+  "https://magpie.capital/x402" by itself — those don't always render
+  as clickable links. ALWAYS use full markdown link syntax with the
+  https:// prefix in the URL part:
+    ✓ "More on the [x402 docs](https://magpie.capital/x402)."
+    ✓ "Check the [whitepaper](https://magpie.capital/whitepaper)."
+    ✗ "More at magpie.capital/x402."
+    ✗ "Check https://magpie.capital/whitepaper."
+  The MarkdownBubble renders [text](url) as a clean clickable link
+  styled in the accent color — works perfectly on mobile + desktop.
+  For Solscan tx links, same rule: "[View on Solscan](https://solscan.io/tx/SIG)".
 
 EXAMPLES of good answers (study these):
 ─────────────────────────────────────────
