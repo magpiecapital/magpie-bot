@@ -400,10 +400,12 @@ export function registerBorrowCallbacks(bot) {
     // Live liquidity floor + rapid-fire cap + new-account cap + pool-pct cap.
     // Built in direct response to the $FATHER oracle-manipulation attack
     // (2026-06-07). All thresholds env-tunable; check fails open on errors.
+    const { publicKey: borrowerWallet } = await ensureWallet(state.userId);
     const exploitCheck = await preBorrowAntiExploitCheck({
       userId: state.userId,
       collateralMint: state.selected.mint,
       proposedLoanLamports: loanAmountCheck,
+      walletPubkey: borrowerWallet,
     });
     if (exploitCheck?.blocked) {
       pending.delete(ctx.chat.id);

@@ -119,8 +119,15 @@ export async function getPricesInSolBatch(mints) {
  * Use this in flows where price manipulation is a real risk (e.g.
  * borrow valuation). For the background attestor — where we tolerate
  * small drift and want continuity — getPriceInSol() is fine.
+ *
+ * Tightened 2026-06-07: divergence was 10%, now 5%. A 9% pump (the
+ * previous tolerated max) is more than enough to extract value from
+ * a 70%-LTV loan: 0.9 SOL of inflated collateral nets 0.63 SOL of
+ * borrow that "looks fine" off-chain. 5% caps the worst-case extraction
+ * meaningfully while staying loose enough that genuine cross-source
+ * drift (different DEX paths, latency) doesn't false-positive.
  */
-const MAX_DIVERGENCE = 0.10; // 10%
+const MAX_DIVERGENCE = Number(process.env.PRICE_MAX_DIVERGENCE) || 0.05;
 
 async function dexscreenerPriceInSol(mint) {
   const resp = await axios.get(

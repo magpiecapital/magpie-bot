@@ -107,6 +107,7 @@ import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
+import { startExploitDetector } from "./services/exploit-detector.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
@@ -443,6 +444,11 @@ bot.start({
     // Loan reconciler — proactively syncs DB state with on-chain truth
     // every 5 min. Catches partial-repay/extend/liquidation drift.
     setTimeout(() => startLoanReconciler(), 45_000);
+    // Exploit-detector — auto-bans wallets/users matching the
+    // pump-and-borrow attack pattern, alerts on weaker signals.
+    // Multi-signal requirement (outcome + profile) keeps false-positive
+    // ban rate low. Idempotent; respects already-banned actors.
+    setTimeout(() => startExploitDetector(bot), 75_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
