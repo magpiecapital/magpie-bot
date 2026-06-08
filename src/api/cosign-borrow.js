@@ -447,6 +447,55 @@ export async function handleCosignBorrow(req) {
     };
   }
 
+  // Just-in-time on-chain price refresh. The Anchor program rejects
+  // request_and_fund_loan with StalePriceAttestation (0x177d / 6013)
+  // if the on-chain price-feed timestamp is > 120s old. Background
+  // attestor only keeps feeds fresh for mints backing active loans or
+  // marked protected — every other mint relies on this JIT refresh.
+  //
+  // Mirrors TG's commands/borrow.js — 60s threshold leaves headroom
+  // before the contract's 120s wall. If the price feed PDA hasn't
+  // been initialized yet, init + attest in one shot.
+  try {
+    const magpieIxForAttest = tx.instructions.find(
+      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
+    );
+    const mintKey = magpieIxForAttest?.keys?.[4]?.pubkey;
+    if (mintKey) {
+      const mintStr = mintKey.toBase58();
+      const { rows: [mintRow] } = await query(
+        `SELECT decimals FROM supported_mints WHERE mint = $1`,
+        [mintStr],
+      );
+      if (mintRow) {
+        const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } =
+          await import("../services/price-attestor.js");
+        const FRESH_THRESHOLD_SEC = 60;
+        const age = await getPriceFeedAgeSeconds(mintStr);
+        if (age === null || age > FRESH_THRESHOLD_SEC) {
+          try {
+            await attestPrice(mintStr, Number(mintRow.decimals));
+          } catch (attestErr) {
+            if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+              await initializePriceFeed(mintStr);
+              await attestPrice(mintStr, Number(mintRow.decimals));
+            } else {
+              throw attestErr;
+            }
+          }
+        }
+      }
+    }
+  } catch (attestErr) {
+    console.error("[cosign-borrow] JIT price attestation failed:", attestErr.message);
+    return {
+      status: 502,
+      body: {
+        error: `Couldn't refresh on-chain price (try again in a moment): ${attestErr.message?.slice(0, 200)}`,
+      },
+    };
+  }
+
   // All gates passed. Add the lender signature.
   let lender;
   try {
