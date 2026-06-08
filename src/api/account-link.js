@@ -261,12 +261,24 @@ export async function handleLinkStatus(req, url) {
   // PRIVACY: never expose the user's telegram_username in this
   // endpoint. The site only needs to know whether the wallet has a
   // Magpie identity; the TG handle (if any) is private and would
-  // otherwise leak to anyone who knows the wallet pubkey. The chat
-  // panel reads `linked` only, so dropping this field is safe.
+  // otherwise leak to anyone who knows the wallet pubkey.
+  //
+  // Distinguish site-native (auto-bootstrapped, synthetic negative
+  // telegram_id) from real TG-linked accounts via telegram_linked.
+  // Negative or null telegram_id → no real TG bond. Positive → real
+  // TG user. The dashboard uses this to show "Connect Telegram
+  // (optional)" only when there isn't yet a real bond, instead of
+  // misleadingly showing every site-native user as "Linked to TG".
+  const tgLinked = typeof u.telegram_id === "number"
+    ? u.telegram_id > 0
+    : typeof u.telegram_id === "string"
+    ? Number(u.telegram_id) > 0
+    : false;
   return {
     status: 200,
     body: {
       linked: true,
+      telegram_linked: tgLinked,
       active_custodial_wallet: activeRows[0]?.public_key ?? null,
     },
   };
