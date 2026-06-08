@@ -465,9 +465,12 @@ export async function handleCosignBorrow(req) {
       maxRetries: 3,
     });
   } catch (e) {
+    // Surface the cluster's actual error in the toast — without this,
+    // users only see "Submission failed" with no clue what to do.
+    const detail = e.message?.slice(0, 400) ?? "unknown";
     return {
       status: 500,
-      body: { error: "Submission failed", detail: e.message?.slice(0, 200) },
+      body: { error: `Submission failed: ${detail}`, detail },
     };
   }
 
