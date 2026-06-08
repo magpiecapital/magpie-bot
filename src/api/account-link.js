@@ -208,10 +208,40 @@ export async function handleLinkRequest(req) {
  * after creating a code; once the user redeems via the bot, this flips
  * to linked=true and the site UI updates.
  */
+// Per-IP throttle for auto-bootstrap. Without this, an attacker can
+// generate arbitrary wallet pubkeys and spray link/status to bloat
+// the users + wallets tables with junk synthetic accounts. 60 calls
+// per minute is plenty for normal dashboard polling but kills spray.
+const PER_IP_WINDOW_MS = 60_000;
+const PER_IP_MAX = 60;
+const ipBuckets = new Map();
+function ipKey(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+function checkIpRate(ip) {
+  const now = Date.now();
+  const bucket = ipBuckets.get(ip) || [];
+  const fresh = bucket.filter((t) => now - t < PER_IP_WINDOW_MS);
+  if (fresh.length >= PER_IP_MAX) return false;
+  fresh.push(now);
+  ipBuckets.set(ip, fresh);
+  if (ipBuckets.size > 1000 && Math.random() < 0.004) {
+    for (const [k, v] of ipBuckets.entries()) {
+      if (v.length === 0 || now - v[v.length - 1] > PER_IP_WINDOW_MS) ipBuckets.delete(k);
+    }
+  }
+  return true;
+}
+
 export async function handleLinkStatus(req, url) {
   const wallet = url.searchParams.get("wallet");
   if (!isValidPubkey(wallet)) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
+  }
+  if (!checkIpRate(ipKey(req))) {
+    return { status: 429, body: { error: "Too many requests — slow down" } };
   }
   let rows;
   ({ rows } = await query(
