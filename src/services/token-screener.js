@@ -1317,13 +1317,33 @@ export function registerScreenerCallbacks(bot) {
   });
 }
 
-// ─── Auto-approve aged review queue tokens ──────────────────────────────────
+// ─── Re-vet aged review queue tokens (NO LONGER AUTO-APPROVES) ──────────────
 
-const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min
+const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min (retained for compat)
 
 /**
- * Tokens that have been in the review queue for 1+ hour and still pass safety
- * checks get auto-approved. This ensures users get a timely response.
+ * 2026-06-07 — ROOT-CAUSE FIX FOR THE $FATHER APPROVAL:
+ *
+ * This function previously auto-promoted any token from review→approved
+ * after 1h if it still passed the SCAM re-checks (no honeypot, no
+ * unsafe extensions, etc.). It did NOT re-evaluate the ORIGINAL
+ * deficiency signals (low liquidity, unknown holder count, etc.)
+ * that caused the token to be queued for review in the first place.
+ *
+ * $FATHER's path was exactly this: queued at $8.5k liquidity with a
+ * failed holder lookup → sat in the queue 1h → no scam signals on
+ * re-check → AUTO-APPROVED with source='review_auto' → became borrowable
+ * collateral → got pumped and exploited.
+ *
+ * Fix: aged queue entries are now RE-VETTED against the full vetToken
+ * criteria including the AUTO_APPROVE bar. Only tokens that meet
+ * the auto-approve bar after the 1h aging window get promoted. Anything
+ * still in "review" verdict stays in the queue — operator must
+ * approve manually via /reviewtokens. Anything in "reject" verdict
+ * gets removed.
+ *
+ * Tokens that fall into manual-review-only territory stay there
+ * permanently until the operator decides. That is the entire point.
  */
 async function processReviewQueue(bot) {
   const { rows } = await query(
@@ -1395,7 +1415,59 @@ async function processReviewQueue(bot) {
       }
     }
 
-    // Approve it
+    // Re-vet using the FULL screening criteria (including AUTO_APPROVE).
+    // Only tokens that hit the auto-approve bar get promoted from the
+    // review queue. Anything still in "review" verdict stays queued for
+    // manual approval. This is the post-$FATHER fix — never auto-promote
+    // tokens that didn't meet the original bar.
+    let liveMarket;
+    try {
+      const marketMap = await getMarketData([t.mint]);
+      liveMarket = marketMap.get(t.mint);
+    } catch (err) {
+      console.warn(`[screener] review re-vet market fetch failed for ${t.symbol}: ${err.message}`);
+      continue; // leave in queue; try again next tick
+    }
+    if (!liveMarket) continue;
+
+    const liveHolderCount = await getHolderCount(t.mint);
+    const { verdict: liveVerdict, fails: liveFails } = vetToken(
+      onChain,
+      liveMarket,
+      liveHolderCount,
+      t.category,
+    );
+
+    if (liveVerdict !== "auto_approve") {
+      // Still doesn't meet the auto-approve bar — leave queued for
+      // manual operator review. Update the queue row with the freshest
+      // observations so /reviewtokens shows current state.
+      await query(
+        `UPDATE token_screen_queue
+            SET liquidity_usd = $2,
+                volume_24h_usd = $3,
+                market_cap_usd = $4,
+                holder_count = $5,
+                fail_reasons = $6
+          WHERE mint = $1`,
+        [
+          t.mint,
+          liveMarket.liquidity,
+          liveMarket.volume24h,
+          liveMarket.marketCap,
+          liveHolderCount,
+          liveFails,
+        ],
+      );
+      console.log(
+        `[screener] Review-queue token ${t.symbol} aged but still not auto-approvable ` +
+        `(${liveVerdict}) — leaving for manual review. Live: liq=$${Math.floor(liveMarket.liquidity)}, ` +
+        `holders=${liveHolderCount}, vol24=$${Math.floor(liveMarket.volume24h)}`,
+      );
+      continue;
+    }
+
+    // Token now meets the FULL auto-approve bar — promote it.
     await query(
       `INSERT INTO supported_mints
          (mint, symbol, name, decimals, category, image_url, liquidity_usd,
@@ -1405,7 +1477,7 @@ async function processReviewQueue(bot) {
        ON CONFLICT (mint) DO UPDATE SET enabled = TRUE`,
       [
         t.mint, t.symbol, t.name, t.decimals, t.category, t.image_url,
-        t.liquidity_usd, t.holder_count, t.market_cap_usd, t.token_age_hours,
+        liveMarket.liquidity, liveHolderCount, liveMarket.marketCap, t.token_age_hours,
       ],
     );
 
@@ -1414,7 +1486,7 @@ async function processReviewQueue(bot) {
       [t.mint],
     );
 
-    console.log(`[screener] Review auto-approved ${t.symbol} (1h elapsed, passed re-check)`);
+    console.log(`[screener] Review auto-approved ${t.symbol} (matured to full auto-approve bar)`);
 
     // Notify submitter
     if (t.submitted_by && bot) {
