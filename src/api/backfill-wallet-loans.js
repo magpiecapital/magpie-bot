@@ -30,6 +30,36 @@ import { recordLoan } from "../services/loans.js";
 const PER_WALLET_MIN_INTERVAL_MS = 15_000;
 const lastByWallet = new Map();
 
+// Per-IP global throttle — prevents an attacker from spraying
+// different wallets to burn through our RPC quota / DB capacity.
+// 20 calls per 60s per IP is plenty for normal users (one dashboard
+// load triggers exactly one call) but kills aggressive spray.
+const PER_IP_WINDOW_MS = 60_000;
+const PER_IP_MAX = 20;
+const ipBuckets = new Map();
+function ipKey(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+function checkIpRate(ip) {
+  const now = Date.now();
+  const bucket = ipBuckets.get(ip) || [];
+  const fresh = bucket.filter((t) => now - t < PER_IP_WINDOW_MS);
+  if (fresh.length >= PER_IP_MAX) {
+    return { ok: false };
+  }
+  fresh.push(now);
+  ipBuckets.set(ip, fresh);
+  // Light cleanup — every ~256 calls, evict stale buckets.
+  if (ipBuckets.size > 1000 && Math.random() < 0.004) {
+    for (const [k, v] of ipBuckets.entries()) {
+      if (v.length === 0 || now - v[v.length - 1] > PER_IP_WINDOW_MS) ipBuckets.delete(k);
+    }
+  }
+  return { ok: true };
+}
+
 // Loan account layout: 8-byte Anchor discriminator + loan_id (u64,
 // 8 bytes) + borrower (pubkey, 32 bytes). memcmp at offset 16 filters
 // by borrower without pulling every loan account.
@@ -69,6 +99,13 @@ async function fetchLoansForBorrowerOnProgram(program, walletPk) {
 
 export async function handleBackfillWalletLoans(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  // Per-IP rate limit gates the expensive RPC scan before parsing
+  // the body — cheap reject for floods.
+  const ipCheck = checkIpRate(ipKey(req));
+  if (!ipCheck.ok) {
+    return { status: 429, body: { error: "Too many requests from this IP — slow down" } };
+  }
 
   let body;
   try { body = await readJsonBody(req); }
