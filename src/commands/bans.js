@@ -78,19 +78,15 @@ export async function handleBanTg(ctx) {
     [telegramId],
   );
   if (!rows.length) {
-    // Still ban by telegram_id even without a user row — they may try to
-    // sign up later. Insert a synthetic row keyed off the telegram_id.
-    await query(
-      `INSERT INTO banned_users (user_id, telegram_id, reason, banned_by)
-       VALUES (NULL, $1, $2, $3)
-       ON CONFLICT DO NOTHING`,
-      [telegramId, reason, String(ctx.from?.id ?? "operator")],
-    ).catch(async () => {
-      // banned_users.user_id is the PK in our schema — can't be null. Fall
-      // back: silently no-op and let the user appear later, then ban them.
-      await ctx.reply(`⚠️ No user row for telegram_id ${telegramId} yet. Ban will be applied when they next interact.`);
-    });
-    return ctx.reply(`🚫 Banned telegram_id ${telegramId} (no Magpie user yet).`);
+    // banned_users.user_id is the PK and can't be null, so we can't
+    // store a ban for a telegram_id that has no Magpie account yet.
+    // In practice every attacker has already /started the bot before
+    // we want to ban them (they had to to import a wallet), so this
+    // path is mostly a usage hint.
+    return ctx.reply(
+      `⚠️ No Magpie user has telegram_id ${telegramId}. They need to /start the bot first.\n` +
+      `If they never interact, they can't borrow anyway. If they do, run this command again.`,
+    );
   }
   const u = rows[0];
   await _banUser({
