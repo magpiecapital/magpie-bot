@@ -56,7 +56,7 @@ function syntheticTelegramIdForWallet(walletPubkey) {
   return -(low48 + 1);
 }
 
-export async function findOrCreateSiteUser(walletPubkey) {
+export async function findOrCreateSiteUser(walletPubkey, refCode = null) {
   const synthTg = syntheticTelegramIdForWallet(walletPubkey);
   // SELECT-then-INSERT instead of ON CONFLICT — the production DB
   // has no unique constraint on users.telegram_id, so the upsert
@@ -104,6 +104,24 @@ export async function findOrCreateSiteUser(walletPubkey) {
       if (!/duplicate|unique|already exists/i.test(err.message)) throw err;
     }
   }
+
+  // If the caller passed a referral code, attribute this freshly-
+  // bootstrapped user to the referrer. Idempotent — attribute()
+  // refuses if the user is already attributed. This lets the site
+  // capture ?ref=CODE from a share link and credit the referrer
+  // even though the user never touched Telegram.
+  if (refCode) {
+    try {
+      const { attribute } = await import("../services/referrals.js");
+      await attribute(userId, refCode);
+    } catch (err) {
+      console.warn(
+        `[link-status] referral attribution failed for ${walletPubkey.slice(0, 8)}…: ${err.message}`,
+      );
+      // Non-fatal — the user account still exists, just unattributed.
+    }
+  }
+
   return userId;
 }
 
@@ -255,8 +273,15 @@ export async function handleLinkStatus(req, url) {
     // Auto-bootstrap a site-native account so this wallet can chat
     // with Pip + transact immediately, no Telegram required. TG
     // remains a fully supported (but optional) backup identity path.
+    //
+    // ?ref=CODE on the request URL credits the referrer when we
+    // create the user. Sanitize to uppercase alphanumerics only.
+    const refRaw = url.searchParams.get("ref");
+    const refCode = refRaw && /^[A-Z0-9]{4,16}$/i.test(refRaw)
+      ? refRaw.toUpperCase()
+      : null;
     try {
-      await findOrCreateSiteUser(wallet);
+      await findOrCreateSiteUser(wallet, refCode);
       // Re-read the user row we just created so the response shape
       // matches what the chat panel expects.
       ({ rows } = await query(
