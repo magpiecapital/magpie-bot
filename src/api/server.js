@@ -73,6 +73,7 @@ import {
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
+import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
@@ -1313,6 +1314,9 @@ const PUBLIC_ROUTES = new Set([
   // header, LENDER_ALARM_WEBHOOK_SECRET on Railway). The handler is
   // fail-closed: returns 503 if the env var isn't set.
   "/api/v1/lender-alarm-webhook",
+  // Streaming variant of ai-chat. Same auth as /api/v1/ai/chat
+  // (Bearer or signed Ed25519 inside the handler).
+  "/api/v1/ai/chat/stream",
   // Post-tx sync hook. The site calls this right after a repay /
   // partial-repay / topup / extend lands so the bot's DB (which feeds
   // the activity feed, /stats lifetime totals, credit score, and
@@ -1531,6 +1535,13 @@ async function router(req, res) {
         // Live tail of console.error/warn. Safe to expose — no PII,
         // cleared on restart, bounded at 200 entries.
         result = await handleDebugRecentErrors(req, url);
+        break;
+      case "/api/v1/ai/chat/stream":
+        // Streaming variant of /api/v1/ai/chat. Writes NDJSON frames
+        // directly to res — we mark the response handled and skip
+        // the writeJson at the end so we don't double-send.
+        result = await handleAiChatStream(req, res);
+        if (result && result.__handled) return;
         break;
       case "/api/v1/lender-alarm-webhook":
         result = await handleLenderAlarmWebhook(req);

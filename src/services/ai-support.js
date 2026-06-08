@@ -3798,6 +3798,146 @@ async function callAnthropic(messages, extraSystemText) {
   throw lastErr;
 }
 
+/**
+ * Streaming variant of callAnthropic. Same prompt + tools + system
+ * caching as the non-streaming version, but reads the SSE stream and
+ * fires onTextDelta(delta) for each text chunk as it arrives. Returns
+ * the same fully-assembled response shape callAnthropic returns, so
+ * the chatWithAgent tool-iteration loop works unchanged.
+ *
+ * Tool-use blocks are reassembled silently (input_json_delta chunks
+ * concatenated, parsed at content_block_stop). Only text deltas fire
+ * onTextDelta — tool calls and middle-of-thought tokens aren't
+ * streamed to the user.
+ */
+async function callAnthropicStream(messages, extraSystemText, onTextDelta) {
+  const systemBlocks = [
+    {
+      type: "text",
+      text: SYSTEM_PROMPT,
+      cache_control: { type: "ephemeral" },
+    },
+  ];
+  if (extraSystemText) {
+    systemBlocks.push({ type: "text", text: extraSystemText });
+  }
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: MAX_OUTPUT_TOKENS,
+      system: systemBlocks,
+      tools: TOOLS,
+      messages,
+      stream: true,
+    }),
+    signal: AbortSignal.timeout(60_000),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    const err = new Error(`Anthropic API ${res.status}: ${errBody.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  // Reassemble the same shape callAnthropic returns: content blocks
+  // indexed by their position. Anthropic guarantees blocks come in
+  // ascending index order via content_block_start.
+  const response = {
+    content: [],
+    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    stop_reason: null,
+  };
+  let active = null;     // { kind: "text", text: "" } | { kind: "tool_use", id, name, jsonStr: "" }
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by blank lines; each frame is one or
+    // more `event:`/`data:` lines. We only need data lines.
+    let nl;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || !line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+
+      let evt;
+      try { evt = JSON.parse(payload); }
+      catch { continue; }
+
+      switch (evt.type) {
+        case "message_start":
+          if (evt.message?.usage) {
+            response.usage.input_tokens = evt.message.usage.input_tokens ?? 0;
+            response.usage.cache_creation_input_tokens = evt.message.usage.cache_creation_input_tokens ?? 0;
+            response.usage.cache_read_input_tokens = evt.message.usage.cache_read_input_tokens ?? 0;
+          }
+          break;
+        case "content_block_start": {
+          const cb = evt.content_block;
+          if (cb?.type === "text") {
+            active = { kind: "text", text: "" };
+            response.content[evt.index] = { type: "text", text: "" };
+          } else if (cb?.type === "tool_use") {
+            active = { kind: "tool_use", id: cb.id, name: cb.name, jsonStr: "" };
+            response.content[evt.index] = { type: "tool_use", id: cb.id, name: cb.name, input: {} };
+          } else {
+            active = null;
+          }
+          break;
+        }
+        case "content_block_delta": {
+          const d = evt.delta;
+          if (d?.type === "text_delta" && active?.kind === "text") {
+            active.text += d.text;
+            response.content[evt.index].text = active.text;
+            if (onTextDelta && d.text) {
+              try { onTextDelta(d.text); } catch { /* never let consumer errors bubble */ }
+            }
+          } else if (d?.type === "input_json_delta" && active?.kind === "tool_use") {
+            active.jsonStr += d.partial_json ?? "";
+          }
+          break;
+        }
+        case "content_block_stop":
+          if (active?.kind === "tool_use") {
+            try { response.content[evt.index].input = JSON.parse(active.jsonStr || "{}"); }
+            catch { response.content[evt.index].input = {}; }
+          }
+          active = null;
+          break;
+        case "message_delta":
+          if (evt.delta?.stop_reason) response.stop_reason = evt.delta.stop_reason;
+          if (evt.usage?.output_tokens != null) response.usage.output_tokens = evt.usage.output_tokens;
+          break;
+        case "message_stop":
+        default:
+          break;
+      }
+    }
+  }
+
+  // Filter out any stray empty slots (defensive — shouldn't happen)
+  response.content = response.content.filter(Boolean);
+  return response;
+}
+
 // ──────────────────────────── MAIN ENTRY ────────────────────────
 
 /**
@@ -4027,4 +4167,200 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
     text: "I went in a loop trying to answer that. Tap *Open a ticket* and I'll route it to the team.",
     used_tools: usedTools,
   };
+}
+
+/**
+ * Streaming variant of chatWithAgent. Same flow + same tool iteration
+ * loop, but fires onEvent(event) for each piece of progress so the
+ * site can render Pip's response as it generates instead of waiting
+ * for the full response. Events:
+ *
+ *   { type: "text",  delta: string }            — append to current bubble
+ *   { type: "tool",  names: string[] }          — tools running (UI hint)
+ *   { type: "done",  result: { text, ... } }    — final assembled result
+ *   { type: "error", text: string }             — friendly user-facing error
+ *
+ * All other behavior — auth, secret scrubbing, spend cap, rate limit,
+ * topic gate, snapshot, tool execution, conversation persistence —
+ * matches chatWithAgent exactly. Anything chatWithAgent does, this
+ * does too.
+ */
+export async function chatWithAgentStream(userId, userMessage, opts = {}, onEvent) {
+  if (!isAiSupportEnabled()) return null;
+  const username = opts.username || null;
+  const languageCode = opts.languageCode || null;
+  const signerPubkey = opts.signerPubkey || null;
+  const emit = (e) => { if (onEvent) try { onEvent(e); } catch { /* swallow */ } };
+
+  // PII scrub — same as non-streaming
+  const secretType = containsSecret(userMessage);
+  if (secretType) {
+    const text = [
+      "⚠️ *I detected what looks like a private key or seed phrase in your message.*",
+      "",
+      "*I refused to send it to the AI and discarded it.* For your safety:",
+      "• Never paste private keys or seed phrases into ANY chat",
+      "• Move any funds in that wallet to a fresh wallet IMMEDIATELY — assume the original is compromised",
+      "• Magpie staff will NEVER ask for your seed phrase",
+      "",
+      "Want help with something else? Just ask without the secret.",
+    ].join("\n");
+    emit({ type: "done", result: { text, blocked_reason: secretType, used_tools: [] } });
+    return { text, blocked_reason: secretType, used_tools: [] };
+  }
+
+  const todaySpend = await getTodaySpendUsd();
+  if (todaySpend >= DAILY_SPEND_CAP_USD) {
+    const text = [
+      "The AI agent has hit today's spending cap and is paused until midnight UTC.",
+      "",
+      "Tap *Open a ticket* and the team will reply via this bot.",
+    ].join("\n");
+    emit({ type: "done", result: { text, spend_capped: true, today_spend_usd: todaySpend, used_tools: [] } });
+    return { text, spend_capped: true, today_spend_usd: todaySpend, used_tools: [] };
+  }
+
+  const allowed = await checkRateLimit(userId);
+  if (!allowed) {
+    const text = "I've hit my hourly limit for our chat. Try again in a bit, or tap *Open a ticket* to leave a message for the team.";
+    emit({ type: "done", result: { text, rate_limited: true, used_tools: [] } });
+    return { text, rate_limited: true, used_tools: [] };
+  }
+
+  const { messages } = await loadConversation(userId);
+  messages.push({ role: "user", content: userMessage });
+
+  let totalIn = 0;
+  let totalOut = 0;
+  const usedTools = [];
+  let escalatedTicketId = null;
+  let escalatedReason = null;
+  let proposedAction = null;
+
+  // Build extra system block (same logic as chatWithAgent)
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  const timeOfDay = utcHour >= 4 && utcHour < 12 ? "morning UTC"
+    : utcHour >= 12 && utcHour < 17 ? "afternoon UTC"
+    : utcHour >= 17 && utcHour < 22 ? "evening UTC"
+    : "late night UTC";
+  const contextParts = [`Current time: ${now.toISOString()} (${timeOfDay}).`];
+  if (username) {
+    contextParts.push(`User's Telegram handle: @${username}. Use sparingly for warmth — at most once per conversation, never in every reply.`);
+  }
+  if (languageCode && languageCode !== "en") {
+    const LANG_NAMES = {
+      es: "Spanish", pt: "Portuguese", fr: "French", de: "German", it: "Italian",
+      ru: "Russian", uk: "Ukrainian", tr: "Turkish", ar: "Arabic", he: "Hebrew",
+      zh: "Mandarin Chinese", "zh-hans": "Simplified Chinese", "zh-hant": "Traditional Chinese",
+      ja: "Japanese", ko: "Korean", vi: "Vietnamese", th: "Thai", id: "Indonesian",
+      ms: "Malay", hi: "Hindi", bn: "Bengali", fil: "Filipino", pl: "Polish",
+      nl: "Dutch", sv: "Swedish", no: "Norwegian", da: "Danish", fi: "Finnish",
+      cs: "Czech", el: "Greek", hu: "Hungarian", ro: "Romanian",
+    };
+    const langName = LANG_NAMES[languageCode.toLowerCase()] || languageCode;
+    contextParts.push(
+      `User's Telegram client language: ${langName} (${languageCode}). RESPOND IN ${langName.toUpperCase()} unless the user clearly writes to you in English.`,
+    );
+  }
+  contextParts.push(
+    "Match your greeting to the time of day if the user greets you ('gm', 'gn', etc.), and don't say 'good morning' at midnight UTC.",
+    "If this is your first message in the conversation, a warm but brief acknowledgment is welcome. If you're already mid-conversation, skip greetings entirely — jump to substance.",
+  );
+  try {
+    const snapshot = await buildUserSnapshot(userId, signerPubkey);
+    if (snapshot) {
+      contextParts.push(`\n\nUSER YOU'RE TALKING TO (auto-fetched — use naturally, don't recite as a list):\n${snapshot}`);
+    }
+  } catch (err) {
+    console.warn("[ai-support] user snapshot failed:", err.message);
+  }
+  const extraSystem = contextParts.join(" ");
+
+  for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+    let response;
+    try {
+      response = await callAnthropicStream(messages, extraSystem, (delta) => {
+        emit({ type: "text", delta });
+      });
+    } catch (err) {
+      console.error("[ai-support] streaming API error:", err.message);
+      const failType = err.status === 429 ? "rate_limit"
+        : err.status >= 500 ? "anthropic_5xx"
+        : err.status === 401 ? "auth"
+        : err.name === "TimeoutError" || err.name === "AbortError" ? "timeout"
+        : "other";
+      recordFailure(failType, err.message);
+      maybeAlertAdmin(botRef).catch(() => {});
+      const userMsg = failType === "rate_limit"
+        ? "Anthropic is rate limiting us right now. Try again in 30 seconds, or tap *Open a ticket*."
+        : failType === "auth"
+        ? "The AI agent is misconfigured (auth). The team has been notified. Tap *Open a ticket* in the meantime."
+        : failType === "timeout"
+        ? "The AI agent timed out. Try a shorter question, or tap *Open a ticket*."
+        : "The support agent hit an issue talking to its brain. Tap *Open a ticket* and the team will follow up.";
+      const result = { text: userMsg, error: err.message, error_type: failType, used_tools: usedTools };
+      emit({ type: "done", result });
+      return result;
+    }
+
+    totalIn += response.usage?.input_tokens ?? 0;
+    totalOut += response.usage?.output_tokens ?? 0;
+
+    const toolUses = (response.content || []).filter((b) => b.type === "tool_use");
+    const textBlocks = (response.content || []).filter((b) => b.type === "text");
+
+    if (toolUses.length === 0) {
+      messages.push({ role: "assistant", content: response.content });
+      await saveConversation(userId, messages, 1, totalIn, totalOut);
+      const result = {
+        text: textBlocks.map((b) => b.text).join("\n").trim() || "I don't have a good answer — try /support and open a ticket.",
+        escalated_ticket_id: escalatedTicketId,
+        escalated_reason: escalatedReason,
+        used_tools: usedTools,
+        proposed_action: proposedAction,
+      };
+      emit({ type: "done", result });
+      return result;
+    }
+
+    // Tool iteration — let the UI show a status hint while we run them
+    emit({ type: "tool", names: toolUses.map((t) => t.name) });
+    messages.push({ role: "assistant", content: response.content });
+    const toolResults = [];
+    for (const tu of toolUses) {
+      const handler = TOOL_HANDLERS[tu.name];
+      let result;
+      if (!handler) {
+        result = { error: `Unknown tool: ${tu.name}` };
+      } else {
+        try {
+          result = await handler(tu.input || {}, { userId, signerPubkey, toolsCalledThisTurn: [...usedTools] });
+          if (tu.name === "open_support_ticket" && result?.ticket_id) {
+            escalatedTicketId = result.ticket_id;
+            escalatedReason = result.reason || null;
+          }
+          if (result?.action_proposed) {
+            proposedAction = result.action_proposed;
+          }
+        } catch (err) {
+          result = { error: err.message?.slice(0, 200) || "Tool failed." };
+        }
+      }
+      if (!result?.retry) usedTools.push(tu.name);
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: JSON.stringify(result),
+      });
+    }
+    messages.push({ role: "user", content: toolResults });
+  }
+
+  const result = {
+    text: "I went in a loop trying to answer that. Tap *Open a ticket* and I'll route it to the team.",
+    used_tools: usedTools,
+  };
+  emit({ type: "done", result });
+  return result;
 }
