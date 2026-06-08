@@ -60,6 +60,11 @@ import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
 import { handleAgentBuildBorrow } from "./agent.js";
 import { handleAgentBuildRepay } from "./agent-repay.js";
+import {
+  handleAgentBuildExtend,
+  handleAgentBuildTopup,
+  handleAgentBuildPartialRepay,
+} from "./agent-manage.js";
 import { handleCreditAttest } from "./credit-attest.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
@@ -1474,6 +1479,15 @@ async function router(req, res) {
         break;
       case "/api/v1/agent/build-repay":
         result = await handleAgentBuildRepay(req);
+        break;
+      case "/api/v1/agent/build-extend":
+        result = await handleAgentBuildExtend(req);
+        break;
+      case "/api/v1/agent/build-topup":
+        result = await handleAgentBuildTopup(req);
+        break;
+      case "/api/v1/agent/build-partial-repay":
+        result = await handleAgentBuildPartialRepay(req);
         break;
       case "/api/v1/agent/credit-attest":
         result = await handleCreditAttest(req, url);
