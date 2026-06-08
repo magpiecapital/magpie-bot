@@ -702,10 +702,24 @@ belongs to ONE specific wallet and only that wallet can sign for it.
 Always read the tool response carefully:
 - \`scoped_to_wallet\`: the wallet whose loans were returned
 - \`other_wallets_loan_count\`: how many MORE loans live on other linked
-  wallets. If >0, tell the user something like:
-    "On your current wallet \`<short>\` you have 1 active loan (\$BUTTCOIN).
-     You also have 1 loan on another linked wallet — switch wallets
-     with /wallets if you want to manage that one."
+  wallets.
+
+DEFAULT BEHAVIOR (site Pip, signerPubkey present): treat the
+conversation as scoped to the connected wallet. Do NOT proactively
+mention loans, holdings, or activity on other wallets — even if
+\`other_wallets_loan_count\` > 0. The user is browsing as one wallet
+and wants answers about that wallet.
+
+ONLY surface other-wallet data when the user explicitly asks for
+their full account picture / all wallets / total across wallets.
+Phrases that flip this on: "all my wallets", "all my loans", "every
+loan", "total across wallets", "my whole account", "across all my
+wallets", "everything I have on Magpie". When you do surface it,
+keep it terse — counts and one-line summary, not full addresses,
+unless the user asks for specifics.
+
+TG context (no signerPubkey, /wallets command flow): the old behavior
+applies — proactively flag other-wallet loans with a switch hint.
 
 NEVER claim a user has a loan unless that loan came back in the
 scoped list. The user reporting this conversation in 2026 saw Pip
@@ -1262,10 +1276,20 @@ You (after list_my_loans returns 1 active loan, scoped to current wallet):
 1.84 SOL, due in 12h). Want me to pull up the repay card so you can close
 it right here?"
 
-CRITICAL when other_wallets_loan_count > 0:
-"You have one active loan on this wallet — \$BUTTCOIN \`#1780...\`. You
-also have 1 more loan on another linked wallet — switch wallets with
-/wallets if you want to manage that one."
+DEFAULT (site, signerPubkey set): answer about the scoped wallet only.
+"You have one active loan on this wallet — \$BUTTCOIN \`#1780...\`."
+Do NOT proactively mention other-wallet loans, even when
+\`other_wallets_loan_count\` > 0. The user is browsing as one wallet
+and asked about that wallet.
+
+ONLY surface other-wallet loans when the user explicitly asks for
+their full picture / all wallets / total across wallets. Then keep it
+short — counts and one-line summary, not enumerated addresses.
+
+TG (no signerPubkey, /wallets flow): proactive mention is fine —
+"You also have 1 more loan on another linked wallet — switch wallets
+with /wallets if you want to manage that one."
+
 DO NOT mention loans you didn't see in the scoped \`loans\` array. The
 scoping is real — a \$TROLL loan on wallet B is NOT a \$TROLL loan you
 can talk about when the user is signed in on wallet A.
@@ -3545,26 +3569,54 @@ async function buildUserSnapshot(userId, signerPubkey = null) {
       console.warn("[ai-support] snapshot credit/limits fetch failed:", err.message);
     }
 
-    // ─── Wallets — the agent should ALWAYS know which wallets the user has ───
-    // Listed inline so the agent doesn't need to call list_my_wallets just
-    // to answer "what wallets do I have" or to spot wallet-mismatch issues.
-    // The mapping below is also critical for diagnosing ConstraintHasOne
-    // errors — the agent can immediately check whether a loan's borrower
-    // address is in this list.
+    // ─── Wallets ─────────────────────────────────────────────────
+    // SITE (signerPubkey set): scope to ONLY the connected wallet by
+    // default. Listing every linked wallet on every turn pulls Pip
+    // into multi-wallet detours the user didn't ask for — they're
+    // browsing as ONE wallet and want answers about that wallet.
+    // Other wallets stay reachable via list_my_wallets when the user
+    // explicitly asks for their full account picture.
+    //
+    // TG (no signerPubkey): inline the full list as before — the TG
+    // bot doesn't have a browser-connected wallet, so "active" is
+    // the only handle Pip has on which wallet the user means.
     try {
       const { listWallets } = await import("./wallet.js");
       const wallets = await listWallets(userId);
       if (wallets.length > 0) {
         lines.push("");
-        lines.push(`Wallets on this account (${wallets.length}/10) — every one is something the user can switch to via /wallets:`);
-        for (const w of wallets) {
-          const flag = w.isActive ? "✅ ACTIVE" : "⚪️";
-          const src = w.source === "custodial" ? "Magpie-generated" : "Imported";
-          lines.push(`  ${flag} ${w.label} · ${w.publicKey} · ${src}`);
-        }
-        if (wallets.length > 1) {
-          lines.push("If the user asks about A SPECIFIC wallet, you already know its address + source — answer directly without calling list_my_wallets.");
-          lines.push("If a loan's borrower pubkey matches one of the inactive wallets above, that's a switch candidate — use switch_active_wallet to flip them, don't make them /wallets manually.");
+        if (signerPubkey) {
+          const connected = wallets.find((w) => w.publicKey === signerPubkey);
+          const others = wallets.filter((w) => w.publicKey !== signerPubkey);
+          if (connected) {
+            const src = connected.source === "custodial" ? "Magpie-generated" : "Imported";
+            lines.push(`Connected wallet (the one the user is signed in with right now): ${connected.label} · ${connected.publicKey} · ${src}.`);
+          } else {
+            // Signer isn't in the linked-wallet list — shouldn't normally
+            // happen since the chat endpoint requires a linked signer.
+            // Still surface it so Pip says SOMETHING useful.
+            lines.push(`Connected wallet: ${signerPubkey} (not in this account's linked-wallet list — flag if user asks about loans).`);
+          }
+          if (others.length > 0) {
+            lines.push(
+              `User also has ${others.length} other linked wallet(s) on this account — DO NOT enumerate them, ` +
+              `DO NOT reference their addresses, and DO NOT describe their loans/holdings unless the user explicitly ` +
+              `asks for their entire account / all wallets / full picture. ` +
+              `If they do ask, call list_my_wallets. Otherwise, treat the conversation as scoped to the connected wallet above.`,
+            );
+          }
+        } else {
+          // TG-style fallback: full list inline
+          lines.push(`Wallets on this account (${wallets.length}/10) — every one is something the user can switch to via /wallets:`);
+          for (const w of wallets) {
+            const flag = w.isActive ? "✅ ACTIVE" : "⚪️";
+            const src = w.source === "custodial" ? "Magpie-generated" : "Imported";
+            lines.push(`  ${flag} ${w.label} · ${w.publicKey} · ${src}`);
+          }
+          if (wallets.length > 1) {
+            lines.push("If the user asks about A SPECIFIC wallet, you already know its address + source — answer directly without calling list_my_wallets.");
+            lines.push("If a loan's borrower pubkey matches one of the inactive wallets above, that's a switch candidate — use switch_active_wallet to flip them, don't make them /wallets manually.");
+          }
         }
       }
     } catch (err) {

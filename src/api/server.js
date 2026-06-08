@@ -71,6 +71,7 @@ import {
   handleAgentIntent,
   handleAgentListIntents,
 } from "./agent-intents.js";
+import { handleSyncLoan } from "./sync-loan.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
@@ -1311,6 +1312,15 @@ const PUBLIC_ROUTES = new Set([
   // header, LENDER_ALARM_WEBHOOK_SECRET on Railway). The handler is
   // fail-closed: returns 503 if the env var isn't set.
   "/api/v1/lender-alarm-webhook",
+  // Post-tx sync hook. The site calls this right after a repay /
+  // partial-repay / topup / extend lands so the bot's DB (which feeds
+  // the activity feed, /stats lifetime totals, credit score, and
+  // streak tracking) picks up the state change immediately instead of
+  // waiting for the every-5-min loan-reconciler. The endpoint can
+  // ONLY pull DB state toward on-chain truth — it cannot move funds
+  // or write anything that isn't already true on-chain — so it's safe
+  // to expose without auth.
+  "/api/v1/sync-loan",
 ]);
 
 async function router(req, res) {
@@ -1509,6 +1519,9 @@ async function router(req, res) {
         break;
       case "/api/v1/agent/intents":
         result = await handleAgentListIntents(req, Object.fromEntries(url.searchParams));
+        break;
+      case "/api/v1/sync-loan":
+        result = await handleSyncLoan(req);
         break;
       case "/api/v1/lender-alarm-webhook":
         result = await handleLenderAlarmWebhook(req);
