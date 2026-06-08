@@ -74,6 +74,7 @@ import {
 import { handleSyncLoan } from "./sync-loan.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleAiChatStream } from "./ai-chat-stream.js";
+import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
@@ -1329,6 +1330,11 @@ const PUBLIC_ROUTES = new Set([
   // Live-debug ring buffer of recent console.error/warn output. No
   // PII; bounded in-memory; cleared on restart.
   "/api/v1/debug/recent-errors",
+  // Backfill any wallet's on-chain loans into the DB. Public-safe —
+  // can only pull DB toward on-chain truth; rate-limited per wallet
+  // by the handler. Used by the dashboard on-connect to self-heal
+  // any missing-loan drift.
+  "/api/v1/wallet/backfill-loans",
 ]);
 
 async function router(req, res) {
@@ -1535,6 +1541,9 @@ async function router(req, res) {
         // Live tail of console.error/warn. Safe to expose — no PII,
         // cleared on restart, bounded at 200 entries.
         result = await handleDebugRecentErrors(req, url);
+        break;
+      case "/api/v1/wallet/backfill-loans":
+        result = await handleBackfillWalletLoans(req);
         break;
       case "/api/v1/ai/chat/stream":
         // Streaming variant of /api/v1/ai/chat. Writes NDJSON frames
