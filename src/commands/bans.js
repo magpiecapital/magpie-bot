@@ -22,6 +22,7 @@ import {
   banWallet as _banWallet,
   unbanWallet as _unbanWallet,
 } from "../services/bans.js";
+import { traceAndBanFunders } from "../services/funding-graph.js";
 
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx.from?.id)) {
@@ -236,12 +237,25 @@ export async function handleBanSweep(ctx) {
     });
   }
 
+  // Trace funders for each wallet — extends the sweep to the funding
+  // graph so the operator gets the wallet-swap defense automatically.
+  let totalFundersBanned = 0;
+  for (const w of walletRows) {
+    try {
+      const r = await traceAndBanFunders(w.public_key, reason, userId);
+      totalFundersBanned += r.banned?.length || 0;
+    } catch (err) {
+      console.warn(`[ban_sweep] funder trace failed for ${w.public_key}: ${err.message}`);
+    }
+  }
+
   const lines = [
     `🚫🚫 *Ban sweep applied*`,
     ``,
     `User: #${userId} @${u.telegram_username ?? "?"} (tg ${u.telegram_id})`,
     `Reason: ${reason}`,
     `Wallets banned: ${walletRows.length}`,
+    `Funder wallets banned: ${totalFundersBanned}`,
     ...walletRows.map((w) => `  • \`${w.public_key}\``),
   ];
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });

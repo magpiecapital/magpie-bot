@@ -108,6 +108,7 @@ import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
 import { startExploitDetector } from "./services/exploit-detector.js";
+import { startPriceSnapshotter } from "./services/price-snapshotter.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
@@ -449,6 +450,11 @@ bot.start({
     // Multi-signal requirement (outcome + profile) keeps false-positive
     // ban rate low. Idempotent; respects already-banned actors.
     setTimeout(() => startExploitDetector(bot), 75_000);
+    // Price snapshotter — feeds the off-chain TWAP gate. Captures live
+    // DEX price + liquidity every 2 min for every enabled non-RWA mint
+    // and stores in mint_price_snapshots. The borrow flow's TWAP check
+    // queries this trailing window to refuse loans against pumped pools.
+    setTimeout(() => startPriceSnapshotter(), 80_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.

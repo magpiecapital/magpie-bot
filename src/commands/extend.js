@@ -31,6 +31,7 @@ export async function handleExtend(ctx) {
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
      WHERE l.user_id = $1 AND l.status = 'active'
+       AND COALESCE(l.suspended, FALSE) = FALSE
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
@@ -98,6 +99,13 @@ export function registerExtendCallbacks(bot) {
     const loan = rows[0];
     if (!loan) {
       await ctx.answerCallbackQuery("Loan not found");
+      return;
+    }
+    if (loan.suspended) {
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(
+        "⚠️ This loan is under review and cannot be extended. Contact support.",
+      );
       return;
     }
 

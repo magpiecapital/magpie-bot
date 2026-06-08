@@ -718,6 +718,48 @@ export async function applyStartupPatches() {
        source TEXT NOT NULL,
        posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
+    // Rolling price + liquidity snapshots per mint. The borrow flow
+    // compares the live spot price against a trailing N-minute average
+    // (off-chain TWAP) to detect price-impact attacks where a thin
+    // pool gets pumped right before a loan open. The snapshot loop
+    // also captures pool liquidity so we can detect rug-pull patterns
+    // post-borrow without depending on DexScreener at the critical
+    // moment. Pruned older than 24h to keep the table small.
+    `CREATE TABLE IF NOT EXISTS mint_price_snapshots (
+       mint TEXT NOT NULL,
+       snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       price_usd DOUBLE PRECISION,
+       liquidity_usd DOUBLE PRECISION,
+       PRIMARY KEY (mint, snapshot_at)
+     )`,
+    `CREATE INDEX IF NOT EXISTS mint_price_snapshots_recent_idx
+       ON mint_price_snapshots(mint, snapshot_at DESC)`,
+    // Funding-graph: when we auto-ban a wallet, we trace its recent
+    // SOL inflows on-chain and ban the funding sources too (excluding
+    // known CEXes / common deposit addresses). This table is just an
+    // audit log of what we found — actual bans go into banned_wallets.
+    `CREATE TABLE IF NOT EXISTS funding_traces (
+       id BIGSERIAL PRIMARY KEY,
+       traced_wallet TEXT NOT NULL,
+       funder_wallet TEXT NOT NULL,
+       lamports_received NUMERIC(20,0) NOT NULL,
+       tx_signature TEXT,
+       block_time TIMESTAMPTZ,
+       traced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       action TEXT NOT NULL CHECK (action IN ('banned','skipped_cex','skipped_already_banned','dry_run'))
+     )`,
+    `CREATE INDEX IF NOT EXISTS funding_traces_traced_wallet_idx
+       ON funding_traces(traced_wallet, traced_at DESC)`,
+    // Suspended-loan flag — when exploit-detector auto-bans a borrower
+    // who has an active loan, we mark that loan suspended. The repay
+    // and extension flows refuse to interact with a suspended loan
+    // (we never want to help the attacker buy back the collateral or
+    // delay liquidation), and the loan-watcher prioritizes it for
+    // immediate liquidation the moment dueTimestamp passes.
+    `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE`,
+    `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`,
+    `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_reason TEXT`,
+    `CREATE INDEX IF NOT EXISTS loans_suspended_idx ON loans(suspended) WHERE suspended = TRUE`,
   ];
   for (const sql of patches) {
     try {
