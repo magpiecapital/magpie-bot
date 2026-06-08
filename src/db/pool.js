@@ -759,6 +759,12 @@ export async function applyStartupPatches() {
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE`,
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`,
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_reason TEXT`,
+    // The wallet that actually signed this borrow. Populated going forward
+    // at recordLoan time. Older rows have NULL — the activity feed
+    // falls back to a temporal heuristic for those (pick the wallet
+    // owned by the user that existed at loan-open time).
+    `ALTER TABLE loans ADD COLUMN IF NOT EXISTS borrower_wallet TEXT`,
+    `CREATE INDEX IF NOT EXISTS loans_borrower_wallet_idx ON loans(borrower_wallet) WHERE borrower_wallet IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS loans_suspended_idx ON loans(suspended) WHERE suspended = TRUE`,
     // Borrow-exempt wallet allowlist. Operator-controlled. Bypasses the
     // wallet/account profile gates in preBorrowAntiExploitCheck (imported-

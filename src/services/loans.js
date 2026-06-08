@@ -442,6 +442,7 @@ export async function recordLoan({
   durationDays,
   txSignature,
   programId,
+  borrowerWallet,
 }) {
   const startTs = new Date();
   const dueTs = new Date(startTs.getTime() + durationDays * 24 * 60 * 60 * 1000);
@@ -455,8 +456,9 @@ export async function recordLoan({
        user_id, loan_id, loan_pda, collateral_mint, collateral_amount,
        loan_amount_lamports, original_loan_amount_lamports,
        ltv_percentage, duration_days,
-       start_timestamp, due_timestamp, status, tx_signature, program_id
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)
+       start_timestamp, due_timestamp, status, tx_signature, program_id,
+       borrower_wallet
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14)
      RETURNING id`,
     [
       userId,
@@ -472,6 +474,7 @@ export async function recordLoan({
       dueTs,
       txSignature,
       recordedProgramId,
+      borrowerWallet ?? null,
     ],
   );
 

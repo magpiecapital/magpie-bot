@@ -489,6 +489,7 @@ export function registerBorrowCallbacks(bot) {
         durationDays: tier.days,
         txSignature: result.signature,
         programId: result.programId,
+        borrowerWallet,
       });
       await incrementBorrowed(state.userId, loanAmountPreFee);
 
