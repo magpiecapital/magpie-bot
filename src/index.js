@@ -23,6 +23,15 @@ import { handleClearStale } from "./commands/clear-stale.js";
 import { handleWhatsNew } from "./commands/whats-new.js";
 import { handleLock, registerLockCallbacks } from "./commands/lock.js";
 import { handleSiteOps } from "./commands/siteops.js";
+import {
+  handleBanUser,
+  handleBanTg,
+  handleBanWallet,
+  handleUnbanUser,
+  handleUnbanWallet,
+  handleBanList,
+  handleBanSweep,
+} from "./commands/bans.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
 import { handleSiteDisable, handleSiteEnable, handleSiteState } from "./commands/site-toggle.js";
 import {
@@ -196,6 +205,13 @@ bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
 bot.command("siteops", handleSiteOps);
+bot.command("ban_user", handleBanUser);
+bot.command("ban_tg", handleBanTg);
+bot.command("ban_wallet", handleBanWallet);
+bot.command("unban_user", handleUnbanUser);
+bot.command("unban_wallet", handleUnbanWallet);
+bot.command("ban_list", handleBanList);
+bot.command("ban_sweep", handleBanSweep);
 bot.command("adminlock", handleAdminLock);
 bot.command("adminunlock", handleAdminUnlock);
 bot.command("sitedisable", handleSiteDisable);

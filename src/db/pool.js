@@ -681,6 +681,34 @@ export async function applyStartupPatches() {
        posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        PRIMARY KEY (chat_id, milestone_key)
      )`,
+    // Per-user / per-wallet bans for the borrow flow. Banned users
+    // can still /start the bot, view stats, etc. — but every borrow
+    // path consults isUserBanned + isAnyWalletBanned and refuses to
+    // open new loans. Idempotent inserts on the operator side; rows
+    // are explicitly tracked with banned_at + banned_by + reason for
+    // auditability.
+    `CREATE TABLE IF NOT EXISTS banned_users (
+       user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+       telegram_id BIGINT,
+       banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       banned_by TEXT,
+       reason TEXT,
+       notes TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS banned_users_tgid_idx
+       ON banned_users(telegram_id) WHERE telegram_id IS NOT NULL`,
+    // Wallet-level bans — catches the case where a banned user
+    // imports their wallet into a new account, or where the same
+    // wallet is shared between accounts. The pre-borrow check
+    // consults this for the ACTIVE wallet on every loan attempt.
+    `CREATE TABLE IF NOT EXISTS banned_wallets (
+       wallet_pubkey TEXT PRIMARY KEY,
+       banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       banned_by TEXT,
+       reason TEXT,
+       related_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+       notes TEXT
+     )`,
     // Tweet IDs we've already cross-posted to the community group.
     // Prevents both the auto-poller and the manual /crosspost from
     // posting the same tweet twice. tweet_id is X's numeric ID stored

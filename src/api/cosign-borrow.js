@@ -40,6 +40,7 @@ import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
 import { connection } from "../solana/connection.js";
+import { isWalletBanned } from "../services/bans.js";
 
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
@@ -265,6 +266,32 @@ export async function handleCosignBorrow(req) {
   );
   if (!borrowerAlreadySigned) {
     return { status: 400, body: { error: "Borrower has not signed yet — co-sign endpoint signs last" } };
+  }
+
+  // Gate 4 (NEW, 2026-06-07): borrower wallet must not be on the ban list.
+  // Catches the case where a banned wallet attempts to open a loan via
+  // the web path. Wallet-level ban applies regardless of which TG account
+  // (if any) owns it.
+  const borrowerSig = tx.signatures.find(
+    (s) => !s.publicKey.equals(LENDER_PUBKEY) && s.signature !== null,
+  );
+  if (borrowerSig) {
+    const borrowerPubkey = borrowerSig.publicKey.toBase58();
+    try {
+      if (await isWalletBanned(borrowerPubkey)) {
+        console.warn(`[cosign-borrow] refused — banned wallet ${borrowerPubkey}`);
+        return {
+          status: 403,
+          body: {
+            error: "This wallet is restricted from opening new loans.",
+            detail: "Contact support if you believe this is in error.",
+          },
+        };
+      }
+    } catch (banErr) {
+      // Fail open — don't break legit borrows on transient DB issues.
+      console.warn("[cosign-borrow] ban check failed (fail-open):", banErr.message);
+    }
   }
 
   // All gates passed. Add the lender signature.

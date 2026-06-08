@@ -10,6 +10,8 @@ import { incrementBorrowed } from "../services/reputation.js";
 import { checkLoanLimits } from "../services/loan-limits.js";
 import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 import { renderRiskBlock } from "../services/token-risk-preview.js";
+import { preBorrowBanCheck } from "../services/bans.js";
+import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 
 const LTV_TIERS = [
   { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
@@ -375,6 +377,39 @@ export function registerBorrowCallbacks(bot) {
         `⚠️ *Loan limit reached*\n\n${limitCheck.reason}\n\nTier: *${limitCheck.tier}*\nRun /borrow to try a smaller amount.`,
         { parse_mode: "Markdown" },
       );
+      return;
+    }
+
+    // ── Ban registry check ──
+    // Operator-controlled deny-list. Applied AFTER loan-limits so the
+    // generic "limit reached" message is shown for normal cases, but
+    // we still refuse the actual loan open for known-bad actors.
+    const banResult = await preBorrowBanCheck({
+      userId: state.userId,
+      telegramId: ctx.from?.id,
+    });
+    if (banResult?.blocked) {
+      pending.delete(ctx.chat.id);
+      await ctx.editMessageText(
+        "⚠️ This account is restricted from opening new loans.\n\nIf you believe this is a mistake, contact support.",
+      );
+      return;
+    }
+
+    // ── Anti-exploit parametric defenses ──
+    // Live liquidity floor + rapid-fire cap + new-account cap + pool-pct cap.
+    // Built in direct response to the $FATHER oracle-manipulation attack
+    // (2026-06-07). All thresholds env-tunable; check fails open on errors.
+    const exploitCheck = await preBorrowAntiExploitCheck({
+      userId: state.userId,
+      collateralMint: state.selected.mint,
+      proposedLoanLamports: loanAmountCheck,
+    });
+    if (exploitCheck?.blocked) {
+      pending.delete(ctx.chat.id);
+      await ctx.editMessageText(`⚠️ *Borrow refused*\n\n${exploitCheck.message}`, {
+        parse_mode: "Markdown",
+      });
       return;
     }
 
