@@ -40,18 +40,20 @@ import { listEnabledChats } from "./community-moderation.js";
 import { answerGroupQuestion } from "./community-pip.js";
 
 const PROACTIVE_DISABLED = process.env.PIP_PROACTIVE_DISABLED === "1";
-// Operator directive 2026-06-07: "Pip should be more active in the TG."
-// Bumped daily cap 5 → 12 + dropped wait threshold 10min → 4min + tightened
-// per-chat pickup gap 1h → 20min so Pip steps in faster on unanswered
-// Magpie questions. Sonnet cost at the new ceiling: ~12 × $0.005 =
-// $0.06/day/chat worst-case — still well under any meaningful budget.
-const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 12);
-const QUESTION_PICKUP_INTERVAL_MS = 3 * 60 * 1000;   // sweep more often
+// Operator directives:
+//   2026-06-07a: "Pip should be more active in the TG"
+//   2026-06-07b: "Pip didn't respond. We need users to know we are
+//                 acknowledging their questions."
+// Cumulative tuning: faster sweep cadence (1min), shorter wait before
+// Pip jumps in (45s), higher daily cap (20), shorter per-chat gap
+// (5min). Cost at the new ceiling: ~20 × $0.005 = $0.10/day/chat worst-case.
+const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 20);
+const QUESTION_PICKUP_INTERVAL_MS = 60 * 1000;       // sweep every minute
 const MILESTONE_INTERVAL_MS = 30 * 60 * 1000;
-const QUESTION_MIN_AGE_MS = 4 * 60 * 1000;           // step in faster
+const QUESTION_MIN_AGE_MS = 45 * 1000;               // 45s — fast enough to feel responsive
 const QUESTION_MAX_AGE_MS = 60 * 60 * 1000;          // ignore older than 1h
-const PICKUP_GAP_MS = 20 * 60 * 1000;                // 20min between pickups in a chat (was 1h)
-const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;         // 3h between milestone posts
+const PICKUP_GAP_MS = 5 * 60 * 1000;                 // 5min between Pip pickups in a chat
+const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;
 
 // Command-cheatsheet reminder cadence.
 //   - Checked every 15min (cheap)
@@ -132,11 +134,16 @@ const QUESTION_KEYWORDS = [
   "extend", "topup", "top-up", "refer", "referral", "pool",
   "keeper", "vault", "auto-protect", "autoprotect", "wallet",
   "stake", "swap", "claim", "audit", "rugged", "scam",
+  "reward", "airdrop", "distribution", "snapshot",
+  // wallets users commonly mention (questions about Phantom support
+  // are extremely common — "if i hold in Phantom will i get rewards")
+  "phantom", "solflare", "backpack", "ledger", "trezor", "hardware",
   // common how-to verbs
   "how do i", "how does", "how can", "what happens", "what's the",
   "what is", "can i ", "is it safe", "is it possible", "is there",
   "do i need", "what tier", "how long", "when does", "when will",
   "why does", "anyone know", "anyone using",
+  "will i", "will i get", "do i get", "where do i",
 ];
 
 // Short keywords (lp, fee, ltv) match inside common words ("help" →

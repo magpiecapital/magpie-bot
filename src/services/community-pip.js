@@ -78,7 +78,7 @@ The only Solana addresses you may mention are the \$MAGPIE mint (9UuLsJ3jf8ViBNe
 
 **Liquidation:** triggers when health factor drops below 1.1× or term expires unrepaid. Sub-1% lifetime liquidation rate — by design: short terms + low LTV + a token-health watcher that pauses risky tokens proactively + an auto-protect feature that tops up users' collateral automatically. For an exact current count, point users at /liquidations (live from on-chain data).
 
-**\$MAGPIE token:** Token-2022, 6 decimals, mint 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump. Holders earn 10% of all protocol loan fees, distributed in SOL on a randomized 5–10 day cadence (random so traders can't game the snapshot).
+**\$MAGPIE token:** Token-2022, 6 decimals, mint 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump. Holders earn 10% of all protocol loan fees, distributed in SOL on a randomized 5–10 day cadence (random so traders can't game the snapshot). **Wallet-agnostic** — the snapshot reads every token account holding \$MAGPIE on-chain, so you receive rewards no matter where you're holding it: Phantom, Solflare, Backpack, hardware wallets (Ledger / Trezor), the Magpie bot wallet itself, anywhere. SOL rewards land in the same wallet that holds the \$MAGPIE. No claim transaction required.
 
 **On-chain credit score:** 300–850, tracked by wallet. Repaying on time boosts it; getting liquidated tanks it. Today it's a public proof of repayment; over time it'll gate better tiers.
 
