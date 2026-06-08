@@ -14,18 +14,20 @@ import { query } from "../db/pool.js";
 import { getAdminId } from "./admin-notify.js";
 
 const ADMIN_TG_ID = getAdminId() || null;
-const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 60 * 60 * 1000; // 1h
+const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 15 * 60 * 1000; // 15min — was 1h, now tight
 
-// Tier index → minimum age in minutes
-// Note: tiers 1 (2h) and 2 (8h) were both removed because the AI
-// auto-ticket-resolver now handles stale tickets autonomously every
-// 30 min. The only thing that should still ping admin is a TRUE
-// dead-letter case — a ticket that the AI tried to resolve, sent
-// the user a follow-up, and the user STILL hasn't acted on 24h+ later
-// AND the ticket isn't closed. At that point it might be a critical
-// issue the AI mishandled or a user who needs human attention.
+// 2026-06-08 — reinstated multi-tier alerting after a ticket sat 12h+
+// without admin notice (user complained publicly in TG). Previously the
+// watcher relied on the AI auto-resolver doing everything, with admin
+// alert only at 24h. That left a gap when the resolver didn't fire or
+// the ticket needed human judgment. Now alerts compound — admin sees
+// the ticket at 2h, again at 6h, again at 12h, again at 24h. Each tier
+// is one-shot per ticket so no spam, just visibility.
 const TIERS = [
-  { idx: 3, mins: 24 * 60, emoji: "🔴", label: "24h+ open — AI auto-resolver didn't get a user response" },
+  { idx: 1, mins: 2 * 60,  emoji: "🟡", label: "2h+ open — AI may still be working but admin should be aware" },
+  { idx: 2, mins: 6 * 60,  emoji: "🟠", label: "6h+ open — AI auto-resolver hasn't closed this" },
+  { idx: 3, mins: 12 * 60, emoji: "🔴", label: "12h+ open — user is likely getting frustrated" },
+  { idx: 4, mins: 24 * 60, emoji: "🚨", label: "24h+ open — DEAD LETTER, handle ASAP" },
 ];
 
 function tierForAge(ageMins) {

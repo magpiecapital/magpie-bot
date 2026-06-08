@@ -718,6 +718,34 @@ export async function handleCommunityWebsite(ctx) {
   });
 }
 
+/* ─────────────────────────── /x402 ─────────────────────────── */
+
+export async function handleCommunityX402(ctx) {
+  const text = [
+    `🤖 *magpie · x402 (agent-native API)*`,
+    ``,
+    `AI agents pay in SOL to query our on-chain lending protocol — credit scores, loan history, pool stats, borrow simulation.`,
+    ``,
+    `*No API keys. No accounts. No custody.* Agents sign x402 payment proofs from their own wallets.`,
+    ``,
+    `First paid lending API on Solana. Targets the agent-spending tailwind: as machine-to-machine commerce grows, this is a new consumer market for the Solana permissionless lending space.`,
+    ``,
+    `[magpie.capital/x402](${SITE_URL}/x402) · [GitHub](https://github.com/magpiecapital/magpie-x402)`,
+  ].join("\n");
+  await ctx.reply(text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: false,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🌐 magpie.capital/x402", url: `${SITE_URL}/x402` },
+          { text: "📦 GitHub", url: "https://github.com/magpiecapital/magpie-x402" },
+        ],
+      ],
+    },
+  });
+}
+
 /* ─────────────────────────── /whitepaper ─────────────────────────── */
 
 export async function handleCommunityWhitepaper(ctx) {
@@ -1340,6 +1368,9 @@ const COMMUNITY_CMD_HANDLERS = {
   scams: handleCommunityScam,          // alias
   website: handleCommunityWebsite,
   site: handleCommunityWebsite,        // alias
+  x402: handleCommunityX402,
+  agent: handleCommunityX402,          // alias — common ask format
+  agents: handleCommunityX402,         // alias
   docs: handleCommunityDocs,
   whitepaper: handleCommunityWhitepaper,
   wp: handleCommunityWhitepaper,       // alias — common abbreviation
