@@ -29,11 +29,18 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
-import { getReadOnlyProgram, chooseProgramIdForLoan } from "../solana/program.js";
+import {
+  getReadOnlyProgram,
+  chooseProgramIdForLoan,
+  PROGRAM_ID,
+  PROGRAM_ID_V2,
+  PROGRAM_ID_V3,
+} from "../solana/program.js";
 import {
   markLoanRepaid,
   recordPartialRepay,
   recordExtendLoan,
+  recordLoan,
 } from "../services/loans.js";
 
 const PER_LOAN_MIN_INTERVAL_MS = 2_000;
@@ -95,8 +102,71 @@ export async function handleSyncLoan(req) {
        FROM loans WHERE loan_pda = $1`,
     [loan_pda],
   );
+
+  // 1b) Loan not yet in DB — this happens for site borrows whose
+  // cosign-borrow path doesn't record the row inline. Read live state
+  // and insert via the canonical recordLoan() helper (which also fires
+  // referral accrual + $MAGPIE holder pool + LP loyalty accrual).
   if (!dbLoan) {
-    return { status: 404, body: { error: "loan_pda not found in DB" } };
+    // Try every known program ID until one decodes the account.
+    let onChainNew = null;
+    let resolvedProgramId = null;
+    for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean)) {
+      try {
+        const prog = getReadOnlyProgram(candidate);
+        onChainNew = await prog.account.loan.fetch(loanPk);
+        resolvedProgramId = candidate;
+        break;
+      } catch { /* try next */ }
+    }
+    if (!onChainNew) {
+      return {
+        status: 404,
+        body: { error: "loan_pda not found in DB and could not decode on any known program" },
+      };
+    }
+    const borrowerStr = onChainNew.borrower.toBase58();
+    const { rows: [walletRow] } = await query(
+      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+      [borrowerStr],
+    );
+    if (!walletRow) {
+      // Borrower's wallet isn't linked to a Magpie account — likely an
+      // agent borrow whose synthetic user was already created by the
+      // agent endpoint. Still surface clearly rather than panicking.
+      return {
+        status: 404,
+        body: { error: "borrower wallet not linked to any Magpie user", borrower: borrowerStr },
+      };
+    }
+    try {
+      await recordLoan({
+        userId: walletRow.user_id,
+        loanId: onChainNew.loanId.toString(),
+        loanPda: loan_pda,
+        collateralMint: onChainNew.collateralMint.toBase58(),
+        collateralAmount: onChainNew.collateralAmount.toString(),
+        loanAmountLamports: onChainNew.loanAmount.toString(),
+        originalLoanAmountLamports: onChainNew.repayAmount.toString(),
+        ltvPercentage: Math.round(Number(onChainNew.ltvBps) / 100),
+        durationDays: Number(onChainNew.durationDays),
+        txSignature: signature ?? null,
+        programId: resolvedProgramId.toBase58(),
+        borrowerWallet: borrowerStr,
+      });
+    } catch (err) {
+      // Unique-constraint races (someone else recorded first) are fine.
+      if (!/duplicate|unique/i.test(err.message)) {
+        return {
+          status: 500,
+          body: { error: "record_loan_failed", detail: err.message?.slice(0, 200) },
+        };
+      }
+    }
+    return {
+      status: 200,
+      body: { ok: true, action: "recorded_new_loan", loan_id: onChainNew.loanId.toString() },
+    };
   }
 
   // 2) Fetch the live on-chain state. The DB row carries program_id

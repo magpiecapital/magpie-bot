@@ -370,8 +370,66 @@ export async function handleCosignBorrow(req) {
     };
   }
 
+  // Persist the loan to the DB inline. Without this, site borrows
+  // land on-chain but never surface in the activity feed, /stats
+  // lifetime totals, leaderboards, or referral / $MAGPIE-holder /
+  // LP-loyalty fee accrual. Fail-soft — if any step here fails, the
+  // /api/v1/sync-loan endpoint (called by the site post-submit) will
+  // catch the row up. Also returns loan_pda in the response so the
+  // site can call sync-loan as a safety net.
+  let recordedLoanPda = null;
+  try {
+    const { getReadOnlyProgram } = await import("../solana/program.js");
+    const { recordLoan } = await import("../services/loans.js");
+    const program = getReadOnlyProgram(chosenProgramId);
+    const magpieIx = tx.instructions.find((ix) =>
+      ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
+    );
+    if (magpieIx) {
+      // Loan PDA is at index 2 in the request_and_fund_loan accounts
+      // (pool, loan_token_vault, loan, ...). We've already validated
+      // there's exactly one magpie ix above, so grab it directly.
+      const loanAccountKey = magpieIx.keys[2]?.pubkey;
+      const borrowerAccountKey = magpieIx.keys[8]?.pubkey;
+      if (loanAccountKey && borrowerAccountKey) {
+        recordedLoanPda = loanAccountKey.toBase58();
+        const onChainLoan = await program.account.loan.fetch(loanAccountKey);
+        const borrowerStr = borrowerAccountKey.toBase58();
+        const { rows: [walletRow] } = await query(
+          `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+          [borrowerStr],
+        );
+        if (walletRow) {
+          await recordLoan({
+            userId: walletRow.user_id,
+            loanId: onChainLoan.loanId.toString(),
+            loanPda: recordedLoanPda,
+            collateralMint: onChainLoan.collateralMint.toBase58(),
+            collateralAmount: onChainLoan.collateralAmount.toString(),
+            loanAmountLamports: onChainLoan.loanAmount.toString(),
+            originalLoanAmountLamports: onChainLoan.repayAmount.toString(),
+            ltvPercentage: Math.round(Number(onChainLoan.ltvBps) / 100),
+            durationDays: Number(onChainLoan.durationDays),
+            txSignature: signature,
+            programId: chosenProgramId.toBase58(),
+            borrowerWallet: borrowerStr,
+          });
+        } else {
+          console.warn(
+            `[cosign-borrow] no wallet row for borrower ${borrowerStr} — site sync-loan will catch up`,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    // Don't fail the request — the on-chain tx already succeeded.
+    // sync-loan from the site (or the every-5-min reconciler) will
+    // fold this into DB shortly.
+    console.warn("[cosign-borrow] post-submit recordLoan failed (sync-loan will catch up):", err.message);
+  }
+
   return {
     status: 200,
-    body: { ok: true, signature },
+    body: { ok: true, signature, loan_pda: recordedLoanPda },
   };
 }
