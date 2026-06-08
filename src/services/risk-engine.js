@@ -433,8 +433,20 @@ export function startRiskEngine(bot) {
       // Generate predictive liquidation signals
       const signals = await generateLiquidationSignals();
 
-      // Notify users of critical signals
-      const criticalSignals = signals.filter(s => s.severity === "critical");
+      // Notify users of critical signals.
+      //
+      // 2026-06-08: removed liquidity_drain from the user-DM path. Bug
+      // report from a borrower with 4-5x health receiving alarming
+      // "liquidation risk" alerts whenever the protocol's pool depth
+      // thinned. liquidity_drain is a PROTOCOL-level signal (operator
+      // delists the mint, screener pauses new borrows) — it's not
+      // something an over-collateralized borrower can act on. The
+      // signal is still computed and logged; the auto-token-health
+      // watcher handles the protocol-side response.
+      const USER_DM_TYPES = new Set(["volatility_spike", "rug_detected", "expiry_risk"]);
+      const criticalSignals = signals.filter(
+        (s) => s.severity === "critical" && USER_DM_TYPES.has(s.type),
+      );
       for (const sig of criticalSignals) {
         try {
           const { rows: [user] } = await query(
@@ -445,7 +457,6 @@ export function startRiskEngine(bot) {
 
           const msgs = {
             volatility_spike: `⚠️ <b>Risk Alert:</b> Your collateral token is experiencing extreme volatility. Consider adding collateral or repaying.`,
-            liquidity_drain: `⚠️ <b>Liquidity Alert:</b> Your collateral token's liquidity has dropped significantly. This increases liquidation risk.`,
             rug_detected: `🚨 <b>CRITICAL:</b> Rug-pull indicators detected on your collateral token! Repay immediately to recover your assets.`,
             expiry_risk: `⏰ <b>Expiry Alert:</b> Your loan expires in less than ${sig.metadata.hoursUntilDue}h. Repay or extend now.`,
           };
