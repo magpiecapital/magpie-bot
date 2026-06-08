@@ -201,14 +201,32 @@ export function startPriceAttestor(intervalMs = 30_000) {
     }
     if (tokens.length === 0) return; // idle — nothing to keep fresh
 
-    // Single batch Jupiter fetch for all enabled mints (1-2 calls instead of N).
-    // On failure (rate limit, transient), skip the whole tick — next one retries.
+    // Single batch Jupiter fetch for all enabled mints (1-2 calls
+    // instead of N). On failure (rate limit, transient), fall back to
+    // per-mint fetches via getPriceInSol — which itself has Jupiter
+    // retry + DexScreener fallback baked in. Slower but resilient:
+    // we'd rather attest a few prices per tick than zero. Zero
+    // attestations stalls every on-chain borrow with StalePriceAttestation
+    // after 2 minutes.
     let priceMap;
     try {
       priceMap = await getPricesInSolBatch(tokens.map((t) => t.mint));
     } catch (err) {
-      console.error(`[PriceAttestor] Batch price fetch failed (will retry next tick): ${err.message}`);
-      return;
+      console.error(`[PriceAttestor] Batch fetch failed (${err.message}) — falling back to per-mint`);
+      priceMap = new Map();
+      for (const t of tokens) {
+        try {
+          const p = await getPriceInSol(t.mint);
+          if (p) priceMap.set(t.mint, p);
+        } catch (perMintErr) {
+          // Skip silently — this individual mint will retry next tick
+        }
+      }
+      if (priceMap.size === 0) {
+        console.error("[PriceAttestor] No prices recovered from any source — will retry next tick");
+        return;
+      }
+      console.warn(`[PriceAttestor] Per-mint fallback recovered ${priceMap.size}/${tokens.length} prices`);
     }
 
     let initsThisTick = 0;
