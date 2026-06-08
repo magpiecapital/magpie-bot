@@ -21,7 +21,65 @@
  * Expiry of 15 min minimizes the window for guessing attacks.
  */
 import crypto from "node:crypto";
+import { createHash } from "node:crypto";
 import { query } from "../db/pool.js";
+
+/**
+ * Site-native account auto-bootstrap.
+ *
+ * The original link flow assumed every user started on Telegram and
+ * later connected the site. As we migrate to site-first, that
+ * assumption inverts: most new users connect Phantom on
+ * magpie.capital and never touch Telegram. Forcing them through the
+ * /link <code> dance just to chat with Pip is friction we don't
+ * want — and it implied TG was mandatory, which it isn't.
+ *
+ * This helper auto-creates a Magpie user record + wallets row for
+ * any site-connected wallet. The user is identified by a synthetic
+ * negative telegram_id derived from a sha256 of the wallet pubkey.
+ * Real TG users always have POSITIVE int64 ids; using the negative
+ * half guarantees we can never collide with a real TG account.
+ * Idempotent — calling repeatedly for the same wallet returns the
+ * same user_id.
+ *
+ * TG remains a fully supported BACKUP path. A user can:
+ *   - Connect on the site only (auto-bootstrap creates everything)
+ *   - Connect on TG only (existing /start flow)
+ *   - Use /link to bond an existing site-only account with a TG account
+ *     (existing flow unchanged)
+ */
+function syntheticTelegramIdForWallet(walletPubkey) {
+  const h = createHash("sha256").update(walletPubkey).digest();
+  // Take low 6 bytes, +1 so we never produce 0, negate. 2^48 ≈ 2.8×10^14
+  // distinct values — collision chance is astronomically low.
+  const low48 = h.readUIntBE(0, 6);
+  return -(low48 + 1);
+}
+
+export async function findOrCreateSiteUser(walletPubkey) {
+  const synthTg = syntheticTelegramIdForWallet(walletPubkey);
+  // Upsert the user row. ON CONFLICT (telegram_id) ensures we get
+  // the same user every time for the same wallet.
+  const { rows } = await query(
+    `INSERT INTO users (telegram_id, telegram_username)
+       VALUES ($1, $2)
+       ON CONFLICT (telegram_id) DO UPDATE
+         SET telegram_username = EXCLUDED.telegram_username
+       RETURNING id`,
+    [synthTg, `site_${walletPubkey.slice(0, 8)}`],
+  );
+  const userId = rows[0].id;
+  // Bond the wallet. ON CONFLICT (public_key) DO NOTHING means if
+  // the wallet was already linked to a different user (real TG
+  // account), we leave that bond untouched.
+  await query(
+    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
+     VALUES ($1, $2, '', '', '', 'site_native', TRUE)
+     ON CONFLICT (public_key) DO NOTHING`,
+    [userId, walletPubkey],
+  );
+  return userId;
+}
 
 const CODE_LENGTH = 8;
 const CODE_TTL_MS = 15 * 60 * 1000;
@@ -129,15 +187,39 @@ export async function handleLinkStatus(req, url) {
   if (!isValidPubkey(wallet)) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
   }
-  const { rows } = await query(
+  let rows;
+  ({ rows } = await query(
     `SELECT u.id, u.telegram_id, u.telegram_username
        FROM wallets w JOIN users u ON u.id = w.user_id
       WHERE w.public_key = $1
       LIMIT 1`,
     [wallet],
-  );
+  ));
   if (rows.length === 0) {
-    return { status: 200, body: { linked: false } };
+    // Auto-bootstrap a site-native account so this wallet can chat
+    // with Pip + transact immediately, no Telegram required. TG
+    // remains a fully supported (but optional) backup identity path.
+    try {
+      await findOrCreateSiteUser(wallet);
+      // Re-read the user row we just created so the response shape
+      // matches what the chat panel expects.
+      ({ rows } = await query(
+        `SELECT u.id, u.telegram_id, u.telegram_username
+           FROM wallets w JOIN users u ON u.id = w.user_id
+          WHERE w.public_key = $1
+          LIMIT 1`,
+        [wallet],
+      ));
+    } catch (err) {
+      console.error("[link-status] auto-bootstrap failed:", err.message);
+      return { status: 200, body: { linked: false, error: "bootstrap_failed" } };
+    }
+    if (rows.length === 0) {
+      // Bootstrap succeeded but the read came back empty — extremely
+      // unlikely (write race?). Surface as not-linked so the UI
+      // doesn't lie.
+      return { status: 200, body: { linked: false } };
+    }
   }
   const u = rows[0];
   // Look up the user's currently-active custodial wallet — the one
