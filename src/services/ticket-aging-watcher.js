@@ -14,7 +14,7 @@ import { query } from "../db/pool.js";
 import { getAdminId } from "./admin-notify.js";
 
 const ADMIN_TG_ID = getAdminId() || null;
-const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 15 * 60 * 1000; // 15min — was 1h, now tight
+const POLL_INTERVAL_MS = Number(process.env.TICKET_AGE_WATCH_MS) || 10 * 60 * 1000; // 10min — every-10 cadence per operator directive
 
 // 2026-06-08 — reinstated multi-tier alerting after a ticket sat 12h+
 // without admin notice (user complained publicly in TG). Previously the

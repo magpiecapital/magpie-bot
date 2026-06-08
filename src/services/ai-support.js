@@ -3254,6 +3254,21 @@ const TOOL_HANDLERS = {
        RETURNING id`,
       [userId, `[AI-escalated] ${detail}`],
     );
+
+    // Fire-and-forget: kick the auto-resolver IMMEDIATELY for this
+    // brand-new ticket. The user gets their "ticket opened" message
+    // first; the AI follow-up DM lands seconds later via the resolver's
+    // own send. Critical-reason tickets (security_incident, bug_report,
+    // refund_request) are SKIP_REASONS in the resolver so admin still
+    // gets primacy on those.
+    if (botRef) {
+      const SKIP_REASONS = ["security_incident", "bug_report", "refund_request"];
+      if (!SKIP_REASONS.includes(escalation_reason)) {
+        import("./auto-ticket-resolver.js")
+          .then(({ resolveTicketImmediate }) => resolveTicketImmediate(botRef, t.id))
+          .catch((err) => console.warn(`[ai-support] immediate-resolve fire for #${t.id} failed:`, err.message));
+      }
+    }
     return { ticket_id: t.id, status: "open", reason: escalation_reason };
   },
 };

@@ -28,11 +28,11 @@ import { query } from "../db/pool.js";
 import { chatWithAgent, resetConversation, isAiSupportEnabled } from "./ai-support.js";
 import { getAdminId } from "./admin-notify.js";
 
-const POLL_INTERVAL_MS = Number(process.env.AUTO_RESOLVER_POLL_MS) || 15 * 60 * 1000; // 15 min — tighter cadence so follow-ups don't sit
-const MIN_TICKET_AGE_MS = 30 * 60 * 1000;          // 30 min — give live response time on FIRST ticket
-const MIN_FOLLOWUP_AGE_MS = 3 * 60 * 1000;          // 3 min — follow-ups already have an AI thread, engage fast
+const POLL_INTERVAL_MS = Number(process.env.AUTO_RESOLVER_POLL_MS) || 10 * 60 * 1000; // 10 min — safety net
+const MIN_TICKET_AGE_MS = 60 * 1000;                // 60s — engage almost immediately
+const MIN_FOLLOWUP_AGE_MS = 60 * 1000;              // 60s — follow-ups engage as fast as first reports
 const MAX_PER_TICK = 5;                             // cap burst spend at ~$0.10/tick
-const FIRST_RUN_DELAY_MS = 5 * 60 * 1000;          // 5 min after boot
+const FIRST_RUN_DELAY_MS = 60 * 1000;               // 60s after boot
 // After this many user follow-ups with no resolution, escalate to admin
 // rather than have the AI keep trying. The AI clearly isn't cracking it.
 const DEAD_LETTER_FOLLOWUP_COUNT = 3;
@@ -70,6 +70,39 @@ function unwrapTicketMessage(message) {
   // Manual ticket — message is the user's verbatim text. Use as-is but
   // strip any "[follow-up N]" prefixes that user-followup adds.
   return message;
+}
+
+/**
+ * Fire-and-forget immediate resolution for a freshly-created ticket.
+ *
+ * Called from the AI's open_support_ticket tool right after the INSERT.
+ * Skips the 60s grace window (the resolver's normal min-age) — this
+ * is the very first AI engagement on the ticket, equivalent to the
+ * AI answering inline, but routed through the ticket flow so the
+ * user gets a real DM with Resolved/Follow-up buttons.
+ *
+ * Caller MUST swallow the promise — never await this in the user-
+ * facing request path. The user already got their "ticket opened"
+ * acknowledgement; this is what happens in the next ~5 seconds.
+ */
+export async function resolveTicketImmediate(bot, ticketId) {
+  if (!bot) return { ok: false, reason: "no_bot_ref" };
+  try {
+    const { rows } = await query(
+      `SELECT t.id, t.user_id, t.message, t.followup_count,
+              u.telegram_id, u.telegram_username
+         FROM support_tickets t
+         JOIN users u ON u.id = t.user_id
+        WHERE t.id = $1 AND t.status = 'open'`,
+      [ticketId],
+    );
+    const t = rows[0];
+    if (!t) return { ok: false, reason: "ticket_not_open" };
+    return await resolveTicket(bot, t);
+  } catch (err) {
+    console.warn(`[auto-resolver] immediate fire for #${ticketId} failed:`, err.message);
+    return { ok: false, reason: err.message?.slice(0, 100) };
+  }
 }
 
 async function resolveTicket(bot, ticket) {
