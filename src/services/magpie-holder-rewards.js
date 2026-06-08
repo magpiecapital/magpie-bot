@@ -283,6 +283,51 @@ export async function snapshotMagpieHolders() {
     byOwner.set(owner, (byOwner.get(owner) ?? 0n) + amount);
   }
 
+  // ── Credit $MAGPIE tokens locked as loan collateral ──
+  // When a user borrows against their $MAGPIE, the tokens move into
+  // the lending program's collateralVault PDA. That PDA's owner is
+  // the program, so the contract-exclusion sweep below would filter
+  // those vaults out, silently punishing the exact users who are
+  // MOST engaged with the protocol.
+  //
+  // Fix: read every active $MAGPIE-collateralized loan from the DB,
+  // attribute the locked amount to the borrower's wallet, and merge
+  // into byOwner BEFORE the PDA filter runs. This way the PDA sweep
+  // still applies to every wallet (defensive — if a borrower_wallet
+  // were ever a contract, the System-program check below would
+  // exclude it), but real user wallets get fully credited for both
+  // in-wallet AND in-collateral $MAGPIE.
+  try {
+    const { rows: collateralized } = await query(
+      `SELECT borrower_wallet, collateral_amount
+         FROM loans
+        WHERE collateral_mint = $1
+          AND status = 'active'
+          AND borrower_wallet IS NOT NULL`,
+      [MAGPIE_MINT.toBase58()],
+    );
+    let creditedCount = 0;
+    for (const row of collateralized) {
+      const owner = row.borrower_wallet;
+      if (!owner || EXCLUDED_WALLETS.has(owner)) continue;
+      const locked = BigInt(String(row.collateral_amount || "0"));
+      if (locked <= 0n) continue;
+      byOwner.set(owner, (byOwner.get(owner) ?? 0n) + locked);
+      creditedCount++;
+    }
+    if (creditedCount > 0) {
+      console.log(
+        `[holder-rewards] Crediting ${creditedCount} active $MAGPIE-collateralized loan(s) into the holder snapshot`,
+      );
+    }
+  } catch (err) {
+    // Don't fail the whole snapshot — log and continue with on-chain-only.
+    console.error(
+      "[holder-rewards] Failed to merge collateralized $MAGPIE into snapshot (continuing with on-chain only):",
+      err.message,
+    );
+  }
+
   // Critical: filter out PDAs / smart-contract accounts (pools, vaults,
   // bonding curves). Real Solana wallets are owned by System Program; any
   // other owner-program means the account is a contract or PDA — these
