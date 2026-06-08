@@ -35,6 +35,8 @@ import {
   handleExemptAdd,
   handleExemptRemove,
   handleExemptList,
+  handleSetTokenCap,
+  handleTokenCapList,
 } from "./commands/bans.js";
 import { handleTicketPulse } from "./commands/ticket-pulse.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
@@ -227,6 +229,8 @@ bot.command("exempt_add", handleExemptAdd);
 bot.command("exempt_remove", handleExemptRemove);
 bot.command("exempt_list", handleExemptList);
 bot.command("ticket_pulse", handleTicketPulse);
+bot.command("set_token_cap", handleSetTokenCap);
+bot.command("token_caps", handleTokenCapList);
 bot.command("adminlock", handleAdminLock);
 bot.command("adminunlock", handleAdminUnlock);
 bot.command("sitedisable", handleSiteDisable);

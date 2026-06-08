@@ -210,6 +210,79 @@ export async function handleExploitReport(ctx) {
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
 
+/* ────────────────────── TOKEN CAP COMMANDS ────────────────────── */
+
+export async function handleSetTokenCap(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const args = parseArgs(ctx);
+  if (!args[0] || !args[1]) {
+    return ctx.reply(
+      "Usage: `/set_token_cap <mint> <sol_amount|unlimited|default>`\n\n" +
+        "• `<sol_amount>` — cap in SOL (e.g. 100)\n" +
+        "• `unlimited` — no cap (recommended for $MAGPIE)\n" +
+        "• `default` — fall back to protocol default (10 SOL)",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const mint = args[0];
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
+    return ctx.reply("That doesn't look like a valid Solana mint.");
+  }
+  const arg = args[1].toLowerCase();
+  let maxLamports;
+  let display;
+  if (arg === "unlimited") {
+    maxLamports = 0n;
+    display = "unlimited (no cap)";
+  } else if (arg === "default") {
+    maxLamports = null;
+    display = "default (protocol-wide cap applies)";
+  } else {
+    const sol = Number(arg);
+    if (!Number.isFinite(sol) || sol < 0) {
+      return ctx.reply("SOL amount must be a non-negative number, or `unlimited`/`default`.");
+    }
+    maxLamports = BigInt(Math.floor(sol * 1e9));
+    display = `${sol} SOL`;
+  }
+
+  const { rowCount } = await query(
+    `UPDATE supported_mints SET max_open_lamports = $2 WHERE mint = $1`,
+    [mint, maxLamports === null ? null : maxLamports.toString()],
+  );
+  if (!rowCount) {
+    return ctx.reply(`No supported_mints row for \`${mint}\` — enable it first via /enablemint.`, { parse_mode: "Markdown" });
+  }
+  await ctx.reply(
+    `✅ Token cap set: \`${mint}\` → ${display}`,
+    { parse_mode: "Markdown" },
+  );
+}
+
+export async function handleTokenCapList(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const { rows } = await query(
+    `SELECT mint, symbol, max_open_lamports
+       FROM supported_mints
+      WHERE enabled = TRUE
+        AND max_open_lamports IS NOT NULL
+      ORDER BY max_open_lamports::numeric DESC NULLS LAST`,
+  );
+  const lines = ["🏷 *Per-token cap overrides*", ""];
+  if (!rows.length) {
+    lines.push("(none — all tokens use protocol default)");
+  } else {
+    for (const r of rows) {
+      const val = r.max_open_lamports;
+      const display = String(val) === "0" ? "unlimited" : `${(Number(val) / 1e9).toFixed(2)} SOL`;
+      lines.push(`  • *${r.symbol}* → ${display}  \`${r.mint}\``);
+    }
+  }
+  lines.push("", "_Default for everything else: 10 SOL (env BORROW_PER_TOKEN_OPEN_CAP_SOL)_");
+  lines.push("Set via `/set_token_cap <mint> <sol|unlimited|default>`");
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
 /* ────────────────────── EXEMPT WALLET COMMANDS ────────────────────── */
 
 export async function handleExemptAdd(ctx) {

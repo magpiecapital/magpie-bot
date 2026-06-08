@@ -772,6 +772,15 @@ export async function applyStartupPatches() {
        added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        reason TEXT
      )`,
+    // Per-token open-loan cap override. NULL = use protocol default
+    // (BORROW_PER_TOKEN_OPEN_CAP_SOL, currently 10 SOL). 0 = unlimited
+    // (no cap). Positive value = override in lamports.
+    //
+    // Set after operator confirms a token is deep enough to take more
+    // exposure (high market cap, deep pool, established history).
+    // $MAGPIE auto-defaults to unlimited (it's our protocol token —
+    // there's no upside in arbitrarily capping borrows against it).
+    `ALTER TABLE supported_mints ADD COLUMN IF NOT EXISTS max_open_lamports NUMERIC(20,0)`,
   ];
   for (const sql of patches) {
     try {
