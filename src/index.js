@@ -1,6 +1,22 @@
 import { Bot } from "grammy";
 import "dotenv/config";
 
+// Fail-fast privacy assertion — refuses to start the bot if any
+// public-route handler under src/api/ surfaces telegram_username in
+// a response. This catches regressions BEFORE they ship, so a future
+// code change can never accidentally re-expose user TG handles to
+// anyone with a wallet pubkey. If a flag is a false positive, add
+// the file to SIGNED_OWNER_ONLY in scripts/check-privacy.js with a
+// comment explaining why exposure there is acceptable.
+import { assertNoPrivacyLeaksOrThrow } from "../scripts/check-privacy.js";
+try {
+  assertNoPrivacyLeaksOrThrow();
+  console.log("[privacy-lint] startup check passed — no telegram_username leaks in public handlers");
+} catch (privacyErr) {
+  console.error(privacyErr.message);
+  process.exit(1);
+}
+
 import { handleStart, registerStartCallbacks } from "./commands/start.js";
 import { handleDeposit } from "./commands/deposit.js";
 import { handlePositions } from "./commands/positions.js";
