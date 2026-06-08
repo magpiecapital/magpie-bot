@@ -1,0 +1,22 @@
+[package]
+name = "magpie-lending-v3"
+version = "0.1.0"
+description = "Magpie lending v3 — on-chain TWAP variant. Stores rolling price samples in a ring buffer per mint and validates borrow LTV against the time-weighted average instead of single-spot. Defeats pump-and-borrow oracle manipulation. v1/v2 programs continue serving existing loans untouched; v3 is a parallel deploy."
+edition = "2021"
+rust-version = "1.79"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "magpie_lending_v3"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl = "0.32.1"
