@@ -258,14 +258,24 @@ async function handleReferrals(req, url) {
     };
   }
   const botUsername = process.env.BOT_USERNAME || "magpie_capital_bot";
-  const shareLink = summary.code
+  const siteUrl = (process.env.MAGPIE_SITE_URL || "https://magpie.capital").replace(/\/$/, "");
+  // Dual share links so referrers can pick the surface that fits
+  // their audience. share_link kept for backward compat (TG-targeted).
+  // site_share_link is the magpie.capital landing with ?ref= — the
+  // site captures it via RefCapture and attributes on auto-bootstrap.
+  const tgShareLink = summary.code
     ? `https://t.me/${botUsername}?start=${summary.code}`
+    : null;
+  const siteShareLink = summary.code
+    ? `${siteUrl}?ref=${summary.code}`
     : null;
   return {
     status: 200,
     body: {
       code: summary.code,
-      share_link: shareLink,
+      share_link: tgShareLink,           // backward-compat (TG audience)
+      site_share_link: siteShareLink,    // for the magpie.capital audience
+      tg_share_link: tgShareLink,        // explicit alias
       reward_bps: REFERRAL_REWARD_BPS,
       reward_pct: REFERRAL_REWARD_BPS / 100,
       min_claim_lamports: MIN_CLAIM_LAMPORTS.toString(),
