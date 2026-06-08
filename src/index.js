@@ -1,5 +1,9 @@
 import { Bot } from "grammy";
 import "dotenv/config";
+// Side-effect import: wraps console.error/warn to record into an
+// in-memory ring buffer that's exposed via /api/v1/debug/recent-errors.
+// Keep this as the FIRST non-dotenv import so it catches everything.
+import "./lib/error-ring.js";
 
 import { handleStart, registerStartCallbacks } from "./commands/start.js";
 import { handleDeposit } from "./commands/deposit.js";

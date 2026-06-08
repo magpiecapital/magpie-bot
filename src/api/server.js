@@ -72,6 +72,7 @@ import {
   handleAgentListIntents,
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
+import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
 import { handleSiteWithdraw } from "./withdraw.js";
@@ -1321,6 +1322,9 @@ const PUBLIC_ROUTES = new Set([
   // or write anything that isn't already true on-chain — so it's safe
   // to expose without auth.
   "/api/v1/sync-loan",
+  // Live-debug ring buffer of recent console.error/warn output. No
+  // PII; bounded in-memory; cleared on restart.
+  "/api/v1/debug/recent-errors",
 ]);
 
 async function router(req, res) {
@@ -1522,6 +1526,11 @@ async function router(req, res) {
         break;
       case "/api/v1/sync-loan":
         result = await handleSyncLoan(req);
+        break;
+      case "/api/v1/debug/recent-errors":
+        // Live tail of console.error/warn. Safe to expose — no PII,
+        // cleared on restart, bounded at 200 entries.
+        result = await handleDebugRecentErrors(req, url);
         break;
       case "/api/v1/lender-alarm-webhook":
         result = await handleLenderAlarmWebhook(req);
