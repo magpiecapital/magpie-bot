@@ -17,8 +17,12 @@
  * is executed — this is a calculator only. Operator approves the
  * actual transfer separately.
  */
-import "dotenv/config";
-import { query } from "../src/db/pool.js";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+const { query } = await import("../src/db/pool.js");
 
 function flag(name, fallback = null) {
   const i = process.argv.indexOf(name);

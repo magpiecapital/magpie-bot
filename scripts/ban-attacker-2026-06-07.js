@@ -18,9 +18,13 @@
  *
  * Idempotent — safe to re-run; ON CONFLICT updates the row.
  */
-import "dotenv/config";
-import { query } from "../src/db/pool.js";
-import { banUser, banWallet } from "../src/services/bans.js";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+const { query } = await import("../src/db/pool.js");
+const { banUser, banWallet } = await import("../src/services/bans.js");
 
 const execute = process.argv.includes("--execute");
 

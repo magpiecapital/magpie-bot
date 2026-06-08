@@ -6,8 +6,12 @@
  * Reads support_tickets where status is not closed/resolved, including
  * a specific ticket id when --id <N> is passed.
  */
-import "dotenv/config";
-import { query } from "../src/db/pool.js";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+const { query } = await import("../src/db/pool.js");
 
 const idArg = process.argv.indexOf("--id");
 const targetId = idArg >= 0 ? Number(process.argv[idArg + 1]) : null;

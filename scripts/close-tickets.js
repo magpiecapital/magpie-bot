@@ -14,8 +14,14 @@
  *   node scripts/close-tickets.js <id1,id2,...> --reason "<text>"
  *   node scripts/close-tickets.js <id1,id2,...> --reason "<text>" --dry-run
  */
-import "dotenv/config";
-import { query } from "../src/db/pool.js";
+// Load .env from REPO ROOT (script invoked from arbitrary cwd in some paths).
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+
+const { query } = await import("../src/db/pool.js");
 
 const dryRun = process.argv.includes("--dry-run");
 const reasonIdx = process.argv.indexOf("--reason");

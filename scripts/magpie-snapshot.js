@@ -25,11 +25,16 @@
  *   node scripts/magpie-snapshot.js
  *   node scripts/magpie-snapshot.js --label "tuesday-1234pm-launch"
  */
-import "dotenv/config";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+
 import { writeFileSync } from "node:fs";
-import { snapshotMagpieHolders, MAGPIE_MINT } from "../src/services/magpie-holder-rewards.js";
-import { query } from "../src/db/pool.js";
-import { getAdminId } from "../src/services/admin-notify.js";
+const { snapshotMagpieHolders, MAGPIE_MINT } = await import("../src/services/magpie-holder-rewards.js");
+const { query } = await import("../src/db/pool.js");
+const { getAdminId } = await import("../src/services/admin-notify.js");
 
 const labelIdx = process.argv.indexOf("--label");
 const label = labelIdx >= 0 ? process.argv[labelIdx + 1] : null;

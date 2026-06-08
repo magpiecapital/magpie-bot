@@ -17,8 +17,12 @@
  *   node scripts/send-ticket-nudge.js --stale  # all awaiting_user >24h
  *   node scripts/send-ticket-nudge.js <ids>... --dry-run
  */
-import "dotenv/config";
-import { query } from "../src/db/pool.js";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+const { query } = await import("../src/db/pool.js");
 
 const dryRun = process.argv.includes("--dry-run");
 const useStale = process.argv.includes("--stale");

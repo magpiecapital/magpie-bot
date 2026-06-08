@@ -14,9 +14,16 @@
  * The reply text MUST be read from a file (not cmdline) because we use
  * Markdown and cmdline escaping is too fragile.
  */
-import "dotenv/config";
+// Load .env from REPO ROOT regardless of cwd (dynamic import the
+// DB module afterward, since static import would hoist above dotenv).
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(REPO_ROOT, ".env") });
+
 import { readFileSync } from "node:fs";
-import { query } from "../src/db/pool.js";
+const { query } = await import("../src/db/pool.js");
 
 const ticketId = Number(process.argv[2]);
 if (!Number.isInteger(ticketId) || ticketId <= 0) {

@@ -9,7 +9,11 @@
  *   node scripts/send-sol-from-lender.js --to <pubkey> --sol <N> --memo "<text>" --dry-run
  *   node scripts/send-sol-from-lender.js --to <pubkey> --sol <N> --memo "<text>" --execute
  */
-import "dotenv/config";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import dotenv from "dotenv";
+const __REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+dotenv.config({ path: join(__REPO_ROOT, ".env") });
 import {
   Connection,
   PublicKey,
