@@ -23,6 +23,7 @@ import {
   unbanWallet as _unbanWallet,
 } from "../services/bans.js";
 import { traceAndBanFunders } from "../services/funding-graph.js";
+import { invalidateExemptCache } from "../services/anti-exploit.js";
 
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx.from?.id)) {
@@ -206,6 +207,90 @@ export async function handleExploitReport(ctx) {
     }
   }
 
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
+/* ────────────────────── EXEMPT WALLET COMMANDS ────────────────────── */
+
+export async function handleExemptAdd(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const args = parseArgs(ctx);
+  if (!args[0]) {
+    return ctx.reply("Usage: `/exempt_add <pubkey> [reason words...]`", { parse_mode: "Markdown" });
+  }
+  const pubkey = args[0];
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(pubkey)) {
+    return ctx.reply("That doesn't look like a valid Solana pubkey.");
+  }
+  const reason = args.slice(1).join(" ") || null;
+  await query(
+    `INSERT INTO borrow_exempt_wallets (wallet_pubkey, added_by, reason)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (wallet_pubkey) DO UPDATE
+       SET added_by = EXCLUDED.added_by,
+           reason = COALESCE(EXCLUDED.reason, borrow_exempt_wallets.reason),
+           added_at = NOW()`,
+    [pubkey, String(ctx.from?.id ?? "operator"), reason],
+  );
+  invalidateExemptCache();
+  await ctx.reply(
+    `✅ Wallet \`${pubkey}\` added to borrow-exempt list.\n\n` +
+      `Bypasses: imported-wallet cooldown + new-account cap.\n` +
+      `Still subject to: bans, per-token cap, pool floor, TWAP, rapid-fire.\n` +
+      `Reason: ${reason ?? "(none)"}`,
+    { parse_mode: "Markdown" },
+  );
+}
+
+export async function handleExemptRemove(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const args = parseArgs(ctx);
+  if (!args[0]) {
+    return ctx.reply("Usage: `/exempt_remove <pubkey>`", { parse_mode: "Markdown" });
+  }
+  const pubkey = args[0];
+  const { rowCount } = await query(
+    `DELETE FROM borrow_exempt_wallets WHERE wallet_pubkey = $1`,
+    [pubkey],
+  );
+  invalidateExemptCache();
+  await ctx.reply(
+    rowCount
+      ? `✅ Removed \`${pubkey}\` from borrow-exempt list.`
+      : `⚠️ Wallet \`${pubkey}\` was not on the exempt list.`,
+    { parse_mode: "Markdown" },
+  );
+}
+
+export async function handleExemptList(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const { rows } = await query(
+    `SELECT wallet_pubkey, added_by, reason, added_at
+       FROM borrow_exempt_wallets
+      ORDER BY added_at DESC`,
+  );
+  const envList = (process.env.BORROW_EXEMPT_WALLETS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const lines = ["🪶 *Borrow-exempt wallets*", ""];
+  if (envList.length) {
+    lines.push("*Env-configured (BORROW_EXEMPT_WALLETS):*");
+    for (const w of envList) lines.push(`  • \`${w}\``);
+    lines.push("");
+  }
+  lines.push(`*DB-managed (${rows.length}):*`);
+  if (!rows.length) {
+    lines.push("  (none)");
+  } else {
+    for (const r of rows) {
+      lines.push(
+        `  • \`${r.wallet_pubkey}\` — ${r.reason ?? "(no reason)"} _(by ${r.added_by})_`,
+      );
+    }
+  }
+  lines.push("", "Manage with `/exempt_add` and `/exempt_remove`.");
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
 

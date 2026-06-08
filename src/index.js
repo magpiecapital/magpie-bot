@@ -32,6 +32,9 @@ import {
   handleBanList,
   handleBanSweep,
   handleExploitReport,
+  handleExemptAdd,
+  handleExemptRemove,
+  handleExemptList,
 } from "./commands/bans.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
 import { handleSiteDisable, handleSiteEnable, handleSiteState } from "./commands/site-toggle.js";
@@ -219,6 +222,9 @@ bot.command("unban_wallet", handleUnbanWallet);
 bot.command("ban_list", handleBanList);
 bot.command("ban_sweep", handleBanSweep);
 bot.command("exploit_report", handleExploitReport);
+bot.command("exempt_add", handleExemptAdd);
+bot.command("exempt_remove", handleExemptRemove);
+bot.command("exempt_list", handleExemptList);
 bot.command("adminlock", handleAdminLock);
 bot.command("adminunlock", handleAdminUnlock);
 bot.command("sitedisable", handleSiteDisable);

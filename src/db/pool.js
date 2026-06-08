@@ -760,6 +760,18 @@ export async function applyStartupPatches() {
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`,
     `ALTER TABLE loans ADD COLUMN IF NOT EXISTS suspended_reason TEXT`,
     `CREATE INDEX IF NOT EXISTS loans_suspended_idx ON loans(suspended) WHERE suspended = TRUE`,
+    // Borrow-exempt wallet allowlist. Operator-controlled. Bypasses the
+    // wallet/account profile gates in preBorrowAntiExploitCheck (imported-
+    // wallet cooldown, new-account cap). All systemic gates (TWAP, pool
+    // floor, per-token cap, rapid-fire, bans) still apply.
+    // Union'd with the BORROW_EXEMPT_WALLETS env var so emergency env-
+    // configured exemptions keep working alongside DB-managed ones.
+    `CREATE TABLE IF NOT EXISTS borrow_exempt_wallets (
+       wallet_pubkey TEXT PRIMARY KEY,
+       added_by TEXT,
+       added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       reason TEXT
+     )`,
   ];
   for (const sql of patches) {
     try {

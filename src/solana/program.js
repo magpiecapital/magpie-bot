@@ -22,6 +22,18 @@ export const PROGRAM_ID_V2 = process.env.PROGRAM_ID_V2
   ? new PublicKey(process.env.PROGRAM_ID_V2)
   : null;
 
+// v3 = on-chain TWAP memecoin program. Only routable when BOTH:
+//   - PROGRAM_ID_V3 is set (program deployed to mainnet)
+//   - ROUTE_MEMECOINS_TO_V3=true (operator flipped the switch)
+// Default behavior: memecoin borrows continue to route to v1, identical
+// to today. Flipping the env routes NEW borrows to v3; v1 loans already
+// open continue to repay/extend/liquidate via v1 because chooseProgramIdForLoan
+// reads loans.program_id from the DB.
+export const PROGRAM_ID_V3 = process.env.PROGRAM_ID_V3
+  ? new PublicKey(process.env.PROGRAM_ID_V3)
+  : null;
+const ROUTE_MEMECOINS_TO_V3 = process.env.ROUTE_MEMECOINS_TO_V3 === "true";
+
 // Categories that should route to v2 once it's deployed. Source of truth
 // for the category vocabulary lives in supported_mints.category — keep in
 // sync with isRwa() in token-screener.js.
@@ -43,12 +55,20 @@ export function isRwaCategory(category) {
 
 /**
  * Pick the program ID for a NEW borrow against the given collateral category.
- * RWAs route to v2 (newer Token-2022 extension support). Everything else —
- * and ALL flows if v2 isn't configured — routes to v1. Fail-safe: when in
- * doubt, return v1, which is the deployed-and-tested program.
+ *
+ *   RWA (stock/etf/metal) → v2 (if configured)
+ *   memecoin (default)    → v3 (if configured AND ROUTE_MEMECOINS_TO_V3=true)
+ *                          otherwise v1
+ *
+ * Fail-safe: when in doubt, return v1, which is the deployed-and-tested
+ * program. The env-gating means v3 only activates when the operator
+ * explicitly confirms deploy + readiness.
  */
 export function chooseProgramIdForCategory(category) {
   if (PROGRAM_ID_V2 && RWA_CATEGORIES.has(category)) return PROGRAM_ID_V2;
+  if (PROGRAM_ID_V3 && ROUTE_MEMECOINS_TO_V3 && !RWA_CATEGORIES.has(category)) {
+    return PROGRAM_ID_V3;
+  }
   return PROGRAM_ID;
 }
 
@@ -60,9 +80,12 @@ export function chooseProgramIdForCategory(category) {
  * into the RWA pool. Callers in the borrow flow MUST call this.
  */
 export function assertProgramMatchesCategory(programId, category) {
-  if (!PROGRAM_ID_V2) return; // single-program deploy — nothing to check
-  const routesToV2 = programId && PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2);
+  if (!programId) return;
   const isRwa = RWA_CATEGORIES.has(category);
+  const routesToV2 = PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2);
+  const routesToV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
+
+  // v2 is RWA-only. Memecoin → v2 is the $FATHER class of vulnerability.
   if (routesToV2 && !isRwa) {
     throw new Error(
       `Program/category mismatch: v2 pool requires RWA category, got "${category ?? "<null>"}". ` +
@@ -70,7 +93,15 @@ export function assertProgramMatchesCategory(programId, category) {
         `supported_mints.category column.`,
     );
   }
-  if (!routesToV2 && isRwa) {
+  // v3 is memecoin-only (TWAP-protected lending). RWA should go to v2.
+  if (routesToV3 && isRwa) {
+    throw new Error(
+      `Program/category mismatch: v3 pool is for memecoins only, got RWA category "${category}". ` +
+        `RWAs belong in v2 — check chooseProgramIdForCategory.`,
+    );
+  }
+  // RWA on v1 is also a routing error (RWAs belong in v2).
+  if (!routesToV2 && !routesToV3 && isRwa && PROGRAM_ID_V2) {
     throw new Error(
       `Program/category mismatch: category "${category}" is RWA but program routes to v1. ` +
         `RWAs belong in v2 — check chooseProgramIdForCategory.`,
