@@ -130,6 +130,10 @@ async function readJsonBody(req) {
 }
 
 export async function handleCosignBorrow(req) {
+  // Trace every hit so the operator can confirm in Railway logs whether
+  // failed site borrows are even reaching the bot. The token after
+  // COSIGN_HIT is the precise UTC timestamp — easy to grep.
+  console.log(`[cosign-borrow] COSIGN_HIT ${new Date().toISOString()} method=${req.method}`);
   if (req.method !== "POST") {
     return { status: 405, body: { error: "POST only" } };
   }
