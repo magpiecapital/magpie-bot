@@ -197,8 +197,13 @@ export async function handleCosignBorrow(req) {
       return {
         status: 403,
         body: {
-          error: "instruction program not allowed in co-signed tx",
+          // Inline the rejected program ID in `error` so it surfaces in
+          // the user-visible toast — otherwise debugging requires the
+          // dev-tools Network tab.
+          error: `instruction program not allowed in co-signed tx: outer ix[${i}] targets ${programIdStr}`,
           detail: `outer instruction ${i} targets program ${programIdStr}; allowed: ${[...OUTER_INSTRUCTION_PROGRAM_ALLOWLIST].join(", ")}`,
+          rejected_program_id: programIdStr,
+          rejected_index: i,
         },
       };
     }
