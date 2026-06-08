@@ -108,18 +108,29 @@ export async function handleSyncLoan(req) {
   // and insert via the canonical recordLoan() helper (which also fires
   // referral accrual + $MAGPIE holder pool + LP loyalty accrual).
   if (!dbLoan) {
-    // Try every known program ID until one decodes the account.
+    // RPC propagation lag: even though the borrow tx confirmed, the
+    // loan PDA can take a few seconds to be readable from some RPC
+    // nodes. Retry with backoff before giving up — the site calls
+    // sync-loan immediately after waitConfirmed, and that's exactly
+    // when this race is hottest.
     let onChainNew = null;
     let resolvedProgramId = null;
-    for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean)) {
-      try {
-        const prog = getReadOnlyProgram(candidate);
-        onChainNew = await prog.account.loan.fetch(loanPk);
-        resolvedProgramId = candidate;
-        break;
-      } catch { /* try next */ }
+    const RETRY_DELAYS_MS = [0, 1500, 3000, 6000];
+    for (let attempt = 0; attempt < RETRY_DELAYS_MS.length && !onChainNew; attempt++) {
+      if (RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+      }
+      for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean)) {
+        try {
+          const prog = getReadOnlyProgram(candidate);
+          onChainNew = await prog.account.loan.fetch(loanPk);
+          resolvedProgramId = candidate;
+          break;
+        } catch { /* try next program / next attempt */ }
+      }
     }
     if (!onChainNew) {
+      console.error(`[sync-loan] could not decode ${loan_pda.slice(0, 8)}... on any program after retries`);
       return {
         status: 404,
         body: { error: "loan_pda not found in DB and could not decode on any known program" },
@@ -134,11 +145,13 @@ export async function handleSyncLoan(req) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
       // agent borrow whose synthetic user was already created by the
       // agent endpoint. Still surface clearly rather than panicking.
+      console.error(`[sync-loan] borrower wallet ${borrowerStr} not in wallets table — loan ${loan_pda.slice(0, 8)}... cannot be attributed`);
       return {
         status: 404,
         body: { error: "borrower wallet not linked to any Magpie user", borrower: borrowerStr },
       };
     }
+    console.error(`[sync-loan] inserting new loan ${loan_pda.slice(0, 8)}... user=${walletRow.user_id} borrower=${borrowerStr.slice(0, 8)}...`);
     try {
       await recordLoan({
         userId: walletRow.user_id,
