@@ -41,6 +41,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { connection } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
+import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
+import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
 import { query } from "../db/pool.js";
 
 // Programs the lender authority has privileges over
@@ -340,6 +342,100 @@ export async function handleCosignBorrow(req) {
       // Fail open — don't break legit borrows on transient DB issues.
       console.warn("[cosign-borrow] ban check failed (fail-open):", banErr.message);
     }
+  }
+
+  // Gate 5 (2026-06-08): full anti-exploit gauntlet — per-token cap,
+  // imported-wallet cooldown, rapid-fire cap, new-account cap, pool-pct
+  // cap, $50k live-liquidity floor, off-chain TWAP, cross-source price
+  // agreement. Same gates the TG bot and agent x402 paths run; without
+  // this, the site was a soft underbelly that could re-open the
+  // $FATHER-style attack surface.
+  //
+  // We decode the request_and_fund_loan args to compute the proposed
+  // loan size in lamports, then re-derive collateral value via the
+  // cross-sourced oracle (don't trust the client's claimed value).
+  try {
+    const magpieIx = tx.instructions.find(
+      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
+    );
+    if (magpieIx && borrowerSig) {
+      const data = magpieIx.data; // Buffer
+      // Layout: 8-byte discriminator | amount u64 LE | option u8 | value_lamports u64 LE | loan_id u64 LE
+      if (data.length >= 8 + 8 + 1 + 8 + 8) {
+        const collateralAmountRaw = data.readBigUInt64LE(8);
+        const tierOption = data.readUInt8(8 + 8);
+        const TIER_LTV = { 0: 30, 1: 25, 2: 20 };
+        const ltv = TIER_LTV[tierOption];
+        const collateralMintKey = magpieIx.keys[4]?.pubkey;
+        const borrowerPubkeyStr = borrowerSig.publicKey.toBase58();
+        if (ltv && collateralMintKey) {
+          const collateralMintStr = collateralMintKey.toBase58();
+          // Look up mint metadata for decimals (anti-exploit doesn't need
+          // it, but cross-sourced valuation does).
+          const { rows: [mintRow] } = await query(
+            `SELECT decimals FROM supported_mints WHERE mint = $1`,
+            [collateralMintStr],
+          );
+          if (!mintRow) {
+            return {
+              status: 400,
+              body: { error: "Unsupported collateral mint", detail: `mint ${collateralMintStr} not in supported_mints` },
+            };
+          }
+          // Re-value collateral with our own cross-sourced oracle —
+          // ignore the client's collateral_value_lamports claim.
+          let valueLamports;
+          try {
+            valueLamports = await fetchValueLamports(
+              collateralMintStr,
+              collateralAmountRaw,
+              Number(mintRow.decimals),
+            );
+          } catch (err) {
+            return {
+              status: 502,
+              body: { error: "Price oracle unavailable — please retry", detail: err.message?.slice(0, 200) },
+            };
+          }
+          if (!valueLamports || valueLamports <= 0) {
+            return { status: 400, body: { error: "Collateral value computed to zero" } };
+          }
+          const proposedLoanLamports = Math.floor((Number(valueLamports) * ltv) / 100);
+          // Resolve user_id (linked wallet → user; or null if standalone)
+          const { rows: [walletRow] } = await query(
+            `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
+            [borrowerPubkeyStr],
+          );
+          const exploitCheck = await preBorrowAntiExploitCheck({
+            userId: walletRow?.user_id ?? null,
+            collateralMint: collateralMintStr,
+            proposedLoanLamports,
+            walletPubkey: borrowerPubkeyStr,
+          });
+          if (exploitCheck?.blocked) {
+            console.warn(
+              `[cosign-borrow] anti-exploit refused — ${exploitCheck.reason} (wallet ${borrowerPubkeyStr.slice(0, 8)}…, mint ${collateralMintStr.slice(0, 8)}…)`,
+            );
+            return {
+              status: 403,
+              body: {
+                error: exploitCheck.message || "Borrow refused by anti-exploit policy",
+                reason: exploitCheck.reason,
+              },
+            };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // Fail CLOSED on unexpected anti-exploit infrastructure errors —
+    // unlike the ban check which fails open. The whole point of these
+    // gates is to refuse borrows we can't safely verify.
+    console.error("[cosign-borrow] anti-exploit gate threw:", err.message);
+    return {
+      status: 503,
+      body: { error: "Borrow safety checks temporarily unavailable — please retry shortly" },
+    };
   }
 
   // All gates passed. Add the lender signature.
