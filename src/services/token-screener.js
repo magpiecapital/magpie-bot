@@ -153,8 +153,15 @@ const AUTO_APPROVE = {
 // auto-approvals.
 // Calibrated for pump.fun-era tokens: a 4-hour-old token literally hasn't had
 // 24 hours to accumulate volume, so the volume bar is much lower.
+//
+// Tightened 2026-06-07 after the $FATHER oracle-manipulation attack: $FATHER
+// was approved with $8.5k liquidity (above the previous $5k floor). At that
+// thinness, a small wallet can move price ~10% with a 20-SOL buy, which is
+// exactly how the attacker pumped the collateral before borrowing. The new
+// $25k floor makes the math much worse for the attacker — they'd have to
+// risk far more capital on a doomed pump.
 const MIN_CONSIDER = {
-  minLiquidityUsd: 5_000,
+  minLiquidityUsd: Number(process.env.SCREENER_MIN_LIQUIDITY_USD) || 25_000,
   minHolders: 25,
   minAgeHours: 4,
   minVolume24h: 500,
@@ -891,12 +898,20 @@ function vetToken(onChain, market, holderCount, category) {
       ageHours >= MIN_CONSIDER.minAgeHours &&
       holderOk(minHolders);
   } else {
-    // Memecoins: full safety checks
+    // Memecoins: full safety checks.
+    //
+    // Tightened 2026-06-07: memecoins MUST have a successful holder
+    // lookup (holdersKnown === true) to auto-approve. Previously a
+    // failed lookup short-circuited holderOk to "pass", which is how
+    // $FATHER auto-approved with no holder data. RWA path keeps the
+    // permissive behavior because their holder distribution is managed
+    // by the issuer and a failed lookup is non-diagnostic.
     canAutoApprove =
       !onChain.hasMintAuthority &&
       !onChain.hasFreezeAuthority &&
       market.liquidity >= AUTO_APPROVE.minLiquidityUsd &&
-      holderOk(AUTO_APPROVE.minHolders) &&
+      holdersKnown &&
+      holderCount >= AUTO_APPROVE.minHolders &&
       ageHours >= AUTO_APPROVE.minAgeHours &&
       market.volume24h >= AUTO_APPROVE.minVolume24h &&
       market.marketCap >= AUTO_APPROVE.minMarketCap;
