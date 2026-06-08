@@ -465,12 +465,21 @@ export async function handleCosignBorrow(req) {
       maxRetries: 3,
     });
   } catch (e) {
-    // Surface the cluster's actual error in the toast — without this,
-    // users only see "Submission failed" with no clue what to do.
-    const detail = e.message?.slice(0, 400) ?? "unknown";
+    // Surface every possible field on the error object — message can be
+    // empty when the cluster rejects via a non-Error throw or websocket
+    // failure. Also log the full JSON server-side for debugging.
+    const message = (e && e.message) || "";
+    const code = (e && e.code) || "";
+    const logs = (e && Array.isArray(e.logs)) ? e.logs.slice(-5).join(" | ") : "";
+    const stringified = (() => {
+      try { return JSON.stringify(e, Object.getOwnPropertyNames(e ?? {})).slice(0, 400); }
+      catch { return String(e).slice(0, 400); }
+    })();
+    const detail = [message, code, logs, stringified].filter(Boolean).join(" :: ").slice(0, 600) || "unknown_submission_error";
+    console.error("[cosign-borrow] SUBMISSION_FAILED:", stringified, "logs:", logs);
     return {
       status: 500,
-      body: { error: `Submission failed: ${detail}`, detail },
+      body: { error: `Submission failed: ${detail}`, detail, message, code, logs },
     };
   }
 
