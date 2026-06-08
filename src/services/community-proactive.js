@@ -135,6 +135,8 @@ const QUESTION_KEYWORDS = [
   "keeper", "vault", "auto-protect", "autoprotect", "wallet",
   "stake", "swap", "claim", "audit", "rugged", "scam",
   "reward", "airdrop", "distribution", "snapshot",
+  // tokenomics — burns, supply, treasury
+  "burn", "burned", "burning", "supply", "treasury",
   // wallets users commonly mention (questions about Phantom support
   // are extremely common — "if i hold in Phantom will i get rewards")
   "phantom", "solflare", "backpack", "ledger", "trezor", "hardware",

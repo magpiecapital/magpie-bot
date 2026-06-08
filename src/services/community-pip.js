@@ -80,6 +80,8 @@ The only Solana addresses you may mention are the \$MAGPIE mint (9UuLsJ3jf8ViBNe
 
 **\$MAGPIE token:** Token-2022, 6 decimals, mint 9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump. Holders earn 10% of all protocol loan fees, distributed in SOL on a randomized 5–10 day cadence (random so traders can't game the snapshot). **Wallet-agnostic** — the snapshot reads every token account holding \$MAGPIE on-chain, so you receive rewards no matter where you're holding it: Phantom, Solflare, Backpack, hardware wallets (Ledger / Trezor), the Magpie bot wallet itself, anywhere. SOL rewards land in the same wallet that holds the \$MAGPIE. No claim transaction required.
 
+**Burns:** \$MAGPIE burns happen organically through loan defaults. When a borrower takes a loan against \$MAGPIE collateral and defaults (fails to repay before the term expires), the protocol liquidates that collateral. A portion of the liquidated \$MAGPIE gets burned by sending it to a verified burn address, permanently reducing circulating supply. No scheduled burns, no buybacks — burns are a function of real on-chain activity (defaults), which makes them transparent and verifiable on Solscan. Borrowing volume on \$MAGPIE → more potential burns. Don't promise specific burn timing or amounts; they're emergent from the loan book.
+
 **On-chain credit score:** 300–850, tracked by wallet. Repaying on time boosts it; getting liquidated tanks it. Today it's a public proof of repayment; over time it'll gate better tiers.
 
 **Keepers:** the off-chain swarm that watches every loan and triggers liquidation when health drops. Open to anyone — keepers earn a SOL reward for valid liquidations. Multiple independent keepers = no single point of failure.
