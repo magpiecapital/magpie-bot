@@ -31,6 +31,7 @@ import {
   handleUnbanWallet,
   handleBanList,
   handleBanSweep,
+  handleExploitReport,
 } from "./commands/bans.js";
 import { handleAdminLock, handleAdminUnlock } from "./commands/admin-lock.js";
 import { handleSiteDisable, handleSiteEnable, handleSiteState } from "./commands/site-toggle.js";
@@ -107,7 +108,10 @@ import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
-import { startExploitDetector } from "./services/exploit-detector.js";
+import {
+  startExploitDetector,
+  registerExploitDetectorCallbacks,
+} from "./services/exploit-detector.js";
 import { startPriceSnapshotter } from "./services/price-snapshotter.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
@@ -214,6 +218,7 @@ bot.command("unban_user", handleUnbanUser);
 bot.command("unban_wallet", handleUnbanWallet);
 bot.command("ban_list", handleBanList);
 bot.command("ban_sweep", handleBanSweep);
+bot.command("exploit_report", handleExploitReport);
 bot.command("adminlock", handleAdminLock);
 bot.command("adminunlock", handleAdminUnlock);
 bot.command("sitedisable", handleSiteDisable);
@@ -293,6 +298,7 @@ registerReferCallbacks(bot);
 registerHoldersCallbacks(bot);
 registerReborrowCallbacks(bot);
 registerScreenerCallbacks(bot);
+registerExploitDetectorCallbacks(bot);
 registerStartCallbacks(bot);
 registerFallbackCallbacks(bot);
 

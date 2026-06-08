@@ -146,6 +146,69 @@ export async function handleUnbanWallet(ctx) {
   await ctx.reply(n ? `✅ Unbanned wallet \`${pubkey}\`` : `⚠️ Wallet \`${pubkey}\` was not banned`, { parse_mode: "Markdown" });
 }
 
+export async function handleExploitReport(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const [autoBans, manualBans, funderTraces, suspendedLoans] = await Promise.all([
+    query(
+      `SELECT bu.user_id, bu.telegram_id, bu.reason, bu.banned_at, u.telegram_username
+         FROM banned_users bu
+         LEFT JOIN users u ON u.id = bu.user_id
+        WHERE bu.banned_by = 'exploit-detector'
+          AND bu.banned_at > NOW() - INTERVAL '24 hours'
+        ORDER BY bu.banned_at DESC LIMIT 20`,
+    ),
+    query(
+      `SELECT COUNT(*)::int AS n FROM banned_users
+        WHERE banned_at > NOW() - INTERVAL '24 hours'
+          AND banned_by NOT LIKE 'exploit-%' AND banned_by NOT LIKE 'funding-%'`,
+    ),
+    query(
+      `SELECT action, COUNT(*)::int AS n
+         FROM funding_traces
+        WHERE traced_at > NOW() - INTERVAL '24 hours'
+        GROUP BY action`,
+    ),
+    query(
+      `SELECT l.loan_id, l.user_id, l.suspended_reason, l.suspended_at,
+              u.telegram_username
+         FROM loans l
+         LEFT JOIN users u ON u.id = l.user_id
+        WHERE l.suspended = TRUE
+          AND l.suspended_at > NOW() - INTERVAL '24 hours'
+        ORDER BY l.suspended_at DESC LIMIT 10`,
+    ),
+  ]);
+
+  const lines = ["🛡 *Exploit-detector report — last 24h*", ""];
+  lines.push(`Auto-bans: *${autoBans.rows.length}*`);
+  lines.push(`Manual bans: *${manualBans.rows[0]?.n ?? 0}*`);
+  lines.push(`Suspended loans: *${suspendedLoans.rows.length}*`);
+  const traceTotals = Object.fromEntries(funderTraces.rows.map((r) => [r.action, r.n]));
+  lines.push(
+    `Funder traces: banned=${traceTotals.banned ?? 0}, skipped_cex=${traceTotals.skipped_cex ?? 0}, ` +
+      `skipped_already_banned=${traceTotals.skipped_already_banned ?? 0}`,
+  );
+  lines.push("");
+
+  if (autoBans.rows.length) {
+    lines.push("*Recent auto-bans:*");
+    for (const r of autoBans.rows) {
+      const t = new Date(r.banned_at).toISOString().slice(11, 16);
+      lines.push(`  • [${t}] #${r.user_id} @${r.telegram_username ?? "?"} — ${(r.reason ?? "").slice(0, 60)}`);
+    }
+    lines.push("");
+  }
+
+  if (suspendedLoans.rows.length) {
+    lines.push("*Suspended loans:*");
+    for (const r of suspendedLoans.rows) {
+      lines.push(`  • Loan #${r.loan_id} (u${r.user_id}) — ${(r.suspended_reason ?? "").slice(0, 50)}`);
+    }
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+}
+
 export async function handleBanList(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const [users, wallets] = await Promise.all([
