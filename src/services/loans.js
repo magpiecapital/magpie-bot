@@ -25,6 +25,7 @@ import {
   getProgramForSigner,
   PROGRAM_ID,
   chooseProgramIdForCategory,
+  assertProgramMatchesCategory,
   chooseProgramIdForLoan,
 } from "../solana/program.js";
 import {
@@ -168,6 +169,11 @@ export async function executeBorrow({
   );
   const category = catRows[0]?.category ?? "memecoin";
   const programId = chooseProgramIdForCategory(category);
+  // Hard safety stop — refuse to open a loan if the program/category
+  // pairing is wrong. The v2 pool must NEVER hold memecoin collateral,
+  // and v1 must never hold RWA. Throws if violated; caller surfaces
+  // the error to the user. Post-$FATHER defense in depth.
+  assertProgramMatchesCategory(programId, category);
 
   const borrower = await loadKeypair(userId);
   const program = getProgramForSigner(borrower, programId);

@@ -28,6 +28,20 @@ export const PROGRAM_ID_V2 = process.env.PROGRAM_ID_V2
 const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
 
 /**
+ * The v2 pool is RWA-ONLY. Anything that isn't a tokenized real-world
+ * asset (stock/etf/metal) MUST route to v1. The check is symmetric:
+ *   v2 ⇔ category ∈ RWA_CATEGORIES
+ *
+ * 2026-06-07: hard-coded after the $FATHER incident, where a memecoin
+ * misclassified as "stock" routed to v2 and bypassed memecoin-only
+ * defenses. If you ever add a non-RWA category that should route to
+ * v2, deploy a separate program for it — do NOT broaden this set.
+ */
+export function isRwaCategory(category) {
+  return RWA_CATEGORIES.has(category);
+}
+
+/**
  * Pick the program ID for a NEW borrow against the given collateral category.
  * RWAs route to v2 (newer Token-2022 extension support). Everything else —
  * and ALL flows if v2 isn't configured — routes to v1. Fail-safe: when in
@@ -36,6 +50,32 @@ const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
 export function chooseProgramIdForCategory(category) {
   if (PROGRAM_ID_V2 && RWA_CATEGORIES.has(category)) return PROGRAM_ID_V2;
   return PROGRAM_ID;
+}
+
+/**
+ * Defense-in-depth assertion. Throws if a v2 program ID is paired with a
+ * non-RWA category — that should be impossible if the routing logic is
+ * correct, but catching it here means a corrupt DB row, a manual
+ * /enablemint typo, or future code drift can't silently put a memecoin
+ * into the RWA pool. Callers in the borrow flow MUST call this.
+ */
+export function assertProgramMatchesCategory(programId, category) {
+  if (!PROGRAM_ID_V2) return; // single-program deploy — nothing to check
+  const routesToV2 = programId && PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2);
+  const isRwa = RWA_CATEGORIES.has(category);
+  if (routesToV2 && !isRwa) {
+    throw new Error(
+      `Program/category mismatch: v2 pool requires RWA category, got "${category ?? "<null>"}". ` +
+        `Memecoins must never route to v2. This is a hard safety stop — review the mint's ` +
+        `supported_mints.category column.`,
+    );
+  }
+  if (!routesToV2 && isRwa) {
+    throw new Error(
+      `Program/category mismatch: category "${category}" is RWA but program routes to v1. ` +
+        `RWAs belong in v2 — check chooseProgramIdForCategory.`,
+    );
+  }
 }
 
 /**

@@ -41,6 +41,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { connection } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
+import { query } from "../db/pool.js";
 
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
@@ -223,16 +224,63 @@ export async function handleCosignBorrow(req) {
 
   // Gate 1: at least one magpie-program instruction must be present,
   //          and ALL magpie-program instructions must be allowed.
+  //          Additionally: if the program is v2 (RWA pool), the
+  //          collateral mint's category must be RWA. The borrow ix
+  //          encodes the collateral mint in its accounts; we sniff
+  //          out the program version + cross-check against DB.
   let magpieIxCount = 0;
+  let chosenProgramId = null;
+  let collateralMintInTx = null;
   for (const ix of tx.instructions) {
     if (!isMagpieProgram(ix.programId)) continue;
     magpieIxCount++;
+    chosenProgramId = ix.programId;
+    // request_and_fund_loan accounts layout: see IDL — collateral mint
+    // is one of the accounts. We find it by intersecting tx accounts
+    // with supported_mints. Anchor's account ordering is stable but
+    // version-dependent; the DB lookup is the authoritative bind.
+    // Batch the lookup: gather all tx account pubkeys, query
+    // supported_mints once. The mint among them tells us category.
+    const txKeys = ix.keys.map((m) => m.pubkey.toBase58());
+    try {
+      const { rows } = await query(
+        `SELECT mint, category FROM supported_mints WHERE mint = ANY($1::text[]) LIMIT 1`,
+        [txKeys],
+      );
+      if (rows.length) {
+        collateralMintInTx = { mint: rows[0].mint, category: rows[0].category };
+      }
+    } catch {
+      // DB lookup failure → fail-open here (other gates still apply)
+    }
     if (!instructionAllowed(ix.data)) {
       return {
         status: 403,
         body: {
           error: "instruction not allowed",
           detail: `instruction discriminator ${[...ix.data.slice(0, 8)].join(",")} is not on the co-sign allowlist (request_and_fund_loan only)`,
+        },
+      };
+    }
+  }
+
+  // POST-$FATHER GATE: hard-stop on v2 (RWA pool) borrows of memecoins.
+  // The v2 pool is RWA-only by policy. If the tx's program is v2 BUT the
+  // collateral mint's category is not in {stock, etf, metal}, refuse to
+  // co-sign — even if every other gate passes.
+  if (chosenProgramId && V2_PROGRAM_ID && chosenProgramId.equals(V2_PROGRAM_ID)) {
+    const cat = collateralMintInTx?.category;
+    const RWA_OK = cat === "stock" || cat === "etf" || cat === "metal";
+    if (!RWA_OK) {
+      console.error(
+        `[cosign-borrow] V2-MEMECOIN BLOCK: v2 pool requested with collateral ` +
+          `${collateralMintInTx?.mint ?? "<unknown>"} category=${cat ?? "<null>"}`,
+      );
+      return {
+        status: 403,
+        body: {
+          error: "v2 pool is RWA-only",
+          detail: `collateral category "${cat ?? "<null>"}" is not in {stock,etf,metal}; memecoins must use v1`,
         },
       };
     }

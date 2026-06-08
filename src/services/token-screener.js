@@ -106,30 +106,97 @@ const STOCK_TICKERS = [
 
 const STOCK_SEARCH_QUERIES = STOCK_TICKERS.map((t) => `x${t}`);
 
-// Detect if a token is a tokenized stock based on symbol/name patterns
-function detectCategory(symbol, name) {
-  const sym = symbol.toUpperCase();
+/**
+ * RWA ISSUER ALLOWLIST — tokens whose mint authority is one of these
+ * pubkeys can be classified as tokenized stocks / metals / ETFs.
+ * Anything else stays a memecoin regardless of symbol/name patterns.
+ *
+ * Why: 2026-06-07 — $FATHER (Nvidia CEO memecoin) was classified as
+ * "stock" because its name contained "nvidia". RWA path skips authority
+ * checks, has lower liquidity/holder bars, and routes to a separate
+ * pool with different risk parameters. A memecoin landing in the RWA
+ * pool defeats every memecoin defense we have.
+ *
+ * Fix: name/symbol patterns are NECESSARY but not SUFFICIENT. The mint
+ * authority must positively match a known RWA issuer. Tokens with NO
+ * mint authority (a hallmark of memecoins after graduation) can never
+ * be RWA — RWAs require an issuer to manage supply.
+ *
+ * Add issuers here as we onboard them — empty by default means NO
+ * automatic RWA classification, only operator-set categories survive.
+ */
+const RWA_ISSUER_AUTHORITIES = new Set([
+  // Backed Finance xStock issuers (mainnet). Source: backedfi.com docs.
+  ...(process.env.RWA_ISSUER_AUTHORITIES?.split(",").map((s) => s.trim()).filter(Boolean) ?? []),
+]);
+
+/**
+ * Detect if a token is a tokenized real-world asset.
+ *
+ * Two-gate model:
+ *   1. Symbol/name pattern indicates RWA intent (stock ticker prefix,
+ *      explicit "tokenized" wording, or company name match).
+ *   2. Mint authority is in RWA_ISSUER_AUTHORITIES (positive ID).
+ *
+ * Both must hold. A memecoin that mentions "Tesla" or "Nvidia" but
+ * isn't actually minted by an RWA issuer stays a memecoin and gets
+ * the strict memecoin vetting path.
+ *
+ * Tokens with no mint authority CANNOT be RWA — RWAs require an
+ * issuer to manage supply. (Graduated memecoins commonly have no
+ * mint authority; previously this was a green flag they were stable,
+ * but here it's a strong DISQUALIFIER for RWA classification.)
+ *
+ * onChain may be null (pre-on-chain-fetch); pass null to get the
+ * naive pattern verdict for /reviewtokens display purposes — but
+ * the screener pipeline ALWAYS passes onChain so this only affects
+ * cosmetic preview.
+ */
+function detectCategory(symbol, name, onChain = null) {
+  const sym = (symbol || "").toUpperCase();
   const nm = (name || "").toLowerCase();
 
-  // xStock pattern: "x" prefix + known stock ticker
-  if (sym.startsWith("X") && STOCK_TICKERS.includes(sym.slice(1))) {
+  // Gate 1: does the name/symbol SUGGEST RWA?
+  const patternSuggestsStock =
+    (sym.startsWith("X") && STOCK_TICKERS.includes(sym.slice(1))) ||
+    /\btokenized\b|\bequity\b/.test(nm) ||
+    // Whole-word match for "stock" so "stockton" doesn't trip — and we
+    // require it to appear in a phrase like "X stock" or "stock token",
+    // not arbitrary mentions.
+    /\b(?:stock\s+token|tokenized\s+stock|stock\s+\([a-z]+\))\b/.test(nm) ||
+    [
+      "tesla", "nvidia", "apple", "alphabet", "amazon", "microsoft",
+      "meta platforms", "microstrategy", "coinbase", "netflix", "intel",
+      "uber", "shopify", "block inc", "paypal", "disney", "boeing",
+      "jpmorgan", "goldman",
+    ].some((c) => {
+      // Whole-word match — "nvidia" in "Father of Nvidia" → matches the
+      // pattern but Gate 2 (issuer allowlist) will reject if no mint
+      // authority or unknown issuer.
+      return new RegExp(`\\b${c.replace(/\s+/g, "\\s+")}\\b`).test(nm);
+    });
+
+  if (!patternSuggestsStock) return "memecoin";
+
+  // Gate 2: positive issuer identification. A real RWA must have a
+  // mint authority (issuer manages supply) AND that authority must be
+  // on our allowlist.
+  if (!onChain) {
+    // No on-chain info available (preview-only call) — provisional
+    // verdict matches old behavior, but the actual pipeline ALWAYS
+    // passes onChain so the strict gate applies in production.
     return "stock";
   }
-
-  // Name-based detection
-  if (nm.includes("tokenized") || nm.includes("stock") || nm.includes("equity")) {
-    return "stock";
+  if (!onChain.hasMintAuthority || !onChain.mintAuthority) {
+    // No mint authority = cannot be a real RWA. Memecoin.
+    return "memecoin";
+  }
+  if (!RWA_ISSUER_AUTHORITIES.has(onChain.mintAuthority)) {
+    // Mint authority not on our allowlist = unknown issuer = memecoin.
+    return "memecoin";
   }
 
-  // Known company names
-  const companies = ["tesla", "nvidia", "apple", "alphabet", "amazon", "microsoft",
-    "meta platforms", "microstrategy", "coinbase", "netflix", "intel", "uber",
-    "shopify", "block inc", "paypal", "disney", "boeing", "jpmorgan", "goldman"];
-  if (companies.some((c) => nm.includes(c))) {
-    return "stock";
-  }
-
-  return "memecoin";
+  return "stock";
 }
 
 // ─── Safety thresholds ──────────────────────────────────────────────────────
@@ -346,10 +413,28 @@ async function getOnChainInfo(mintStr) {
     const decimals = data.readUInt8(44);
     const freezeAuthorityOption = data.readUInt32LE(46);
 
+    // Read the actual authority pubkeys when set — needed for RWA issuer
+    // verification (only tokens minted by a known RWA issuer should be
+    // classified as 'stock'/'etf'/'metal').
+    let mintAuthority = null;
+    let freezeAuthority = null;
+    try {
+      if (mintAuthorityOption === 1) {
+        mintAuthority = new PublicKey(data.subarray(4, 36)).toBase58();
+      }
+      if (freezeAuthorityOption === 1) {
+        freezeAuthority = new PublicKey(data.subarray(50, 82)).toBase58();
+      }
+    } catch {
+      // bad pubkey bytes — leave nulls; safer to not classify than to misclassify
+    }
+
     return {
       decimals,
       hasMintAuthority: mintAuthorityOption === 1,
       hasFreezeAuthority: freezeAuthorityOption === 1,
+      mintAuthority,
+      freezeAuthority,
     };
   } catch {
     return null;
@@ -1057,7 +1142,10 @@ async function tick(bot) {
     }
 
     const holderCount = await getHolderCount(mint);
-    const category = detectCategory(market.symbol, market.name);
+    // detectCategory NOW requires onChain for the strict issuer-allowlist
+    // gate (post-$FATHER fix). A memecoin whose name happens to mention
+    // a tickered company can no longer slip into the RWA path.
+    const category = detectCategory(market.symbol, market.name, onChain);
 
     const { verdict, safetyScore, fails, ageHours } = vetToken(onChain, market, holderCount, category);
 
