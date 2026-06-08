@@ -24,7 +24,8 @@
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
     "grammy": "^1.33.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/bn.js": "^5.2.0",
