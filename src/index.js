@@ -136,6 +136,7 @@ import {
   registerExploitDetectorCallbacks,
 } from "./services/exploit-detector.js";
 import { startPriceSnapshotter } from "./services/price-snapshotter.js";
+import { startExtendLoanWatcher } from "./services/extend-loan-watcher.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
@@ -464,6 +465,12 @@ bot.start({
     });
     startDbHealth(bot); // Start immediately — monitors DB connectivity
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
+    // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1
+    // (SECURITY-AUDIT-ANCHOR-2026-06-09.md). Polls confirmed program
+    // sigs every 30s, audits extend_loan instructions, applies a
+    // credit-score penalty on detected fee-wallet evasion. Removed
+    // once v3 ships with the on-chain owner constraint.
+    setTimeout(() => startExtendLoanWatcher(), 40_000);
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
     // queries supported_mints (enabled=TRUE) every tick, so newly approved
     // tokens get attested without a restart. Drift-gated to keep cost low.
