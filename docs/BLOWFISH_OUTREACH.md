@@ -247,7 +247,7 @@ If any of those don't match, the registry's auto-build produces a different bina
 Run locally on the tagged commit (~15 min):
 
 ```bash
-cd /Users/[redacted]/bagbank-bot
+cd path/to/bagbank-bot
 # Tag a candidate release
 git tag v1.0.0-candidate
 

@@ -216,11 +216,16 @@ const FORBIDDEN_OUTPUT_PATTERNS = [
   /\bmy\s+instructions\b/i,
   /\bjailbreak/i,
   /\bdeveloper\s+mode\b/i,
-  // Operator-identifying terms — never in output
-  /\b[redacted]\b/i,
-  /\b[redacted]\b/i,
-  /\b[redacted]\b/i,
-  /\b[redacted-dev]\b/i,
+  // Operator-identifying terms — never in output. Patterns are
+  // expressed in Unicode escapes so the source file does NOT contain
+  // the literal names that anyone reading the public repo can grep.
+  // The regex engine decodes \uXXXX at parse time; runtime behavior
+  // is identical to the literal form, but the source string never
+  // shows the names.
+  /\b\u0062\u0072\u0061\u0064\u006c\u0065\u0079\b/i,
+  /\b\u006c\u0075\u0062\u0065\u0074\u006b\u0069\u006e\b/i,
+  /\b\u0062\u0072\u0061\u0064\u006c\u0065\u0079\u006c\u0075\u0062\u0065\u0074\u006b\u0069\u006e\b/i,
+  /\b\u0074\u0068\u0065\u006d\u0065\u006d\u0065\u0062\u0061\u006e\u006b\u0065\u0072\b/i,
 ];
 
 /**
