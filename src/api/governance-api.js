@@ -39,9 +39,15 @@ const lastBySigner = new Map();
  */
 const ACTIVE_PROPOSALS = {
   "MGP-001": {
+    // Voting window shifted on 2026-06-09 to open 2026-06-10 00:00 UTC
+    // so holders get a clean day after the rescope. The activation gate
+    // (issuedAt >= activated_at_iso) rejects any vote payload signed
+    // before 2026-06-10. Status stays "active" so the proposal page
+    // renders as the lead surface, but votes won't be accepted until
+    // the gate opens.
     status: "active",
-    activated_at_iso: "2026-06-09T00:00:00Z",
-    closes_at_iso: "2026-06-12T23:59:59Z",
+    activated_at_iso: "2026-06-10T00:00:00Z",
+    closes_at_iso: "2026-06-13T23:59:59Z",
     questions: {
       Vote: { choices: ["YES", "NO", "ABSTAIN"] },
     },
