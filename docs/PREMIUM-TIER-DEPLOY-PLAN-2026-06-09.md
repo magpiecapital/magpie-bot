@@ -22,7 +22,10 @@ This document is the plan-of-attack — what's shipping, the order, the code dif
 **Pool structure:** separate liquidity pool for Premium tiers. v3 program, fresh `initialize_pool` call, own vault, own LP positions. v1 pool unaffected. Existing v1 loans continue under v1 program ID; existing v1 LPs continue earning v1 fee shares.
 
 **Why this design:**
-- **Tokenized stocks only at launch** because memecoins at 40%+ LTV / 15+ day duration are a coinflip even with strict screening. Stocks have institutional-grade price feeds (Pyth) and fundamentally lower volatility. Memecoin expansion is a follow-up after 90 days of Premium operating data.
+- **Two collateral tracks at launch:**
+  - **Equity track** — tokenized stocks (NVDAx, COINx, TSLAx, AAPLx, MSFTx). Institutional Pyth feeds, low volatility, full Premium parameters (45% LTV @ 15d, 40% LTV @ 30d).
+  - **Blue-chip Solana memecoin track** — top-tier memecoins ($PUMP, $BONK, $FARTCOIN, $TROLL). More conservative parameters (35% LTV @ 15d, 30% LTV @ 30d) to absorb higher volatility, plus tighter screener thresholds ($500K 24h volume floor vs $250K for equities, max-unwind ceiling 30 min vs 60 min). No long-tail / random pump.fun graduates — only protocol-recognized blue-chips.
+  - Memecoin expansion beyond these four is a follow-up after 90 days of Premium operating data — both tracks evaluated independently.
 - **Two duration options, different parameters per duration** because the risk profile changes with time-at-risk: shorter duration tolerates a more aggressive LTV; longer duration needs lower LTV plus a higher fee to compensate for added duration risk.
 - **Separate pool** because Premium-tier liquidation cascades should not eat existing LP yield. Premium LPs opt in to a different risk profile and earn Premium-only fees.
 - **Tier B operator discretion not Tier A vote** because (a) MGP-002 was withdrawn in favor of executive decision, (b) loan-duration changes are explicitly Tier B in v0 GOVERNANCE.md, (c) a future MGP-NNN can move loan-duration into Tier A via Tier C escalation if the community wants that authority back. Operator's choice not to escalate is within scope.
@@ -35,19 +38,44 @@ This document is the plan-of-attack — what's shipping, the order, the code dif
 
 ## 1. Final tier parameters
 
-| Parameter | Premium-15 | Premium-30 | Notes |
+Two collateral tracks share the Premium-15 / Premium-30 duration structure but apply different LTV + fee parameters and screener thresholds based on the volatility class.
+
+### 1a. Equity track (tokenized stocks)
+
+| Parameter | Premium-15-EQ | Premium-30-EQ | Notes |
 |---|---|---|---|
 | **Term** | 15 days | 30 days | Hard-coded in v3 `TIER_DURATION_DAYS` |
 | **LTV cap** | 45% | 40% | Hard-coded in v3 `TIER_LTV_BPS` |
 | **Upfront fee** | 3.5% | 5.0% | Hard-coded in v3 `TIER_FEE_BPS` |
 | **Per-loan cap (launch)** | 10 SOL | 10 SOL | Env: `PREMIUM_TIER_MAX_LOAN_LAMPORTS` |
 | **Per-token aggregate cap (launch)** | 10 SOL | 10 SOL | `premium_tier_whitelist.max_open_lamports` |
-| **Liquidation gauntlet** | TWAP + cross-source + post-borrow watcher (existing) + on-chain TWAP (v3 ships this) | Same | No new defenses; reuses existing + v3's on-chain TWAP |
-| **Eligible collateral** | Tokenized stocks on whitelist | Same | Screener Gate 1+2 enforce |
-| **Eligible borrowers** | 3+ clean repays, no liquidations in 90d | Same | Screener Gate 6 enforces |
-| **Liquidation reward** | Same `keeper_reward_bps` as v1 | Same | No change to liquidator economics |
-| **Fee split (Premium pool)** | Per MGP-001 outcome (60% holders / 30% Premium-LPs / 5% referrer / 2% LP loyalty / 3% protocol if it passes; otherwise current 80/10/5/2/3) | Same | Premium LPs participate in the same split table; their share of the 30% (or 80% if MGP-001 fails) is pro-rata to their Premium-pool deposit share |
-| **Allowed borrower wallet states** | Per existing bot gates (anti-exploit gauntlet still applies) | Same | No relaxation |
+| **Eligible collateral** | Tokenized stocks on the Equity whitelist | Same | Screener Gate 1 (category=stock) + Gate 2 (whitelist) |
+| **24h volume floor** | $250K | Same | Screener Gate 4 |
+| **Max liquidation unwind** | ≤ 60 min | Same | Screener Gate 5 |
+| **Eligible borrowers** | 3+ clean repays, no liquidations in 90d | Same | Screener Gate 6 |
+
+### 1b. Blue-chip Solana memecoin track
+
+Only the top-tier Solana memecoins with verified depth, multiple oracle sources, and established holder distribution. No long-tail / random pump.fun graduates — this whitelist is intentionally narrow.
+
+| Parameter | Premium-15-BC | Premium-30-BC | Notes |
+|---|---|---|---|
+| **Term** | 15 days | 30 days | Same on-chain duration constants |
+| **LTV cap** | 35% | 30% | More conservative than equity — absorbs higher volatility |
+| **Upfront fee** | 4.5% | 6.5% | Higher fee compensates for higher volatility risk |
+| **Per-loan cap (launch)** | 5 SOL | 5 SOL | Half of equity cap — tighter blast radius while gathering data |
+| **Per-token aggregate cap (launch)** | 5 SOL | 5 SOL | Same — keep per-token concentration low at launch |
+| **Eligible collateral** | Blue-chip Solana memecoins on whitelist | Same | Screener Gate 1 (category=memecoin) + Gate 2 (blue-chip whitelist) |
+| **24h volume floor** | **$500K** | Same | Tighter than equity's $250K — memecoin liquidity dries up faster |
+| **Max liquidation unwind** | **≤ 30 min** | Same | Tighter than equity's 60 min — memecoin price-discovery cliffs are faster |
+| **Eligible borrowers** | 5+ clean repays, no liquidations in 90d, no Trusted-tier loans currently active over 5 SOL | Same | Stricter than equity — need more history before betting on memecoin volatility |
+
+### Shared parameters (both tracks)
+
+- **Liquidation gauntlet:** existing TWAP + cross-source + post-borrow watcher + v3's on-chain TWAP. No new defenses; layered application.
+- **Liquidation reward:** same `keeper_reward_bps` as v1. No change to liquidator economics.
+- **Fee split (Premium pool):** per MGP-001 outcome (60% holders / 30% Premium-LPs / 5% referrer / 2% LP loyalty / 3% protocol if it passes; otherwise current 80/10/5/2/3). Premium LPs earn pro-rata to their Premium-pool deposit share. Both tracks deposit into the same Premium pool — separate-from-v1 risk isolation is at the v1/v3 boundary, not at the track boundary.
+- **Allowed borrower wallet states:** per existing bot gates (anti-exploit gauntlet still applies). No relaxation.
 
 Why 45% LTV on 15-day vs 40% on 30-day: shorter time-at-risk allows a more aggressive LTV at the same expected liquidation rate. Empirical traditional-margin parallel: brokerages allow higher initial margin on shorter holding periods.
 
@@ -195,7 +223,9 @@ Already drafted in `src/services/premium-tier-screener.js` and spec'd in `PREMIU
 
 ## 5. Initial whitelist seeding
 
-Seed `premium_tier_whitelist` with **5 tokens** at launch. Conservative — adjusted upward after 30 days of operational data.
+Two whitelist tables seeded at launch — one per track. Both intentionally narrow; widened by operator after 30 days of operating data per track.
+
+### 5a. Equity whitelist (5 tokens)
 
 | # | Symbol | Mint | Why | Per-token cap |
 |---|---|---|---|---:|
@@ -207,13 +237,36 @@ Seed `premium_tier_whitelist` with **5 tokens** at launch. Conservative — adju
 
 Mints for TSLAx, AAPLx, MSFTx need to be resolved against the live Backed Finance xStocks registry at seed time. `scripts/seed-premium-whitelist.js` does this lookup + insert in one shot.
 
-Each whitelisted token must independently:
+Each Equity-track whitelisted token must independently:
 - Have an active Pyth or Switchboard price feed
 - Have >$500K of on-chain DEX liquidity
 - Be tagged `category = 'stock'` in `supported_mints`
 - Have its `protected` flag set TRUE (signals operator-reviewed)
 
 If any of these fails for a candidate, skip and move to the next. The seeding script halts with a list of failures rather than partial-seeding.
+
+### 5b. Blue-chip Solana memecoin whitelist (4 tokens)
+
+| # | Symbol | Resolution at seed time | Why on the list | Per-token cap |
+|---|---|---|---|---:|
+| 1 | $PUMP | pump.fun's native token (mint resolved at seed time) | The platform that launched ~all of Solana's memecoin economy. Deepest holder base of any Solana token. Multi-source oracles. | 5 SOL |
+| 2 | $BONK | `DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263` | First Solana airdrop memecoin to hit and hold material market cap. Listed on every major CEX. Pyth + Switchboard. | 5 SOL |
+| 3 | $FARTCOIN | (mint resolved at seed time) | Top-tier Solana memecoin by volume + holder distribution. Surprisingly resilient through multiple market cycles. | 5 SOL |
+| 4 | $TROLL | (mint resolved at seed time — confirm correct $TROLL by liquidity rank if multiple candidates exist) | Established Solana memecoin with persistent on-chain depth + holder base. | 5 SOL |
+
+Each Blue-chip-track whitelisted token must independently:
+- Have multiple working price sources (Pyth/Switchboard preferred; DexScreener + Jupiter aggregator as fallback signals)
+- Have >$2M of on-chain DEX liquidity at the time of seeding (4× the Equity floor)
+- Have at least one CEX listing (signals price-discovery beyond on-chain only)
+- Have its `protected` flag set TRUE (signals operator-reviewed)
+- Have ≥6 months of price history visible on Pyth / DexScreener
+- Pass an extra "no recent major drama" check — no token-program changes, no large-holder sell waves, no oracle attacks recorded in the screener's incident log
+
+If any check fails for a candidate, skip — DO NOT relax the criteria mid-seed. The Blue-chip track exists precisely because the criteria are stricter than the rest of the protocol's approved-collateral set.
+
+### Why the blue-chip cap is 5 SOL not 10 SOL
+
+Equity-track stocks are bounded by traditional-market price discovery (NASDAQ closes nightly; institutional feeds enforce orderly state). Memecoins are not. A 50% intraday drawdown is normal for even the bluest Solana memecoin. At 10 SOL per-token aggregate, the worst-case Premium-pool exposure to one memecoin liquidation cascade is 4× larger than the operator wants to absorb at launch. Halving the cap to 5 SOL preserves the option to ramp up after the first 30 days of data.
 
 ---
 
