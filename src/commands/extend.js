@@ -85,6 +85,13 @@ export function registerExtendCallbacks(bot) {
   });
 
   bot.callbackQuery(/^extend:loan:(\d+)$/, async (ctx) => {
+    // Ack the callback IMMEDIATELY so the loading spinner stops and
+    // the user gets feedback within ~50ms. Below this point we do
+    // multiple on-chain RPC calls (getSolBalance, getLiveOwedLamports)
+    // that can take seconds when Jupiter rate-limits us — without this
+    // early ack the button spins indefinitely on the user's TG client.
+    await ctx.answerCallbackQuery().catch(() => {});
+
     const loanDbId = Number(ctx.match[1]);
     const user = await upsertUser(ctx.from.id, ctx.from.username);
     const { publicKey } = await ensureWallet(user.id);
@@ -98,14 +105,15 @@ export function registerExtendCallbacks(bot) {
     );
     const loan = rows[0];
     if (!loan) {
-      await ctx.answerCallbackQuery("Loan not found");
+      // We already ack'd above; surface the not-found state inline
+      // instead of via the popup-style answerCallbackQuery text.
+      await ctx.editMessageText("❌ Loan not found.").catch(() => {});
       return;
     }
     if (loan.suspended) {
-      await ctx.answerCallbackQuery();
       await ctx.editMessageText(
         "⚠️ This loan is under review and cannot be extended. Contact support.",
-      );
+      ).catch(() => {});
       return;
     }
 
@@ -116,7 +124,6 @@ export function registerExtendCallbacks(bot) {
 
     // Need enough SOL to cover fee + ~0.003 SOL buffer for tx + rent.
     if (BigInt(sol) < fee + 3_000_000n) {
-      await ctx.answerCallbackQuery();
       await ctx.editMessageText(
         [
           `❌ Insufficient SOL for extension fee.`,
@@ -128,7 +135,7 @@ export function registerExtendCallbacks(bot) {
           `\`${publicKey}\``,
         ].join("\n"),
         { parse_mode: "Markdown" },
-      );
+      ).catch(() => {});
       return;
     }
 
@@ -143,7 +150,6 @@ export function registerExtendCallbacks(bot) {
       .text("✅ Confirm extension", `extend:confirm:${loan.id}`)
       .row().text("✕ Cancel", "extend:cancel");
 
-    await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
         `*Extend loan #${loan.loan_id}*`,

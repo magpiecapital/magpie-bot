@@ -82,6 +82,16 @@ export function registerRepayCallbacks(bot) {
   });
 
   bot.callbackQuery(/^repay:loan:(\d+)$/, async (ctx) => {
+    // Ack the callback IMMEDIATELY so the loading spinner stops and
+    // the user gets visual feedback within ~50ms. Without this, the
+    // button can spin indefinitely if any pre-flight (DB lookup, RPC
+    // balance check, etc.) takes long under load — e.g., when Jupiter
+    // is rate-limiting and our PriceAttestor falls back per-mint. We
+    // wrap in .catch() because if grammy already answered for any
+    // reason, a re-answer throws and we don't want that to abort the
+    // rest of the handler.
+    await ctx.answerCallbackQuery().catch(() => {});
+
     const loanDbId = Number(ctx.match[1]);
     const user = await upsertUser(ctx.from.id, ctx.from.username);
 
@@ -94,11 +104,12 @@ export function registerRepayCallbacks(bot) {
     );
     const loan = rows[0];
     if (!loan) {
-      await ctx.answerCallbackQuery("Loan not found or already closed");
+      // We already ack'd above, so use editMessageText (replaces the
+      // notification body) instead of the popup-style answerCallbackQuery
+      // text we used to surface here.
+      await ctx.editMessageText("❌ Loan not found or already closed.").catch(() => {});
       return;
     }
-
-    await ctx.answerCallbackQuery();
 
     // Capture the live owed amount so the success message reflects what
     // was actually paid (not whatever stale value happens to be in the DB).
