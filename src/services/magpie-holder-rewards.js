@@ -259,6 +259,24 @@ function getMagpieAtaForOwner(owner) {
  *   - Empty balances
  */
 export async function snapshotMagpieHolders() {
+  // Merge the hardcoded baseline (burn/system/protocol) with the
+  // operator-curated permanent exempt list from the DB. The DB rows
+  // are managed via the private magpiecapital/magpie-airdrop repo's
+  // scripts/exempt-wallet.js — addresses themselves stay private
+  // (DB-only); only the table existence is public in this code.
+  const exempt = new Set(EXCLUDED_WALLETS);
+  try {
+    const { rows: extraExempt } = await query(
+      `SELECT wallet_address FROM airdrop_exempt_wallets`,
+    );
+    for (const r of extraExempt) exempt.add(r.wallet_address);
+  } catch (err) {
+    // Table doesn't exist yet (pre-migration) or DB blip — fall back
+    // to hardcoded baseline only. Distribution still works; we just
+    // don't filter operator extras this round.
+    console.warn("[holder-rewards] exempt-list load failed (using baseline only):", err.message);
+  }
+
   // Token-2022 accounts can be longer than 165 bytes when the mint has
   // extensions enabled, so we DON'T constrain dataSize — just match by
   // mint at offset 0 (same as legacy Token layout for the first 64 bytes).
@@ -275,7 +293,7 @@ export async function snapshotMagpieHolders() {
     if (data.length < 72) continue;
     const ownerBytes = data.subarray(32, 64);
     const owner = new PublicKey(ownerBytes).toBase58();
-    if (EXCLUDED_WALLETS.has(owner)) continue;
+    if (exempt.has(owner)) continue;
 
     const amount = data.readBigUInt64LE(64);
     if (amount < MIN_HOLDER_BALANCE_RAW) continue;
@@ -309,7 +327,10 @@ export async function snapshotMagpieHolders() {
     let creditedCount = 0;
     for (const row of collateralized) {
       const owner = row.borrower_wallet;
-      if (!owner || EXCLUDED_WALLETS.has(owner)) continue;
+      // Honor BOTH the hardcoded baseline AND the operator's DB-curated
+      // exempt list. A wallet on either should never get an allocation
+      // even when it holds collateralized $MAGPIE.
+      if (!owner || exempt.has(owner)) continue;
       const locked = BigInt(String(row.collateral_amount || "0"));
       if (locked <= 0n) continue;
       byOwner.set(owner, (byOwner.get(owner) ?? 0n) + locked);
