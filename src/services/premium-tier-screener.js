@@ -1,0 +1,258 @@
+/**
+ * Premium-tier eligibility screener.
+ *
+ * Runtime gate for v3 Premium-tier borrows. Every Premium-tier borrow
+ * must pass this before the bot authority signs the on-chain
+ * request_and_fund_loan instruction.
+ *
+ * STATUS: DRAFT. Not wired into the borrow flow. Activation gated on
+ * MGP-002 + MGP-003 + MGP-004 passing, the v3 program being deployed,
+ * and the activation runbook in
+ * docs/PREMIUM-TIER-SCREENER-SPEC.md being completed.
+ *
+ * Same { blocked, reason, message } result shape as anti-exploit.js
+ * so the existing borrow-error UX renders unchanged.
+ */
+import { query } from "../db/pool.js";
+
+const PREMIUM_TIER_MIN_VOLUME_USD = Number(
+  process.env.PREMIUM_TIER_MIN_VOLUME_USD || 250_000,
+);
+const PREMIUM_TIER_MAX_UNWIND_SECONDS = Number(
+  process.env.PREMIUM_TIER_MAX_UNWIND_SECONDS || 3_600,
+);
+const PREMIUM_TIER_MAX_LOAN_LAMPORTS = BigInt(
+  process.env.PREMIUM_TIER_MAX_LOAN_LAMPORTS || "10000000000", // 10 SOL
+);
+
+/**
+ * @param {object} opts
+ * @param {string} opts.collateralMint base58 pubkey
+ * @param {bigint} opts.proposedLoanLamports
+ * @param {string} opts.borrowerPubkey base58
+ * @param {"v1" | "v3-premium"} opts.pool
+ * @param {number} [opts.now] Unix seconds; defaults to current
+ * @returns {Promise<{ blocked: boolean, reason: string, message?: string }>}
+ */
+export async function screenPremiumBorrow(opts) {
+  if (opts.pool !== "v3-premium") {
+    return { blocked: false, reason: "non_premium_skip" };
+  }
+
+  const gateStart = Date.now();
+  const gateTimes = {};
+
+  // ── Gate 1: category gate ────────────────────────────────────────
+  let t = Date.now();
+  const { rows: [mintRow] } = await query(
+    `SELECT enabled, protected, category
+       FROM supported_mints WHERE mint = $1`,
+    [opts.collateralMint],
+  );
+  gateTimes.category = Date.now() - t;
+
+  if (!mintRow) {
+    return refused("category_unknown_mint",
+      "Token isn't in the protocol's approved list. Not eligible for Premium tier.");
+  }
+  if (mintRow.category !== "stock") {
+    return refused("category_not_stock",
+      "This token isn't eligible for Premium-tier borrowing. Premium tier is restricted to tokenized stocks; use a different tier for non-stock collateral.");
+  }
+  if (!mintRow.enabled) {
+    return refused("category_disabled",
+      "This token has been disabled and is not eligible for any new borrows. Existing loans can still be repaid.");
+  }
+  if (!mintRow.protected) {
+    return refused("category_not_protected",
+      "This stock hasn't completed the protected-collateral review yet. Not eligible for Premium tier.");
+  }
+
+  // ── Gate 2: Premium whitelist gate ───────────────────────────────
+  t = Date.now();
+  const { rows: [wlRow] } = await query(
+    `SELECT mint, max_open_lamports
+       FROM premium_tier_whitelist
+       WHERE mint = $1 AND enabled = TRUE`,
+    [opts.collateralMint],
+  );
+  gateTimes.whitelist = Date.now() - t;
+
+  if (!wlRow) {
+    return refused("not_on_premium_whitelist",
+      "This stock isn't yet on the Premium-tier whitelist. The operator adds stocks via governance proposals (see magpie.capital/governance). For now, use a shorter-tier loan.");
+  }
+
+  // ── Gate 3: institutional price feed gate ────────────────────────
+  t = Date.now();
+  const feedHealth = await fetchOracleFeedHealth(opts.collateralMint).catch(() => null);
+  gateTimes.feed = Date.now() - t;
+
+  if (!feedHealth || feedHealth.status !== "live") {
+    return refused("feed_offline",
+      "The price feed for this stock is currently offline. Premium tier requires a live institutional feed (Pyth/Switchboard). Try again when the feed recovers.");
+  }
+  if (feedHealth.age_seconds > 60) {
+    return refused("feed_stale",
+      `The price feed for this stock is ${Math.round(feedHealth.age_seconds)}s old (Premium tier requires fresh feed). Try again in a moment.`);
+  }
+  if (feedHealth.confidence_bps > 250) {
+    return refused("feed_degraded",
+      "The price feed for this stock is in a degraded-confidence state. Premium tier requires the feed in healthy mode. Try again later.");
+  }
+
+  // ── Gate 4: 24h volume floor ─────────────────────────────────────
+  t = Date.now();
+  const { rows: [mkt] } = await query(
+    `SELECT volume_24h_usd, liquidity_usd
+       FROM mint_market_metadata WHERE mint = $1`,
+    [opts.collateralMint],
+  );
+  gateTimes.volume = Date.now() - t;
+
+  const vol = Number(mkt?.volume_24h_usd || 0);
+  if (vol < PREMIUM_TIER_MIN_VOLUME_USD) {
+    return refused("volume_too_low",
+      `This stock's 24h volume ($${Math.round(vol).toLocaleString()}) is below the Premium-tier floor ($${PREMIUM_TIER_MIN_VOLUME_USD.toLocaleString()}). Premium tier requires deep on-chain liquidity to safely support 30-day borrows.`);
+  }
+
+  // ── Gate 5: liquidation-solvability simulation ───────────────────
+  t = Date.now();
+  // collateralAmount implied by loan / LTV(40%) — caller passes loan,
+  // we work backwards through the 40% LTV at the v3 Premium tier.
+  const impliedCollateralUsd = Number(opts.proposedLoanLamports) / 1e9 * (1 / 0.40) * 200; // assumes ~$200/SOL placeholder; use feedHealth.price_sol_usd in production
+  const liquidityUsd = Number(mkt?.liquidity_usd || 0);
+  const sim = simulateLiquidation({
+    collateralUsd: impliedCollateralUsd,
+    liquidityUsd,
+    worstCaseSlipBps: 1000,
+  });
+  gateTimes.simulation = Date.now() - t;
+
+  if (!sim.solvable) {
+    return refused("not_solvable",
+      "At your borrow size, the protocol's liquidation simulator can't guarantee unwind at current on-chain depth. Try a smaller loan.");
+  }
+  if (sim.unwind_seconds_estimate > PREMIUM_TIER_MAX_UNWIND_SECONDS) {
+    return refused("unwind_too_slow",
+      `At your borrow size, liquidation unwind is estimated at ${Math.round(sim.unwind_seconds_estimate / 60)} minutes (Premium tier requires ≤${Math.round(PREMIUM_TIER_MAX_UNWIND_SECONDS / 60)} minutes). Try a smaller loan, or wait for deeper liquidity.`);
+  }
+
+  // ── Gate 6: per-borrower credit gate ─────────────────────────────
+  t = Date.now();
+  const { rows: [credit] } = await query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status = 'liquidated'
+                          AND start_timestamp > EXTRACT(EPOCH FROM NOW() - INTERVAL '90 days'))::int AS recent_liquidations,
+       COUNT(*) FILTER (WHERE status = 'repaid')::int      AS lifetime_repaid,
+       COUNT(*) FILTER (WHERE status = 'liquidated')::int  AS lifetime_liquidated
+     FROM loans
+     WHERE borrower_wallet = $1`,
+    [opts.borrowerPubkey],
+  );
+  gateTimes.credit = Date.now() - t;
+
+  if ((credit?.recent_liquidations || 0) > 0) {
+    return refused("recent_liquidation",
+      "Premium tier requires a clean repayment history. You have a liquidation in the last 90 days; wait it out before requesting Premium-tier loans.");
+  }
+  // First-time Premium borrowers need 3+ successful repays on existing tiers
+  const { rows: [premiumHist] } = await query(
+    `SELECT COUNT(*)::int AS n FROM loans
+       WHERE borrower_wallet = $1 AND pool = 'v3-premium' AND status IN ('repaid', 'active')`,
+    [opts.borrowerPubkey],
+  );
+  if ((premiumHist?.n || 0) === 0 && (credit?.lifetime_repaid || 0) < 3) {
+    return refused("insufficient_history",
+      "Premium tier requires at least 3 successful repays on the existing tiers (Express/Quick/Standard) before your first Premium borrow. Build that history first.");
+  }
+
+  // ── Gate 7: per-token aggregate cap ──────────────────────────────
+  t = Date.now();
+  const { rows: [agg] } = await query(
+    `SELECT COALESCE(SUM(original_loan_amount_lamports), 0)::TEXT AS open_lamports
+       FROM loans
+       WHERE collateral_mint = $1 AND status = 'active' AND pool = 'v3-premium'`,
+    [opts.collateralMint],
+  );
+  gateTimes.aggregate_cap = Date.now() - t;
+
+  const currentlyOpen = BigInt(agg?.open_lamports || "0");
+  const cap = BigInt(String(wlRow.max_open_lamports));
+  if (currentlyOpen + opts.proposedLoanLamports > cap) {
+    const openSol = (Number(currentlyOpen) / 1e9).toFixed(2);
+    const capSol = (Number(cap) / 1e9).toFixed(2);
+    return refused("aggregate_cap_reached",
+      `This stock has reached the Premium-tier aggregate exposure cap (${openSol} of ${capSol} SOL already lent). New Premium-tier loans pause against this mint until existing loans repay or roll off.`);
+  }
+
+  // ── Gate 8: per-loan absolute cap ────────────────────────────────
+  if (opts.proposedLoanLamports > PREMIUM_TIER_MAX_LOAN_LAMPORTS) {
+    const capSol = (Number(PREMIUM_TIER_MAX_LOAN_LAMPORTS) / 1e9).toFixed(0);
+    return refused("per_loan_cap",
+      `Premium-tier loans are capped at ${capSol} SOL per loan in v0. The cap will be raised as the tier matures and the operator has more liquidation data.`);
+  }
+
+  // ── All gates passed ─────────────────────────────────────────────
+  console.log(JSON.stringify({
+    event: "premium_screen",
+    ts: new Date().toISOString(),
+    collateralMint: opts.collateralMint,
+    borrower: opts.borrowerPubkey,
+    proposed_loan_sol: Number(opts.proposedLoanLamports) / 1e9,
+    result: "ok",
+    total_ms: Date.now() - gateStart,
+    gate_durations_ms: gateTimes,
+  }));
+  return { blocked: false, reason: "ok" };
+
+  function refused(reason, message) {
+    console.log(JSON.stringify({
+      event: "premium_screen",
+      ts: new Date().toISOString(),
+      collateralMint: opts.collateralMint,
+      borrower: opts.borrowerPubkey,
+      proposed_loan_sol: Number(opts.proposedLoanLamports) / 1e9,
+      result: `refused:${reason}`,
+      total_ms: Date.now() - gateStart,
+      gate_durations_ms: gateTimes,
+    }));
+    return { blocked: true, reason, message };
+  }
+}
+
+/**
+ * Placeholder — wire to Pyth/Switchboard SDK during activation.
+ * Returns { source, price_usd, slot, age_seconds, confidence_bps, status }.
+ * `status` ∈ "live" | "degraded" | "offline".
+ */
+async function fetchOracleFeedHealth(_mint) {
+  throw new Error("fetchOracleFeedHealth not yet implemented — wire Pyth/Switchboard during activation");
+}
+
+/**
+ * Pure-math liquidation simulator. Estimates whether the collateral
+ * can be unwound on-chain within MAX_UNWIND_SECONDS at current pair
+ * depth + worst-case slippage.
+ *
+ * Returns { solvable, unwind_seconds_estimate, max_safe_collateral_usd }.
+ */
+function simulateLiquidation({ collateralUsd, liquidityUsd, worstCaseSlipBps }) {
+  if (liquidityUsd <= 0) {
+    return { solvable: false, unwind_seconds_estimate: Infinity, max_safe_collateral_usd: 0 };
+  }
+  // Naive: unwind time ∝ (collateralUsd / liquidityUsd). 1× = 60s; 2× = 240s; etc.
+  // Conservative: cubic relationship past 1× to penalize concentrated positions.
+  const ratio = collateralUsd / liquidityUsd;
+  const unwindSeconds = ratio <= 1
+    ? 60 * ratio
+    : 60 + Math.pow(ratio, 3) * 60;
+  const solvable = ratio < 0.5; // refuse if loan > 50% of pair liquidity
+  const slipFactor = 1 + worstCaseSlipBps / 10_000;
+  const maxSafe = (liquidityUsd * 0.5) / slipFactor;
+  return {
+    solvable,
+    unwind_seconds_estimate: unwindSeconds,
+    max_safe_collateral_usd: maxSafe,
+  };
+}
