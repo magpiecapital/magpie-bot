@@ -47,15 +47,15 @@ const ACTIVE_PROPOSALS = {
     },
   },
   "MGP-002": {
-    status: "active",
+    // Withdrawn 2026-06-09. The endpoint rejects new votes against
+    // MGP-002 with the "not active" 409. Any votes already recorded
+    // before the withdrawal stay in governance_votes for audit but
+    // are not tallied (operator decided to ship the Premium tier
+    // under Tier B discretion).
+    status: "withdrawn",
     activated_at_iso: "2026-06-09T00:00:00Z",
-    closes_at_iso: "2026-06-12T23:59:59Z",
-    questions: {
-      Q1: { choices: ["YES", "NO", "ABSTAIN"] },
-      Q2: { choices: ["YES", "NO", "ABSTAIN"] },
-      Q3: { choices: ["YES", "NO", "ABSTAIN"] },
-      Q4: { choices: ["YES", "NO", "ABSTAIN"] },
-    },
+    closes_at_iso: "2026-06-09T23:59:59Z",
+    questions: {},
   },
   "MGP-003": {
     status: "draft",
