@@ -86,6 +86,11 @@ import {
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
+import {
+  handleGovernanceVoteSubmit,
+  handleGovernanceVotesAggregate,
+  initGovernanceSchema,
+} from "./governance-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handlePipSession } from "./pip-session.js";
@@ -1317,6 +1322,11 @@ const PUBLIC_ROUTES = new Set([
   // write is signed JSON.
   "/api/v1/prefs",
   "/api/v1/prefs/set",
+  // Governance — wallet-signed vote submission + aggregate (counts
+  // only) read. Per-wallet vote choices never published per the
+  // v0 GOVERNANCE.md commitment.
+  "/api/v1/governance/vote",
+  "/api/v1/governance/votes",
   // Unified activity feed (borrows, repays, auto-protect, withdraws,
   // referral payouts, holder rewards). Same risk envelope as /loans.
   "/api/v1/activity",
@@ -1606,6 +1616,12 @@ async function router(req, res) {
         break;
       case "/api/v1/prefs/set":
         result = await handlePrefsSet(req);
+        break;
+      case "/api/v1/governance/vote":
+        result = await handleGovernanceVoteSubmit(req);
+        break;
+      case "/api/v1/governance/votes":
+        result = await handleGovernanceVotesAggregate(req, url);
         break;
       case "/api/v1/activity":
         result = await handleActivity(req, url);

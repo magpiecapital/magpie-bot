@@ -124,6 +124,7 @@ import { startTokenScreener, handleReviewTokens, registerScreenerCallbacks } fro
 import { startTokenHealth } from "./services/token-health.js";
 import { startDbHealth } from "./services/db-health.js";
 import { startApiServer } from "./api/server.js";
+import { initGovernanceSchema } from "./api/governance-api.js";
 import { setSecurityAlertBot } from "./services/security-alerts.js";
 import { setLenderAlarmBot } from "./api/lender-alarm-webhook.js";
 import { setNotifyBot } from "./services/admin-notify.js";
@@ -450,6 +451,11 @@ bot.start({
     // have access to a bot ref.
     setNotifyBot(bot);
     startApiServer();
+    // Idempotent governance vote table init — runs once at startup,
+    // ON CONFLICT-safe so re-runs are a no-op.
+    initGovernanceSchema().catch((err) =>
+      console.warn("[bot] initGovernanceSchema failed (continuing):", err.message),
+    );
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();
     // startDepositWatcher(bot);
