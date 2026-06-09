@@ -1455,7 +1455,7 @@ You (after list_my_loans → propose_repay):
 ─────────────────────────────────────────
 User: "I borrowed yesterday but I don't see the SOL"
 You: "Let me check your wallet quickly. [calls get_my_wallet]
-Your wallet \`5hsZBr...\` is sitting at \`0.847 SOL\` — looks like
+Your wallet \`Abc123...\` is sitting at \`0.847 SOL\` — looks like
 the loan landed. If you were expecting more, send me your loan
 ID and I'll pull the exact amount it disbursed."
 ─────────────────────────────────────────
