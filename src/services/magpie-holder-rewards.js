@@ -194,7 +194,12 @@ export async function getHolderInfoByWallet(walletAddress) {
 
   // 3. Estimated next payout — pool × (this wallet's balance / total eligible).
   //    "Total eligible" comes from the last snapshot if we have one,
-  //    otherwise from on-chain circulating supply.
+  //    otherwise from getEffectiveEligibleSupply() (circulating supply
+  //    minus exempt-wallet holdings). Using effective-eligible instead
+  //    of raw circulating gives holders an accurate pre-first-snapshot
+  //    estimate that already accounts for operator-curated exemptions —
+  //    so removing wallets from the pool actually shows up as larger
+  //    slices for the remaining holders.
   //    We DO expose the estimate (size of slice) but NOT when the slice
   //    will be paid — that timing stays private to prevent dump-after-snapshot
   //    behavior.
@@ -211,7 +216,7 @@ export async function getHolderInfoByWallet(walletAddress) {
     if (pool > 0n && balanceRaw > 0n) {
       const totalBalance = lastSnap.rows[0]
         ? BigInt(lastSnap.rows[0].total_balance)
-        : await getMagpieCirculatingSupply().catch(() => 0n);
+        : await getEffectiveEligibleSupply().catch(() => 0n);
       if (totalBalance > 0n) {
         estimatedNextPayout = (pool * balanceRaw) / totalBalance;
       }
@@ -239,6 +244,62 @@ export async function getHolderInfoByWallet(walletAddress) {
 async function getMagpieCirculatingSupply() {
   const info = await connection.getTokenSupply(MAGPIE_MINT);
   return BigInt(info?.value?.amount ?? "0");
+}
+
+/**
+ * Effective eligible supply for fallback estimate calculation.
+ *
+ * Used as the denominator in `estimated_next_payout` ONLY before the
+ * first real snapshot exists. Once at least one distribution has run,
+ * lastSnap.total_balance is preferred — that already excludes every
+ * exempt wallet because it was computed from the post-filter byOwner
+ * set in snapshotMagpieHolders().
+ *
+ * Subtracting exempt holdings here means the pre-first-snapshot
+ * estimate reflects what eligible holders will ACTUALLY receive,
+ * not a worst-case "if exempt wallets were eligible" lower bound.
+ *
+ * Cached for 5 minutes — 3-4 RPC calls per recompute and the answer
+ * doesn't change often enough to recompute on every wallet query.
+ */
+let _eligibleSupplyCache = null;
+let _eligibleSupplyCacheExpiresAt = 0;
+const ELIGIBLE_SUPPLY_TTL_MS = 5 * 60 * 1000;
+
+export async function getEffectiveEligibleSupply() {
+  if (_eligibleSupplyCache !== null && Date.now() < _eligibleSupplyCacheExpiresAt) {
+    return _eligibleSupplyCache;
+  }
+  const circulating = await getMagpieCirculatingSupply();
+  // Merge hardcoded baseline with operator-curated exempt list.
+  const exempt = new Set(EXCLUDED_WALLETS);
+  try {
+    const { rows } = await query(`SELECT wallet_address FROM airdrop_exempt_wallets`);
+    for (const r of rows) exempt.add(r.wallet_address);
+  } catch {
+    // Fail open: if the exempt table is unreachable, fall back to
+    // baseline only. The estimate is informational, not authoritative.
+  }
+  let exemptBalance = 0n;
+  for (const w of exempt) {
+    try {
+      const accounts = await connection.getTokenAccountsByOwner(
+        new PublicKey(w),
+        { mint: MAGPIE_MINT, programId: MAGPIE_TOKEN_PROGRAM },
+        { commitment: "confirmed" },
+      );
+      for (const a of accounts.value) {
+        const data = a.account.data;
+        if (data.length < 72) continue;
+        exemptBalance += data.readBigUInt64LE(64);
+      }
+    } catch {
+      // Wallet has no $MAGPIE ATA or RPC blip — counts as 0.
+    }
+  }
+  _eligibleSupplyCache = circulating > exemptBalance ? circulating - exemptBalance : 0n;
+  _eligibleSupplyCacheExpiresAt = Date.now() + ELIGIBLE_SUPPLY_TTL_MS;
+  return _eligibleSupplyCache;
 }
 
 function getMagpieAtaForOwner(owner) {
