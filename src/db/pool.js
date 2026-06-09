@@ -306,6 +306,20 @@ export async function applyStartupPatches() {
     // the same way. After the first snapshot fires, the random-window
     // logic takes over for subsequent runs.
 
+    // ─────── AIRDROP / HOLDER-REWARDS EXEMPT LIST ───────
+    // Operator-curated list of wallets that should NEVER receive holder
+    // rewards or future airdrops. Schema is public (this repo); contents
+    // are operator-private (live only in production DB and the private
+    // magpiecapital/magpie-airdrop repo's management scripts). The
+    // snapshot path reads this at distribution time and merges with the
+    // hardcoded burn/system/protocol baseline in
+    // services/magpie-holder-rewards.js.
+    `CREATE TABLE IF NOT EXISTS airdrop_exempt_wallets (
+       wallet_address TEXT PRIMARY KEY,
+       reason         TEXT,
+       added_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+
     // ─────── LP LOYALTY BONUS POOL ───────
     // 2% of every loan fee accrues to this pool, distributed pro-rata to
     // each LP's share-seconds (shares × time held). Long-term holders
