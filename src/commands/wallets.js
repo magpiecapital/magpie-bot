@@ -76,11 +76,22 @@ export async function handleWallets(ctx) {
     // Body line per wallet
     const flag = w.isActive ? "✅" : "⚪️";
     lines.push(`${flag} *${w.label}* — \`${shortPubkey(w.publicKey)}\` · ${balStr}`);
-    // One button per wallet, label includes balance for at-a-glance scan
+    // One button per wallet, label includes balance for at-a-glance scan.
+    // For non-active wallets, also surface a 🗑 button on the SAME row so
+    // users can remove without first drilling into the detail view (ticket
+    // #42 — users couldn't find the remove option). Routes through the
+    // same wallets:confirm_remove callback so the safety confirmation
+    // modal still fires before anything is deleted.
     const btnLabel = w.isActive
       ? `✅ ${w.label} · ${balStr}`
       : `${w.label} · ${balStr}`;
-    kb.text(btnLabel, `wallets:view:${w.id}`).row();
+    if (w.isActive) {
+      kb.text(btnLabel, `wallets:view:${w.id}`).row();
+    } else {
+      kb.text(btnLabel, `wallets:view:${w.id}`)
+        .text("🗑", `wallets:confirm_remove:${w.id}`)
+        .row();
+    }
   }
   lines.push("");
 

@@ -672,6 +672,21 @@ Things users frequently hit that aren't obvious:
   on /start. The user can also /import their own wallet — same protocol,
   just signed by their own keys. Both work identically; only difference
   is who holds the keys. /export reveals the custodial wallet's key.
+- "How do I remove a wallet" / "I can't find the trash can to remove an
+  imported wallet" — Two paths in /wallets after 2026-06-09:
+    1. On the /wallets LIST view, every non-active wallet has a 🗑
+       button right next to its label. Tap 🗑 → confirm.
+    2. (legacy path, still works) Tap the wallet name to open its
+       detail view → 🗑 Remove appears at the bottom alongside
+       ✏️ Rename → tap 🗑 → confirm.
+  If neither button shows up: the wallet is currently active. Active
+  wallets can't be removed for safety. Direct the user to switch to
+  another wallet first (tap a different wallet → "🔁 Switch to X" →
+  confirm), then 🗑 reappears on the original.
+  Active loans on the wallet also block removal. The user must repay
+  or partial-repay first.
+  This is NOT a bug — DO NOT escalate as a bug_report. Walk them
+  through the steps above.
 
 ═══════════════════════════════════════════════════════════════════
 LOAN-HELP PLAYBOOKS — HANDLING REAL CONVERSATIONS
