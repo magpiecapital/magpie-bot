@@ -233,6 +233,16 @@ export async function handleLinkRequest(req) {
 const PER_IP_WINDOW_MS = 60_000;
 const PER_IP_MAX = 60;
 const ipBuckets = new Map();
+
+// Per-IP CREATION cap (separate, much stricter). Reading link/status
+// for the same wallet should be free; what we want to bound is how
+// many DISTINCT synthetic accounts a single IP can spin up. 8 per
+// 24 hours covers a power user with multiple wallets + a small team
+// onboarding from one office, but blocks DB-bloat spray attacks
+// where an attacker generates thousands of throwaway pubkeys.
+const PER_IP_CREATE_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PER_IP_CREATE_MAX = 8;
+const ipCreateBuckets = new Map();
 function ipKey(req) {
   const xf = req.headers["x-forwarded-for"];
   if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
@@ -251,6 +261,33 @@ function checkIpRate(ip) {
     }
   }
   return true;
+}
+
+/**
+ * Separate counter for actually-creating a synthetic account (vs just
+ * reading status). Returns true if this IP is still allowed to spin
+ * up a new account, false if it's hit the daily cap.
+ */
+function canIpCreateAccount(ip) {
+  const now = Date.now();
+  const bucket = ipCreateBuckets.get(ip) || [];
+  const fresh = bucket.filter((t) => now - t < PER_IP_CREATE_WINDOW_MS);
+  ipCreateBuckets.set(ip, fresh);
+  return fresh.length < PER_IP_CREATE_MAX;
+}
+function recordIpCreate(ip) {
+  const now = Date.now();
+  const bucket = ipCreateBuckets.get(ip) || [];
+  bucket.push(now);
+  ipCreateBuckets.set(ip, bucket);
+  // Opportunistic eviction so the map doesn't grow unbounded.
+  if (ipCreateBuckets.size > 5000 && Math.random() < 0.002) {
+    for (const [k, v] of ipCreateBuckets.entries()) {
+      if (v.length === 0 || now - v[v.length - 1] > PER_IP_CREATE_WINDOW_MS) {
+        ipCreateBuckets.delete(k);
+      }
+    }
+  }
 }
 
 export async function handleLinkStatus(req, url) {
@@ -274,6 +311,24 @@ export async function handleLinkStatus(req, url) {
     // with Pip + transact immediately, no Telegram required. TG
     // remains a fully supported (but optional) backup identity path.
     //
+    // Per-IP creation cap: stops a single IP from spinning up
+    // thousands of throwaway synthetic accounts to bloat the users +
+    // wallets tables. The READ rate limit (checkIpRate) above is
+    // looser because polling an EXISTING wallet's status should be
+    // cheap; this is the strict cap on actually creating new rows.
+    const ip = ipKey(req);
+    if (!canIpCreateAccount(ip)) {
+      console.warn(`[link-status] IP ${ip} hit per-IP creation cap for new wallet ${String(wallet).slice(0, 8)}…`);
+      return {
+        status: 429,
+        body: {
+          linked: false,
+          error: "create_rate_limited",
+          message: "Too many new accounts from this IP today. Wait 24h or contact support.",
+        },
+      };
+    }
+
     // ?ref=CODE on the request URL credits the referrer when we
     // create the user. Sanitize to uppercase alphanumerics only.
     const refRaw = url.searchParams.get("ref");
@@ -282,6 +337,7 @@ export async function handleLinkStatus(req, url) {
       : null;
     try {
       await findOrCreateSiteUser(wallet, refCode);
+      recordIpCreate(ip);
       // Re-read the user row we just created so the response shape
       // matches what the chat panel expects.
       ({ rows } = await query(
