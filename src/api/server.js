@@ -1239,6 +1239,123 @@ async function handleMarketplaceStats() {
   return { status: 200, body: { stats } };
 }
 
+/**
+ * GET /api/v1/public/activity
+ *
+ * Public, anonymized stream of recent protocol activity. Designed for
+ * agents (and any third-party monitor) checking "is this protocol alive?"
+ * without going through wallet-scoped views.
+ *
+ * Returns the last N (default 50, max 200) of: borrow / repay /
+ * liquidate events. Each event's wallet is reduced to a
+ * `Xxxx…Yyyy` short form — recognizable by its owner, useless for
+ * profiling. No usernames, no Telegram, no PII.
+ *
+ * Cached upstream — implementation does fresh DB hits and lets the
+ * CDN handle deduplication via Cache-Control.
+ */
+async function handlePublicActivity(_req, url) {
+  const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit") || "50", 10)));
+  const short = (pk) => (pk && pk.length >= 8 ? `${pk.slice(0, 4)}…${pk.slice(-4)}` : null);
+
+  const [
+    { rows: borrows },
+    { rows: closed },
+  ] = await Promise.all([
+    query(
+      `SELECT l.loan_id, l.loan_amount_lamports::text AS amount, l.duration_days,
+              l.ltv_percentage, l.start_timestamp AS at, l.borrower_wallet,
+              sm.symbol
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.start_timestamp > NOW() - INTERVAL '7 days'
+        ORDER BY l.start_timestamp DESC
+        LIMIT $1`,
+      [limit],
+    ),
+    query(
+      `SELECT l.loan_id, l.original_loan_amount_lamports::text AS amount,
+              l.status, l.updated_at AS at, l.borrower_wallet,
+              sm.symbol
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.status IN ('repaid', 'liquidated')
+          AND l.updated_at > NOW() - INTERVAL '7 days'
+        ORDER BY l.updated_at DESC
+        LIMIT $1`,
+      [limit],
+    ),
+  ]);
+
+  const events = [];
+  for (const b of borrows) {
+    events.push({
+      type: "borrow",
+      at: b.at,
+      borrower_short: short(b.borrower_wallet),
+      amount_sol: Number(b.amount) / 1e9,
+      collateral_symbol: b.symbol || null,
+      ltv_pct: b.ltv_percentage,
+      duration_days: b.duration_days,
+    });
+  }
+  for (const c of closed) {
+    events.push({
+      type: c.status, // "repaid" | "liquidated"
+      at: c.at,
+      borrower_short: short(c.borrower_wallet),
+      amount_sol: Number(c.amount) / 1e9,
+      collateral_symbol: c.symbol || null,
+    });
+  }
+  events.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+  return {
+    status: 200,
+    body: { events: events.slice(0, limit), count: Math.min(events.length, limit) },
+  };
+}
+
+/**
+ * GET /api/v1/public/protocol-pulse
+ *
+ * Pure aggregates over the last 24h. Lightweight, cheap to cache,
+ * useful as a healthcheck-with-context for any monitor — "the protocol
+ * had X borrows worth Y SOL in the last day, Z active loans right now."
+ *
+ * No per-wallet data emitted. No PII possible.
+ */
+async function handleProtocolPulse() {
+  const { rows: [agg] } = await query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status = 'active')::int AS active_loans,
+       COUNT(DISTINCT borrower_wallet) FILTER (WHERE status = 'active')::int AS active_borrowers,
+       COUNT(*) FILTER (WHERE start_timestamp > NOW() - INTERVAL '24 hours')::int AS borrows_24h,
+       COUNT(*) FILTER (WHERE start_timestamp > NOW() - INTERVAL '1 hour')::int  AS borrows_1h,
+       COALESCE(SUM(CASE WHEN start_timestamp > NOW() - INTERVAL '24 hours'
+                          THEN loan_amount_lamports::numeric ELSE 0 END), 0)::text
+         AS borrowed_24h_lamports,
+       COUNT(*) FILTER (WHERE status = 'repaid' AND updated_at > NOW() - INTERVAL '24 hours')::int
+         AS repays_24h,
+       COUNT(*) FILTER (WHERE status = 'liquidated' AND updated_at > NOW() - INTERVAL '24 hours')::int
+         AS liquidations_24h
+     FROM loans`,
+  );
+  return {
+    status: 200,
+    body: {
+      active_loans: agg.active_loans,
+      active_borrowers: agg.active_borrowers,
+      borrows_1h: agg.borrows_1h,
+      borrows_24h: agg.borrows_24h,
+      borrowed_24h_sol: Number(agg.borrowed_24h_lamports) / 1e9,
+      repays_24h: agg.repays_24h,
+      liquidations_24h: agg.liquidations_24h,
+      generated_at: new Date().toISOString(),
+    },
+  };
+}
+
 async function handleLeaderboard() {
   const { getLeaderboard } = await import("../services/credit-score.js");
   const leaders = await getLeaderboard(20);
@@ -1274,6 +1391,11 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/credit/score",
   // Public leaderboard — no PII, just usernames (TG handles) + scores.
   "/api/v1/credit/leaderboard",
+  // Public anonymized activity feed + protocol pulse — both designed
+  // for agents and third-party monitors. No PII, anonymized wallet
+  // short-forms only, pure aggregates on protocol-pulse.
+  "/api/v1/public/activity",
+  "/api/v1/public/protocol-pulse",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1486,6 +1608,12 @@ async function router(req, res) {
         break;
       case "/api/v1/credit/leaderboard":
         result = await handleLeaderboard();
+        break;
+      case "/api/v1/public/activity":
+        result = await handlePublicActivity(req, url);
+        break;
+      case "/api/v1/public/protocol-pulse":
+        result = await handleProtocolPulse();
         break;
       case "/api/v1/tokens":
         result = await handleTokens();
