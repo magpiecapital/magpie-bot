@@ -121,7 +121,7 @@ export async function handleDashboardAggregate(req, url) {
     ),
     query(
       `SELECT
-         COALESCE(SUM(reward_lamports::numeric), 0)::text AS lifetime,
+         COALESCE(SUM(CASE WHEN status IN ('paid','accrued') THEN reward_lamports::numeric ELSE 0 END), 0)::text AS lifetime,
          COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS paid,
          COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS pending
          FROM referral_earnings WHERE referrer_user_id = $1`,
@@ -129,7 +129,7 @@ export async function handleDashboardAggregate(req, url) {
     ),
     query(
       `SELECT
-         COALESCE(SUM(reward_lamports::numeric), 0)::text AS lifetime,
+         COALESCE(SUM(CASE WHEN status IN ('paid','accrued') THEN reward_lamports::numeric ELSE 0 END), 0)::text AS lifetime,
          COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS paid,
          COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS pending
          FROM magpie_holder_rewards mhr
@@ -139,7 +139,7 @@ export async function handleDashboardAggregate(req, url) {
     ),
     query(
       `SELECT
-         COALESCE(SUM(reward_lamports::numeric), 0)::text AS lifetime,
+         COALESCE(SUM(CASE WHEN status IN ('paid','accrued') THEN reward_lamports::numeric ELSE 0 END), 0)::text AS lifetime,
          COALESCE(SUM(CASE WHEN status='paid' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS paid,
          COALESCE(SUM(CASE WHEN status='accrued' THEN reward_lamports::numeric ELSE 0 END), 0)::text AS pending
          FROM lp_loyalty_rewards llr
