@@ -82,6 +82,7 @@ import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
 import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
+import { handleDistributions } from "./commands/distributions.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
 import { handleMyTickets, registerMyTicketsCallbacks } from "./commands/my-tickets.js";
 import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/autoprotect.js";
@@ -230,6 +231,9 @@ bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
 bot.command("holders", handleHolders);
 bot.command("holder", handleHolders); // alias
+bot.command("distributions", handleDistributions);
+bot.command("distribution", handleDistributions); // alias
+bot.command("mydistributions", handleDistributions); // alias
 
 // Admin commands (authorization enforced in handlers)
 bot.command("pause", handlePause);
@@ -432,7 +436,8 @@ async function registerBotCommands() {
       { command: "history", description: "📜 Loan history" },
       { command: "refer", description: "🎁 Earn 5% of friends' loan fees" },
       { command: "share", description: "📤 Flex your loan / streak on Twitter" },
-      { command: "holders", description: "💎 $MAGPIE holder rewards" },
+      { command: "holders", description: "$MAGPIE holder rewards" },
+      { command: "distributions", description: "Your full distribution history" },
       { command: "submit", description: "➕ Submit a new token" },
       { command: "magpie", description: "✨ $MAGPIE token info" },
       { command: "support", description: "🛟 Self-serve help / message the team" },
