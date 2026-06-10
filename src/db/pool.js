@@ -826,6 +826,21 @@ export async function applyStartupPatches() {
        ON borrow_intents(status, last_checked_at) WHERE status = 'pending'`,
     `CREATE INDEX IF NOT EXISTS borrow_intents_wallet_idx
        ON borrow_intents(borrower_wallet, created_at DESC)`,
+    // Webhook delivery — optional per-intent push notification when
+    // status flips to 'matched'. Lets agents stop polling. The watcher
+    // POSTs an HMAC-signed payload to webhook_url. webhook_secret is
+    // server-generated if the caller doesn't supply one; agents store
+    // it and use it to verify the signature on receive.
+    `ALTER TABLE borrow_intents ADD COLUMN IF NOT EXISTS webhook_url TEXT`,
+    `ALTER TABLE borrow_intents ADD COLUMN IF NOT EXISTS webhook_secret TEXT`,
+    `ALTER TABLE borrow_intents ADD COLUMN IF NOT EXISTS webhook_delivered_at TIMESTAMPTZ`,
+    `ALTER TABLE borrow_intents ADD COLUMN IF NOT EXISTS webhook_attempts INT NOT NULL DEFAULT 0`,
+    `ALTER TABLE borrow_intents ADD COLUMN IF NOT EXISTS webhook_last_error TEXT`,
+    // Index for retry pass: find matched-but-undelivered intents that
+    // are due for another delivery attempt.
+    `CREATE INDEX IF NOT EXISTS borrow_intents_webhook_retry_idx
+       ON borrow_intents(matched_at, webhook_attempts)
+       WHERE webhook_url IS NOT NULL AND webhook_delivered_at IS NULL AND status = 'matched'`,
     // Borrow-exempt wallet allowlist. Operator-controlled. Bypasses the
     // wallet/account profile gates in preBorrowAntiExploitCheck (imported-
     // wallet cooldown, new-account cap). All systemic gates (TWAP, pool

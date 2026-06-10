@@ -217,14 +217,42 @@ export async function handleAgentCreateIntent(req) {
     };
   }
 
+  // Optional webhook subscription. If webhook_url is supplied, we POST
+  // an HMAC-signed payload to it when the intent flips to 'matched'.
+  // webhook_secret is server-generated and returned ONCE in this
+  // response — agents must store it to verify signatures on receive.
+  let webhookUrl = null;
+  let webhookSecret = null;
+  const webhookUrlInput = body?.webhook_url;
+  if (webhookUrlInput !== undefined && webhookUrlInput !== null && webhookUrlInput !== "") {
+    const { isValidWebhookUrl, generateWebhookSecret } = await import(
+      "../services/intent-webhook.js"
+    );
+    if (!isValidWebhookUrl(webhookUrlInput)) {
+      return {
+        status: 400,
+        body: {
+          error: "invalid_webhook_url",
+          detail:
+            "webhook_url must be HTTPS, not contain credentials, " +
+            "and not point at a local / private / link-local / metadata address. " +
+            "Max length 2048.",
+        },
+      };
+    }
+    webhookUrl = String(webhookUrlInput);
+    webhookSecret = generateWebhookSecret();
+  }
+
   const intentId = newIntentId();
   const expiresAt = new Date(Date.now() + ttl * 1000);
 
   await query(
     `INSERT INTO borrow_intents (
        intent_id, borrower_wallet, collateral_mint, collateral_amount,
-       tier, condition_type, condition_params, expires_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       tier, condition_type, condition_params, expires_at,
+       webhook_url, webhook_secret
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
     [
       intentId,
       borrower_wallet,
@@ -234,23 +262,43 @@ export async function handleAgentCreateIntent(req) {
       condition_type,
       JSON.stringify(condition_params),
       expiresAt.toISOString(),
+      webhookUrl,
+      webhookSecret,
     ],
   );
 
-  return {
-    status: 200,
-    body: {
-      ok: true,
-      intent_id: intentId,
-      status: "pending",
-      expires_at: expiresAt.toISOString(),
-      poll_url: `/api/v1/agent/intent/${intentId}`,
-      next_step:
-        "Poll GET /api/v1/agent/intent/:id every 30s. When status='matched', " +
-        "decode partial_signed_tx_b64, sign with borrower_wallet, and POST " +
-        "to /api/v1/cosign-borrow.",
-    },
+  const responseBody = {
+    ok: true,
+    intent_id: intentId,
+    status: "pending",
+    expires_at: expiresAt.toISOString(),
+    poll_url: `/api/v1/agent/intent/${intentId}`,
+    next_step:
+      "Poll GET /api/v1/agent/intent/:id every 30s. When status='matched', " +
+      "decode partial_signed_tx_b64, sign with borrower_wallet, and POST " +
+      "to /api/v1/cosign-borrow.",
   };
+  // The webhook secret is returned EXACTLY ONCE — at intent-create time.
+  // It's never retrievable via GET poll responses (would defeat the
+  // shared-secret model). Agents must persist it now.
+  if (webhookUrl) {
+    responseBody.webhook = {
+      url: webhookUrl,
+      secret: webhookSecret,
+      signature_header: "X-Magpie-Signature",
+      signature_alg: "HMAC-SHA256",
+      verify_example:
+        "Verify on receive: const expected = HMAC_SHA256(webhook_secret, raw_body_bytes).hex(); if (constant_time_equals(expected, X-Magpie-Signature)) accept;",
+      retry_policy: "5 attempts with exponential backoff (5s → 15s → 45s → 135s → 405s). 4xx never retried. 5xx retried.",
+    };
+    responseBody.next_step =
+      "Wait for POST to your webhook URL. The HMAC-SHA256 signature is in " +
+      "the X-Magpie-Signature header — verify before trusting the body. " +
+      "If your webhook never fires (e.g., your endpoint was down), fall back " +
+      "to GET /api/v1/agent/intent/:id to retrieve the same data.";
+  }
+
+  return { status: 200, body: responseBody };
 }
 
 /**

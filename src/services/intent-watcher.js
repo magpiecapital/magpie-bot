@@ -185,6 +185,22 @@ async function fireIntent(intent) {
   );
   if (updated[0]) {
     console.log(`[intent-watcher] ${intent.intent_id} MATCHED → tx built (${built.principalLamports / 1e9} SOL)`);
+    // Best-effort inline webhook delivery. Errors are recorded on the
+    // intent row by tryDeliverNow itself; the retry tick picks up
+    // anything that failed. Wrapping in try/catch so a webhook bug
+    // can't break the main fire path — the match itself has already
+    // committed at this point.
+    try {
+      const { tryDeliverNow } = await import("./intent-webhook.js");
+      const r = await tryDeliverNow(intent.intent_id);
+      if (r && r.ok) {
+        console.log(`[intent-webhook] ${intent.intent_id} delivered inline`);
+      } else if (r && !r.ok) {
+        console.warn(`[intent-webhook] ${intent.intent_id} inline failed (${r.error}) — retry queue will pick up`);
+      }
+    } catch (err) {
+      console.error(`[intent-webhook] inline delivery threw (intent still committed): ${err.message}`);
+    }
   }
 }
 
@@ -200,6 +216,18 @@ async function tick() {
   );
   if (nExpired > 0) {
     console.log(`[intent-watcher] expired ${nExpired} stale intents`);
+  }
+
+  // Webhook retry pass — picks up matched-but-undelivered intents that
+  // failed inline delivery. Lightweight (only matched intents with a
+  // webhook_url + null delivered_at; bounded to 50 rows per tick).
+  // Wrapped in try/catch so a webhook bug can never affect the main
+  // intent-evaluation path below.
+  try {
+    const { retryPendingWebhooks } = await import("./intent-webhook.js");
+    await retryPendingWebhooks();
+  } catch (err) {
+    console.error(`[intent-watcher] webhook retry pass threw: ${err.message}`);
   }
 
   // Pull pending intents. Limit to 100 per tick to bound work per cycle.
