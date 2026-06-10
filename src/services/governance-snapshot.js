@@ -182,75 +182,94 @@ async function getLpProviders() {
  * Take the full categorized governance snapshot. Returns an object
  * with all three categories + a deduplicated combined_eligible_set
  * the distribution layer can iterate once.
+ *
+ * Holds a session-scoped Postgres advisory lock for the duration so
+ * two concurrent invocations can't snapshot against an in-flight
+ * exempt-wallet edit and produce divergent eligible sets. The lock
+ * key is a fixed namespace (governance_snapshot:0). A second
+ * concurrent invocation will block until the first finishes —
+ * deterministic ordering, no torn reads.
  */
+const GOV_SNAPSHOT_LOCK_KEY = 0x6d706965_676f7621n & 0x7fffffff_ffffffffn; // 'mpiego v!' — fixed namespace
+
 export async function snapshotForGovernance() {
-  const exempt = await loadFullExemptSet();
+  // Acquire the lock. pg_advisory_lock blocks until granted.
+  // Using a session-level lock (not xact_lock) since we may run
+  // outside an explicit transaction.
+  await query(`SELECT pg_advisory_lock($1::bigint)`, [GOV_SNAPSHOT_LOCK_KEY.toString()]);
+  try {
+    const exempt = await loadFullExemptSet();
 
-  const [holdersMap, collateralized, lpProviders] = await Promise.all([
-    enumeratePureHolders(exempt),
-    getCollateralizedBorrowers(exempt),
-    getLpProviders(),
-  ]);
+    const [holdersMap, collateralized, lpProviders] = await Promise.all([
+      enumeratePureHolders(exempt),
+      getCollateralizedBorrowers(exempt),
+      getLpProviders(),
+    ]);
 
-  // Convert holders Map to array form for the snapshot.
-  const holders = Array.from(holdersMap.entries()).map(([wallet, balance]) => ({
-    wallet,
-    magpie_balance_raw: balance.toString(),
-  }));
+    // Convert holders Map to array form for the snapshot.
+    const holders = Array.from(holdersMap.entries()).map(([wallet, balance]) => ({
+      wallet,
+      magpie_balance_raw: balance.toString(),
+    }));
 
-  // Build the combined eligible set: every wallet appearing in any
-  // category, deduplicated, with per-category enrichment so the
-  // distribution layer can credit each contribution path.
-  const combined = new Map();
-  for (const h of holders) {
-    const e = combined.get(h.wallet) ?? { wallet: h.wallet };
-    e.in_holders = true;
-    e.magpie_balance_raw = h.magpie_balance_raw;
-    combined.set(h.wallet, e);
+    // Build the combined eligible set: every wallet appearing in any
+    // category, deduplicated, with per-category enrichment so the
+    // distribution layer can credit each contribution path.
+    const combined = new Map();
+    for (const h of holders) {
+      const e = combined.get(h.wallet) ?? { wallet: h.wallet };
+      e.in_holders = true;
+      e.magpie_balance_raw = h.magpie_balance_raw;
+      combined.set(h.wallet, e);
+    }
+    for (const c of collateralized) {
+      const e = combined.get(c.wallet) ?? { wallet: c.wallet };
+      e.in_collateralized = true;
+      e.magpie_collateralized_raw = c.magpie_collateralized_raw;
+      e.collateralized_loan_ids = c.loan_ids;
+      combined.set(c.wallet, e);
+    }
+    for (const lp of lpProviders) {
+      const e = combined.get(lp.wallet) ?? { wallet: lp.wallet };
+      e.in_lp_providers = true;
+      e.lp_shares = lp.shares;
+      combined.set(lp.wallet, e);
+    }
+
+    // Per-category totals — sums for the operator's summary line.
+    const totalHeldRaw = holders.reduce(
+      (acc, h) => acc + BigInt(h.magpie_balance_raw),
+      0n,
+    );
+    const totalCollateralizedRaw = collateralized.reduce(
+      (acc, c) => acc + BigInt(c.magpie_collateralized_raw),
+      0n,
+    );
+    const totalLpShares = lpProviders.reduce(
+      (acc, lp) => acc + BigInt(lp.shares),
+      0n,
+    );
+
+    return {
+      holders,
+      collateralized_borrowers: collateralized,
+      lp_providers: lpProviders,
+      combined_eligible_set: Array.from(combined.values()).sort((a, b) =>
+        a.wallet < b.wallet ? -1 : a.wallet > b.wallet ? 1 : 0,
+      ),
+      totals: {
+        holders_count: holders.length,
+        collateralized_count: collateralized.length,
+        lp_providers_count: lpProviders.length,
+        unique_eligible_count: combined.size,
+        total_held_raw: totalHeldRaw.toString(),
+        total_collateralized_raw: totalCollateralizedRaw.toString(),
+        total_lp_shares: totalLpShares.toString(),
+      },
+    };
+  } finally {
+    // Always release the lock, even if the snapshot threw — otherwise
+    // the lock outlives the process and blocks the next legit run.
+    await query(`SELECT pg_advisory_unlock($1::bigint)`, [GOV_SNAPSHOT_LOCK_KEY.toString()]);
   }
-  for (const c of collateralized) {
-    const e = combined.get(c.wallet) ?? { wallet: c.wallet };
-    e.in_collateralized = true;
-    e.magpie_collateralized_raw = c.magpie_collateralized_raw;
-    e.collateralized_loan_ids = c.loan_ids;
-    combined.set(c.wallet, e);
-  }
-  for (const lp of lpProviders) {
-    const e = combined.get(lp.wallet) ?? { wallet: lp.wallet };
-    e.in_lp_providers = true;
-    e.lp_shares = lp.shares;
-    combined.set(lp.wallet, e);
-  }
-
-  // Per-category totals — sums for the operator's summary line.
-  const totalHeldRaw = holders.reduce(
-    (acc, h) => acc + BigInt(h.magpie_balance_raw),
-    0n,
-  );
-  const totalCollateralizedRaw = collateralized.reduce(
-    (acc, c) => acc + BigInt(c.magpie_collateralized_raw),
-    0n,
-  );
-  const totalLpShares = lpProviders.reduce(
-    (acc, lp) => acc + BigInt(lp.shares),
-    0n,
-  );
-
-  return {
-    holders,
-    collateralized_borrowers: collateralized,
-    lp_providers: lpProviders,
-    combined_eligible_set: Array.from(combined.values()).sort((a, b) =>
-      a.wallet < b.wallet ? -1 : a.wallet > b.wallet ? 1 : 0,
-    ),
-    totals: {
-      holders_count: holders.length,
-      collateralized_count: collateralized.length,
-      lp_providers_count: lpProviders.length,
-      unique_eligible_count: combined.size,
-      total_held_raw: totalHeldRaw.toString(),
-      total_collateralized_raw: totalCollateralizedRaw.toString(),
-      total_lp_shares: totalLpShares.toString(),
-    },
-  };
 }

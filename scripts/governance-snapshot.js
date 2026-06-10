@@ -32,8 +32,8 @@
  *     node scripts/governance-snapshot.js MGP-XXX
  */
 import { createHash } from "node:crypto";
-import { writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
@@ -59,8 +59,37 @@ if (!outDir) {
   process.exit(1);
 }
 
+// Defense against env-var injection or operator misconfiguration:
+// the output dir MUST be absolute (no relative paths that could resolve
+// outside intended trees) and resolve under one of an allowlist of
+// operator-controlled prefixes. Any attempt to write under /etc, /var,
+// or anywhere world-readable is rejected.
+if (!isAbsolute(outDir)) {
+  console.error(`Refusing to run: GOVERNANCE_SNAPSHOT_OUT_DIR must be absolute (got ${outDir})`);
+  process.exit(1);
+}
 if (!existsSync(outDir)) {
   mkdirSync(outDir, { recursive: true, mode: 0o700 });
+}
+const resolvedOutDir = realpathSync(outDir);
+// Resolve allowlist prefixes too — macOS aliases /tmp → /private/tmp,
+// so a direct string prefix comparison against literal "/tmp/" would
+// reject every legitimate macOS /tmp/ path. realpath-ing both sides
+// normalizes the comparison.
+const allowedPrefixes = [
+  realpathSync(resolve(process.env.HOME || "/", ".magpie-private")),
+  realpathSync("/tmp"),
+].filter(Boolean);
+const insideAllowed = allowedPrefixes.some(
+  (p) => resolvedOutDir === p || resolvedOutDir.startsWith(p + "/"),
+);
+if (!insideAllowed) {
+  console.error(
+    `Refusing to run: GOVERNANCE_SNAPSHOT_OUT_DIR (${resolvedOutDir}) is not under ` +
+      `~/.magpie-private or /tmp/. Snapshot contains per-wallet eligibility data ` +
+      `— it must land in a private, operator-controlled directory.`,
+  );
+  process.exit(1);
 }
 
 (async () => {

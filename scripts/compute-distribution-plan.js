@@ -47,9 +47,9 @@
  * plan for auditability. The total holder-pool-sol IS the budget
  * that gets allocated. Pass the COMBINED amount as --holder-pool-sol.
  */
-import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join } from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 const args = process.argv.slice(2);
 const snapshotPath = args[0];
@@ -79,9 +79,61 @@ if (!outDir) {
   console.error("Refusing to run: DISTRIBUTION_PLAN_OUT_DIR is not set.");
   process.exit(1);
 }
+if (!isAbsolute(outDir)) {
+  console.error(`Refusing to run: DISTRIBUTION_PLAN_OUT_DIR must be absolute (got ${outDir})`);
+  process.exit(1);
+}
 if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true, mode: 0o700 });
+const resolvedOutDir = realpathSync(outDir);
+const allowedPrefixes = [
+  realpathSync(resolve(process.env.HOME || "/", ".magpie-private")),
+  realpathSync("/tmp"),
+].filter(Boolean);
+const insideAllowed = allowedPrefixes.some(
+  (p) => resolvedOutDir === p || resolvedOutDir.startsWith(p + "/"),
+);
+if (!insideAllowed) {
+  console.error(
+    `Refusing to run: DISTRIBUTION_PLAN_OUT_DIR (${resolvedOutDir}) is not under ` +
+      `~/.magpie-private or /tmp/. Plans contain per-wallet allocations ` +
+      `— they must land in a private, operator-controlled directory.`,
+  );
+  process.exit(1);
+}
 
-const snap = JSON.parse(readFileSync(snapshotPath, "utf8"));
+// Read snapshot bytes so we can hash + parse from the same buffer.
+// Hashing the parsed-then-canonical form would let an attacker
+// insert whitespace/key-order differences that don't affect parsing
+// but DO change the hash they think they're verifying against. The
+// only safe integrity check is over the raw bytes.
+const snapshotRaw = readFileSync(snapshotPath);
+const snapshotHash = createHash("sha256").update(snapshotRaw).digest("hex");
+
+// Opt-in: --expected-snapshot-hash <hex> performs constant-time
+// verification before any allocation math runs. The operator can
+// note the hash from the snapshot's stdout (which is also written
+// into the snapshot's own canonical body, but printed to stdout at
+// snapshot fire time) and pass it here.
+const expectedHash = arg("expected-snapshot-hash");
+if (expectedHash !== undefined) {
+  if (!/^[0-9a-f]{64}$/.test(expectedHash)) {
+    console.error(`Invalid --expected-snapshot-hash format (must be 64 hex chars)`);
+    process.exit(1);
+  }
+  const a = Buffer.from(expectedHash, "hex");
+  const b = Buffer.from(snapshotHash, "hex");
+  if (!timingSafeEqual(a, b)) {
+    console.error(
+      `Snapshot hash mismatch.\n` +
+        `  expected: ${expectedHash}\n` +
+        `  actual:   ${snapshotHash}\n` +
+        `Refusing to compute a plan against an unverified snapshot.`,
+    );
+    process.exit(1);
+  }
+}
+
+const snap = JSON.parse(snapshotRaw.toString("utf8"));
 if (snap.scope_version !== "v2-categorized") {
   console.error(
     `Snapshot scope_version "${snap.scope_version}" is not v2-categorized. ` +
@@ -205,6 +257,7 @@ const canonical = JSON.stringify({
   proposal_id: proposalId,
   generated_at_utc: generatedAt,
   snapshot_source: basename(snapshotPath),
+  snapshot_sha256: snapshotHash,
   snapshot_taken_at_utc: snap.taken_at_utc,
   memo: memo ?? null,
   pools: {
@@ -235,6 +288,7 @@ console.log(
     proposal_id: proposalId,
     generated_at_utc: generatedAt,
     memo: memo ?? null,
+    snapshot_sha256: snapshotHash,
     pools_sol: {
       holder_pool: Number(holderPoolLamports) / 1e9,
       lp_pool: Number(lpPoolLamports) / 1e9,
