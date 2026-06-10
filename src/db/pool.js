@@ -841,6 +841,29 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS borrow_intents_webhook_retry_idx
        ON borrow_intents(matched_at, webhook_attempts)
        WHERE webhook_url IS NOT NULL AND webhook_delivered_at IS NULL AND status = 'matched'`,
+    // Paid x402 call log. The x402 service fires-and-forgets a row to
+    // this table after every successful payment verification. Lets us
+    // surface live revenue + adoption metrics without re-deriving the
+    // data by walking SOL transactions on-chain.
+    //
+    // (path, ts) index supports the 24h-aggregate read pattern; the
+    // (payer_pubkey) index supports unique-paying-wallets counts.
+    `CREATE TABLE IF NOT EXISTS x402_paid_calls (
+       id BIGSERIAL PRIMARY KEY,
+       endpoint_path TEXT NOT NULL,
+       method TEXT NOT NULL,
+       amount_lamports NUMERIC(20,0) NOT NULL,
+       payer_pubkey TEXT NOT NULL,
+       tx_signature TEXT UNIQUE NOT NULL,
+       nonce TEXT,
+       recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS x402_paid_calls_recent_idx
+       ON x402_paid_calls(recorded_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS x402_paid_calls_endpoint_idx
+       ON x402_paid_calls(endpoint_path, recorded_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS x402_paid_calls_payer_idx
+       ON x402_paid_calls(payer_pubkey)`,
     // Borrow-exempt wallet allowlist. Operator-controlled. Bypasses the
     // wallet/account profile gates in preBorrowAntiExploitCheck (imported-
     // wallet cooldown, new-account cap). All systemic gates (TWAP, pool

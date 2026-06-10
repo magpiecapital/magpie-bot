@@ -1396,6 +1396,14 @@ const PUBLIC_ROUTES = new Set([
   // short-forms only, pure aggregates on protocol-pulse.
   "/api/v1/public/activity",
   "/api/v1/public/protocol-pulse",
+  // Live x402 revenue + adoption — pure aggregates over the
+  // x402_paid_calls log. No payer pubkeys surfaced, only counts +
+  // SOL totals + per-endpoint breakdown.
+  "/api/v1/public/x402-metrics",
+  // Internal record endpoint — auth is INTERNAL_API_TOKEN at the
+  // handler level (same pattern as the agent endpoints), so we list
+  // it as "public" at the API-key layer to bypass the API-key gate.
+  "/api/v1/internal/x402/record",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1615,6 +1623,16 @@ async function router(req, res) {
       case "/api/v1/public/protocol-pulse":
         result = await handleProtocolPulse();
         break;
+      case "/api/v1/public/x402-metrics": {
+        const { handleX402Metrics } = await import("./x402-metrics.js");
+        result = await handleX402Metrics();
+        break;
+      }
+      case "/api/v1/internal/x402/record": {
+        const { handleX402Record } = await import("./x402-metrics.js");
+        result = await handleX402Record(req);
+        break;
+      }
       case "/api/v1/tokens":
         result = await handleTokens();
         break;
