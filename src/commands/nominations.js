@@ -59,7 +59,7 @@ export async function handleNominate(ctx) {
       nominatorWallet: wallet,
     });
     return ctx.reply(
-      `✅ Nomination #${id} submitted.\n\n` +
+      `Nomination #${id} submitted.\n\n` +
         `Others can upvote with /upvote_nomination ${id}\n` +
         `You can withdraw with /withdraw_nomination ${id}\n\n` +
         `If it gets enough community interest, the operator will review it for promotion to a formal MGP proposal.`,
@@ -80,12 +80,12 @@ export async function handleNominationsList(ctx) {
         "Submit your own with /nominate <idea>",
     );
   }
-  const lines = ["🗳️ *Community Nominations* (top 10 by upvotes)", ""];
+  const lines = ["*Community Nominations* (top 10 by upvotes)", ""];
   for (const n of noms) {
     const headline = n.nomination_text.length > 100
       ? n.nomination_text.slice(0, 100) + "…"
       : n.nomination_text;
-    lines.push(`*#${n.id}* — ${n.upvote_count} 👍 — by @${n.nominator_username || "anon"}`);
+    lines.push(`*#${n.id}* — ${n.upvote_count} upvotes — by @${n.nominator_username || "anon"}`);
     lines.push(headline);
     lines.push(`  /upvote_nomination ${n.id}`);
     lines.push("");
@@ -122,8 +122,8 @@ export async function handleUpvoteNomination(ctx) {
   });
   return ctx.reply(
     r.now_upvoted
-      ? `👍 Upvoted nomination #${id} — now at ${r.count} upvotes.`
-      : `↩️ Upvote removed from #${id} — now at ${r.count} upvotes.`,
+      ? `Upvoted nomination #${id} — now at ${r.count} upvotes.`
+      : `Upvote removed from #${id} — now at ${r.count} upvotes.`,
   );
 }
 
@@ -141,7 +141,7 @@ export async function handleWithdrawNomination(ctx) {
   }
   try {
     await withdrawNomination({ nominationId: id, nominatorTgId: tgUser.id });
-    return ctx.reply(`✅ Nomination #${id} withdrawn.`);
+    return ctx.reply(`Nomination #${id} withdrawn.`);
   } catch (err) {
     return ctx.reply(`Couldn't withdraw — ${err.message}`);
   }
@@ -179,7 +179,7 @@ export async function handleNominationReview(ctx) {
       promotedToProposalId: action === "promote" ? tail : null,
       duplicateOfId: action === "duplicate" ? Number(tail) || null : null,
     });
-    return ctx.reply(`✅ Nomination #${id} marked as ${action}.`);
+    return ctx.reply(`Nomination #${id} marked as ${action}.`);
   } catch (err) {
     return ctx.reply(`Couldn't review — ${err.message}`);
   }
@@ -202,10 +202,10 @@ export async function handleMyNominations(ctx) {
   if (rows.length === 0) {
     return ctx.reply("You haven't submitted any nominations yet. Try /nominate <your idea>.");
   }
-  const lines = ["📋 *Your Nominations*", ""];
+  const lines = ["*Your Nominations*", ""];
   for (const r of rows) {
     const head = r.nomination_text.length > 80 ? r.nomination_text.slice(0, 80) + "…" : r.nomination_text;
-    lines.push(`#${r.id} · ${r.status} · ${r.upvote_count} 👍`);
+    lines.push(`#${r.id} · ${r.status} · ${r.upvote_count} upvotes`);
     lines.push(head);
     lines.push("");
   }
