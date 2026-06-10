@@ -150,6 +150,9 @@ export async function reminderTick() {
   for (const proposalId of listProposalIds()) {
     const p = getProposal(proposalId);
     if (!p?.voting_started_at_iso || !p?.voting_ends_at_iso) continue;
+    // Snapshot-only proposals (MGP-001 etc.) don't get reminder broadcasts —
+    // they're not votes, they're eligibility records for a distribution.
+    if (p.proposal_type === "snapshot_only") continue;
     const start = new Date(p.voting_started_at_iso);
     const end = new Date(p.voting_ends_at_iso);
     if (now < start || now > end) continue;  // not in active window
