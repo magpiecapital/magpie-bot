@@ -40,7 +40,7 @@ export async function handleVotingPowerQuery(req, url) {
     return { status: 404, body: { error: "proposal_not_found", proposal_id: proposalId } };
   }
 
-  const power = getVotingPower({
+  const power = await getVotingPower({
     wallet,
     proposalId,
     snapshotId: proposal.snapshot_id,

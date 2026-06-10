@@ -1,35 +1,14 @@
 /**
  * Voting-power lookup — exposes "what's MY voting weight on proposal X?"
  *
- * Reads the proposal's snapshot file, returns the caller's eligible
- * weight, post-whale-cap weight, and their share of the eligible pool.
- *
- * Used by:
- *   - /votingpower TG command (caller's wallet looked up via /me state)
- *   - dashboard /api/v1/governance/voting-power?wallet=...&proposal_id=...
- *   - Pip nudges when user mentions voting
+ * Reads from the governance_snapshots + governance_snapshot_weights DB
+ * tables. The snapshot's JSON file remains on the snapshot-author's disk
+ * as the operator-private master record (mode 0600); the DB stores a
+ * normalized, queryable mirror so the bot (on Railway / any ephemeral
+ * filesystem) can answer per-wallet voting weight without disk access.
  */
 
-import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-
-const SNAPSHOT_DIR = process.env.GOVERNANCE_SNAPSHOT_DIR || `${process.env.HOME}/.magpie-private/snapshots`;
-
-/**
- * Find the most recent snapshot file for a snapshot_id.
- * Returns null if not found.
- */
-function findSnapshotFile(snapshotId) {
-  try {
-    const files = readdirSync(SNAPSHOT_DIR)
-      .filter((f) => f.startsWith(snapshotId + "-") && f.endsWith(".json"))
-      .sort();
-    if (files.length === 0) return null;
-    return join(SNAPSHOT_DIR, files[files.length - 1]);
-  } catch {
-    return null;
-  }
-}
+import { query } from "../db/pool.js";
 
 /**
  * Lookup voting power for a given (wallet, proposal_id).
@@ -49,28 +28,37 @@ function findSnapshotFile(snapshotId) {
  *     cap_fraction: number,
  *     reason?: string              // present when eligible=false
  *   }
+ *
+ * NOTE: async now (DB-backed). Previous file-backed version was sync.
  */
-export function getVotingPower({ wallet, proposalId, snapshotId, capFraction = 0.02 }) {
+export async function getVotingPower({ wallet, proposalId, snapshotId, capFraction = 0.02 }) {
   const snapId = snapshotId || proposalId;
-  const path = findSnapshotFile(snapId);
-  if (!path) {
+
+  const headerRes = await query(
+    `SELECT taken_at_utc, total_eligible_weight, hash_sha256
+       FROM governance_snapshots WHERE snapshot_id = $1`,
+    [snapId],
+  );
+  if (headerRes.rows.length === 0) {
     return {
       eligible: false,
       wallet,
-      reason: "no_snapshot_found",
+      reason: "no_snapshot_in_db",
       snapshot_id: snapId,
     };
   }
-  let snap;
-  try {
-    snap = JSON.parse(readFileSync(path, "utf8"));
-  } catch (err) {
-    return { eligible: false, wallet, reason: `snapshot_unreadable: ${err.message}` };
-  }
-  const holder = (snap.categories?.holders ?? []).find((h) => h.wallet === wallet);
-  const collat = (snap.categories?.collateralized_borrowers ?? []).find((c) => c.wallet === wallet);
-  const held = holder ? BigInt(holder.magpie_balance_raw) : 0n;
-  const locked = collat ? BigInt(collat.magpie_collateralized_raw) : 0n;
+  const header = headerRes.rows[0];
+  const totalRaw = BigInt(header.total_eligible_weight);
+
+  const weightRes = await query(
+    `SELECT held_raw::text AS held, collateralized_raw::text AS collat, lp_shares::text AS lp
+       FROM governance_snapshot_weights
+       WHERE snapshot_id = $1 AND wallet = $2`,
+    [snapId, wallet],
+  );
+  const row = weightRes.rows[0];
+  const held = BigInt(row?.held ?? "0");
+  const locked = BigInt(row?.collat ?? "0");
   const raw = held + locked;
 
   if (raw === 0n) {
@@ -79,26 +67,10 @@ export function getVotingPower({ wallet, proposalId, snapshotId, capFraction = 0
       wallet,
       reason: "wallet_not_in_snapshot_or_zero_balance",
       snapshot_id: snapId,
-      snapshot_taken_at: snap.taken_at_utc,
+      snapshot_taken_at: header.taken_at_utc,
     };
   }
 
-  // Compute pool totals (raw and capped)
-  let totalRaw = 0n;
-  const allWeights = new Map();
-  for (const h of snap.categories?.holders ?? []) {
-    const w = BigInt(h.magpie_balance_raw);
-    allWeights.set(h.wallet, w);
-    totalRaw += w;
-  }
-  for (const c of snap.categories?.collateralized_borrowers ?? []) {
-    const cur = allWeights.get(c.wallet) ?? 0n;
-    const add = BigInt(c.magpie_collateralized_raw);
-    allWeights.set(c.wallet, cur + add);
-    totalRaw += add;
-  }
-
-  // Per-wallet cap in raw units
   const capBps = BigInt(Math.round(capFraction * 10_000));
   const capWeight = (totalRaw * capBps) / 10_000n;
   const cappedRaw = raw > capWeight ? capWeight : raw;
@@ -110,7 +82,7 @@ export function getVotingPower({ wallet, proposalId, snapshotId, capFraction = 0
     eligible: true,
     wallet,
     snapshot_id: snapId,
-    snapshot_taken_at: snap.taken_at_utc,
+    snapshot_taken_at: header.taken_at_utc,
     raw_weight: raw.toString(),
     held_raw: held.toString(),
     collateralized_raw: locked.toString(),
