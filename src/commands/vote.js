@@ -17,6 +17,10 @@ function activeProposals() {
     .map(getProposal)
     .filter((p) => {
       if (!p?.voting_started_at_iso || !p?.voting_ends_at_iso) return false;
+      // Skip snapshot-only proposals (MGP-001 etc.) — they're not votes,
+      // they're eligibility-snapshot records for a distribution. Showing
+      // them with a "Cast your vote" button confuses users.
+      if (p.proposal_type === "snapshot_only") return false;
       const start = new Date(p.voting_started_at_iso);
       const end = new Date(p.voting_ends_at_iso);
       return now >= start && now <= end;
@@ -76,10 +80,11 @@ export async function handleVotingPower(ctx) {
   }
 
   const active = activeProposals();
-  // Also include the most recent CLOSED proposal so users can see their historical weight
+  // Also include the most recent CLOSED proposal so users can see their
+  // historical weight. Skip snapshot_only entries — they're not votes.
   const allRecent = listProposalIds()
     .map(getProposal)
-    .filter((p) => p.voting_ends_at_iso)
+    .filter((p) => p.voting_ends_at_iso && p.proposal_type !== "snapshot_only")
     .sort((a, b) => new Date(b.voting_ends_at_iso) - new Date(a.voting_ends_at_iso))
     .slice(0, 3);
 
@@ -90,7 +95,7 @@ export async function handleVotingPower(ctx) {
 
   const lines = ["⚖️ *Your Voting Weight*", "", `Wallet: \`${wallet.slice(0, 8)}...${wallet.slice(-4)}\``, ""];
   for (const p of proposalsToShow) {
-    const power = getVotingPower({ wallet, proposalId: p.id, snapshotId: p.snapshot_id });
+    const power = await getVotingPower({ wallet, proposalId: p.id, snapshotId: p.snapshot_id });
     lines.push(`*${p.id}* — ${p.title}`);
     if (!power.eligible) {
       lines.push(`  ❌ Not eligible — ${power.reason}`);
