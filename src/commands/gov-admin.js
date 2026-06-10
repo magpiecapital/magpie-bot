@@ -59,7 +59,7 @@ export async function handleGovPause(ctx) {
       WHERE id = 1`,
     [String(ctx.from.id), reason],
   );
-  await ctx.reply(`🛑 Governance autopilot PAUSED.\nReason: ${reason}\nUse /gov-resume to re-enable.`);
+  await ctx.reply(`Governance autopilot PAUSED.\nReason: ${reason}\nUse /gov-resume to re-enable.`);
 }
 
 export async function handleGovResume(ctx) {
@@ -72,7 +72,7 @@ export async function handleGovResume(ctx) {
             paused_reason = NULL
       WHERE id = 1`,
   );
-  await ctx.reply("✅ Governance autopilot RESUMED.");
+  await ctx.reply("Governance autopilot RESUMED.");
 }
 
 export async function handleGovStatus(ctx) {
@@ -88,7 +88,7 @@ export async function handleGovStatus(ctx) {
   );
   const lines = [
     "═══ Governance Autopilot Status ═══",
-    `Enabled         : ${s.enabled ? "✅ YES" : "🛑 PAUSED"}`,
+    `Enabled         : ${s.enabled ? "YES" : "PAUSED"}`,
     s.paused_at ? `Paused by       : ${s.paused_by}` : null,
     s.paused_at ? `Paused at       : ${s.paused_at.toISOString()}` : null,
     s.paused_reason ? `Paused reason   : ${s.paused_reason}` : null,
@@ -118,7 +118,7 @@ export async function handleGovConfirmManual(ctx) {
     [proposalId, JSON.stringify({ action_idx: actionIdx, confirmed_by: String(ctx.from.id), confirmed_at: new Date().toISOString() })],
   );
   await ctx.reply(
-    `✅ Manual action confirmed for ${proposalId}[${actionIdx}].\n` +
+    `Manual action confirmed for ${proposalId}[${actionIdx}].\n` +
     `Next autopilot run will re-audit and update implementation_status accordingly.`,
   );
 }
