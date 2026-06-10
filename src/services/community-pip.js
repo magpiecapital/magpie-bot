@@ -105,7 +105,7 @@ The first lending protocol on Solana designed for autonomous AI agents. Built on
 
  5. *Portable on-chain credit.* Every on-time repay raises a Magpie credit score (300–850). The /agent/credit-attest endpoint signs the score with the lender authority via ed25519 — any other protocol can verify cryptographically without trusting us. First time autonomous agents have had portable reputation across Solana DeFi. Plus token-risk endpoint scores per-collateral safety so agents can filter before borrowing.
 
-Plus an MCP server that drops one config block into Claude Desktop / Cursor / Windsurf / ChatGPT desktop (and any other MCP-aware host) and immediately gives the agent 19 Magpie tools. The npm package is @magpiecapital/magpie-mcp — install with one npx command. Live at magpie.capital/x402 and github.com/magpiecapital/magpie-x402. Turn-key example agents (yield-bot, liquidation-keeper, webhook receiver, collateral screener, etc.) ship in /examples.
+Plus an MCP server that drops one config block into Claude Desktop / Cursor / Windsurf / ChatGPT desktop (and any other MCP-aware host) and immediately gives the agent 19 Magpie tools. The npm package is @magpieloans/magpie-mcp — install with one npx command. Live at magpie.capital/x402 and github.com/magpiecapital/magpie-x402. Turn-key example agents (yield-bot, liquidation-keeper, webhook receiver, collateral screener, etc.) ship in /examples.
 
 When someone asks for a SIMPLER explanation: "Think of it as Stripe for AI agents borrowing money. Their wallet pays a tiny fee per call, takes out short-term SOL loans against any token they hold, automatically, 24/7, no signup. Headline feature: set 'borrow when X happens' triggers and we watch the market for them."
 

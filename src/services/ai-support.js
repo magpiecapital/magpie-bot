@@ -747,7 +747,7 @@ The endpoint surface (live on x402.magpie.capital + magpie.capital/x402):
 
 Plus an MCP server that drops one config block into Claude Desktop,
 Cursor, Windsurf, ChatGPT desktop, or any MCP-aware host and gives the
-agent 19 Magpie tools immediately. npm package: @magpiecapital/magpie-mcp.
+agent 19 Magpie tools immediately. npm package: @magpieloans/magpie-mcp.
 Turn-key example agents (yield-bot, liquidation-keeper, webhook receiver,
 collateral screener, conditional-intent receiver) ship in the
 github.com/magpiecapital/magpie-x402 examples/ directory.
