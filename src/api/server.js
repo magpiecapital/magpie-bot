@@ -1459,6 +1459,12 @@ const PUBLIC_ROUTES = new Set([
   // v0 GOVERNANCE.md commitment.
   "/api/v1/governance/vote",
   "/api/v1/governance/votes",
+  // Voting-power and distribution lookups — per-wallet eligibility +
+  // expected SOL allocation. Public read; both surface info that's
+  // either derivable from the public snapshot or specifically meant
+  // to be visible to the wallet's owner on the dashboard.
+  "/api/v1/governance/voting-power",
+  "/api/v1/governance/distribution",
   // Unified activity feed (borrows, repays, auto-protect, withdraws,
   // referral payouts, holder rewards). Same risk envelope as /loans.
   "/api/v1/activity",
