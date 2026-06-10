@@ -536,10 +536,14 @@ bot.start({
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
     // Delayed start to avoid bunching with other startup workers.
     setTimeout(() => startRwaScreener(bot), 180_000);
-    // $MAGPIE holder reward distributions (weekly snapshot + pro-rata payout).
-    // Idempotent — only runs when the pool has accrued AND 7+ days have
-    // passed since the last distribution.
-    setTimeout(() => startHolderDistributor(bot), 90_000);
+    // $MAGPIE holder reward distributions — DISABLED as of MGP-001 (2026-06-10).
+    // Distributions now flow through the governance autopilot (MGP-XXX) instead
+    // of an automated bot-driven cadence. The auto-snapshotter previously created
+    // pre-staged rows in magpie_holder_rewards that confused the dashboard's
+    // activity feed when the actual on-chain send never happened. Keeping it
+    // permanently off; if a future MGP proposal restores automated distributions,
+    // re-enable this line as part of that proposal's ratified implementation.
+    // setTimeout(() => startHolderDistributor(bot), 90_000);
     // LP Loyalty distributor — rewards long-term LPs from 2% of fees
     setTimeout(() => startLpLoyaltyDistributor(), 120_000);
     // Loan reconciler — proactively syncs DB state with on-chain truth
