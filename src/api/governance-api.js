@@ -64,9 +64,16 @@ const ACTIVE_PROPOSALS = {
     questions: {},
   },
   "MGP-003": {
-    status: "draft",
-    activated_at_iso: null,
-    closes_at_iso: null,
+    // Pre-armed activation. The vote endpoint's time-gate already
+    // rejects any payload signed before activated_at_iso, so by
+    // setting both timestamps now (a few days before activation)
+    // the proposal flips itself live at 2026-06-12T00:00:00Z without
+    // requiring an operator-issued config push at activation time.
+    // status: "active" is the UI-facing label; the on-vote gate is
+    // the load-bearing piece, not this string.
+    status: "active",
+    activated_at_iso: "2026-06-12T00:00:00Z",
+    closes_at_iso: "2026-06-15T00:00:00Z",
     questions: {
       Vote: { choices: ["A", "B", "C", "D", "E", "ABSTAIN"] },
     },
