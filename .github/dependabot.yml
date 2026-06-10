@@ -1,0 +1,61 @@
+version: 2
+
+# Dependabot configuration for the bot.
+#
+# Security patches: highest priority, auto-PR immediately.
+# Non-security: weekly, grouped.
+# No auto-merge — the bot is the load-bearing piece of the protocol;
+# dependency changes get explicit operator review.
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Chicago"
+    open-pull-requests-limit: 10
+    groups:
+      production-deps:
+        applies-to: version-updates
+        dependency-type: "production"
+        update-types: ["patch", "minor"]
+      dev-deps:
+        applies-to: version-updates
+        dependency-type: "development"
+        update-types: ["patch", "minor"]
+      # Solana / Anchor get their own group — these are protocol-
+      # critical; operator wants concentrated visibility on them.
+      solana:
+        applies-to: version-updates
+        patterns:
+          - "@solana/*"
+          - "@coral-xyz/*"
+          - "bs58"
+          - "bn.js"
+    labels:
+      - "dependencies"
+      - "bot"
+
+  # Docker base image bumps (node:alpine etc.) — picks up CVE patches
+  # in the image layer.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
