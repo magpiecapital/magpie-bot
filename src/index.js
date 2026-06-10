@@ -284,6 +284,7 @@ bot.command("pools", handleHolderPool); // alias
 // operator can enable it on demand; the per-chat enable check inside
 // the handlers ensures it does nothing in groups that haven't opted in.
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
+import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
@@ -295,6 +296,17 @@ bot.command("unban", handleCommunityUnban);
 bot.command("strikes", handleCommunityStrikes);
 bot.command("clear_strikes", handleCommunityClearStrikes);
 bot.command("crosspost", handleCommunityCrosspost);
+
+// Governance autopilot admin — operator-only commands gated inside each handler
+// via OPERATOR_TG_IDS env var. /gov-pause is the master kill switch.
+bot.command("gov-pause", handleGovPause);
+bot.command("gov_pause", handleGovPause);   // underscore alias (TG strips dashes inconsistently on some clients)
+bot.command("gov-resume", handleGovResume);
+bot.command("gov_resume", handleGovResume);
+bot.command("gov-status", handleGovStatus);
+bot.command("gov_status", handleGovStatus);
+bot.command("gov-confirm-manual", handleGovConfirmManual);
+bot.command("gov_confirm_manual", handleGovConfirmManual);
 
 // Inline callback registration.
 //
@@ -455,6 +467,13 @@ bot.start({
     // ON CONFLICT-safe so re-runs are a no-op.
     initGovernanceSchema().catch((err) =>
       console.warn("[bot] initGovernanceSchema failed (continuing):", err.message),
+    );
+    // Governance autopilot — wakes every 5 min, processes any proposal whose
+    // voting window has closed. No-op while autopilot is disabled (operator
+    // toggle via /gov-pause /gov-resume; DB-backed flag). Safe to start even
+    // before any proposal is active — pipeline finds no work and exits clean.
+    import("./services/governance-pipeline-scheduler.js").then((m) =>
+      m.startGovernancePipelineScheduler(),
     );
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();
