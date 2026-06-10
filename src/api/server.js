@@ -92,6 +92,7 @@ import {
   initGovernanceSchema,
 } from "./governance-api.js";
 import { handleVotingPowerQuery } from "./governance-voting-power-api.js";
+import { handleDistributionQuery } from "./governance-distribution-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handlePipSession } from "./pip-session.js";
@@ -1772,6 +1773,9 @@ async function router(req, res) {
         break;
       case "/api/v1/governance/voting-power":
         result = await handleVotingPowerQuery(req, url);
+        break;
+      case "/api/v1/governance/distribution":
+        result = await handleDistributionQuery(req, url);
         break;
       case "/api/v1/activity":
         result = await handleActivity(req, url);
