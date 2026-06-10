@@ -27,8 +27,28 @@ function isOperator(ctx) {
   return OPERATOR_IDS.includes(String(ctx.from?.id ?? ""));
 }
 
+// Diagnostic helper for the temporary debug rejection. Surfaces enough
+// info to know whether the env var is missing, the value mismatches,
+// or the caller's id is reading differently than expected. Strip back
+// to a quiet "Command is operator-only" once the autopilot is verified
+// wired up correctly.
+function rejectWithDebug(ctx) {
+  const callerId = String(ctx.from?.id ?? "(no id)");
+  const whitelistDump = OPERATOR_IDS.length === 0
+    ? "(env var EMPTY at bot startup — Railway didn't load OPERATOR_TG_IDS)"
+    : `[${OPERATOR_IDS.map((s) => `"${s}"`).join(", ")}]`;
+  return ctx.reply(
+    `Command is operator-only.\n\n` +
+      `Debug:\n` +
+      `  Your TG id : "${callerId}"\n` +
+      `  Whitelist  : ${whitelistDump}\n` +
+      `  Count      : ${OPERATOR_IDS.length}\n\n` +
+      `If your id is NOT in the whitelist, fix the Railway env var. If the whitelist is empty, the env var didn't load at startup — re-check Railway and redeploy.`,
+  );
+}
+
 export async function handleGovPause(ctx) {
-  if (!isOperator(ctx)) return ctx.reply("Command is operator-only.");
+  if (!isOperator(ctx)) return rejectWithDebug(ctx);
   const reason = (ctx.message?.text ?? "").replace(/^\/gov-pause\s*/, "").trim() || "(no reason given)";
   await query(
     `UPDATE governance_autopilot_state
@@ -43,7 +63,7 @@ export async function handleGovPause(ctx) {
 }
 
 export async function handleGovResume(ctx) {
-  if (!isOperator(ctx)) return ctx.reply("Command is operator-only.");
+  if (!isOperator(ctx)) return rejectWithDebug(ctx);
   await query(
     `UPDATE governance_autopilot_state
         SET enabled = true,
@@ -56,7 +76,7 @@ export async function handleGovResume(ctx) {
 }
 
 export async function handleGovStatus(ctx) {
-  if (!isOperator(ctx)) return ctx.reply("Command is operator-only.");
+  if (!isOperator(ctx)) return rejectWithDebug(ctx);
   const { rows: [s] } = await query(
     `SELECT enabled, paused_by, paused_at, paused_reason, last_run_at, last_run_status, last_run_detail
        FROM governance_autopilot_state WHERE id = 1`,
@@ -84,7 +104,7 @@ export async function handleGovStatus(ctx) {
 }
 
 export async function handleGovConfirmManual(ctx) {
-  if (!isOperator(ctx)) return ctx.reply("Command is operator-only.");
+  if (!isOperator(ctx)) return rejectWithDebug(ctx);
   const parts = (ctx.message?.text ?? "").split(/\s+/);
   const proposalId = parts[1];
   const actionIdxStr = parts[2];
