@@ -48,19 +48,23 @@ export const PROPOSALS = {
   },
 
   /**
-   * MGP-002 — Fee restructure to 70/10/10/10 (DRAFT — not yet activated).
-   * Full spec lives at magpiecapital/magpie-partners:protocol-economics.md.
-   * Activated_at_iso fills in when the operator opens voting.
+   * MGP-002 — Fee restructure to 70/10/10/10.
+   * Full spec at magpiecapital/magpie-partners:protocol-economics.md.
+   *
+   * ACTIVATED 2026-06-10T20:40 UTC, closes 2026-06-13T20:40 UTC (72h window).
+   * Snapshot taken at activation: MGP-002-2026-06-10T20-38-44-683Z.json,
+   *   sha256 f217caef513729bc37e8f89d1205ba6d641640f05f314127a606d856fc0abc69,
+   *   2,204 unique eligible wallets.
    */
   "MGP-002": {
     id: "MGP-002",
     title: "Fee Restructure — Holder-First Economics (70/10/10/10)",
     proposal_type: "economics_change",
-    voting_started_at_iso: null,  // TBD when activated
-    voting_ends_at_iso: null,
+    voting_started_at_iso: "2026-06-10T20:40:00Z",
+    voting_ends_at_iso: "2026-06-13T20:40:00Z",
     quorum_pct: 10.0,
     threshold_pct: 66.6,
-    snapshot_id: null,  // taken at activation time
+    snapshot_id: "MGP-002",
     // The implementation_plan below is the autopilot's task list IF MGP-002 passes.
     // Order matters — actions execute sequentially; failure halts the rest.
     implementation_plan: [
