@@ -286,6 +286,14 @@ bot.command("pools", handleHolderPool); // alias
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
 import { handleVote, handleVotingPower } from "./commands/vote.js";
+import {
+  handleNominate,
+  handleNominationsList,
+  handleUpvoteNomination,
+  handleWithdrawNomination,
+  handleNominationReview,
+  handleMyNominations,
+} from "./commands/nominations.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
@@ -313,6 +321,15 @@ bot.command("gov_confirm_manual", handleGovConfirmManual);
 bot.command("vote", handleVote);
 bot.command("votingpower", handleVotingPower);
 bot.command("voting_power", handleVotingPower);
+
+// User-driven governance nominations — anyone can nominate, upvote, etc.
+// Operator-only review command gated inside its handler.
+bot.command("nominate", handleNominate);
+bot.command("nominations", handleNominationsList);
+bot.command("upvote_nomination", handleUpvoteNomination);
+bot.command("withdraw_nomination", handleWithdrawNomination);
+bot.command("my_nominations", handleMyNominations);
+bot.command("nomination_review", handleNominationReview);
 
 // Inline callback registration.
 //
