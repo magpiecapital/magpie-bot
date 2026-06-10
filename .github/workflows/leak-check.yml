@@ -1,0 +1,90 @@
+name: Leak check
+
+# Defense-in-depth pre-merge guard. Blocks any commit that introduces:
+#   - The operator's protected names (in obfuscated form so the workflow
+#     source itself doesn't contain the literal strings)
+#   - Plausible hardcoded secrets (api_key/private_key/secret = <long-hex>)
+#   - Filesystem paths that include the operator's username
+#
+# Runs on every push to main and every PR targeting main. Branch
+# protection requires this status to pass before merge — see the
+# repo's branch-protection rules.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    # Read-only. No write scopes needed for a grep job.
+    permissions:
+      contents: read
+      id-token: none
+      actions: none
+      checks: none
+      deployments: none
+      packages: none
+      pull-requests: none
+      statuses: none
+    steps:
+      # Actions pinned to commit SHAs (immutable). Tags can be re-pointed
+      # by a compromised maintainer; SHAs cannot.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Verify no operator identifiers in source
+        run: |
+          # Pattern stored as base64 so the workflow source doesn't itself
+          # contain the literal protected names. Defeats casual grep of
+          # the public repo for the very strings we're guarding against.
+          NAME_PATTERN=$(echo 'YnJhZGxleXxsdWJldGtpbnxicmFkbGV5bHViZXRraW58dGhlbWVtZWJhbmtlcg==' | base64 -d)
+          if grep -rinE "$NAME_PATTERN" \
+              --include='*.ts' --include='*.js' --include='*.json' \
+              --include='*.md' --include='*.yml' --include='*.yaml' \
+              --include='*.sh' --include='*.sql' --include='Dockerfile*' \
+              src/ scripts/ docs/ 2>/dev/null; then
+            echo ''
+            echo 'LEAK: operator identifier found in source. See matches above.'
+            echo 'If the match is in a defensive matcher (e.g. a regex meant'
+            echo 'to refuse user input containing the name), rewrite using'
+            echo 'Unicode escapes \\uXXXX so the regex matches at runtime but'
+            echo 'the source bytes do not contain the literal characters.'
+            exit 1
+          fi
+          echo 'no operator identifier leaks'
+
+      - name: Verify no plausible hardcoded secrets
+        run: |
+          # Generic regex for "api_key" / "private_key" / "secret" followed
+          # by a value-shaped token. Won't catch every secret pattern but
+          # catches the obvious ones. CI failure → operator investigates.
+          if grep -rE '(api[_-]?key|private[_-]?key|secret)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9]{16,}' \
+              --include='*.ts' --include='*.js' --include='*.json' \
+              --include='*.yml' --include='*.yaml' \
+              src/ scripts/ 2>/dev/null; then
+            echo ''
+            echo 'LEAK: plausible hardcoded secret found. Move to env var.'
+            exit 1
+          fi
+          echo 'no hardcoded secrets'
+
+      - name: Verify no operator filesystem paths
+        run: |
+          # The operator's username appearing as a /Users/<name>/ filesystem
+          # path is a classic leak (rgrep'd from docs/screenshots). We
+          # check for any /Users/ path with a long name segment — false
+          # positives are acceptable since legit /Users/ paths shouldn't
+          # be in committed code anyway (they'd be machine-specific).
+          if grep -rE '/Users/[a-zA-Z]{6,}/' \
+              --include='*.ts' --include='*.js' --include='*.json' \
+              --include='*.md' --include='*.yml' --include='*.yaml' \
+              --include='*.sh' --include='Dockerfile*' \
+              src/ scripts/ docs/ .github/ 2>/dev/null; then
+            echo ''
+            echo 'LEAK: hardcoded /Users/<name>/ path found. Rewrite to use'
+            echo '$HOME, ~, or a relative path.'
+            exit 1
+          fi
+          echo 'no filesystem-path leaks'
