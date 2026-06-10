@@ -93,6 +93,7 @@ import {
 } from "./governance-api.js";
 import { handleVotingPowerQuery } from "./governance-voting-power-api.js";
 import { handleDistributionQuery } from "./governance-distribution-api.js";
+import { handleDistributionsListQuery } from "./governance-distributions-list-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handlePipSession } from "./pip-session.js";
@@ -1465,6 +1466,7 @@ const PUBLIC_ROUTES = new Set([
   // to be visible to the wallet's owner on the dashboard.
   "/api/v1/governance/voting-power",
   "/api/v1/governance/distribution",
+  "/api/v1/governance/distributions",
   // Unified activity feed (borrows, repays, auto-protect, withdraws,
   // referral payouts, holder rewards). Same risk envelope as /loans.
   "/api/v1/activity",
@@ -1782,6 +1784,9 @@ async function router(req, res) {
         break;
       case "/api/v1/governance/distribution":
         result = await handleDistributionQuery(req, url);
+        break;
+      case "/api/v1/governance/distributions":
+        result = await handleDistributionsListQuery(req, url);
         break;
       case "/api/v1/activity":
         result = await handleActivity(req, url);
