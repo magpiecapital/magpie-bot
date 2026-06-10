@@ -2,26 +2,32 @@
 /**
  * Take a governance vote-weight snapshot for a specific proposal.
  *
- * Reuses snapshotMagpieHolders() from the holder-rewards pipeline —
- * same eligibility rules (exempt list + System-Program owner check)
- * so vote weight matches the protocol's already-vetted holder set.
+ * Captures THREE categories of eligible wallets at a single point
+ * in time + a deduplicated combined set. Operator decides the
+ * distribution model from there:
+ *
+ *   1. holders                  — on-chain $MAGPIE holders
+ *   2. collateralized_borrowers — wallets whose $MAGPIE is locked
+ *                                  in active loan vaults (economic
+ *                                  owners; not punished for engaging)
+ *   3. lp_providers             — wallets supplying SOL to the
+ *                                  LendingPool (lp_positions.shares > 0)
+ *
+ * Categories 1 + 2 inherit the same exempt-list + PDA-sweep that
+ * protects the holder-rewards path. Category 3 uses DB-tracked
+ * positions (already filtered upstream).
  *
  * Privacy contract:
- *   - Output path is taken from $GOVERNANCE_SNAPSHOT_OUT_DIR (no
- *     default committed to repo; the operator sets a private path
- *     outside any git tree). If unset, refuses to run.
- *   - Per-wallet balances are written to the output file only.
- *     stdout receives ONLY the holder count, weighted total, and
- *     a SHA-256 hash of the canonicalized snapshot — never any
- *     wallet address or balance.
- *   - The exact moment this script fires is sensitive. Do not log
- *     it anywhere besides the output file's own timestamped name.
+ *   - Output path comes from $GOVERNANCE_SNAPSHOT_OUT_DIR (no
+ *     default committed). Must be a private directory outside any
+ *     git tree.
+ *   - Per-wallet data goes ONLY to the output file. stdout receives
+ *     counts, totals, and a SHA-256 hash — never wallet addresses
+ *     or balances.
+ *   - The exact moment this fires is sensitive. Do not log it
+ *     anywhere besides the output file's own timestamped name.
  *
  * Usage:
- *   GOVERNANCE_SNAPSHOT_OUT_DIR=/path/to/private \
- *     node scripts/governance-snapshot.js <PROPOSAL_ID>
- *
- * Example:
  *   GOVERNANCE_SNAPSHOT_OUT_DIR=$HOME/.magpie-private/snapshots \
  *     node scripts/governance-snapshot.js MGP-XXX
  */
@@ -35,7 +41,7 @@ import dotenv from "dotenv";
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 dotenv.config({ path: join(REPO_ROOT, ".env") });
 
-import { snapshotMagpieHolders } from "../src/services/magpie-holder-rewards.js";
+import { snapshotForGovernance } from "../src/services/governance-snapshot.js";
 
 const proposalId = process.argv[2];
 if (!proposalId || !/^MGP-\d{3}$/.test(proposalId)) {
@@ -54,64 +60,62 @@ if (!outDir) {
 }
 
 if (!existsSync(outDir)) {
-  // mkdir with restrictive mode — only the owner can read the dir
-  // even if the parent permits broader access.
   mkdirSync(outDir, { recursive: true, mode: 0o700 });
 }
 
 (async () => {
   const tookAt = new Date().toISOString();
-  // Embed UTC date + minute precision in the filename — same proposal
-  // could in principle be re-snapshotted on a different day; clobbering
-  // a prior snapshot would be silent and disastrous.
   const stamp = tookAt.replace(/[:.]/g, "-");
   const outFile = join(outDir, `${proposalId}-${stamp}.json`);
 
-  let holders;
+  let snap;
   try {
-    holders = await snapshotMagpieHolders();
+    snap = await snapshotForGovernance();
   } catch (err) {
     console.error("Snapshot failed:", err.message);
     process.exit(2);
   }
 
-  // Sort by owner for deterministic hashing — same eligible set
-  // must always hash to the same value regardless of RPC return order.
-  holders.sort((a, b) => (a.owner < b.owner ? -1 : a.owner > b.owner ? 1 : 0));
+  // Deterministic sort per category — same eligible set must always
+  // hash to the same value regardless of RPC / DB row order.
+  const sortByWallet = (a, b) =>
+    a.wallet < b.wallet ? -1 : a.wallet > b.wallet ? 1 : 0;
+  snap.holders.sort(sortByWallet);
+  snap.collateralized_borrowers.sort(sortByWallet);
+  snap.lp_providers.sort(sortByWallet);
+  // combined_eligible_set is already sorted by the service.
 
-  const totalRaw = holders.reduce((acc, h) => acc + BigInt(h.balance_raw), 0n);
-
-  // Canonical JSON for hashing — stringify with explicit ordering and
-  // convert BigInts to decimal strings.
   const canonical = JSON.stringify({
     proposal_id: proposalId,
     taken_at_utc: tookAt,
-    holder_count: holders.length,
-    total_weighted_raw: totalRaw.toString(),
-    holders: holders.map((h) => ({
-      owner: h.owner,
-      balance_raw: h.balance_raw.toString(),
-    })),
+    scope_version: "v2-categorized",
+    totals: snap.totals,
+    categories: {
+      holders: snap.holders,
+      collateralized_borrowers: snap.collateralized_borrowers,
+      lp_providers: snap.lp_providers,
+    },
+    combined_eligible_set: snap.combined_eligible_set,
   });
 
   const hash = createHash("sha256").update(canonical).digest("hex");
 
-  // Output file is JSON; hash is stored alongside so verification
-  // can be done by re-hashing the holders array later.
   writeFileSync(outFile, canonical, { mode: 0o600 });
 
-  // stdout: counts + hash only. NO wallet addresses, NO balances.
-  // Wide enough to confirm "snapshot fired and looks sane" without
-  // leaking the eligible set.
-  console.log(JSON.stringify({
-    ok: true,
-    proposal_id: proposalId,
-    taken_at_utc: tookAt,
-    holder_count: holders.length,
-    total_weighted_raw: totalRaw.toString(),
-    hash_sha256: hash,
-    output_basename: outFile.split("/").pop(),
-  }));
+  // stdout: counts + totals + hash only. NO wallet addresses, NO
+  // balances. Enough to confirm "snapshot fired and looks sane"
+  // without leaking eligibility.
+  console.log(
+    JSON.stringify({
+      ok: true,
+      proposal_id: proposalId,
+      taken_at_utc: tookAt,
+      scope_version: "v2-categorized",
+      totals: snap.totals,
+      hash_sha256: hash,
+      output_basename: outFile.split("/").pop(),
+    }),
+  );
 
   process.exit(0);
 })();
