@@ -52,30 +52,30 @@ export function computeMilestoneTimes(proposal) {
  */
 const TEMPLATES = {
   vote_opens:
-    "🗳️ Voting is now open: {{title}}\n\n" +
+    "Voting is now open: {{title}}\n\n" +
     "MGP-XXX details: {{governance_url}}\n" +
     "Closes: {{closes_at_human}}\n\n" +
     "If you held $MAGPIE at the snapshot, your dashboard shows your voting weight. " +
     "Cast YES or NO from your wallet — you can change your vote any time before close.",
 
   "48h_quorum_check":
-    "📊 Voting check-in: {{title}}\n\n" +
+    "Voting check-in: {{title}}\n\n" +
     "Current participation: {{participation_pct}}% (quorum: {{quorum_pct}}%)\n" +
     "Cast your vote at {{governance_url}}",
 
   halfway_mark:
-    "⏳ Halfway through voting: {{title}}\n\n" +
+    "Halfway through voting: {{title}}\n\n" +
     "Participation so far: {{participation_pct}}%\n" +
     "Time remaining: {{time_remaining_human}}\n\n" +
     "{{governance_url}}",
 
   final_24h:
-    "⚠️ 24 HOURS LEFT to vote on {{title}}\n\n" +
+    "24 HOURS LEFT to vote on {{title}}\n\n" +
     "Current participation: {{participation_pct}}%\n" +
     "{{governance_url}}",
 
   final_1h:
-    "🚨 FINAL HOUR to vote on {{title}}\n\n" +
+    "FINAL HOUR to vote on {{title}}\n\n" +
     "Participation: {{participation_pct}}%\n" +
     "If you've been holding off, this is the time.\n\n" +
     "{{governance_url}}",

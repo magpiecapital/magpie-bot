@@ -55,7 +55,7 @@ export async function handleVote(ctx) {
     );
   }
 
-  const lines = ["🗳️ *Active Governance Proposals*", ""];
+  const lines = ["*Active Governance Proposals*", ""];
   for (const p of active) {
     lines.push(`*${p.id}* — ${p.title}`);
     lines.push(`${fmtCloses(p.voting_ends_at_iso)}`);
@@ -93,17 +93,17 @@ export async function handleVotingPower(ctx) {
     return ctx.reply("No governance proposals are active or recent.");
   }
 
-  const lines = ["⚖️ *Your Voting Weight*", "", `Wallet: \`${wallet.slice(0, 8)}...${wallet.slice(-4)}\``, ""];
+  const lines = ["*Your Voting Weight*", "", `Wallet: \`${wallet.slice(0, 8)}...${wallet.slice(-4)}\``, ""];
   for (const p of proposalsToShow) {
     const power = await getVotingPower({ wallet, proposalId: p.id, snapshotId: p.snapshot_id });
     lines.push(`*${p.id}* — ${p.title}`);
     if (!power.eligible) {
-      lines.push(`  ❌ Not eligible — ${power.reason}`);
+      lines.push(`  Not eligible — ${power.reason}`);
     } else {
       lines.push(`  Weight: *${fmtMagpie(power.raw_weight)} $MAGPIE*`);
       lines.push(`  (${(power.weight_pct_of_pool).toFixed(4)}% of eligible pool)`);
       if (power.was_capped) {
-        lines.push(`  ⚠️ Whale-capped at ${(power.cap_fraction * 100).toFixed(0)}% — voting power counted as ${(power.capped_pct_of_pool).toFixed(4)}%`);
+        lines.push(`  Whale-capped at ${(power.cap_fraction * 100).toFixed(0)}% — voting power counted as ${(power.capped_pct_of_pool).toFixed(4)}%`);
       }
       if (Number(power.collateralized_raw) > 0) {
         lines.push(`  Held: ${fmtMagpie(power.held_raw)} · Locked as collateral: ${fmtMagpie(power.collateralized_raw)}`);
