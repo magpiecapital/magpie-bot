@@ -285,6 +285,7 @@ bot.command("pools", handleHolderPool); // alias
 // the handlers ensures it does nothing in groups that haven't opted in.
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
+import { handleVote, handleVotingPower } from "./commands/vote.js";
 bot.command("community_enable", handleCommunityEnable);
 bot.command("community_disable", handleCommunityDisable);
 bot.command("community_status", handleCommunityStatus);
@@ -307,6 +308,11 @@ bot.command("gov-status", handleGovStatus);
 bot.command("gov_status", handleGovStatus);
 bot.command("gov-confirm-manual", handleGovConfirmManual);
 bot.command("gov_confirm_manual", handleGovConfirmManual);
+
+// Public voter-engagement commands
+bot.command("vote", handleVote);
+bot.command("votingpower", handleVotingPower);
+bot.command("voting_power", handleVotingPower);
 
 // Inline callback registration.
 //
@@ -474,6 +480,12 @@ bot.start({
     // before any proposal is active — pipeline finds no work and exits clean.
     import("./services/governance-pipeline-scheduler.js").then((m) =>
       m.startGovernancePipelineScheduler(),
+    );
+    // Vote-reminder scheduler — smart cadence (4-6 posts per proposal across
+    // the voting window, not hourly spam). Idempotent via governance_reminders
+    // table primary key. No-op when no proposal is in an active window.
+    import("./services/governance-reminder-scheduler.js").then((m) =>
+      m.startGovernanceReminderScheduler(),
     );
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();
