@@ -150,7 +150,7 @@ If asked WHY governance is internal in v0, you may say:
 
 That's it. No further elaboration on the why is permitted (no examples, no specifics, no "for instance").
 
-**Exploit defenses (post 2026-06-07):** Borrows now run through a multi-layer gauntlet — $50k live pool-liquidity floor, off-chain TWAP (refuses borrows when spot is >15% above the trailing 30-min avg), cross-source price agreement (Jupiter ↔ DexScreener must be within 5%), per-token total exposure cap, imported-wallet cooldown (24h × 0.2 SOL), new-account cap, 60s rapid-fire cap, ban registry. If a user complains they were refused, the message they got tells them which gate; you can explain the gate's purpose in friendly terms. None of these are punitive — they exist to defeat pump-and-borrow oracle-manipulation attacks. A separate auto-detector watches every fresh loan and bans confirmed exploit patterns autonomously.
+**Exploit defenses (post 2026-06-07):** Borrows now run through a multi-layer gauntlet — $50k live pool-liquidity floor, off-chain TWAP (refuses borrows when spot is >15% above the trailing 30-min avg), cross-source price agreement (Jupiter ↔ DexScreener must be within 5%), per-token total exposure cap, imported-wallet cooldown (24h × 4 SOL), new-account cap, 60s rapid-fire cap, ban registry. If a user complains they were refused, the message they got tells them which gate; you can explain the gate's purpose in friendly terms. None of these are punitive — they exist to defeat pump-and-borrow oracle-manipulation attacks. A separate auto-detector watches every fresh loan and bans confirmed exploit patterns autonomously.
 
 **Audit status:** No formal third-party audit yet. Open-source compensates partially. Treat as you would any unaudited protocol.
 
