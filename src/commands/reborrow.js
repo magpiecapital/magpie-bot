@@ -164,6 +164,8 @@ export function registerReborrowCallbacks(bot) {
     await ctx.editMessageText("⏳ Submitting on-chain...");
 
     try {
+      const { publicKey: borrowerWallet } = await ensureWallet(user.id);
+
       const result = await executeBorrow({
         userId: user.id,
         collateralMint: mint,
@@ -187,6 +189,7 @@ export function registerReborrowCallbacks(bot) {
         durationDays: tier.days,
         txSignature: result.signature,
         programId: result.programId,
+        borrowerWallet,
       });
       await incrementBorrowed(user.id, loanAmount);
 
