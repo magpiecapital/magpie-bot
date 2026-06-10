@@ -265,6 +265,16 @@ let batchN = 0;
 let successCount = 0;
 let failureCount = 0;
 
+// Inter-batch delay to stay under RPC rate limits. Helius free tier is
+// ~10 req/s; sendAndConfirmTransaction takes 3-5 requests per batch (send,
+// confirm-poll, etc), so a 750ms delay gives us comfortable headroom.
+// Configurable via INTER_BATCH_DELAY_MS env in case a paid RPC supports faster.
+const INTER_BATCH_DELAY_MS = Math.max(
+  0,
+  Number(process.env.INTER_BATCH_DELAY_MS) || 750,
+);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 for (let i = 0; i < work.length; i += BATCH_SIZE) {
   batchN++;
   const batch = work.slice(i, i + BATCH_SIZE);
@@ -284,6 +294,10 @@ for (let i = 0; i < work.length; i += BATCH_SIZE) {
     sig = await sendAndConfirmTransaction(connection, tx, [sender], {
       commitment: "confirmed",
     });
+    // Slow the next batch down a bit to keep the RPC quota happy
+    if (INTER_BATCH_DELAY_MS > 0 && i + BATCH_SIZE < work.length) {
+      await sleep(INTER_BATCH_DELAY_MS);
+    }
   } catch (err) {
     failureCount += batch.length;
     appendFileSync(

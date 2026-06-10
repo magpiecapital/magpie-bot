@@ -110,14 +110,32 @@ export async function handleActivity(req, url) {
     ),
     // Holder rewards are keyed on wallet_address, not user_id — fan out
     // over every wallet this user owns.
+    //
+    // UNION across two sources:
+    //   - magpie_holder_rewards: the legacy auto-trigger distribution path
+    //     (currently unused — disabled per MGP-001 cutover, all rows deleted).
+    //     Left in the UNION so any future re-enable of that path surfaces
+    //     correctly without an API change.
+    //   - governance_distributions: the MGP-XXX governance-flow distributions.
+    //     'sent' status means tx_signature has been confirmed on-chain.
     query(
-      `SELECT mhr.id, mhr.reward_lamports::text AS amount, mhr.paid_tx_signature,
-              mhr.paid_at, mhr.created_at
-         FROM magpie_holder_rewards mhr
-         JOIN wallets w ON w.public_key = mhr.wallet_address
-        WHERE w.user_id = $1 AND mhr.status = 'paid'
-        ORDER BY mhr.paid_at DESC NULLS LAST
-        LIMIT $2`,
+      `(SELECT mhr.id::text AS id, mhr.reward_lamports::text AS amount,
+               mhr.paid_tx_signature AS tx_signature,
+               mhr.paid_at AS at_time, mhr.created_at
+          FROM magpie_holder_rewards mhr
+          JOIN wallets w ON w.public_key = mhr.wallet_address
+         WHERE w.user_id = $1 AND mhr.status = 'paid')
+       UNION ALL
+       (SELECT gd.proposal_id || ':' || gd.wallet AS id,
+               gd.allocated_lamports::text AS amount,
+               gd.tx_signature,
+               gd.sent_at AS at_time,
+               gd.created_at
+          FROM governance_distributions gd
+          JOIN wallets w ON w.public_key = gd.wallet
+         WHERE w.user_id = $1 AND gd.status = 'sent' AND gd.tx_signature IS NOT NULL)
+       ORDER BY at_time DESC NULLS LAST
+       LIMIT $2`,
       [userId, limit],
     ),
     query(
@@ -210,9 +228,9 @@ export async function handleActivity(req, url) {
   for (const r of holderRows) {
     events.push({
       kind: "holder_reward_paid",
-      at: r.paid_at || r.created_at,
+      at: r.at_time || r.created_at,
       amount_lamports: r.amount,
-      tx_signature: r.paid_tx_signature,
+      tx_signature: r.tx_signature,
     });
   }
   for (const r of lockRows) {
