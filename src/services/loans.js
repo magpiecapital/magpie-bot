@@ -451,6 +451,18 @@ export async function recordLoan({
   // don't pass programId fall through to v1 — matches the column backfill.
   const recordedProgramId = programId ?? PROGRAM_ID.toBase58();
 
+  // A missing borrowerWallet here means the loan row gets inserted as NULL,
+  // which silently excludes the borrower from governance snapshots + holder
+  // aggregations. /reborrow shipped without this for a while — keep the
+  // surface visible so any future caller bug is immediately noisy.
+  if (!borrowerWallet) {
+    console.warn(
+      `[loans.recordLoan] borrowerWallet missing for loan_id=${loanId} ` +
+        `loan_pda=${loanPda} — row will be inserted with NULL; ` +
+        `re-check the caller (this used to silently drop borrowers from snapshots).`,
+    );
+  }
+
   const { rows } = await query(
     `INSERT INTO loans (
        user_id, loan_id, loan_pda, collateral_mint, collateral_amount,
