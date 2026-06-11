@@ -330,6 +330,17 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("limitorders", lc.handleLimitOrders);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
 }
+// Agent delegations — Tier 2 (x402 agentic wrapper). Users authorize
+// agents to arm limit-close orders on their behalf within explicit
+// bounds (max per order, max active, max slippage, expiry). The
+// magpie-x402 endpoint validates every agent request against these
+// rows BEFORE writing to limit_close_orders.
+{
+  const ad = await import("./commands/agent-delegations.js");
+  bot.command("agent_authorize", ad.handleAgentAuthorize);
+  bot.command("agent_revoke", ad.handleAgentRevoke);
+  bot.command("agent_list", ad.handleAgentList);
+}
 
 // Governance autopilot admin — operator-only commands gated inside each handler
 // via OPERATOR_TG_IDS env var. /gov-pause is the master kill switch.
