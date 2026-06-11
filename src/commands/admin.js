@@ -824,15 +824,29 @@ export async function handleFundPool(ctx) {
     const p = await program.account.lendingPool.fetch(pool);
     const newTvl = Number(p.totalDeposits) / 1e9;
 
+    // Sync the lender's lp_positions row immediately. Without this,
+    // the row stays at its old shares value until the next 6h lp-loyalty
+    // tick, leaving every read of "operator's LP share" wrong post-/fundpool.
+    let syncedShares = null;
+    try {
+      const { syncPositionsForWallet } = await import("../services/lp-loyalty.js");
+      const updates = await syncPositionsForWallet(lender.publicKey);
+      const match = updates.find((u) => u.pool === pool.toBase58());
+      if (match) syncedShares = match.shares;
+    } catch (err) {
+      console.warn("[fundpool] post-deposit lp_positions sync failed:", err.message);
+    }
+
     await ctx.reply(
       [
         `✅ *${poolLabel} funded*`,
         "",
         `Deposited: \`${amountSol} SOL\``,
         `New pool TVL: \`${newTvl.toFixed(4)} SOL\``,
+        syncedShares ? `Your shares now: \`${syncedShares}\`` : null,
         "",
         `[View tx](https://solscan.io/tx/${sig})`,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       { parse_mode: "Markdown", disable_web_page_preview: true },
     );
   } catch (err) {
