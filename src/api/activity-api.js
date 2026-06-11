@@ -53,6 +53,8 @@ export async function handleActivity(req, url) {
     { rows: refRows },
     { rows: holderRows },
     { rows: lockRows },
+    { rows: creditEventRows },
+    { rows: [pointsAgg] },
   ] = await Promise.all([
     // Add loan_pda + program_id so we can scope to THIS WALLET via PDA-
     // derivation. Multi-wallet users were seeing borrows from ALL their
@@ -146,6 +148,27 @@ export async function handleActivity(req, url) {
         LIMIT $2`,
       [userId, limit],
     ),
+    // Credit events — sum of score_delta is what the dashboard renders
+    // as "points". Without this join, every event in the response had
+    // score_delta undefined and the dashboard's reduce returned 0
+    // even when credit_events.score_delta totalled positive.
+    query(
+      `SELECT id, loan_id, event_type, score_delta, created_at
+         FROM credit_events
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [userId, limit],
+    ),
+    // Total points across the user's entire history — a single SUM is
+    // cheaper than asking the dashboard to reconstruct from per-event
+    // deltas, and it correctly counts events older than the `limit`.
+    query(
+      `SELECT COALESCE(SUM(score_delta), 0)::int AS total_points
+         FROM credit_events
+        WHERE user_id = $1`,
+      [userId],
+    ),
   ]);
 
   // ── Wallet-scope the loan-derived events ──────────────────────
@@ -169,6 +192,47 @@ export async function handleActivity(req, url) {
   );
   const protectRows = protectRowsRaw.filter((r) => walletLoanIds.has(String(r.loan_id)));
 
+  // Build a quick lookup of credit_events by loan_db_id so we can attach
+  // score_delta to the matching activity event. credit_events.loan_id
+  // is the DB primary key (loans.id), not the on-chain loan_id.
+  // Group by (loan_id, event_type) so a single loan with multiple
+  // credit-affecting events (e.g. borrow + repay_early) gets each one
+  // attached to the right activity row.
+  const creditByLoanAndType = new Map();
+  for (const ce of creditEventRows) {
+    const key = `${ce.loan_id}:${ce.event_type}`;
+    if (!creditByLoanAndType.has(key)) creditByLoanAndType.set(key, ce.score_delta);
+  }
+  // Map activity-event kind → the credit_events.event_type names that
+  // produce score for it. Multiple credit events can affect one
+  // activity event (e.g. a repaid loan has BOTH "repay_early" and the
+  // implicit "borrow" delta from earlier). For "borrow" the
+  // credit_event is recorded with the loan_id at borrow time.
+  function deltaForLoanEvent(loanDbId, kind) {
+    if (loanDbId == null) return null;
+    if (kind === "borrow") {
+      return creditByLoanAndType.get(`${loanDbId}:borrow`) ?? null;
+    }
+    if (kind === "repaid") {
+      // Could be repay_ontime, repay_early, or repay_late.
+      return (
+        creditByLoanAndType.get(`${loanDbId}:repay_early`) ??
+        creditByLoanAndType.get(`${loanDbId}:repay_ontime`) ??
+        creditByLoanAndType.get(`${loanDbId}:repay_late`) ??
+        null
+      );
+    }
+    if (kind === "liquidated") {
+      return creditByLoanAndType.get(`${loanDbId}:liquidated`) ?? null;
+    }
+    if (kind === "auto_protect") {
+      // auto_protect actions don't map 1:1 to credit events; closest
+      // is `partial_repay` which we record on the underlying loan.
+      return creditByLoanAndType.get(`${loanDbId}:partial_repay`) ?? null;
+    }
+    return null;
+  }
+
   const events = [];
   for (const r of borrowsRows) {
     events.push({
@@ -180,6 +244,7 @@ export async function handleActivity(req, url) {
       ltv_percentage: r.ltv_percentage,
       duration_days: r.duration_days,
       tx_signature: r.tx_signature,
+      score_delta: deltaForLoanEvent(r.id, "borrow"),
     });
   }
   for (const r of closedRows) {
@@ -190,6 +255,7 @@ export async function handleActivity(req, url) {
       collateral_mint: r.collateral_mint,
       amount_lamports: r.amount,
       tx_signature: r.tx_signature,
+      score_delta: deltaForLoanEvent(r.id, r.status),
     });
   }
   for (const r of protectRows) {
@@ -202,6 +268,7 @@ export async function handleActivity(req, url) {
       health_before: r.health_before,
       health_after: r.health_after,
       tx_signature: r.signature,
+      score_delta: deltaForLoanEvent(r.loan_id, "auto_protect"),
     });
   }
   for (const r of withdrawRows) {
@@ -247,6 +314,14 @@ export async function handleActivity(req, url) {
 
   return {
     status: 200,
-    body: { linked: true, events: events.slice(0, limit) },
+    body: {
+      linked: true,
+      events: events.slice(0, limit),
+      // Total credit points across the user's entire history. Surfaced
+      // here (not derived from `events`) because the activity feed is
+      // limit-paged but points are cumulative — the dashboard needs the
+      // honest lifetime total even when only the last 30 events render.
+      total_points: pointsAgg?.total_points ?? 0,
+    },
   };
 }
