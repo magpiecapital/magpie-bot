@@ -525,7 +525,20 @@ bot.start({
     setTimeout(() => startPumpWatcher(bot), 20_000);
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
-    // Apply idempotent schema patches before anything that touches DB writes.
+    // Apply file-based migrations BEFORE startup-patches and BEFORE
+    // anything else that writes to the DB. Migration 017 sat unapplied
+    // in prod for several hours after PR-merge today because there was
+    // no auto-runner — manual psql was the previous workflow. We crash
+    // on failure: a half-migrated DB is worse than a visibly-down bot.
+    import("./db/migrations-runner.js").then((m) => m.applyPendingMigrations()).then((res) => {
+      if (res.applied.length > 0) {
+        console.log(`[migrations] applied ${res.applied.length} new migration(s): ${res.applied.join(", ")}`);
+      }
+    }).catch((err) => {
+      console.error("[bot] migrations FAILED — crashing:", err.message);
+      process.exit(1);
+    });
+    // Apply idempotent schema patches AFTER file-based migrations.
     import("./db/pool.js").then((m) => m.applyStartupPatches()).catch((err) => {
       console.warn("[bot] applyStartupPatches failed (continuing):", err.message);
     });
