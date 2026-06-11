@@ -1472,6 +1472,11 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/internal/agent/limit-close",
   "/api/v1/internal/agent/limit-close/list",
   "/api/v1/internal/agent/limit-close/delegations",
+  // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
+  // so the on-chain feed is fresh by the time the wallet simulates the
+  // tx — closes the window where Phantom rejects with StalePriceAttestation
+  // before the user can even sign.
+  "/api/v1/price/refresh",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1742,6 +1747,11 @@ async function router(req, res) {
         } else {
           result = await m.handleAgentLimitCloseGet(req, Object.fromEntries(url.searchParams));
         }
+        break;
+      }
+      case "/api/v1/price/refresh": {
+        const { handlePriceRefresh } = await import("./price-refresh.js");
+        result = await handlePriceRefresh(req);
         break;
       }
       case "/api/v1/tokens":
