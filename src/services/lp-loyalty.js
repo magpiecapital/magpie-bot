@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
-import { getReadOnlyProgram } from "../solana/program.js";
+import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 
@@ -104,37 +104,29 @@ export async function getLpLoyaltyPoolState() {
 }
 
 /**
- * Sync on-chain depositor positions into the lp_positions DB table.
+ * Sync on-chain depositor positions into the lp_positions DB table
+ * for one specific pool / program. Internal helper — callers below
+ * use this to iterate across all live programs.
  *
  * For each on-chain DepositorPosition:
  *   - If new: insert with first_seen_at = NOW(), weighted_deposit_at = NOW()
  *   - If shares increased (new deposit): advance weighted_deposit_at
  *     proportionally toward NOW(). Formula:
- *
  *       new_weighted_time = (old_shares × old_time + added × NOW) / new_shares
- *
- *     This time-weights the deposit moment correctly. A user who added 50%
- *     more shares right before snapshot won't get full credit for the new
- *     half — their effective deposit time moves halfway toward now.
- *   - If shares decreased (withdrew): keep weighted_deposit_at as-is
- *     (they're reducing their position, not resetting their loyalty clock).
+ *   - If shares decreased (withdrew): keep weighted_deposit_at as-is.
  *   - If shares == 0: clear the row (fully exited).
- *
- * Called on every distribution tick (every 6h) so the DB stays in sync
- * without needing real-time event subscriptions.
  */
-export async function syncOnChainPositions() {
-  const program = getReadOnlyProgram();
-  const [poolPda] = lendingPoolPda(LENDER_PUBKEY);
+async function syncPositionsForPool(programId) {
+  const program = getReadOnlyProgram(programId);
+  const [poolPda] = lendingPoolPda(LENDER_PUBKEY, programId);
+  const poolStr = poolPda.toBase58();
+  const programStr = programId.toBase58();
 
-  // Enumerate all depositor positions for this pool.
+  // Enumerate all depositor positions for THIS pool.
   // Layout: [discriminator(8)] [owner pubkey(32)] [pool pubkey(32)] ...
-  // So `pool` lives at offset 40, not 8. The earlier offset=8 silently
-  // filtered out every position (matched on `owner` bytes against the
-  // pool pubkey, which obviously never matched), leaving the entire
-  // lp_positions table empty.
+  // `pool` lives at offset 40.
   const positions = await program.account.depositorPosition.all([
-    { memcmp: { offset: 40, bytes: poolPda.toBase58() } },
+    { memcmp: { offset: 40, bytes: poolStr } },
   ]);
 
   const onChainByOwner = new Map();
@@ -144,72 +136,181 @@ export async function syncOnChainPositions() {
     if (shares > 0n) onChainByOwner.set(owner, shares);
   }
 
-  // Pull current DB state
-  const { rows: dbRows } = await query(`SELECT * FROM lp_positions WHERE shares > 0`);
+  // Pull current DB state for THIS pool.
+  const { rows: dbRows } = await query(
+    `SELECT wallet_address, shares::text AS shares, weighted_deposit_at
+       FROM lp_positions WHERE pool = $1 AND shares > 0`,
+    [poolStr],
+  );
   const dbByOwner = new Map(
     dbRows.map((r) => [r.wallet_address, { shares: BigInt(r.shares), weightedAt: r.weighted_deposit_at }]),
   );
 
-  // Reconcile
   for (const [owner, onChainShares] of onChainByOwner) {
     const dbEntry = dbByOwner.get(owner);
     if (!dbEntry) {
-      // New position
       await query(
-        `INSERT INTO lp_positions (wallet_address, shares, weighted_deposit_at, first_seen_at, last_synced_at)
-         VALUES ($1, $2, NOW(), NOW(), NOW())
-         ON CONFLICT (wallet_address) DO UPDATE SET
+        `INSERT INTO lp_positions
+           (wallet_address, pool, program_id, shares, weighted_deposit_at, first_seen_at, last_synced_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())
+         ON CONFLICT (wallet_address, pool) DO UPDATE SET
            shares = EXCLUDED.shares,
            weighted_deposit_at = NOW(),
            first_seen_at = lp_positions.first_seen_at,
            last_synced_at = NOW()`,
-        [owner, onChainShares.toString()],
+        [owner, poolStr, programStr, onChainShares.toString()],
       );
     } else if (onChainShares > dbEntry.shares) {
-      // Net deposit — advance weighted_deposit_at proportionally
-      // new_time = (old_shares × old_time + added × NOW) / new_shares
       const added = onChainShares - dbEntry.shares;
       await query(
         `UPDATE lp_positions
-            SET shares = $2,
+            SET shares = $3,
                 weighted_deposit_at = TO_TIMESTAMP(
-                  ( $3::numeric * EXTRACT(EPOCH FROM weighted_deposit_at)
-                  + $4::numeric * EXTRACT(EPOCH FROM NOW()) )
-                  / $5::numeric
+                  ( $4::numeric * EXTRACT(EPOCH FROM weighted_deposit_at)
+                  + $5::numeric * EXTRACT(EPOCH FROM NOW()) )
+                  / $6::numeric
                 ),
                 last_synced_at = NOW()
-          WHERE wallet_address = $1`,
-        [owner, onChainShares.toString(), dbEntry.shares.toString(), added.toString(), onChainShares.toString()],
+          WHERE wallet_address = $1 AND pool = $2`,
+        [owner, poolStr, onChainShares.toString(), dbEntry.shares.toString(), added.toString(), onChainShares.toString()],
       );
     } else if (onChainShares < dbEntry.shares) {
-      // Net withdraw — keep weighted_deposit_at, just reduce shares
       await query(
         `UPDATE lp_positions
-            SET shares = $2,
-                last_synced_at = NOW()
-          WHERE wallet_address = $1`,
-        [owner, onChainShares.toString()],
+            SET shares = $3, last_synced_at = NOW()
+          WHERE wallet_address = $1 AND pool = $2`,
+        [owner, poolStr, onChainShares.toString()],
       );
     } else {
-      // No change — just touch last_synced_at
       await query(
-        `UPDATE lp_positions SET last_synced_at = NOW() WHERE wallet_address = $1`,
-        [owner],
+        `UPDATE lp_positions SET last_synced_at = NOW()
+          WHERE wallet_address = $1 AND pool = $2`,
+        [owner, poolStr],
       );
     }
   }
 
-  // Mark fully-exited positions (in DB but not on-chain)
+  // Mark fully-exited positions (in DB but not on-chain), pool-scoped.
   for (const owner of dbByOwner.keys()) {
     if (!onChainByOwner.has(owner)) {
       await query(
-        `UPDATE lp_positions SET shares = 0, last_synced_at = NOW() WHERE wallet_address = $1`,
-        [owner],
+        `UPDATE lp_positions SET shares = 0, last_synced_at = NOW()
+          WHERE wallet_address = $1 AND pool = $2`,
+        [owner, poolStr],
       );
     }
   }
 
-  return { tracked: onChainByOwner.size, db_rows_seen: dbByOwner.size };
+  return { pool: poolStr, tracked: onChainByOwner.size, db_rows_seen: dbByOwner.size };
+}
+
+/**
+ * Sync every live lending program's positions into lp_positions.
+ * Called on every distribution tick (every 6h) so the DB stays in sync
+ * across v1 / v2 / v3 without needing real-time event subscriptions.
+ *
+ * Programs that aren't configured (env unset locally) are silently
+ * skipped — production has all of them set on Railway.
+ */
+export async function syncOnChainPositions() {
+  const programs = [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean);
+  const results = [];
+  for (const pid of programs) {
+    try {
+      results.push(await syncPositionsForPool(pid));
+    } catch (err) {
+      console.warn(`[lp-loyalty] sync failed for program ${pid.toBase58().slice(0, 8)}:`, err.message);
+    }
+  }
+  const total_tracked = results.reduce((s, r) => s + r.tracked, 0);
+  const total_db_rows = results.reduce((s, r) => s + r.db_rows_seen, 0);
+  return { tracked: total_tracked, db_rows_seen: total_db_rows, pools: results };
+}
+
+/**
+ * Fast single-wallet sync. Reads the wallet's Position PDA on each
+ * known program and updates the corresponding lp_positions row. Used
+ * by /fundpool right after a deposit lands so the DB reflects the new
+ * shares immediately instead of waiting for the next 6h tick.
+ */
+export async function syncPositionsForWallet(walletPubkey) {
+  const { PublicKey } = await import("@solana/web3.js");
+  const ownerPk = walletPubkey instanceof PublicKey ? walletPubkey : new PublicKey(walletPubkey);
+  const programs = [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean);
+  const updates = [];
+  for (const pid of programs) {
+    try {
+      const program = getReadOnlyProgram(pid);
+      const [poolPda] = lendingPoolPda(LENDER_PUBKEY, pid);
+      const [posPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("position"), poolPda.toBuffer(), ownerPk.toBuffer()],
+        pid,
+      );
+      let shares = 0n;
+      try {
+        const posAcc = await program.account.depositorPosition.fetch(posPda);
+        shares = BigInt(posAcc.shares.toString());
+      } catch {
+        // Position doesn't exist on this program for this wallet — that's
+        // fine, this wallet just isn't an LP in this pool. shares stays 0.
+      }
+      const poolStr = poolPda.toBase58();
+      const programStr = pid.toBase58();
+      if (shares > 0n) {
+        // UPSERT with weighted-time correctness. We can't run the exact
+        // same time-weighting formula without knowing the previous DB
+        // shares; instead we fetch them and branch by direction.
+        const { rows: [existing] } = await query(
+          `SELECT shares::text AS shares
+             FROM lp_positions WHERE wallet_address = $1 AND pool = $2`,
+          [ownerPk.toBase58(), poolStr],
+        );
+        if (!existing) {
+          await query(
+            `INSERT INTO lp_positions
+               (wallet_address, pool, program_id, shares, weighted_deposit_at, first_seen_at, last_synced_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())`,
+            [ownerPk.toBase58(), poolStr, programStr, shares.toString()],
+          );
+        } else {
+          const oldShares = BigInt(existing.shares);
+          if (shares > oldShares) {
+            const added = shares - oldShares;
+            await query(
+              `UPDATE lp_positions
+                  SET shares = $3,
+                      weighted_deposit_at = TO_TIMESTAMP(
+                        ( $4::numeric * EXTRACT(EPOCH FROM weighted_deposit_at)
+                        + $5::numeric * EXTRACT(EPOCH FROM NOW()) )
+                        / $6::numeric
+                      ),
+                      last_synced_at = NOW()
+                WHERE wallet_address = $1 AND pool = $2`,
+              [ownerPk.toBase58(), poolStr, shares.toString(), oldShares.toString(), added.toString(), shares.toString()],
+            );
+          } else {
+            await query(
+              `UPDATE lp_positions
+                  SET shares = $3, last_synced_at = NOW()
+                WHERE wallet_address = $1 AND pool = $2`,
+              [ownerPk.toBase58(), poolStr, shares.toString()],
+            );
+          }
+        }
+        updates.push({ pool: poolStr, shares: shares.toString() });
+      } else {
+        // Zero or missing on-chain — mark any DB row to 0.
+        await query(
+          `UPDATE lp_positions SET shares = 0, last_synced_at = NOW()
+            WHERE wallet_address = $1 AND pool = $2`,
+          [ownerPk.toBase58(), poolStr],
+        );
+      }
+    } catch (err) {
+      console.warn(`[lp-loyalty] syncPositionsForWallet failed on ${pid.toBase58().slice(0, 8)}:`, err.message);
+    }
+  }
+  return updates;
 }
 
 /**
