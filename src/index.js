@@ -329,6 +329,25 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("limitclose", lc.handleLimitClose);
   bot.command("limitorders", lc.handleLimitOrders);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
+
+  // Layer 3 — intervention callback handler (inline keyboard taps).
+  // Registers a bot.callbackQuery(/^lcint:/) handler that processes
+  // approve/decline/cancel taps from the intervention DMs the
+  // engine sends when single-block + TWAP both can't fit within
+  // the borrower's slippage cap.
+  const lci = await import("./commands/limit-close-intervention.js");
+  lci.registerLimitCloseInterventionCallbacks(bot);
+}
+// Agent delegations — Tier 2 (x402 agentic wrapper). Users authorize
+// agents to arm limit-close orders on their behalf within explicit
+// bounds (max per order, max active, max slippage, expiry). The
+// magpie-x402 endpoint validates every agent request against these
+// rows BEFORE writing to limit_close_orders.
+{
+  const ad = await import("./commands/agent-delegations.js");
+  bot.command("agent_authorize", ad.handleAgentAuthorize);
+  bot.command("agent_revoke", ad.handleAgentRevoke);
+  bot.command("agent_list", ad.handleAgentList);
 }
 // Agent delegations — Tier 2 (x402 agentic wrapper). Users authorize
 // agents to arm limit-close orders on their behalf within explicit

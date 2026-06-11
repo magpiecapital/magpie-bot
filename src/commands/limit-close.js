@@ -26,6 +26,7 @@
  */
 import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
+import { runArmPreflight } from "../services/limit-close-preflight.js";
 
 const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL eligibility floor
 const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -207,7 +208,8 @@ export async function handleLimitClose(ctx) {
   const { rows: [loan] } = await query(
     `SELECT id, loan_id, status,
             original_loan_amount_lamports::text AS owed,
-            collateral_mint, collateral_amount::text AS coll_amount
+            collateral_mint, collateral_amount::text AS coll_amount,
+            collateral_amount::text AS collateral_amount_raw
        FROM loans
       WHERE user_id = $1 AND loan_id = $2`,
     [user.id, loan_id],
@@ -252,12 +254,51 @@ export async function handleLimitClose(ctx) {
     return ctx.reply(`You have ${activeCount.n} active limit orders (max ${MAX_ACTIVE_ORDERS_PER_USER}). Cancel one with /cancellimitorder first.`);
   }
 
-  // 4. Pre-arm "would-fire-immediately" check. Refuse trigger values <= current
-  //    market level. We DON'T fetch the live price here (cheaper to refuse only
-  //    obviously-bad values via the trigger_value_micro range gates); the
-  //    engine's pre-flight gate does the live-price re-check at fire time.
-  //    The schema CHECK constraint enforces > 0 already; this is just a UX
-  //    hint when the user clearly typed something wrong.
+  // 4. Pre-flight liquidity check (Layer 1).
+  //    Quote Jupiter at current state. If the order can't clear at the
+  //    user's slippage right now, refuse with a friendly suggestion.
+  //    Fail-open on Jupiter outages — advisory not gating.
+  const preflight = await runArmPreflight({
+    collateralMint: loan.collateral_mint,
+    collateralAmountRaw: loan.collateral_amount_raw,
+    sellDestination: dest,
+    slippageBps: slippage_bps,
+    loanOwedLamports: loan.owed,
+    protocolFeeBps: 100,
+  });
+  if (!preflight.ok) {
+    if (preflight.reason === "slippage_too_low" && preflight.suggestedSlippageBps) {
+      return ctx.reply(
+        [
+          `*Order would not fill right now.*`,
+          ``,
+          `At current liquidity, ${(slippage_bps / 100).toFixed(2)}% slippage can't cover the loan + fee.`,
+          `A setting of *${(preflight.suggestedSlippageBps / 100).toFixed(2)}%* would clear at current prices.`,
+          ``,
+          `Re-run with \`slip=${(preflight.suggestedSlippageBps / 100).toFixed(2)}%\` or wait for deeper liquidity.`,
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    }
+    if (preflight.reason === "liquidity_insufficient") {
+      return ctx.reply(
+        `*Can't arm this order.*\n\n` +
+        `Even at 10% slippage, current Jupiter routes can't cover the loan + fee. ` +
+        `Consider a smaller collateral position, lowering your trigger, or waiting for deeper liquidity.`,
+        { parse_mode: "Markdown" },
+      );
+    }
+    if (preflight.reason === "no_route_for_collateral") {
+      return ctx.reply(
+        `Jupiter can't route a swap for this collateral right now. ` +
+        `Wait a few minutes and try again.`,
+      );
+    }
+    return ctx.reply(
+      `Couldn't pre-check the order: ${preflight.reason}. Please try again.`,
+    );
+  }
+  const preflightAdvisory = !!preflight.advisory;
 
   // 5. Insert. The UNIQUE partial index on (loan_id WHERE status='armed')
   //    makes "two orders on the same loan" physically impossible at the
@@ -267,11 +308,19 @@ export async function handleLimitClose(ctx) {
     insertResult = await query(
       `INSERT INTO limit_close_orders
          (user_id, loan_id, trigger_kind, trigger_value_micro,
-          slippage_bps, sell_destination, expires_at, source, status, armed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'tg', 'armed', NOW())
+          slippage_bps, sell_destination, expires_at, source, status, armed_at,
+          initial_slippage_bps,
+          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'tg', 'armed', NOW(),
+               $8,
+               $9, $10, $11)
        RETURNING id`,
       [user.id, loan.id, trigger_kind, trigger_value_micro.toString(),
-       slippage_bps, dest, expire_iso],
+       slippage_bps, dest, expire_iso,
+       slippage_bps,
+       preflightAdvisory ? null : slippage_bps,
+       preflightAdvisory ? null : (preflight.proceedsLamports || null),
+       preflightAdvisory ? null : (preflight.quotedAtIso || new Date().toISOString())],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message)) {
