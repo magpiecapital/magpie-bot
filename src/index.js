@@ -309,6 +309,15 @@ bot.command("unban", handleCommunityUnban);
 bot.command("strikes", handleCommunityStrikes);
 bot.command("clear_strikes", handleCommunityClearStrikes);
 bot.command("crosspost", handleCommunityCrosspost);
+// Raid monitor — public claim + status; operator add/remove/list.
+{
+  const r = await import("./commands/raid.js");
+  bot.command("raided", r.handleRaided);
+  bot.command("raidstatus", r.handleRaidStatus);
+  bot.command("raidadd", r.handleRaidAdd);
+  bot.command("raidremove", r.handleRaidRemove);
+  bot.command("raidlist", r.handleRaidList);
+}
 
 // Governance autopilot admin — operator-only commands gated inside each handler
 // via OPERATOR_TG_IDS env var. /gov-pause is the master kill switch.
@@ -480,6 +489,12 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
+    // Raid monitor — polls the curated influencer list (raid_targets)
+    // every 90s. Posts new tweets to @magpietalk with a raid CTA and
+    // tracks /raided claims against a per-event goal. Prefers X API
+    // when X_BEARER_TOKEN is set, falls back to Nitter RSS otherwise.
+    // RAID_MONITOR_DISABLED=true on Railway hard-stops the poller.
+    import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.
