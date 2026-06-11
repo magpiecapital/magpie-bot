@@ -37,7 +37,26 @@ function fmtMcUsd(micros) {
   return `$${usd.toFixed(2)}`;
 }
 
+/**
+ * Render an "an agent did this" attribution line if the order's
+ * source is agent_x402. Borrower needs to know whether they (via TG)
+ * or an authorized agent took the action — and which agent, so they
+ * can revoke if it wasn't expected.
+ *
+ * If source is 'tg' (or missing — older orders predate the field),
+ * return null and let renderers omit the line entirely.
+ */
+function agentAttribution(p) {
+  if (p.source !== "agent_x402") return null;
+  const pk = p.source_agent_pubkey;
+  if (!pk || typeof pk !== "string" || pk.length < 12) {
+    return `Armed by an authorized agent.`;
+  }
+  return `Armed by your authorized agent \`${pk.slice(0, 8)}...${pk.slice(-4)}\`. Revoke with /agent_revoke if unexpected.`;
+}
+
 function renderLimitCloseArmed(p) {
+  const agentLine = agentAttribution(p);
   return [
     `*Limit-close armed* — order #${p.order_id}`,
     ``,
@@ -45,25 +64,31 @@ function renderLimitCloseArmed(p) {
     `Trigger: ${p.trigger_label}`,
     `Slippage: ${(p.slippage_bps / 100).toFixed(2)}%`,
     `Destination: ${p.sell_destination.toUpperCase()}`,
+    agentLine ? `` : null,
+    agentLine,
     ``,
     `I'll repay and sell automatically when the trigger fires.`,
-  ].join("\n");
+  ].filter((s) => s !== null).join("\n");
 }
 
 function renderLimitCloseFired(p) {
+  const agentLine = agentAttribution(p);
   return [
     `*Limit-close FIRED* — order #${p.order_id}`,
     ``,
-    `Trigger: ${p.trigger_label} ✓`,
+    `Trigger: ${p.trigger_label} hit`,
     `Repaid: ${fmtSol(p.loan_owed_lamports)} SOL · [tx](https://solscan.io/tx/${p.tx_repay})`,
     `Sold: ${p.collateral_sold_human} ${p.collateral_symbol} → ${fmtSol(p.proceeds_lamports)} ${p.dest.toUpperCase()} · [tx](https://solscan.io/tx/${p.tx_swap})`,
     `Fee: ${fmtSol(p.fee_lamports)} ${p.dest.toUpperCase()} (1%)`,
     ``,
     `Net to your wallet: *${fmtSol(p.net_to_user_lamports)} ${p.dest.toUpperCase()}*`,
-  ].join("\n");
+    agentLine ? `` : null,
+    agentLine,
+  ].filter((s) => s !== null).join("\n");
 }
 
 function renderLimitCloseFailed(p) {
+  const agentLine = agentAttribution(p);
   return [
     `*Limit-close FAILED* — order #${p.order_id}`,
     ``,
@@ -71,15 +96,20 @@ function renderLimitCloseFailed(p) {
     p.detail ? `Detail: ${p.detail}` : null,
     ``,
     `Your loan is *unchanged*. Set a new order with /limitclose or close manually with /repay.`,
-  ].filter(Boolean).join("\n");
+    agentLine ? `` : null,
+    agentLine,
+  ].filter((s) => s !== null).join("\n");
 }
 
 function renderLimitCloseCancelled(p) {
+  const agentLine = agentAttribution(p);
   return [
     `*Limit-close cancelled* — order #${p.order_id}`,
     ``,
     `Reason: ${p.reason}`,
-  ].join("\n");
+    agentLine ? `` : null,
+    agentLine,
+  ].filter((s) => s !== null).join("\n");
 }
 
 const RENDERERS = {

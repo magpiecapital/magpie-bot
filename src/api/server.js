@@ -1471,6 +1471,7 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/internal/agent/limit-close/arm",
   "/api/v1/internal/agent/limit-close",
   "/api/v1/internal/agent/limit-close/list",
+  "/api/v1/internal/agent/limit-close/delegations",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1727,6 +1728,11 @@ async function router(req, res) {
       case "/api/v1/internal/agent/limit-close/list": {
         const { handleAgentLimitCloseList } = await import("./internal-agent-limitclose.js");
         result = await handleAgentLimitCloseList(req, Object.fromEntries(url.searchParams));
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/delegations": {
+        const { handleAgentLimitCloseListDelegations } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitCloseListDelegations(req, Object.fromEntries(url.searchParams));
         break;
       }
       case "/api/v1/internal/agent/limit-close": {

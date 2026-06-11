@@ -23,12 +23,22 @@
  *
  * The agent never names the user by Telegram id or DB primary key —
  * it identifies the borrower by on-chain wallet pubkey, which is what
- * the user knew when they ran /agent-authorize.
+ * the user knew when they ran /agent_authorize.
  */
 import { query } from "../db/pool.js";
 import { constantTimeEqual } from "./auth-utils.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
+
+// Operator kill switch — set LIMIT_CLOSE_AGENT_DISABLED=1 to disable
+// the x402 agent arm path WITHOUT affecting TG-armed orders or any
+// already-armed agent orders. The engine still processes armed
+// orders; this just refuses new ones from the x402 endpoint.
+// Read fresh on every request so flipping the env doesn't need a
+// process restart.
+function agentArmDisabled() {
+  return /^(1|true|yes|on)$/i.test(process.env.LIMIT_CLOSE_AGENT_DISABLED || "");
+}
 
 const MIN_LOAN_LAMPORTS = 1_000_000_000n; // 1 SOL eligibility floor (same as TG path)
 const MIN_TRIGGER_VALUE_MICRO = 1n;
@@ -69,6 +79,13 @@ export async function handleAgentLimitCloseArm(req) {
   }
   if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
     return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  if (agentArmDisabled()) {
+    // Operator kill switch — refuse new agent arms. TG-armed orders
+    // and already-armed agent orders continue to be processed by the
+    // engine. The x402 service surfaces this to the agent as a 503
+    // with reason, which they should treat as "retry later".
+    return { status: 503, body: { error: "agent_arm_disabled_by_operator" } };
   }
 
   let body;
@@ -127,7 +144,7 @@ export async function handleAgentLimitCloseArm(req) {
     return { status: 403, body: { error: "no_active_delegation" } };
   }
   if (delegation.expires_at && new Date(delegation.expires_at) < new Date()) {
-    // Best-effort cleanup; the next /agent-authorize will overwrite.
+    // Best-effort cleanup; the next /agent_authorize will overwrite.
     await query(
       `UPDATE agent_delegations SET status = 'expired', revoked_at = NOW(), revoked_by = 'system'
         WHERE id = $1`,
@@ -245,6 +262,29 @@ export async function handleAgentLimitCloseArm(req) {
   }
 
   const orderId = inserted.rows[0].id;
+
+  // Borrower wasn't the actor here — DM them so they know an
+  // authorized agent just armed an order on their loan. Best-effort:
+  // if the enqueue fails the order is still armed (correct), they
+  // just don't get the immediate ping.
+  try {
+    await query(
+      `INSERT INTO pending_notifications (user_id, channel, kind, payload, status)
+         VALUES ($1, 'tg', 'limit_close_armed', $2::jsonb, 'pending')`,
+      [delegation.user_id, JSON.stringify({
+        order_id: orderId,
+        loan_id_chain: loan.loan_id,
+        trigger_label: `${triggerKind}=${triggerValueMicro.toString()}`,
+        slippage_bps: slippageBps,
+        sell_destination: sellDestination,
+        source: "agent_x402",
+        source_agent_pubkey: agentPubkey,
+      })],
+    );
+  } catch (err) {
+    console.warn("[internal-agent-limitclose] arm-DM enqueue failed:", err.message?.slice(0, 200));
+  }
+
   return {
     status: 200,
     body: {
@@ -381,6 +421,90 @@ export async function handleAgentLimitCloseDelete(req, params) {
     return { status: 409, body: { error: "not_cancellable_or_not_found" } };
   }
   return { status: 200, body: { ok: true, cancelled_order_id: result.rows[0].id } };
+}
+
+/**
+ * GET /api/v1/internal/agent/limit-close/delegations?agent=<pubkey>
+ *
+ * The agent reads its OWN active grants — every (user_wallet, action,
+ * bounds) tuple that the borrower authorized to it. This is what an
+ * agent calls on startup to discover the surface it can operate over.
+ *
+ * Scoped strictly by agent_pubkey so one agent cannot enumerate
+ * another's delegations. Same INTERNAL_API_TOKEN gate as the other
+ * internal endpoints — the x402 service binds the agent_pubkey to
+ * the verified x402 payer before calling us, OR (for the free path)
+ * the x402 service requires the agent to assert its pubkey via the
+ * X-Agent-Pubkey header. Read-only and exposes only the bounds the
+ * agent itself agreed to, so no payer-binding is required.
+ */
+export async function handleAgentLimitCloseListDelegations(req, params) {
+  if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
+    return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  const agentPubkey = String(params.agent ?? "");
+  if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
+
+  const { rows } = await query(
+    `SELECT user_wallet,
+            action,
+            max_per_order_lamports::text AS max_per_order_lamports,
+            max_active_orders,
+            max_slippage_bps,
+            granted_at,
+            expires_at
+       FROM agent_delegations
+      WHERE agent_pubkey = $1
+        AND status = 'active'
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY granted_at DESC
+      LIMIT 200`,
+    [agentPubkey],
+  );
+
+  // For each delegation also surface the agent's current armed-orders
+  // count against the cap — the agent needs this to know whether it
+  // has headroom to arm another order without round-tripping.
+  let activeByWallet = new Map();
+  if (rows.length > 0) {
+    const wallets = rows.map((r) => r.user_wallet);
+    const { rows: counts } = await query(
+      `SELECT w.public_key AS user_wallet, COUNT(*)::int AS active
+         FROM limit_close_orders lc
+         JOIN users u ON u.id = lc.user_id
+         JOIN wallets w ON w.user_id = u.id
+        WHERE lc.status = 'armed'
+          AND lc.source = 'agent_x402'
+          AND lc.source_agent_pubkey = $1
+          AND w.public_key = ANY($2::text[])
+        GROUP BY w.public_key`,
+      [agentPubkey, wallets],
+    );
+    activeByWallet = new Map(counts.map((c) => [c.user_wallet, c.active]));
+  }
+
+  return {
+    status: 200,
+    body: {
+      count: rows.length,
+      delegations: rows.map((r) => ({
+        user_wallet: r.user_wallet,
+        action: r.action,
+        bounds: {
+          max_per_order_lamports: r.max_per_order_lamports,
+          max_per_order_sol: Number(r.max_per_order_lamports) / 1e9,
+          max_active_orders: r.max_active_orders,
+          max_slippage_bps: r.max_slippage_bps,
+        },
+        usage: {
+          active_orders: activeByWallet.get(r.user_wallet) ?? 0,
+          headroom: r.max_active_orders - (activeByWallet.get(r.user_wallet) ?? 0),
+        },
+        granted_at: r.granted_at,
+        expires_at: r.expires_at,
+      })),
+    },
+  };
 }
 
 function bad(err) { return { status: 400, body: { error: err } }; }
