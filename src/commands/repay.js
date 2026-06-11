@@ -8,6 +8,7 @@ import { ensureWallet } from "../services/wallet.js";
 import { connection } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
+import { formatLoanButtonLabel, totalOwedSol, countDueWithin } from "../services/loan-display.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -33,7 +34,7 @@ export async function handleRepay(ctx) {
   );
 
   if (rows.length === 0) {
-    return ctx.reply("📭 No active loans to repay.");
+    return ctx.reply("No active loans to repay.");
   }
 
   // Scope to the user's CURRENTLY ACTIVE wallet — multi-wallet users
@@ -45,7 +46,7 @@ export async function handleRepay(ctx) {
 
   if (scopedRows.length === 0) {
     return ctx.reply(
-      `📭 No active loans on your *current* wallet.\n\n` +
+      `No active loans on your *current* wallet.\n\n` +
       (otherWalletCount > 0
         ? `You have *${otherWalletCount}* loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets. Use /wallets to switch, then /repay.`
         : `Nothing to repay anywhere on this account.`),
@@ -59,17 +60,35 @@ export async function handleRepay(ctx) {
   const kb = new InlineKeyboard();
   scopedRows.forEach((loan, i) => {
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${fmtSol(liveAmounts[i])} SOL`,
+      formatLoanButtonLabel(loan, liveAmounts[i], i + 1),
       `repay:loan:${loan.id}`,
     ).row();
   });
-  kb.text("✕ Cancel", "repay:cancel");
+  kb.text("Cancel", "repay:cancel");
 
-  const header = `*Pick a loan to repay:*` +
-    (otherWalletCount > 0
-      ? `\n_Showing loans on your active wallet. ${otherWalletCount} more on other linked wallets — switch with /wallets to see them._`
-      : "");
-  await ctx.reply(header, {
+  // Header with at-a-glance summary so the user understands what's on
+  // the screen before tapping. Lists count + total owed + how many are
+  // urgent (within 24h or already overdue).
+  const totalSol = totalOwedSol(liveAmounts);
+  const dueSoonCount = countDueWithin(scopedRows, 24);
+  const summaryParts = [
+    `${scopedRows.length} active`,
+    `${totalSol} SOL owed total`,
+  ];
+  if (dueSoonCount > 0) {
+    summaryParts.push(`${dueSoonCount} due within 24h`);
+  }
+  const headerLines = [
+    `*Pick a loan to repay*`,
+    `_${summaryParts.join(" · ")} · sorted by due date_`,
+  ];
+  if (otherWalletCount > 0) {
+    headerLines.push(
+      "",
+      `_+${otherWalletCount} more on other linked wallets — /wallets to switch._`,
+    );
+  }
+  await ctx.reply(headerLines.join("\n"), {
     parse_mode: "Markdown",
     reply_markup: kb,
   });
@@ -78,7 +97,7 @@ export async function handleRepay(ctx) {
 export function registerRepayCallbacks(bot) {
   bot.callbackQuery(/^repay:cancel$/, async (ctx) => {
     await ctx.answerCallbackQuery("Cancelled");
-    await ctx.editMessageText("❌ Repay cancelled.");
+    await ctx.editMessageText("Repay cancelled.");
   });
 
   bot.callbackQuery(/^repay:loan:(\d+)$/, async (ctx) => {
@@ -107,7 +126,7 @@ export function registerRepayCallbacks(bot) {
       // We already ack'd above, so use editMessageText (replaces the
       // notification body) instead of the popup-style answerCallbackQuery
       // text we used to surface here.
-      await ctx.editMessageText("❌ Loan not found or already closed.").catch(() => {});
+      await ctx.editMessageText("Loan not found or already closed.").catch(() => {});
       return;
     }
 
@@ -145,7 +164,7 @@ export function registerRepayCallbacks(bot) {
         const recommendedSend = short + 1_000_000n;
         await ctx.editMessageText(
           [
-            "⚠️ *Your wallet doesn't have enough SOL*",
+            "*Your wallet doesn't have enough SOL*",
             "",
             "Repaying a loan needs the *loan amount + Solana network fees*. Here's the math:",
             "",
@@ -179,7 +198,7 @@ export function registerRepayCallbacks(bot) {
       console.warn("[repay] preflight balance check failed:", err.message);
     }
 
-    await ctx.editMessageText("⏳ Submitting repayment on-chain...");
+    await ctx.editMessageText("Submitting repayment on-chain...");
 
     try {
       const result = await executeRepay({ userId: user.id, loanDbRow: loan });
@@ -211,31 +230,30 @@ export function registerRepayCallbacks(bot) {
 
         if (milestone) {
           // Hit a milestone — celebrate + offer streak-specific share
-          milestoneLine = `\n🔥 *${streak} on-time repays in a row — milestone unlocked!*\n`;
+          milestoneLine = `\n*${streak} on-time repays in a row — milestone unlocked.*\n`;
           const streakCard = shareStreak({ streak, referralCode: code });
           shareKb = new InlineKeyboard()
-            .url(`𝕏 Flex ${streak}-streak`, streakCard.twitterUrl)
+            .url(`Flex ${streak}-streak on X`, streakCard.twitterUrl)
             .row()
-            .url("𝕏 Share repay", repayCard.twitterUrl)
-            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+            .url("Share repay on X", repayCard.twitterUrl)
+            .url("Tell a friend", repayCard.telegramShareUrl);
         } else if (streak > 0) {
-          milestoneLine = `\n🔥 _On-time streak: ${streak}_\n`;
+          milestoneLine = `\n_On-time streak: ${streak}_\n`;
           shareKb = new InlineKeyboard()
-            .url("𝕏 Share to Twitter", repayCard.twitterUrl)
-            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+            .url("Share on X", repayCard.twitterUrl)
+            .url("Tell a friend", repayCard.telegramShareUrl);
         } else {
           shareKb = new InlineKeyboard()
-            .url("𝕏 Share to Twitter", repayCard.twitterUrl)
-            .url("📨 Tell a friend", repayCard.telegramShareUrl);
+            .url("Share on X", repayCard.twitterUrl)
+            .url("Tell a friend", repayCard.telegramShareUrl);
         }
       } catch { /* non-critical */ }
 
       await ctx.editMessageText(
         [
-          "✅ *Loan repaid*",
+          "*Loan repaid*",
           "",
-          `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
-          `Repaid: ${fmtSol(owedNow)} SOL`,
+          `${loan.symbol ?? "?"} loan · ${fmtSol(owedNow)} SOL`,
           "Collateral returned to your wallet.",
           milestoneLine,
           `[View tx](https://solscan.io/tx/${result.signature})`,

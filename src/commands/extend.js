@@ -6,6 +6,7 @@ import { getSolBalance } from "../services/deposits.js";
 import { executeExtendLoan, recordExtendLoan, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
+import { formatTimeToDue, countDueWithin } from "../services/loan-display.js";
 
 const pending = new Map();
 
@@ -37,7 +38,7 @@ export async function handleExtend(ctx) {
   );
 
   if (rows.length === 0) {
-    return ctx.reply("📭 No active loans.");
+    return ctx.reply("No active loans.");
   }
 
   // Scope to active wallet — multi-wallet users were seeing every loan
@@ -47,7 +48,7 @@ export async function handleExtend(ctx) {
 
   if (scopedRows.length === 0) {
     return ctx.reply(
-      `📭 No active loans on your *current* wallet.` +
+      `No active loans on your *current* wallet.` +
       (otherWalletCount > 0
         ? `\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets — /wallets to switch.`
         : ""),
@@ -63,25 +64,33 @@ export async function handleExtend(ctx) {
   scopedRows.forEach((loan, i) => {
     const bps = feeBpsForLtv(loan.ltv_percentage);
     const fee = (liveAmounts[i] * bps) / 10_000n;
+    // Extend-specific label: time-to-due + the fee. Lets the user
+    // see at a glance which loans are urgent enough to want to extend.
+    const symbol = loan.symbol ?? "?";
+    const timeStr = formatTimeToDue(loan.due_timestamp);
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · fee ${fmtSol(fee)} SOL`,
+      `${i + 1}. ${symbol} · ${timeStr} · fee ${fmtSol(fee)} SOL`,
       `extend:loan:${loan.id}`,
     ).row();
   });
-  kb.text("✕ Cancel", "extend:cancel");
+  kb.text("Cancel", "extend:cancel");
 
-  const header = `*Extend loan* — adds the original duration for the tier fee.\n\nPick a loan:` +
-    (otherWalletCount > 0
-      ? `\n_${otherWalletCount} more on other wallets — /wallets to switch._`
-      : "");
-  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
+  const dueSoonCount = countDueWithin(scopedRows, 24);
+  const headerLines = [
+    `*Extend loan* — adds the original duration for the tier fee.`,
+    `_${scopedRows.length} active${dueSoonCount > 0 ? ` · ${dueSoonCount} due within 24h` : ""} · sorted by due date_`,
+  ];
+  if (otherWalletCount > 0) {
+    headerLines.push("", `_+${otherWalletCount} more on other wallets — /wallets to switch._`);
+  }
+  await ctx.reply(headerLines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerExtendCallbacks(bot) {
   bot.callbackQuery(/^extend:cancel$/, async (ctx) => {
     pending.delete(ctx.chat.id);
     await ctx.answerCallbackQuery("Cancelled");
-    await ctx.editMessageText("❌ Extend cancelled.");
+    await ctx.editMessageText("Extend cancelled.");
   });
 
   bot.callbackQuery(/^extend:loan:(\d+)$/, async (ctx) => {
@@ -107,12 +116,12 @@ export function registerExtendCallbacks(bot) {
     if (!loan) {
       // We already ack'd above; surface the not-found state inline
       // instead of via the popup-style answerCallbackQuery text.
-      await ctx.editMessageText("❌ Loan not found.").catch(() => {});
+      await ctx.editMessageText("Loan not found.").catch(() => {});
       return;
     }
     if (loan.suspended) {
       await ctx.editMessageText(
-        "⚠️ This loan is under review and cannot be extended. Contact support.",
+        "This loan is under review and cannot be extended. Contact support.",
       ).catch(() => {});
       return;
     }
@@ -126,7 +135,7 @@ export function registerExtendCallbacks(bot) {
     if (BigInt(sol) < fee + 3_000_000n) {
       await ctx.editMessageText(
         [
-          `❌ Insufficient SOL for extension fee.`,
+          `Insufficient SOL for extension fee.`,
           ``,
           `Needed: ~${fmtSol(fee + 3_000_000n)} SOL`,
           `Wallet: ${fmtSol(sol)} SOL`,
@@ -147,13 +156,12 @@ export function registerExtendCallbacks(bot) {
       : new Date(new Date(loan.due_timestamp).getTime() + loan.duration_days * 86400_000);
 
     const kb = new InlineKeyboard()
-      .text("✅ Confirm extension", `extend:confirm:${loan.id}`)
-      .row().text("✕ Cancel", "extend:cancel");
+      .text("Confirm extension", `extend:confirm:${loan.id}`)
+      .row().text("Cancel", "extend:cancel");
 
     await ctx.editMessageText(
       [
-        `*Extend loan #${loan.loan_id}*`,
-        `Symbol: ${loan.symbol ?? "?"}`,
+        `*Extend ${loan.symbol ?? "?"} loan*`,
         `Extension fee: *${fmtSol(fee)} SOL* (${Number(bps) / 100}%)`,
         `New due: ${newDue.toUTCString()}`,
         wasDue ? "_(loan was past due — clock resets from now)_" : "",
@@ -185,7 +193,7 @@ export function registerExtendCallbacks(bot) {
       return;
     }
 
-    await ctx.editMessageText("⏳ Extending loan on-chain...");
+    await ctx.editMessageText("Extending loan on-chain...");
 
     try {
       const result = await executeExtendLoan({
@@ -198,10 +206,10 @@ export function registerExtendCallbacks(bot) {
 
       await ctx.editMessageText(
         [
-          "✅ *Loan extended*",
+          "*Loan extended*",
           "",
           `Fee paid: ${fmtSol(result.feeLamports)} SOL`,
-          `Loan #${state.loan.loan_id} extended by ${state.loan.duration_days} days.`,
+          `${state.loan.symbol ?? "?"} loan extended by ${state.loan.duration_days} days.`,
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
           "",

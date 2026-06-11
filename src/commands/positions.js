@@ -3,26 +3,13 @@ import { upsertUser } from "../services/users.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLiveOwedLamports } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
-
-function formatSol(lamports) {
-  return (Number(lamports) / 1e9).toFixed(4);
-}
-
-function timeLeft(due) {
-  const ms = new Date(due).getTime() - Date.now();
-  if (ms <= 0) return "⚠️ PAST DUE";
-  const hours = Math.floor(ms / 3_600_000);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return `${days}d ${hours % 24}h left`;
-  return `${hours}h left`;
-}
-
-function healthEmoji(ratio) {
-  if (ratio >= 1.5) return "🟢";
-  if (ratio >= 1.2) return "🟡";
-  if (ratio >= 1.1) return "🟠";
-  return "🔴";
-}
+import {
+  formatLoanCard,
+  totalOwedSol,
+  countDueWithin,
+  formatTimeToDue,
+  formatHealthLabel,
+} from "../services/loan-display.js";
 
 async function enrichWithHealth(loan, owedLamports) {
   try {
@@ -38,7 +25,7 @@ async function enrichWithHealth(loan, owedLamports) {
     );
     const owed = Number(owedLamports ?? loan.original_loan_amount_lamports);
     const ratio = owed > 0 ? currentLamports / owed : 0;
-    return { currentLamports, ratio };
+    return { currentLamports, ratio, decimals: rows[0].decimals };
   } catch {
     return null;
   }
@@ -51,7 +38,7 @@ export async function handlePositions(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
 
   const { rows: rawRows } = await query(
-    `SELECT l.*, sm.symbol
+    `SELECT l.*, sm.symbol, sm.decimals
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
      WHERE l.user_id = $1 AND l.status = 'active'
@@ -60,23 +47,20 @@ export async function handlePositions(ctx) {
   );
 
   if (rawRows.length === 0) {
-    return ctx.reply("📭 No active loans.\n\nUse /borrow to take one out.");
+    return ctx.reply("No active loans.\n\nUse /borrow to take one out.");
   }
 
   // Wallet-scope: only show loans owned by the user's currently-active
-  // wallet. Per the multi-wallet design principle ("only credit + points
-  // aggregate across linked wallets; holdings stay separate"), showing
-  // every wallet's loans here would be confusing — the user runs /repay
-  // and gets a CONSTRAINT_HAS_ONE because the active wallet didn't open
-  // the loan. Scope here, surface a hint at the bottom for cross-wallet
-  // visibility.
+  // wallet. Per the multi-wallet design principle, every wallet's loans
+  // here would confuse the signer (they run /repay and get
+  // CONSTRAINT_HAS_ONE because the active wallet didn't open it).
   const { filtered: rows, otherWalletCount } = await scopeLoansToActiveWallet(user.id, rawRows);
 
   if (rows.length === 0) {
     return ctx.reply(
       otherWalletCount > 0
-        ? `📭 No active loans on your current wallet.\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch.`
-        : "📭 No active loans.\n\nUse /borrow to take one out.",
+        ? `No active loans on your current wallet.\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on another linked wallet — /wallets to switch.`
+        : "No active loans.\n\nUse /borrow to take one out.",
     );
   }
 
@@ -86,30 +70,36 @@ export async function handlePositions(ctx) {
     rows.map((loan, i) => enrichWithHealth(loan, liveAmounts[i])),
   );
 
-  const lines = ["📊 *Your Active Loans*", ""];
-  for (let i = 0; i < rows.length; i++) {
-    const loan = rows[i];
-    const health = healthResults[i];
-    const owed = liveAmounts[i];
-    lines.push(
-      `*Loan #${loan.loan_id}* — ${loan.symbol ?? "Unknown"}`,
-      `Collateral: ${loan.collateral_amount}`,
-      `Borrowed: ${formatSol(loan.loan_amount_lamports)} SOL`,
-      `Repay: ${formatSol(owed)} SOL`,
-      `LTV: ${loan.ltv_percentage}% | ${loan.duration_days}d term`,
-    );
-    if (health) {
-      lines.push(
-        `${healthEmoji(health.ratio)} Health: ${health.ratio.toFixed(2)}x ` +
-          `(collateral now ${formatSol(health.currentLamports)} SOL)`,
-      );
-    }
-    lines.push(`⏱ ${timeLeft(loan.due_timestamp)}`, "");
-  }
-  lines.push(
-    "_Health <1.1x risks liquidation._",
+  const totalSol = totalOwedSol(liveAmounts);
+  const dueSoonCount = countDueWithin(rows, 24);
+
+  const summary = [
+    `${rows.length} active`,
+    `${totalSol} SOL owed`,
+  ];
+  if (dueSoonCount > 0) summary.push(`${dueSoonCount} due within 24h`);
+
+  const lines = [
+    "*Your Active Loans*",
+    `_${summary.join(" · ")} · sorted by due date_`,
     "",
-    "Actions: /repay · /partialrepay · /topup · /extend",
+  ];
+
+  for (let i = 0; i < rows.length; i++) {
+    const loan = { ...rows[i], decimals: healthResults[i]?.decimals ?? rows[i].decimals };
+    const card = formatLoanCard(loan, {
+      owedLamports: liveAmounts[i],
+      healthRatio: healthResults[i]?.ratio,
+      collateralValueLamports: healthResults[i]?.currentLamports,
+      position: i + 1,
+    });
+    lines.push(card, "");
+  }
+
+  lines.push(
+    "_Health < 1.1× risks liquidation._",
+    "",
+    "Actions: /repay · /partialrepay · /topup · /extend · /health",
   );
   if (otherWalletCount > 0) {
     lines.push(
@@ -120,10 +110,10 @@ export async function handlePositions(ctx) {
 
   // Pip-as-coach: surface ONE actionable suggestion if we see a clear
   // opportunity in the user's book. Read-only — Pip only suggests, never
-  // takes action. Keeps the output concise (1 line max).
+  // takes action.
   const coachLine = pipCoachSuggestion(rows, healthResults, liveAmounts);
   if (coachLine) {
-    lines.push("", `🦅 *Pip:* ${coachLine}`);
+    lines.push("", `*Pip:* ${coachLine}`);
   }
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
@@ -132,58 +122,66 @@ export async function handlePositions(ctx) {
 /**
  * Returns ONE coaching suggestion based on the user's active loan book,
  * or null if nothing actionable. Ordered by urgency — most urgent wins.
- * Pure read-only; no action taken. The user has to actually run the
- * suggested command themselves.
  *
  * Priority order:
  *   1. Past-due loans (most urgent — liquidation imminent)
  *   2. Health <1.15 (one move from liquidation)
  *   3. Due within 24h (clock pressure)
  *   4. Health <1.30 (mild buffer suggestion)
- *   5. Healthy book → reinforce the good behavior (rare suggestion path)
+ *   5. Healthy book → reinforce
  */
 function pipCoachSuggestion(loans, healthResults, liveAmounts) {
   if (!loans || loans.length === 0) return null;
   let minHealth = Infinity;
   let minHealthLoan = null;
+  let minHealthIdx = -1;
   let earliestDueMs = Infinity;
   let earliestDueLoan = null;
+  let earliestDueIdx = -1;
   let pastDueLoan = null;
+  let pastDueIdx = -1;
   for (let i = 0; i < loans.length; i++) {
     const loan = loans[i];
     const dueMs = new Date(loan.due_timestamp).getTime();
     const msLeft = dueMs - Date.now();
-    if (msLeft <= 0 && !pastDueLoan) pastDueLoan = loan;
+    if (msLeft <= 0 && !pastDueLoan) {
+      pastDueLoan = loan;
+      pastDueIdx = i;
+    }
     if (msLeft > 0 && dueMs < earliestDueMs) {
       earliestDueMs = dueMs;
       earliestDueLoan = loan;
+      earliestDueIdx = i;
     }
     const h = healthResults[i];
     if (h && Number.isFinite(h.ratio) && h.ratio < minHealth) {
       minHealth = h.ratio;
       minHealthLoan = loan;
+      minHealthIdx = i;
     }
   }
+  // Loans are referred to by position number (matches the cards above)
+  // rather than the long loan_id u64 — much easier to follow.
   // 1. Past due — liquidation imminent
   if (pastDueLoan) {
-    return `Loan #${pastDueLoan.loan_id} (${pastDueLoan.symbol ?? "?"}) is *past due*. /repay now or it'll be liquidated.`;
+    return `Loan ${pastDueIdx + 1} (${pastDueLoan.symbol ?? "?"}) is *past due*. /repay now or it'll be liquidated.`;
   }
   // 2. Health critical
   if (minHealthLoan && minHealth < 1.15) {
-    return `Loan #${minHealthLoan.loan_id} (${minHealthLoan.symbol ?? "?"}) health is *${minHealth.toFixed(2)}×* — one bad candle from liquidation. Consider /topup to add collateral.`;
+    return `Loan ${minHealthIdx + 1} (${minHealthLoan.symbol ?? "?"}) health is *${minHealth.toFixed(2)}×* — one bad candle from liquidation. Consider /topup to add collateral.`;
   }
   // 3. Due within 24h
   if (earliestDueLoan) {
     const hoursLeft = (earliestDueMs - Date.now()) / 3_600_000;
     if (hoursLeft < 24) {
-      return `Loan #${earliestDueLoan.loan_id} (${earliestDueLoan.symbol ?? "?"}) due in *${Math.floor(hoursLeft)}h*. /repay early (zero penalty) or /extend if you need more time.`;
+      return `Loan ${earliestDueIdx + 1} (${earliestDueLoan.symbol ?? "?"}) ${formatTimeToDue(earliestDueLoan.due_timestamp)} until due. /repay early (zero penalty) or /extend if you need more time.`;
     }
   }
   // 4. Mild health concern
   if (minHealthLoan && minHealth < 1.30) {
-    return `Loan #${minHealthLoan.loan_id} health is ${minHealth.toFixed(2)}× — comfy but not flush. /topup adds buffer with no fee.`;
+    return `Loan ${minHealthIdx + 1} (${minHealthLoan.symbol ?? "?"}) health is ${minHealth.toFixed(2)}× (${formatHealthLabel(minHealth)}) — comfy but not flush. /topup adds buffer with no fee.`;
   }
-  // 5. Reinforce — only if multiple loans and all healthy
+  // 5. Reinforce
   if (loans.length >= 2 && minHealth >= 1.50) {
     return `All ${loans.length} positions healthy. Keep an eye on token volatility — /health any time for a snapshot.`;
   }
