@@ -319,6 +319,18 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("raidlist", r.handleRaidList);
 }
 
+// Limit-close-and-sell — Tier 1 (custodial TG users only). Engine that
+// actually executes lives in the private magpiecapital/magpie-limitclose
+// repo; this bot only writes orders to the DB. The notification sender
+// further down reads pending_notifications and DMs users when the engine
+// fires an order.
+{
+  const lc = await import("./commands/limit-close.js");
+  bot.command("limitclose", lc.handleLimitClose);
+  bot.command("limitorders", lc.handleLimitOrders);
+  bot.command("cancellimitorder", lc.handleCancelLimitOrder);
+}
+
 // Governance autopilot admin — operator-only commands gated inside each handler
 // via OPERATOR_TG_IDS env var. /gov-pause is the master kill switch.
 bot.command("gov-pause", handleGovPause);
@@ -495,6 +507,9 @@ bot.start({
     // when X_BEARER_TOKEN is set, falls back to Nitter RSS otherwise.
     // RAID_MONITOR_DISABLED=true on Railway hard-stops the poller.
     import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
+    // Notification sender — drains pending_notifications and DMs users.
+    // Used by the private limit-close engine to talk back to TG users.
+    import("./services/notification-sender.js").then((m) => m.startNotificationSender(bot));
     registerBotCommands();
     // Background watchers — stagger startup to avoid RPC rate-limit flood.
     // Deposit watcher disabled: free public RPC can't handle background polling.
