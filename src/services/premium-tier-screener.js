@@ -25,6 +25,67 @@ const PREMIUM_TIER_MAX_LOAN_LAMPORTS = BigInt(
   process.env.PREMIUM_TIER_MAX_LOAN_LAMPORTS || "10000000000", // 10 SOL
 );
 
+// Friday-close cutoff. Tokenized stocks' AMM peg degrades 3-5% on
+// weekend news/earnings events because the Backed/MM arb path goes
+// stale once Kraken's full equity book closes. We refuse to ORIGINATE
+// new premium-tier loans inside the weekend window so the borrower
+// can't open a loan against TSLAx at Friday 4pm ET and watch earnings
+// blow up the collateral over the weekend before any liquidator can
+// react with reliable price data. Existing loans roll through the
+// weekend unaffected — repay/extend/topup remain available.
+//
+// Window definition (UTC):
+//   - Window CLOSES Friday at PREMIUM_TIER_WEEKEND_CLOSE_HOUR (default 21:00 UTC = 16:00 ET = US RTH close)
+//   - Window REOPENS Monday at PREMIUM_TIER_WEEKEND_OPEN_HOUR (default 13:30 UTC = 08:30 ET = pre-market open)
+//   - All of Saturday + Sunday refuse.
+//   - PREMIUM_TIER_WEEKEND_CUTOFF_DISABLED=true bypasses the gate entirely.
+const PREMIUM_TIER_WEEKEND_CLOSE_HOUR_UTC = Number(
+  process.env.PREMIUM_TIER_WEEKEND_CLOSE_HOUR || 21,
+);
+const PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC = Number(
+  process.env.PREMIUM_TIER_WEEKEND_OPEN_HOUR || 13,
+);
+const PREMIUM_TIER_WEEKEND_OPEN_MINUTE_UTC = Number(
+  process.env.PREMIUM_TIER_WEEKEND_OPEN_MINUTE || 30,
+);
+const PREMIUM_TIER_WEEKEND_CUTOFF_DISABLED =
+  process.env.PREMIUM_TIER_WEEKEND_CUTOFF_DISABLED === "true";
+
+/**
+ * Returns true if `at` is inside the weekend cutoff window where new
+ * premium-tier borrows are refused.
+ */
+export function isInWeekendCutoff(at = new Date()) {
+  if (PREMIUM_TIER_WEEKEND_CUTOFF_DISABLED) return false;
+  const dow = at.getUTCDay();           // 0 Sun, 5 Fri, 6 Sat
+  const hour = at.getUTCHours();
+  const minute = at.getUTCMinutes();
+  if (dow === 6 || dow === 0) return true;                // Sat / Sun all day
+  if (dow === 5 && hour >= PREMIUM_TIER_WEEKEND_CLOSE_HOUR_UTC) return true;  // Fri after close
+  if (dow === 1) {                                         // Mon before open
+    if (hour < PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC) return true;
+    if (hour === PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC && minute < PREMIUM_TIER_WEEKEND_OPEN_MINUTE_UTC) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns a human-readable next-open timestamp in UTC for the message.
+ */
+function nextWeekendOpenIso(at = new Date()) {
+  const dow = at.getUTCDay();
+  const next = new Date(at);
+  // Find next Monday (or stay on Monday if today is Monday before open)
+  let daysToAdd;
+  if (dow === 5) daysToAdd = 3;                  // Fri → Mon
+  else if (dow === 6) daysToAdd = 2;             // Sat → Mon
+  else if (dow === 0) daysToAdd = 1;             // Sun → Mon
+  else daysToAdd = 0;                            // Mon early
+  next.setUTCDate(at.getUTCDate() + daysToAdd);
+  next.setUTCHours(PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC, PREMIUM_TIER_WEEKEND_OPEN_MINUTE_UTC, 0, 0);
+  return next.toISOString().slice(0, 16) + " UTC";
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.collateralMint base58 pubkey
@@ -41,6 +102,19 @@ export async function screenPremiumBorrow(opts) {
 
   const gateStart = Date.now();
   const gateTimes = {};
+
+  // ── Gate 0: Friday-close cutoff ───────────────────────────────────
+  // Refuse to ORIGINATE new premium-tier loans during the weekend window.
+  // Cheap to evaluate (no DB / RPC) so it short-circuits before the rest.
+  // Existing premium loans roll through the weekend unaffected.
+  const at = opts.now ? new Date(opts.now * 1000) : new Date();
+  if (isInWeekendCutoff(at)) {
+    const reopens = nextWeekendOpenIso(at);
+    return refused(
+      "weekend_cutoff",
+      `New premium-tier borrows pause Friday ${PREMIUM_TIER_WEEKEND_CLOSE_HOUR_UTC.toString().padStart(2, "0")}:00 UTC → Monday ${PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC.toString().padStart(2, "0")}:${PREMIUM_TIER_WEEKEND_OPEN_MINUTE_UTC.toString().padStart(2, "0")} UTC so US-equity peg + oracle data stay reliable. Existing premium loans are unaffected — repay/extend/topup remain available. New borrows reopen ${reopens}.`,
+    );
+  }
 
   // ── Gate 1: category gate ────────────────────────────────────────
   let t = Date.now();
