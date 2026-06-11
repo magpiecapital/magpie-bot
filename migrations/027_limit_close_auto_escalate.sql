@@ -34,24 +34,33 @@ ALTER TABLE limit_close_orders
   ADD COLUMN IF NOT EXISTS initial_slippage_bps   INTEGER,
   ADD COLUMN IF NOT EXISTS slippage_escalations   INTEGER NOT NULL DEFAULT 0;
 
--- Cap must be within the global allowable range AND must be ≥ the
--- order's current slippage. Engine never reads max_slippage_bps_cap
--- without checking it's > current slippage_bps, but we belt-and-suspenders
--- this at the schema layer.
-ALTER TABLE limit_close_orders
-  ADD CONSTRAINT limit_close_orders_cap_in_range
-  CHECK (
-    max_slippage_bps_cap IS NULL OR
-    (max_slippage_bps_cap >= 10 AND max_slippage_bps_cap <= 1000)
-  );
+-- Cap must be within the global allowable range. Wrapped in
+-- DO $$ … EXCEPTION block so the migration is idempotent — re-running
+-- on a DB where the constraint already exists is a clean no-op
+-- instead of a fatal "constraint already exists" error. Postgres
+-- doesn't support `ADD CONSTRAINT IF NOT EXISTS` for CHECK
+-- constraints, so this DO block is the canonical workaround.
+DO $$ BEGIN
+  ALTER TABLE limit_close_orders
+    ADD CONSTRAINT limit_close_orders_cap_in_range
+    CHECK (
+      max_slippage_bps_cap IS NULL OR
+      (max_slippage_bps_cap >= 10 AND max_slippage_bps_cap <= 1000)
+    );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
 
--- Initial slippage, if recorded, must match schema bounds too.
-ALTER TABLE limit_close_orders
-  ADD CONSTRAINT limit_close_orders_initial_slippage_in_range
-  CHECK (
-    initial_slippage_bps IS NULL OR
-    (initial_slippage_bps >= 10 AND initial_slippage_bps <= 1000)
-  );
+DO $$ BEGIN
+  ALTER TABLE limit_close_orders
+    ADD CONSTRAINT limit_close_orders_initial_slippage_in_range
+    CHECK (
+      initial_slippage_bps IS NULL OR
+      (initial_slippage_bps >= 10 AND initial_slippage_bps <= 1000)
+    );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
 
 -- Backfill — for any existing armed orders we set initial_slippage_bps
 -- = slippage_bps so audit trails make sense. We leave auto_escalate_slippage
