@@ -50,9 +50,32 @@ import { listEnabledChats } from "./community-moderation.js";
 
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN || "";
 const POLL_INTERVAL_MS = Number(process.env.RAID_POLL_INTERVAL_MS) || 90_000;
-const NITTER_INSTANCE = (process.env.NITTER_INSTANCE_URL || "https://nitter.net").replace(/\/$/, "");
 const QUIET_HOURS = process.env.RAID_QUIET_HOURS_UTC || ""; // "02:00-06:00" format
 const DEFAULT_GOAL = Number(process.env.RAID_DEFAULT_GOAL) || 10;
+
+// Nitter / Twitter mirror fallback chain. Public Nitter instances die
+// constantly; one is rarely enough. We try each in order on every poll.
+// Operator can override via NITTER_INSTANCES (comma-separated) — set this
+// when a new working instance is discovered.
+const NITTER_INSTANCES = (process.env.NITTER_INSTANCES
+  || process.env.NITTER_INSTANCE_URL  // legacy single-instance env, still respected
+  || "https://nitter.net,https://nitter.privacydev.net,https://nitter.poast.org,https://xcancel.com"
+).split(",").map((s) => s.trim().replace(/\/$/, "")).filter(Boolean);
+
+// Legacy Twitter syndication endpoint — works without auth but rate-limits
+// IP-based within a few requests/hour. Used as a last-resort source after
+// every Nitter instance fails. We back off aggressively when it 429s.
+const SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name";
+let _syndicationBackoffUntil = 0; // monotonic ms — set when we hit 429
+
+// Source-health tracking. If NO source returns a tweet for any handle in
+// this many minutes, DM the operator once. Reset on first success.
+// Threshold chosen so a normal "no new tweets" lull doesn't trigger but
+// a genuine source-outage does.
+const SOURCE_DEAD_ALERT_MIN = Number(process.env.RAID_SOURCE_DEAD_ALERT_MIN) || 30;
+const OPERATOR_DM_CHAT_ID = process.env.OPERATOR_DM_CHAT_ID;
+let _lastSuccessfulPollAt = Date.now();
+let _operatorDeadAlertSentAt = 0; // once-per-outage
 
 /* ─── Quiet-hours helper ─────────────────────────────────────────── */
 
@@ -102,29 +125,105 @@ async function xApiFetchLatestTweet(userId) {
   }
 }
 
-/* ─── Nitter RSS fallback ────────────────────────────────────────── */
+/* ─── Nitter RSS fallback chain ──────────────────────────────────── */
 
-async function nitterFetchLatestTweet(handle) {
+async function nitterFetchOneInstance(instance, handle) {
   try {
-    const res = await fetch(`${NITTER_INSTANCE}/${encodeURIComponent(handle)}/rss`, {
-      signal: AbortSignal.timeout(15_000),
-      headers: { "User-Agent": "magpie-raid-monitor/1.0" },
+    const res = await fetch(`${instance}/${encodeURIComponent(handle)}/rss`, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(12_000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; magpie-raid-monitor)" },
     });
     if (!res.ok) return null;
     const xml = await res.text();
-    // Cheap XML parsing — we only need the first <item> and its <link>/<title>.
+    if (xml.length < 200) return null; // some instances return 200 with empty body
     const itemMatch = xml.match(/<item>[\s\S]*?<\/item>/);
     if (!itemMatch) return null;
     const linkMatch = itemMatch[0].match(/<link>(.*?)<\/link>/);
     const titleMatch = itemMatch[0].match(/<title>([\s\S]*?)<\/title>/);
     if (!linkMatch) return null;
-    // Nitter link is `https://nitter.net/{handle}/status/{id}#m`. Pull the id.
     const idMatch = linkMatch[1].match(/\/status\/(\d+)/);
     if (!idMatch) return null;
     return {
       id: idMatch[1],
       text: titleMatch ? titleMatch[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim() : null,
       created_at: null,
+      source: instance,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Per-instance health gating — when an instance fails repeatedly, exponentially
+// back off so we don't waste every poll on it. Stored in-memory; resets on
+// bot restart (acceptable — every Nitter instance dies and resurrects on its
+// own schedule, so a hard reset matches reality).
+const _nitterCooldown = new Map(); // instance → timestamp until which to skip
+
+function _markNitterFail(instance) {
+  const now = Date.now();
+  const cur = _nitterCooldown.get(instance) || { failures: 0, skipUntil: 0 };
+  cur.failures = Math.min(cur.failures + 1, 8);
+  // Backoff: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m. Caps at ~2h.
+  cur.skipUntil = now + 60_000 * Math.pow(2, cur.failures - 1);
+  _nitterCooldown.set(instance, cur);
+}
+
+function _markNitterSuccess(instance) {
+  _nitterCooldown.delete(instance);
+}
+
+async function nitterFetchLatestTweet(handle) {
+  const now = Date.now();
+  for (const instance of NITTER_INSTANCES) {
+    const cool = _nitterCooldown.get(instance);
+    if (cool && cool.skipUntil > now) continue;
+    const result = await nitterFetchOneInstance(instance, handle);
+    if (result) {
+      _markNitterSuccess(instance);
+      return result;
+    }
+    _markNitterFail(instance);
+  }
+  return null;
+}
+
+/* ─── Twitter syndication endpoint (last-resort source) ──────────── */
+
+async function syndicationFetchLatestTweet(handle) {
+  const now = Date.now();
+  if (now < _syndicationBackoffUntil) return null;
+  try {
+    const url = `${SYNDICATION_URL}/${encodeURIComponent(handle)}`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(12_000),
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+    });
+    if (res.status === 429) {
+      // Aggressive backoff — this endpoint is IP-rate-limited and recovers slowly.
+      _syndicationBackoffUntil = now + 60 * 60 * 1000; // 1 hour
+      return null;
+    }
+    if (!res.ok) return null;
+    const html = await res.text();
+    // Response is HTML with embedded NEXT_DATA JSON. Extract.
+    const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!m) return null;
+    let data;
+    try { data = JSON.parse(m[1]); } catch { return null; }
+    // The shape varies; walk for first id_str.
+    const blob = JSON.stringify(data);
+    const idMatch = blob.match(/"id_str":"(\d+)"/);
+    if (!idMatch) return null;
+    return {
+      id: idMatch[1],
+      text: null,
+      created_at: null,
+      source: "syndication",
     };
   } catch {
     return null;
@@ -135,6 +234,7 @@ async function nitterFetchLatestTweet(handle) {
 
 async function pollTarget(target) {
   let tweet = null;
+  // Source 1: X API v2 (preferred, if X_BEARER_TOKEN set)
   let userId = target.x_user_id;
   if (X_BEARER_TOKEN) {
     if (!userId) {
@@ -145,9 +245,41 @@ async function pollTarget(target) {
     }
     if (userId) tweet = await xApiFetchLatestTweet(userId);
   }
-  // Fallback: Nitter RSS
+  // Source 2: Nitter RSS (fallback chain, multiple instances)
   if (!tweet) tweet = await nitterFetchLatestTweet(target.handle);
+  // Source 3: Syndication endpoint (last-resort, IP rate-limited)
+  if (!tweet) tweet = await syndicationFetchLatestTweet(target.handle);
   return tweet;
+}
+
+/* ─── Source-health alerting ─────────────────────────────────────── */
+
+async function notifyOperatorSourcesDead(botApi) {
+  if (!OPERATOR_DM_CHAT_ID) return;
+  const minSinceLastSuccess = Math.floor((Date.now() - _lastSuccessfulPollAt) / 60_000);
+  const lines = [
+    "RAID MONITOR — DATA SOURCES OFFLINE",
+    "",
+    `No tweet has been successfully fetched in ${minSinceLastSuccess} minutes.`,
+    "",
+    `Sources tried per poll cycle:`,
+    `  - X API: ${X_BEARER_TOKEN ? "enabled (failing)" : "disabled (no X_BEARER_TOKEN)"}`,
+    `  - Nitter instances: ${NITTER_INSTANCES.length} (${NITTER_INSTANCES.map((i) => i.replace(/^https?:\/\//, "")).join(", ")})`,
+    `  - Twitter syndication endpoint: ${Date.now() < _syndicationBackoffUntil ? "backing off (rate limited)" : "available"}`,
+    "",
+    "Public Nitter instances die constantly — this alert is your nudge to either:",
+    "  1. Update NITTER_INSTANCES env on Railway with a fresh working instance, OR",
+    "  2. Set X_BEARER_TOKEN env to enable the X API v2 path (most reliable).",
+    "",
+    "This alert fires at most once per outage. Recovery is auto-detected.",
+  ];
+  try {
+    await botApi.sendMessage(Number(OPERATOR_DM_CHAT_ID), lines.join("\n"));
+    _operatorDeadAlertSentAt = Date.now();
+    console.warn(`[raid-monitor] sent dead-sources DM to operator (last success ${minSinceLastSuccess}min ago)`);
+  } catch (err) {
+    console.error("[raid-monitor] failed to DM operator:", err.message);
+  }
 }
 
 /* ─── Broadcast ──────────────────────────────────────────────────── */
@@ -223,10 +355,12 @@ async function tick(botApi) {
   );
   if (targets.length === 0) return;
 
+  let anySuccess = false;
   for (const target of targets) {
     try {
       const tweet = await pollTarget(target);
       if (!tweet) continue;
+      anySuccess = true;
 
       // Have we already broadcast this tweet?
       const { rows: dup } = await query(
@@ -260,6 +394,22 @@ async function tick(botApi) {
       await new Promise((r) => setTimeout(r, 1000));
     } catch (err) {
       console.warn(`[raid-monitor] tick error for @${target.handle}:`, err.message);
+    }
+  }
+
+  // Source-health bookkeeping. If at least ONE handle returned a tweet
+  // this cycle, the sources are alive. Otherwise, check whether we've
+  // been dark long enough to nudge the operator.
+  if (anySuccess) {
+    _lastSuccessfulPollAt = Date.now();
+    _operatorDeadAlertSentAt = 0; // re-arm the alert for the next outage
+  } else {
+    const minSinceLastSuccess = (Date.now() - _lastSuccessfulPollAt) / 60_000;
+    if (
+      minSinceLastSuccess >= SOURCE_DEAD_ALERT_MIN &&
+      _operatorDeadAlertSentAt === 0 // hasn't been sent for this outage yet
+    ) {
+      await notifyOperatorSourcesDead(botApi);
     }
   }
 }
