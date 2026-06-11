@@ -54,8 +54,20 @@ export const MIN_DISTRIBUTION_LAMPORTS = 10_000_000n; // 0.01 SOL
 const DIST_WINDOW_MIN_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
 const DIST_WINDOW_MAX_MS = 10 * 24 * 60 * 60 * 1000; // 10 days
 
+import { randomInt as _cryptoRandomInt } from "node:crypto";
+
 function pickNextDistributionDelay() {
-  return DIST_WINDOW_MIN_MS + Math.random() * (DIST_WINDOW_MAX_MS - DIST_WINDOW_MIN_MS);
+  // crypto.randomInt instead of Math.random for the snapshot timing.
+  // Math.random is a Mersenne-Twister PRNG — predictable to anyone who
+  // observes 624 consecutive outputs. The previous distribution time
+  // is on-chain (it's a SOL transfer), so a sophisticated adversary
+  // could fingerprint the PRNG state across distributions and then
+  // predict the next snapshot ±0.0 ms, defeating the anti-dump random
+  // window entirely (front-run the snapshot with a giant $MAGPIE buy,
+  // claim the pro-rata reward, dump). crypto.randomInt is CSPRNG; no
+  // amount of historical observation reveals the next output.
+  const span = DIST_WINDOW_MAX_MS - DIST_WINDOW_MIN_MS;
+  return DIST_WINDOW_MIN_MS + _cryptoRandomInt(span);
 }
 
 /**
