@@ -645,6 +645,11 @@ bot.start({
       }
     })();
     startDbHealth(bot); // Start immediately — monitors DB connectivity
+    // Self-monitoring — probes sub-systems every 60s and DMs operator
+    // on degradation BEFORE users notice. Catches silent failures the
+    // external watchdogs can't see (queue backlog, DB pool exhaustion,
+    // stuck orders, lingering TWAPs, migration ledger drift).
+    import("./services/self-monitor.js").then((m) => m.startSelfMonitor(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1
     // (SECURITY-AUDIT-ANCHOR-2026-06-09.md). Polls confirmed program
