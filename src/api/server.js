@@ -238,28 +238,40 @@ async function handleHolders(req, url) {
   }
   const {
     getHolderInfoByWallet,
-    HOLDER_REWARD_BPS,
     MAGPIE_MINT,
   } = await import("../services/magpie-holder-rewards.js");
   const info = await getHolderInfoByWallet(wallet);
   if (!info) {
     return { status: 400, body: { error: "Invalid wallet address" } };
   }
+  // info.holder_reward_bps_live reflects the LIVE bps from
+  // governance_config (10% pre-MGP-001, 70% the moment it ratifies).
+  const liveBps = info.holder_reward_bps_live;
   return {
     status: 200,
     body: {
       wallet: info.wallet,
       magpie_mint: MAGPIE_MINT.toBase58(),
+      // balance_raw NOW INCLUDES collateralized $MAGPIE in addition to
+      // in-wallet — matches the snapshot logic. held_raw and
+      // collateralized_raw broken out for transparency.
       magpie_balance_raw: info.balance_raw,
       magpie_balance: Number(info.balance_raw) / 1e6, // $MAGPIE has 6 decimals
+      held_raw: info.held_raw,
+      collateralized_raw: info.collateralized_raw,
       has_balance: info.has_balance,
-      reward_bps: HOLDER_REWARD_BPS,
-      reward_pct: HOLDER_REWARD_BPS / 100,
+      reward_bps: liveBps,
+      reward_pct: liveBps / 100,
       lifetime_lamports: info.lifetime_lamports.toString(),
       paid_lamports: info.paid_lamports.toString(),
       pending_lamports: info.pending_lamports.toString(),
       distributions_count: info.distributions_count,
+      // The headline estimate includes any planned operator deposit
+      // (HOLDER_REWARD_POOL_PLANNED_ADD_LAMPORTS env). The "live"
+      // variant excludes it — clients that want strict-current-pool
+      // can show that instead.
       estimated_next_payout_lamports: info.estimated_next_payout_lamports.toString(),
+      estimated_next_payout_live_lamports: info.estimated_next_payout_live_lamports.toString(),
       // INTENTIONALLY NOT EXPOSED: snapshot timing. The window is random
       // (5-10 days) and internal-only — prevents mercenary holders from
       // timing buy-just-before / dump-just-after distributions.
@@ -269,17 +281,20 @@ async function handleHolders(req, url) {
 }
 
 async function handleHolderPool() {
-  const { getHolderPoolState, HOLDER_REWARD_BPS } = await import(
+  const { getHolderPoolState, getHolderRewardBps } = await import(
     "../services/magpie-holder-rewards.js"
   );
-  const state = await getHolderPoolState();
+  const [state, liveBps] = await Promise.all([
+    getHolderPoolState(),
+    getHolderRewardBps(),
+  ]);
   return {
     status: 200,
     body: {
       pool_lamports: state.accrued_lamports.toString(),
       pool_sol: Number(state.accrued_lamports) / 1e9,
-      reward_bps: HOLDER_REWARD_BPS,
-      reward_pct: HOLDER_REWARD_BPS / 100,
+      reward_bps: liveBps,
+      reward_pct: liveBps / 100,
       // Timing intentionally omitted — snapshots fire at random within
       // a hidden 5-10 day window after each distribution.
     },

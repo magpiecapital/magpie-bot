@@ -340,8 +340,11 @@ export async function handleTickets(ctx) {
 export async function handleHolderPool(ctx) {
   if (!(await requireAdmin(ctx))) return;
 
-  const HOLDER_REWARD_BPS = 1_000;   // 10% — kept in sync with magpie-holder-rewards.js
-  const LP_LOYALTY_BPS = 200;        // 2%
+  // Read the LIVE bps from governance_config — flips automatically when
+  // MGP-001 ratifies.
+  const { getHolderRewardBps } = await import("../services/magpie-holder-rewards.js");
+  const HOLDER_REWARD_BPS = await getHolderRewardBps();
+  const LP_LOYALTY_BPS = 200;        // 2% (no governance flip planned)
 
   const { rows: [hp] } = await query(
     `SELECT accrued_lamports::text, last_distribution_at, updated_at,
