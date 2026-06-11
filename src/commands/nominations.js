@@ -191,6 +191,11 @@ export async function handleNominationReview(ctx) {
 export async function handleMyNominations(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
+  if (ctx.chat?.type !== "private") {
+    return ctx.reply(
+      "Your nominations list is private. DM me — run /my_nominations in a direct message with @magpie_capital_bot.",
+    );
+  }
   const { query } = await import("../db/pool.js");
   const { rows } = await query(
     `SELECT id, nomination_text, status, upvote_count, created_at

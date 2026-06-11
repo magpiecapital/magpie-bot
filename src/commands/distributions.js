@@ -33,6 +33,12 @@ export async function handleDistributions(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
 
+  if (ctx.chat?.type !== "private") {
+    return ctx.reply(
+      "Your distributions are private. DM me to see them — run /distributions in a direct message with @magpie_capital_bot.",
+    );
+  }
+
   const user = await upsertUser(tgUser.id, tgUser.username);
 
   // All wallets owned by this user
