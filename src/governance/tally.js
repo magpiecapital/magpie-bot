@@ -89,14 +89,22 @@ export function applyWhaleCap(weights, capFraction) {
  *
  * Snapshot file lives at SNAPSHOT_PATH (operator-private, mode 0600).
  * We read it inline (small enough — < 1 MB typically).
+ *
+ * Snapshot files are tagged with the snapshot_id they were generated
+ * UNDER, not the proposal they're used FOR. A proposal can intentionally
+ * reuse another proposal's snapshot (MGP-001 reuses MGP-002's snapshot
+ * per the registry's snapshot_id field). The caller passes the
+ * expected snapshot_id; this function verifies the file matches that,
+ * not the proposal id.
  */
-export async function loadEligibleVoters(proposalId, snapshotPath) {
+export async function loadEligibleVoters(proposalId, snapshotPath, expectedSnapshotId = null) {
   const fs = await import("node:fs");
   const raw = fs.readFileSync(snapshotPath, "utf8");
   const snap = JSON.parse(raw);
-  if (snap.proposal_id !== proposalId) {
+  const expected = expectedSnapshotId ?? proposalId;
+  if (snap.proposal_id !== expected) {
     throw new Error(
-      `Snapshot file proposal_id (${snap.proposal_id}) does not match expected ${proposalId} — refusing to tally.`,
+      `Snapshot file proposal_id (${snap.proposal_id}) does not match expected snapshot id ${expected} — refusing to tally.`,
     );
   }
   const weights = new Map();
@@ -132,8 +140,8 @@ export async function loadVotes(proposalId, questionId) {
  * Compute a full tally for a proposal. Returns an object with all
  * the numbers the rest of the pipeline needs.
  */
-export async function tallyProposal({ proposalId, questionId, snapshotPath, capFraction = 0.02 }) {
-  const eligible = await loadEligibleVoters(proposalId, snapshotPath);
+export async function tallyProposal({ proposalId, questionId, snapshotPath, expectedSnapshotId = null, capFraction = 0.02 }) {
+  const eligible = await loadEligibleVoters(proposalId, snapshotPath, expectedSnapshotId);
   const votes = await loadVotes(proposalId, questionId);
 
   // Build raw weights of voters who actually voted, restricted to eligible set
@@ -149,7 +157,14 @@ export async function tallyProposal({ proposalId, questionId, snapshotPath, capF
 
   let yesWeight = 0n, noWeight = 0n, abstainWeight = 0n;
   for (const [voter, w] of capped) {
-    const choice = votes.get(voter);
+    // Normalize case before comparison. Votes are stored as the literal
+    // choice strings from the proposal's `choices` array (e.g. "YES",
+    // "NO", "ABSTAIN" for MGP-001 — see ACTIVE_PROPOSALS in
+    // src/api/governance-api.js:51-53). Without normalization, every
+    // uppercase vote fell into the `else` branch and was counted as
+    // abstain — meaning MGP-001's 15+ live YES votes would have tallied
+    // as 0% YES, failing the proposal at autopilot close.
+    const choice = (votes.get(voter) || "").toLowerCase();
     if (choice === "yes") yesWeight += w;
     else if (choice === "no") noWeight += w;
     else abstainWeight += w;

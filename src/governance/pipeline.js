@@ -123,11 +123,27 @@ export async function processProposal(proposal) {
       await markPipelineError(proposalId, "no_snapshot_file_found");
       return "pipeline_error";
     }
+    // questionId MUST match what the vote-submission API stored. Votes
+    // are stored with question_id = the key in
+    // src/api/governance-api.js:51-53 — currently "Vote" for MGP-001 and
+    // MGP-003 (the only proposals with active voting in v0). Without
+    // this match the WHERE clause in loadVotes returns zero rows and the
+    // entire tally collapses to 0/0/0, failing the proposal at close.
+    // Hardcoded "Vote" matches today's single-question structure; a
+    // future multi-question proposal will need a refactor to iterate
+    // proposal.questions and tally each separately.
+    const questionId = "Vote";
+    // expectedSnapshotId tells tallyProposal what to verify against the
+    // snapshot file's internal proposal_id field. MGP-001 intentionally
+    // reuses the MGP-002 snapshot (per registry.snapshot_id); the file's
+    // proposal_id is "MGP-002" even though we're tallying MGP-001.
+    const expectedSnapshotId = proposal.snapshot_id ?? proposalId;
     try {
       tally = await tallyProposal({
         proposalId,
-        questionId: proposal.id,
+        questionId,
         snapshotPath,
+        expectedSnapshotId,
         capFraction: 0.02,
       });
       await log("tally", "ok", tally, null, Date.now() - t0);
@@ -145,8 +161,9 @@ export async function processProposal(proposal) {
     try {
       crossTally = await tallyProposal({
         proposalId,
-        questionId: proposal.id,
+        questionId: "Vote",
         snapshotPath,
+        expectedSnapshotId: proposal.snapshot_id ?? proposalId,
         capFraction: 0.02,
       });
     } catch (err) {
