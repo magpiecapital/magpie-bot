@@ -162,7 +162,15 @@ async function verifyMintOnChain(mintStr) {
 const ETF_TICKERS = new Set(["SPY", "QQQ", "IWM", "VOO", "VTI", "DIA", "EFA", "EEM", "TQQQ", "SOXL"]);
 const METAL_SYMBOLS = new Set(["VNXAU", "PAXG", "XAUT", "VNXAG"]);
 
-function classify(symbol, name) {
+function classify(symbol, name, mint = null) {
+  // Hard rule: pump.fun mints can NEVER classify as stock/etf/metal.
+  // Real Backed xStocks use Xs... mints; pump.fun memecoins end in
+  // 'pump'. The DB CHECK constraint (migration 019) is the backstop;
+  // this rejects in code so the rest of the rwa-screener never tries
+  // to insert a pump.fun mint into supported_mints with an RWA category.
+  if (typeof mint === "string" && mint.endsWith("pump")) {
+    return "memecoin";
+  }
   const sym = (symbol || "").toUpperCase();
   if (METAL_SYMBOLS.has(sym)) return "metal";
   // Backed Finance ETFs follow <TICKER>x. Strip the trailing x and match.
@@ -192,7 +200,7 @@ async function decideForCandidate(candidate, dbRow) {
     return { action: "skip", reason: "issuer-paused, currently disabled" };
   }
 
-  const category = classify(candidate.symbol, candidate.name);
+  const category = classify(candidate.symbol, candidate.name, candidate.mint);
   const meetsApprove = candidate.liquidity >= APPROVE_LIQUIDITY_USD
     && candidate.volume24h >= APPROVE_VOLUME_24H_USD;
   const failsDisable = candidate.liquidity < DISABLE_LIQUIDITY_USD
