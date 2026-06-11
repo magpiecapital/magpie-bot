@@ -63,6 +63,40 @@ async function executeDbConfigUpdate(action, proposalId) {
 async function executeBotConstantPr(action, proposalId) {
   const { file_path, old_string, new_string, branch_name, description } = action;
 
+  // Precheck: working tree must be clean and HEAD must be on main. If the
+  // bot's git state is dirty or detached at the moment a vote passes, the
+  // sequence of checkout/commit/push below would silently mangle whatever
+  // is already there. Halt instead and let the operator clean it up.
+  try {
+    const statusOut = execSync("git status --porcelain", { stdio: ["ignore", "pipe", "pipe"] })
+      .toString()
+      .trim();
+    if (statusOut.length > 0) {
+      return {
+        ok: false,
+        detail: {
+          error: "working_tree_dirty",
+          hint: "Autopilot refuses to checkout a new branch when the bot's working tree has uncommitted changes. Investigate before resuming.",
+          status_porcelain: statusOut.slice(0, 500),
+        },
+      };
+    }
+    const headOut = execSync("git rev-parse --abbrev-ref HEAD", { stdio: ["ignore", "pipe", "pipe"] })
+      .toString()
+      .trim();
+    if (headOut !== "main") {
+      return {
+        ok: false,
+        detail: {
+          error: "not_on_main",
+          hint: `Autopilot expected HEAD on main but found '${headOut}'. Investigate before resuming.`,
+        },
+      };
+    }
+  } catch (err) {
+    return { ok: false, detail: { error: "git_precheck_failed", stderr: err.stderr?.toString?.()?.slice(0, 500) } };
+  }
+
   // Check if branch already exists on remote
   let branchExists = false;
   try {
