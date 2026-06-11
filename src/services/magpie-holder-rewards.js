@@ -85,7 +85,14 @@ const EXCLUDED_WALLETS = new Set([
 function loadLenderKeypair() {
   const b58 = process.env.LENDER_PRIVATE_KEY;
   if (b58) return Keypair.fromSecretKey(bs58.decode(b58));
-  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+  // Fail closed if neither env var is set — never fall back to a CWD-
+  // relative default path. See cosign-borrow.js for the same pattern.
+  const kpPath = process.env.LENDER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error(
+      "[magpie-holder-rewards] LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing to fall back to a CWD-relative default",
+    );
+  }
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }
