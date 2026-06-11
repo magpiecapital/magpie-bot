@@ -160,7 +160,7 @@ export async function processProposal(proposal) {
     if (!match) {
       await log("verify", "halted", { first: tally, second: crossTally }, "tally_cross_check_mismatch", Date.now() - t0);
       await markPipelineError(proposalId, "tally_cross_check_mismatch");
-      await operatorDm(`⚠️ AUTOPILOT HALT: ${proposalId} tally cross-check disagreed. Manual review required.`);
+      await operatorDm(`AUTOPILOT HALT: ${proposalId} tally cross-check disagreed. Manual review required.`);
       return "pipeline_error";
     }
     await log("verify", "ok", { match: true }, null, Date.now() - t0);
@@ -220,7 +220,7 @@ export async function processProposal(proposal) {
           WHERE proposal_id = $2`,
         [anomaly.flags, proposalId],
       );
-      await operatorDm(`⚠️ AUTOPILOT HALT: ${proposalId} anomaly checks failed:\n${anomaly.flags.join("\n")}`);
+      await operatorDm(`AUTOPILOT HALT: ${proposalId} anomaly checks failed:\n${anomaly.flags.join("\n")}`);
       return "anomaly_held";
     }
     await log("anomaly", "ok", null, null, Date.now() - t0);
@@ -277,7 +277,7 @@ export async function processProposal(proposal) {
     );
     if (!auditResult.overall_verified) {
       await operatorDm(
-        `⚠️ AUTOPILOT HALT: ${proposalId} passed the vote but implementation audit failed.\n` +
+        `AUTOPILOT HALT: ${proposalId} passed the vote but implementation audit failed.\n` +
         `Blocking unverified actions: ${auditResult.summary.blocking_unverified}\n` +
         `Announcement WITHHELD. Manual review required.`,
       );
@@ -311,7 +311,7 @@ export async function processProposal(proposal) {
   {
     const t0 = Date.now();
     await operatorDm(
-      `✅ AUTOPILOT: ${proposalId} (${proposal.title})\n` +
+      `AUTOPILOT: ${proposalId} (${proposal.title})\n` +
       `Outcome: ${outcome}\n` +
       `Yes: ${tally.percentages.yes_share_of_cast_pct.toFixed(2)}% | Participation: ${tally.percentages.participation_pct.toFixed(2)}%\n` +
       `Implementation: ${auditResult.summary.verified_count} verified / ${auditResult.summary.unverified_count} pending`,

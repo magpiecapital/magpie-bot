@@ -23,6 +23,7 @@
  * Configurable via LENDER_ALARM_THRESHOLD_LAMPORTS env var.
  */
 import "dotenv/config";
+import { timingSafeEqual } from "node:crypto";
 import { notifyAdmin } from "../services/admin-notify.js";
 
 // Bot reference is injected at startup via setLenderAlarmBot(bot) so
@@ -87,7 +88,18 @@ export async function handleLenderAlarmWebhook(req) {
     };
   }
   const got = req.headers["authorization"] || req.headers["Authorization"];
-  if (got !== WEBHOOK_SECRET) {
+  // Constant-time compare to avoid timing-side-channel reveal of the
+  // shared-secret. String !== compares byte-by-byte and short-circuits on
+  // first mismatch, which is observable from outside via response-time
+  // measurement.
+  const gotBuf = Buffer.from(String(got ?? ""), "utf-8");
+  const expectedBuf = Buffer.from(WEBHOOK_SECRET, "utf-8");
+  const lengthsMatch = gotBuf.length === expectedBuf.length;
+  // Pad to equal length to keep timingSafeEqual happy even on length mismatch —
+  // if lengths differ, the final equality result is forced false.
+  const a = lengthsMatch ? gotBuf : Buffer.alloc(expectedBuf.length);
+  const ok = lengthsMatch && timingSafeEqual(a, expectedBuf);
+  if (!ok) {
     console.warn("[lender-alarm-webhook] bad auth header");
     return { status: 401, body: { error: "auth" } };
   }
@@ -106,7 +118,7 @@ export async function handleLenderAlarmWebhook(req) {
 
     const solAmount = (Number(outflow.amount) / 1e9).toFixed(6);
     const message =
-      `🚨 *Lender wallet outflow detected*\n\n` +
+      `*LENDER WALLET OUTFLOW DETECTED*\n\n` +
       `*Amount:* ${solAmount} SOL\n` +
       `*To:* \`${outflow.to}\`\n` +
       `*Tx:* [${outflow.signature.slice(0, 16)}…](https://solscan.io/tx/${outflow.signature})\n` +
