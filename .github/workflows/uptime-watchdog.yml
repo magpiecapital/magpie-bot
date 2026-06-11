@@ -1,0 +1,108 @@
+name: Uptime watchdog (backup)
+
+# BACKUP uptime monitor — runs every 5 minutes on GitHub's infra,
+# pings the bot's /api/v1/health, and DMs the operator via the
+# Telegram API directly if it's unreachable.
+#
+# This is the SECOND of two independent watchdogs:
+#   1. Vercel cron @ magpie-site/api/cron/bot-watchdog — runs every
+#      minute. Primary. Lower latency but depends on Vercel staying up.
+#   2. THIS workflow — runs every 5 min on GitHub infra. Lower-cadence
+#      but independent of Vercel. If Vercel itself has issues, this
+#      catches the missed alert.
+#
+# Both alerts use the same Telegram bot token to DM the operator, so
+# the operator sees ONE source of alerts (their existing magpie bot
+# chat) regardless of which watchdog fires. Adds path discrimination
+# in the alert text so they can tell which watchdog noticed.
+#
+# Secrets required (set at the repo level):
+#   MAGPIE_BOT_TOKEN          — same token the bot uses
+#   OPERATOR_TG_CHAT_ID       — numeric chat id
+#
+# Failure modes handled:
+#   - Network timeout (the curl --max-time)
+#   - Non-200/503 response (anything else means broken or 4xx)
+#   - GitHub Actions runner outage — workflow simply doesn't run; the
+#     Vercel watchdog still fires. Two-source design covers this.
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub Actions cron minimum granularity is also
+    # ~5 min in practice (the docs say 5 but it can drift to 10-15 under
+    # load). That's still useful: 5-15 min alert latency from this
+    # watchdog plus 60s from the Vercel one means most outages get
+    # caught within 60s by the Vercel cron, and any Vercel-itself
+    # outage gets caught within ~15 min by this one.
+    - cron: "*/5 * * * *"
+  # Manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: none
+      id-token: none
+      actions: none
+      checks: none
+      deployments: none
+      packages: none
+      pull-requests: none
+      statuses: none
+    steps:
+      - name: Probe bot health endpoint
+        id: probe
+        run: |
+          set +e
+          STATUS=$(curl -sS -o /tmp/health_body -w "%{http_code}" \
+            --max-time 10 \
+            https://magpie-bot-production.up.railway.app/api/v1/health)
+          EXIT=$?
+          echo "exit=$EXIT"
+          echo "status=$STATUS"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "exit=$EXIT" >> "$GITHUB_OUTPUT"
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "503" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            # Print response body (if any) for the workflow log so
+            # operator can grep the run output.
+            echo "--- response body ---"
+            head -c 1000 /tmp/health_body || true
+            echo ""
+          fi
+
+      - name: Send Telegram alert on failure
+        if: steps.probe.outputs.ok == 'false'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.MAGPIE_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.OPERATOR_TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::warning::watchdog secrets not configured — set MAGPIE_BOT_TOKEN + OPERATOR_TG_CHAT_ID in repo secrets to enable alerts"
+            exit 0
+          fi
+          STATUS="${{ steps.probe.outputs.status }}"
+          EXIT="${{ steps.probe.outputs.exit }}"
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          MSG="BOT DOWN (backup watchdog, GitHub Actions)
+
+          time: $TS
+          curl status: $STATUS
+          curl exit: $EXIT
+
+          Site dashboard, /borrow, /repay, and Pip will all be broken until this recovers.
+          Check Railway service status + logs.
+
+          Note: the Vercel cron watchdog should also fire on this incident — if you didn't see one, Vercel itself may be having issues."
+          curl -sS -X POST \
+            "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg cid "$TG_CHAT_ID" --arg msg "$MSG" '{chat_id: $cid, text: $msg, disable_notification: false}')" \
+            -o /tmp/tg_resp \
+            -w "tg_send_http=%{http_code}\n" || true
+          head -c 500 /tmp/tg_resp || true
+          echo ""
