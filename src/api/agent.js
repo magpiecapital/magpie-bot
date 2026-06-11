@@ -75,6 +75,7 @@ import {
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { Keypair } from "@solana/web3.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
@@ -358,6 +359,12 @@ export async function handleAgentBuildBorrow(req) {
       body: { error: "Agent API temporarily disabled", detail: "Use the TG bot or magpie.capital site." },
     };
   }
+  // DB-driven global site pause (separate from the env kill switch).
+  // agent-manage.js and agent-repay.js both check this; build-borrow
+  // was the lone gap. During an incident the operator flips this to
+  // halt all borrow activity instantly without a redeploy.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   // Auth: x402 service must present the shared internal token.
   if (!INTERNAL_API_TOKEN) {
     console.error("[agent/build-borrow] INTERNAL_API_TOKEN not configured");

@@ -4,9 +4,23 @@
  * Returns the caller's voting weight for a given proposal. Used by the
  * dashboard to display "your weight" on the governance tab.
  *
- * Public read — no auth required. The wallet is the query param; nothing
- * sensitive is returned. (Per-wallet $MAGPIE balance is already public via
- * on-chain token account scan, so surfacing it here is no new exposure.)
+ * Public read — no auth required. Response is intentionally minimal:
+ * only the wallet's capped percentage-of-pool plus proposal metadata.
+ *
+ * Fields deliberately NOT returned (operator-internal per
+ * MEMORY/feedback_governance_snapshot_internal):
+ *   - snapshot_taken_at / snapshot_id   (exact snapshot timing is load-
+ *                                       bearing — would let attackers
+ *                                       game the next snapshot)
+ *   - total_eligible_weight             (denominator of the pool size)
+ *   - raw_weight / held_raw / collat_raw (per-wallet balances — caller
+ *                                       likely knows their own, but the
+ *                                       JSON API shouldn't be the source
+ *                                       of truth on someone else's)
+ *   - weight_pct_of_pool                (pre-cap — capped-pct is enough)
+ *
+ * Pip's system prompt enforces the verbal version of this rule; the
+ * JSON API needs the same redaction so a scraper can't bypass it.
  */
 
 import { getProposal } from "../governance/registry.js";
@@ -46,11 +60,29 @@ export async function handleVotingPowerQuery(req, url) {
     snapshotId: proposal.snapshot_id,
   });
 
+  // Public response: ONLY the wallet's eligibility + capped pct + the
+  // cap fraction itself + proposal metadata. Everything else from
+  // getVotingPower (raw balances, snapshot timing, total eligible
+  // weight) stays operator-internal.
+  const publicBody = power.eligible
+    ? {
+        eligible: true,
+        wallet: power.wallet,
+        capped_pct_of_pool: power.capped_pct_of_pool,
+        cap_fraction: power.cap_fraction,
+        was_capped: power.was_capped,
+      }
+    : {
+        eligible: false,
+        wallet: power.wallet,
+        reason: power.reason,
+      };
+
   return {
     status: 200,
     headers: { "Cache-Control": "public, max-age=15, s-maxage=15" },
     body: {
-      ...power,
+      ...publicBody,
       proposal: {
         id: proposal.id,
         title: proposal.title,
