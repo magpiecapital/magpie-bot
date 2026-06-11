@@ -1217,7 +1217,9 @@ async function computeLifetimeStats() {
       paid_lamports: holderRewards.paid_lamports,
       pending_lamports: holderRewards.pending_lamports,
       accrued_lamports: holderPool.accrued_lamports,
-      next_distribution_at: holderPool.next_distribution_at,
+      // next_distribution_at is operator-internal per the standing rule on
+      // randomized-cadence snapshots — exact firing time is unguessable on
+      // purpose. Not surfaced in admin responses.
     },
     lp_loyalty: {
       distributions_to_date: loyaltyDist.count,
