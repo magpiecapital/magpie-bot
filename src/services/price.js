@@ -246,10 +246,96 @@ export async function getPriceInUsdCrossSourced(mint) {
  * Given an amount of collateral tokens (raw, with decimals), return its
  * equivalent value in lamports. Cross-sourced (Jupiter + DexScreener)
  * to defend against single-source price manipulation.
+ *
+ * ScaledUiAmount-aware. Backed xStocks (and any future Token-2022
+ * mint with the ScaledUiAmountConfig extension) carry a per-mint
+ * multiplier that grows over time as dividends accrue and adjusts at
+ * stock splits. The on-chain raw amount stays constant; the UI amount
+ * users see (and DEX-quoted prices) reflect raw × multiplier. Without
+ * applying the multiplier here, after any dividend or split the bot
+ * would under-value collateral by exactly that factor.
+ *
+ * Verified live 2026-06-10 against real SPYx (multiplier 1.002561 →
+ * 0.26% under-valuation if uncorrected) and NVDAx (multiplier 1.000103).
  */
 export async function collateralValueLamports(mint, rawAmount, decimals) {
-  const priceSol = await getPriceInSolCrossSourced(mint);
-  const humanAmount = Number(rawAmount) / 10 ** decimals;
+  const [priceSol, multiplier] = await Promise.all([
+    getPriceInSolCrossSourced(mint),
+    getScaledUiMultiplier(mint),
+  ]);
+  // (rawAmount × multiplier) / 10^decimals = the UI amount users see in
+  // their wallet, which is what Jupiter/DexScreener price quotes refer to.
+  const humanAmount = (Number(rawAmount) * multiplier) / 10 ** decimals;
   const valueSol = humanAmount * priceSol;
   return Math.floor(valueSol * 1e9);
+}
+
+// ─── ScaledUiAmount helpers ─────────────────────────────────────────────
+//
+// Cached per-mint. Backed updates the multiplier at most a few times per
+// year (quarterly dividends + stock splits); 15-min TTL is conservative.
+//
+// The ScaledUiAmountConfig layout (after deserialization) carries TWO
+// multipliers — the currently-active one and a "newer" one that becomes
+// active at newer_multiplier_effective_timestamp. We pick whichever the
+// current wall-clock says is in force.
+
+const SCALED_UI_CACHE = new Map(); // mint → { multiplier, expires_at_ms }
+const SCALED_UI_TTL_MS = 15 * 60 * 1000;
+const SCALED_UI_NEGATIVE_TTL_MS = 60 * 60 * 1000; // 1h cache that "no extension exists"
+
+/**
+ * Returns the live ScaledUiAmount multiplier for a mint. For mints
+ * without the extension (every non-Token-2022 token + most Token-2022
+ * tokens), returns 1.0. Cached.
+ */
+export async function getScaledUiMultiplier(mint) {
+  const now = Date.now();
+  const cached = SCALED_UI_CACHE.get(mint);
+  if (cached && cached.expires_at_ms > now) return cached.multiplier;
+
+  let multiplier = 1.0;
+  try {
+    const { PublicKey } = await import("@solana/web3.js");
+    const spl = await import("@solana/spl-token");
+    const { connection } = await import("../solana/connection.js");
+    const { getMint, getExtensionData, TOKEN_2022_PROGRAM_ID, ExtensionType } = spl;
+    const mintPk = new PublicKey(mint);
+    const info = await connection.getAccountInfo(mintPk);
+    if (info && info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      const m = await getMint(connection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
+      const scalData = m.tlvData?.length
+        ? getExtensionData(ExtensionType.ScaledUiAmountConfig, m.tlvData)
+        : null;
+      if (scalData && scalData.length >= 56) {
+        // Layout: authority(32) + multiplier(f64=8) +
+        //         newer_multiplier_effective_timestamp(i64=8) + newer_multiplier(f64=8)
+        const older = scalData.readDoubleLE(32);
+        const newerEffectiveTs = scalData.readBigInt64LE(40);
+        const newer = scalData.readDoubleLE(48);
+        const nowSec = Math.floor(Date.now() / 1000);
+        multiplier = nowSec >= Number(newerEffectiveTs) && Number.isFinite(newer) && newer > 0
+          ? newer
+          : older;
+        // Defensive: never apply a non-finite or non-positive multiplier.
+        // Better to value the collateral at "raw / 10^decimals" (pre-multiplier)
+        // than to multiply by NaN and silently zero everything out.
+        if (!Number.isFinite(multiplier) || multiplier <= 0) {
+          console.warn(`[price] ScaledUiAmount multiplier for ${mint.slice(0, 8)} is non-finite (${multiplier}); falling back to 1.0`);
+          multiplier = 1.0;
+        }
+      }
+    }
+    SCALED_UI_CACHE.set(mint, {
+      multiplier,
+      expires_at_ms: now + (multiplier === 1.0 ? SCALED_UI_NEGATIVE_TTL_MS : SCALED_UI_TTL_MS),
+    });
+  } catch (err) {
+    // Fail-safe: 1.0 means the formula degrades to the pre-existing
+    // (correct for non-ScaledUiAmount tokens) behavior. Cache briefly
+    // so a transient RPC blip doesn't hammer the chain on every loan.
+    console.warn(`[price] getScaledUiMultiplier failed for ${mint.slice(0, 8)}: ${err.message}`);
+    SCALED_UI_CACHE.set(mint, { multiplier: 1.0, expires_at_ms: now + 60_000 });
+  }
+  return multiplier;
 }
