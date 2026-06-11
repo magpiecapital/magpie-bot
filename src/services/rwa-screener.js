@@ -175,22 +175,68 @@ async function verifyMintOnChain(mintStr) {
 //   RWA_TRANSFER_FEE_AUTHORITIES   — typically empty (Backed charges 0)
 //   RWA_MAX_TRANSFER_FEE_BPS       — hard cap, default 0
 const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
-const RWA_FREEZE_AUTHORITIES = new Set(
-  (process.env.RWA_FREEZE_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
-);
-const RWA_PERMANENT_DELEGATES = new Set(
-  (process.env.RWA_PERMANENT_DELEGATES || "").split(",").map((s) => s.trim()).filter(Boolean),
-);
-const RWA_TRANSFER_HOOK_PROGRAMS = new Set(
-  [SYSTEM_PROGRAM_ID, ...(process.env.RWA_TRANSFER_HOOK_PROGRAMS || "").split(",").map((s) => s.trim()).filter(Boolean)],
-);
-const RWA_TRANSFER_HOOK_AUTHORITIES = new Set(
-  (process.env.RWA_TRANSFER_HOOK_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
-);
-const RWA_TRANSFER_FEE_AUTHORITIES = new Set(
-  (process.env.RWA_TRANSFER_FEE_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
-);
-const RWA_MAX_TRANSFER_FEE_BPS = Number(process.env.RWA_MAX_TRANSFER_FEE_BPS || 0);
+
+// Parse + validate a comma-separated env var of base58 pubkeys.
+// Invalid entries throw at module load — better to crash the bot at
+// startup than to silently drop a misconfigured allowlist entry and
+// have the screener reject a legitimate Backed xStock with the
+// confusing reason "freeze_authority_not_trusted".
+function _parseAllowlist(envName, raw) {
+  const seen = new Set();
+  for (const piece of (raw || "").split(",")) {
+    const s = piece.trim();
+    if (!s) continue;
+    try {
+      // Round-trip through PublicKey to validate base58 + 32-byte length.
+      const pk = new PublicKey(s);
+      seen.add(pk.toBase58());
+    } catch (err) {
+      throw new Error(
+        `[rwa-screener] ${envName} contains an invalid base58 pubkey: "${s.slice(0, 12)}…". Fix the env var or unset it.`,
+      );
+    }
+  }
+  return seen;
+}
+const RWA_FREEZE_AUTHORITIES = _parseAllowlist("RWA_FREEZE_AUTHORITIES", process.env.RWA_FREEZE_AUTHORITIES);
+const RWA_PERMANENT_DELEGATES = _parseAllowlist("RWA_PERMANENT_DELEGATES", process.env.RWA_PERMANENT_DELEGATES);
+const RWA_TRANSFER_HOOK_PROGRAMS = new Set([
+  SYSTEM_PROGRAM_ID,
+  ..._parseAllowlist("RWA_TRANSFER_HOOK_PROGRAMS", process.env.RWA_TRANSFER_HOOK_PROGRAMS),
+]);
+const RWA_TRANSFER_HOOK_AUTHORITIES = _parseAllowlist("RWA_TRANSFER_HOOK_AUTHORITIES", process.env.RWA_TRANSFER_HOOK_AUTHORITIES);
+const RWA_TRANSFER_FEE_AUTHORITIES = _parseAllowlist("RWA_TRANSFER_FEE_AUTHORITIES", process.env.RWA_TRANSFER_FEE_AUTHORITIES);
+
+// Transfer-fee cap with sanity ceiling. Backed Finance charges 0, so 0
+// is the strict-by-default value. Operator can raise it via env if a
+// future issuer charges a small fee, but we hard-cap the env-supplied
+// value at 100 bps (1%) — any value higher is almost certainly a typo
+// (a scammer can encode up to 10000 bps = 100%, which would seize the
+// borrower's entire RWA collateral on every move).
+const RWA_MAX_TRANSFER_FEE_BPS_HARD_CAP = 100;
+const _envFee = Number(process.env.RWA_MAX_TRANSFER_FEE_BPS || 0);
+if (!Number.isFinite(_envFee) || _envFee < 0 || _envFee > RWA_MAX_TRANSFER_FEE_BPS_HARD_CAP) {
+  throw new Error(
+    `[rwa-screener] RWA_MAX_TRANSFER_FEE_BPS=${process.env.RWA_MAX_TRANSFER_FEE_BPS} is out of allowed range [0, ${RWA_MAX_TRANSFER_FEE_BPS_HARD_CAP}]. Unset or fix.`,
+  );
+}
+const RWA_MAX_TRANSFER_FEE_BPS = _envFee;
+
+// One-time startup warning if any allowlist is empty. Empty == fail
+// closed (the audit correctly rejects every mint with that extension
+// set), but operators should know the screener is effectively
+// disabled for that extension class. This logs ONCE at module load,
+// not per-tick, so it stays out of the way after acknowledgement.
+{
+  const empties = [];
+  if (RWA_FREEZE_AUTHORITIES.size === 0) empties.push("RWA_FREEZE_AUTHORITIES");
+  if (RWA_PERMANENT_DELEGATES.size === 0) empties.push("RWA_PERMANENT_DELEGATES");
+  if (empties.length > 0) {
+    console.warn(
+      `[rwa-screener] WARNING: ${empties.join(", ")} env var(s) are empty. Every Backed xStock has both a freeze authority and a permanent delegate set — empty allowlists will fail-close every candidate. Configure the env vars in Railway to enable auto-approval.`,
+    );
+  }
+}
 
 async function auditRwaExtensions(mint) {
   const spl = await import("@solana/spl-token");
@@ -208,7 +254,10 @@ async function auditRwaExtensions(mint) {
   if (isSet(mint.freezeAuthority)) {
     const addr = b58(mint.freezeAuthority);
     if (!RWA_FREEZE_AUTHORITIES.has(addr)) {
-      return { safe: false, reason: `freeze_authority_not_trusted: ${addr.slice(0, 8)}…` };
+      const hint = RWA_FREEZE_AUTHORITIES.size === 0
+        ? " (RWA_FREEZE_AUTHORITIES env unset — set it to enable RWA auto-approval)"
+        : "";
+      return { safe: false, reason: `freeze_authority_not_trusted: ${addr.slice(0, 8)}…${hint}` };
     }
   }
 

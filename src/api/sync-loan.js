@@ -140,14 +140,26 @@ export async function handleSyncLoan(req) {
   // and insert via the canonical recordLoan() helper (which also fires
   // referral accrual + $MAGPIE holder pool + LP loyalty accrual).
   if (!dbLoan) {
-    // RPC propagation lag: even though the borrow tx confirmed, the
-    // loan PDA can take a few seconds to be readable from some RPC
-    // nodes. Retry with backoff before giving up — the site calls
-    // sync-loan immediately after waitConfirmed, and that's exactly
-    // when this race is hottest.
+    // Worker-exhaustion defense: the recovery path holds an HTTP worker
+    // for up to ~10s of retry sleep. With IP_MAX=120/min an attacker
+    // can keep ~21 concurrent workers pinned per IP forever by spraying
+    // random loan_pda strings — enough to crowd out legitimate callers
+    // on the bot's small worker pool. Two mitigations:
+    //   1. Require `signature` to enter the recovery path. The site
+    //      always passes signature (it's the just-confirmed tx). An
+    //      attacker can mint random tx sig strings, but a legitimate
+    //      sync flow always has one. No signature = no retries.
+    //   2. Halve the retry budget. RPC propagation lag is normally
+    //      under 2s; the previous 10.5s was over-engineered.
+    if (!signature) {
+      return {
+        status: 404,
+        body: { error: "loan_pda not found in DB; provide signature to trigger recovery path" },
+      };
+    }
     let onChainNew = null;
     let resolvedProgramId = null;
-    const RETRY_DELAYS_MS = [0, 1500, 3000, 6000];
+    const RETRY_DELAYS_MS = [0, 1000, 2500];
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length && !onChainNew; attempt++) {
       if (RETRY_DELAYS_MS[attempt] > 0) {
         await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
@@ -176,11 +188,18 @@ export async function handleSyncLoan(req) {
     if (!walletRow) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
       // agent borrow whose synthetic user was already created by the
-      // agent endpoint. Still surface clearly rather than panicking.
+      // agent endpoint. Log internally with the wallet string, but
+      // return a GENERIC 404 to the caller. Distinguishing "wallet
+      // not linked" from "loan not found" would let anyone probe
+      // arbitrary wallets to learn if they're Magpie users (since
+      // the loan PDA's on-chain borrower field is publicly readable,
+      // the marginal leak is the wallet↔user-id mapping). The site
+      // never legitimately hits this branch — site flows always have
+      // a linked wallet — so a generic 404 doesn't hurt UX.
       console.error(`[sync-loan] borrower wallet ${borrowerStr} not in wallets table — loan ${loan_pda.slice(0, 8)}... cannot be attributed`);
       return {
         status: 404,
-        body: { error: "borrower wallet not linked to any Magpie user", borrower: borrowerStr },
+        body: { error: "loan_pda not found" },
       };
     }
     console.error(`[sync-loan] inserting new loan ${loan_pda.slice(0, 8)}... user=${walletRow.user_id} borrower=${borrowerStr.slice(0, 8)}...`);
