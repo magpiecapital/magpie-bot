@@ -31,14 +31,34 @@ import { connection } from "../solana/connection.js";
 import { getReadOnlyProgram, getProgramForSigner } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { readFileSync } from "node:fs";
+import bs58 from "bs58";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const POLL_MS = Number(process.env.KEEPER_POLL_MS) || 30_000;
 
-/** Load the keeper's signing keypair */
+/**
+ * Load the keeper's signing keypair.
+ *
+ * Resolution order (first match wins):
+ *   1. KEEPER_PRIVATE_KEY      — base58 secret key, env-var-only.
+ *                                Preferred for Railway/container deploys
+ *                                where you don't want a keypair file
+ *                                living in the image.
+ *   2. KEEPER_KEYPAIR_PATH     — JSON keypair file path.
+ *   3. LENDER_KEYPAIR_PATH     — legacy fallback. The keeper sharing
+ *                                the lender's keypair is a least-privilege
+ *                                violation flagged in the 2026-06-11 audit.
+ *                                Setting KEEPER_PRIVATE_KEY or
+ *                                KEEPER_KEYPAIR_PATH avoids it.
+ */
 function loadKeeperKeypair() {
+  const b58 = process.env.KEEPER_PRIVATE_KEY;
+  if (b58) {
+    const decode = bs58.decode || (bs58.default && bs58.default.decode);
+    return Keypair.fromSecretKey(decode(b58));
+  }
   const kpPath = process.env.KEEPER_KEYPAIR_PATH || process.env.LENDER_KEYPAIR_PATH;
-  if (!kpPath) throw new Error("KEEPER_KEYPAIR_PATH not set");
+  if (!kpPath) throw new Error("KEEPER_PRIVATE_KEY or KEEPER_KEYPAIR_PATH must be set");
   return Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(readFileSync(kpPath, "utf8"))),
   );
