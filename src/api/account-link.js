@@ -168,6 +168,16 @@ function isValidPubkey(pubkey) {
  */
 export async function handleLinkRequest(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  // Per-IP throttle BEFORE we touch the DB. Without it, an attacker who
+  // generates arbitrary pubkeys can spray link/request to fill the
+  // account_link_codes table (each call writes one row + sets a 15min TTL).
+  // 60/min from any single IP is generous for legitimate use (a user
+  // creating a code refreshes maybe once per minute at most).
+  if (!checkIpRate(ipKey(req))) {
+    return { status: 429, body: { error: "Rate limit exceeded" } };
+  }
+
   let body;
   try {
     body = await readJsonBody(req);
@@ -390,7 +400,15 @@ export async function handleLinkStatus(req, url) {
     body: {
       linked: true,
       telegram_linked: tgLinked,
-      active_custodial_wallet: activeRows[0]?.public_key ?? null,
+      // active_custodial_wallet pubkey deliberately omitted from the
+      // unsigned wallet-keyed status endpoint — exposing the managed
+      // wallet's pubkey to anyone holding ONE linked wallet leaks the
+      // operator's wallet-routing graph. Boolean existence is fine for
+      // the site to know "yes, there's a managed wallet for me"; the
+      // actual pubkey is fetched via /api/v1/wallets through the
+      // signed-flow widgets (CustodialWithdraw, WalletsList) when
+      // they actually need it.
+      has_active_custodial_wallet: !!activeRows[0]?.public_key,
     },
   };
 }
