@@ -60,8 +60,17 @@ BEGIN
   END IF;
 END $$;
 
-ALTER TABLE lp_positions
-  ADD CONSTRAINT lp_positions_wallet_pool_pk PRIMARY KEY (wallet_address, pool);
+-- Wrapped in DO block to be idempotent on re-run. Postgres doesn't
+-- support `ADD CONSTRAINT IF NOT EXISTS`, so we catch the
+-- duplicate_table exception (PRIMARY KEY creates an implicit unique
+-- index too, so the error kind can be duplicate_table or
+-- duplicate_object depending on the path).
+DO $$ BEGIN
+  ALTER TABLE lp_positions
+    ADD CONSTRAINT lp_positions_wallet_pool_pk PRIMARY KEY (wallet_address, pool);
+EXCEPTION
+  WHEN duplicate_table OR duplicate_object THEN NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS lp_positions_pool_shares_idx
   ON lp_positions(pool, shares) WHERE shares > 0;
