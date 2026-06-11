@@ -46,20 +46,62 @@ if (!LENDER) {
 const THRESHOLD = BigInt(process.env.LENDER_ALARM_THRESHOLD_LAMPORTS || "10000000"); // 0.01 SOL
 const WEBHOOK_SECRET = process.env.LENDER_ALARM_WEBHOOK_SECRET;
 
+// Self-ATA suppression set. Outflows FROM the lender wallet TO an ATA
+// the lender itself owns are not drains — they're wrap-SOL or
+// fund-own-ATA steps of routine flows like /fundpool (the deposit
+// instruction needs the lender's wSOL ATA to be funded before it can
+// transfer wSOL into the pool vault).
+//
+// Built lazily on first webhook call (lender pubkey + derivation
+// requires @solana/web3.js and @solana/spl-token which we don't want
+// to import at module-load time of an auth-gated webhook).
+let SUPPRESSED_DESTS = null;
+async function getSuppressedDests() {
+  if (SUPPRESSED_DESTS) return SUPPRESSED_DESTS;
+  if (!LENDER) return new Set();
+  try {
+    const { PublicKey } = await import("@solana/web3.js");
+    const spl = await import("@solana/spl-token");
+    const { getAssociatedTokenAddressSync } = spl;
+    const lenderPk = new PublicKey(LENDER);
+    const wsol = new PublicKey("So11111111111111111111111111111111111111112");
+    const usdc = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const out = new Set([
+      // Both legacy SPL Token and Token-2022 programs derive ATAs the
+      // same way for the same (mint, owner); only one of these ATAs
+      // actually exists per (mint, owner) on chain. Pre-deriving both
+      // tells the suppression set what to silence.
+      getAssociatedTokenAddressSync(wsol, lenderPk, true).toBase58(),
+      getAssociatedTokenAddressSync(usdc, lenderPk, true).toBase58(),
+    ]);
+    SUPPRESSED_DESTS = out;
+    console.log(`[lender-alarm-webhook] self-ATA suppression armed: ${[...out].map(a => a.slice(0, 8) + "…").join(", ")}`);
+    return out;
+  } catch (err) {
+    console.error("[lender-alarm-webhook] failed to derive self-ATAs (suppression disabled this boot):", err.message);
+    return new Set();
+  }
+}
+
 // Helius sends a batch of transactions; webhook receives an array.
-function isOutflowFromLender(tx) {
+async function isOutflowFromLender(tx) {
   // Helius enhanced format gives us nativeTransfers and tokenTransfers
   // arrays. We care about nativeTransfers where the lender is the source.
   if (!Array.isArray(tx.nativeTransfers)) return null;
+  const suppressed = await getSuppressedDests();
   for (const t of tx.nativeTransfers) {
-    if (t.fromUserAccount === LENDER && BigInt(t.amount || 0) >= THRESHOLD) {
-      return {
-        amount: BigInt(t.amount),
-        to: t.toUserAccount,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-      };
-    }
+    if (t.fromUserAccount !== LENDER) continue;
+    if (BigInt(t.amount || 0) < THRESHOLD) continue;
+    // Suppress wrap-SOL-into-own-ATA outflows. These show up during
+    // /fundpool (lender → own wSOL ATA → pool deposit) and any other
+    // path that prepares the lender's own token account.
+    if (suppressed.has(t.toUserAccount)) continue;
+    return {
+      amount: BigInt(t.amount),
+      to: t.toUserAccount,
+      signature: tx.signature,
+      timestamp: tx.timestamp,
+    };
   }
   return null;
 }
@@ -156,7 +198,7 @@ export async function handleLenderAlarmWebhook(req) {
 
   const txs = Array.isArray(body) ? body : [body];
   for (const tx of txs) {
-    const outflow = isOutflowFromLender(tx);
+    const outflow = await isOutflowFromLender(tx);
     if (!outflow) continue;
     // Drop replays — Helius can retry the same payload, and a captured
     // valid payload replayed by an attacker would otherwise spam the
