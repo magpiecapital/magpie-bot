@@ -56,10 +56,21 @@ function isOutflowFromLender(tx) {
   return null;
 }
 
+const MAX_BODY_BYTES = 64 * 1024; // 64KB hard cap on inbound payload
+
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let total = 0;
+    req.on("data", (c) => {
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error("payload_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
@@ -69,6 +80,27 @@ async function readJsonBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+// In-memory tx-signature replay LRU. Helius may retry the same webhook
+// payload across transient failures, and an attacker that captures one
+// valid payload (e.g., from logs) could replay it to spam the operator's
+// DM. We dedup the last 1024 signatures we've seen; an older signature
+// rotates out naturally.
+const SEEN_SIG_LRU_MAX = 1024;
+const seenSignatures = new Set();
+const seenSignatureOrder = [];
+
+function markAndCheckSeen(signature) {
+  if (!signature) return false;
+  if (seenSignatures.has(signature)) return true;
+  seenSignatures.add(signature);
+  seenSignatureOrder.push(signature);
+  while (seenSignatureOrder.length > SEEN_SIG_LRU_MAX) {
+    const evict = seenSignatureOrder.shift();
+    seenSignatures.delete(evict);
+  }
+  return false;
 }
 
 export async function handleLenderAlarmWebhook(req) {
@@ -108,6 +140,9 @@ export async function handleLenderAlarmWebhook(req) {
   try {
     body = await readJsonBody(req);
   } catch (e) {
+    if (e?.message === "payload_too_large") {
+      return { status: 413, body: { error: "payload too large" } };
+    }
     return { status: 400, body: { error: "Invalid body" } };
   }
 
@@ -115,6 +150,10 @@ export async function handleLenderAlarmWebhook(req) {
   for (const tx of txs) {
     const outflow = isOutflowFromLender(tx);
     if (!outflow) continue;
+    // Drop replays — Helius can retry the same payload, and a captured
+    // valid payload replayed by an attacker would otherwise spam the
+    // operator with duplicate DMs.
+    if (markAndCheckSeen(outflow.signature)) continue;
 
     const solAmount = (Number(outflow.amount) / 1e9).toFixed(6);
     const message =

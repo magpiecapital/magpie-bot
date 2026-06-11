@@ -69,8 +69,40 @@ async function readJsonBody(req) {
   });
 }
 
+// Per-IP rate limit for sync-loan. The per-loan_pda throttle below is
+// not enough — an attacker who can generate arbitrary loan_pda strings
+// can spray and bypass the per-loan limit entirely, burning RPC quota
+// on getAccountInfo lookups. 120/min per IP covers legitimate use (one
+// per tx confirm) by a wide margin.
+const IP_WINDOW_MS = 60_000;
+const IP_MAX = 120;
+const ipBuckets = new Map();
+function ipKey(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+function checkIpRate(ip) {
+  const now = Date.now();
+  const bucket = ipBuckets.get(ip) || [];
+  const fresh = bucket.filter((t) => now - t < IP_WINDOW_MS);
+  if (fresh.length >= IP_MAX) return false;
+  fresh.push(now);
+  ipBuckets.set(ip, fresh);
+  if (ipBuckets.size > 1000 && Math.random() < 0.004) {
+    for (const [k, v] of ipBuckets.entries()) {
+      if (v.every((t) => now - t >= IP_WINDOW_MS)) ipBuckets.delete(k);
+    }
+  }
+  return true;
+}
+
 export async function handleSyncLoan(req) {
   if (req.method !== "POST") return { status: 405, body: { error: "POST only" } };
+
+  if (!checkIpRate(ipKey(req))) {
+    return { status: 429, body: { error: "Rate limit exceeded" } };
+  }
 
   let body;
   try { body = await readJsonBody(req); }
