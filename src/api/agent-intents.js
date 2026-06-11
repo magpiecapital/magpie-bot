@@ -36,6 +36,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
+import { constantTimeEqual } from "./auth-utils.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
@@ -71,7 +72,7 @@ function checkAuth(req) {
   }
   const auth = req.headers["x-internal-token"] || req.headers["authorization"] || "";
   const presented = String(auth).replace(/^Bearer\s+/i, "");
-  if (presented !== INTERNAL_API_TOKEN) {
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
     return { ok: false, status: 401, error: "unauthorized" };
   }
   return { ok: true };

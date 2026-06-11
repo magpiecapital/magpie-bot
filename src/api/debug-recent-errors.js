@@ -10,6 +10,7 @@
  * restart, so this is for live debugging only — not a long-term log.
  */
 import { getRecentErrors } from "../lib/error-ring.js";
+import { constantTimeEqual } from "./auth-utils.js";
 
 const DEBUG_TOKEN = process.env.DEBUG_ERRORS_TOKEN || "";
 
@@ -27,7 +28,7 @@ export async function handleDebugRecentErrors(req, url) {
   const presented = (req.headers["x-debug-token"] || req.headers["authorization"] || "")
     .toString()
     .replace(/^Bearer\s+/i, "");
-  if (presented !== DEBUG_TOKEN) {
+  if (!constantTimeEqual(presented, DEBUG_TOKEN)) {
     // Same generic 401 the API-key path uses — don't leak that the
     // endpoint exists or that it's checking a different header.
     return { status: 401, body: { error: "Invalid or missing API key" } };

@@ -31,6 +31,7 @@
  *
  * Returns: { ok, partial_signed_tx_b64, summary, next_step }
  */
+import { constantTimeEqual } from "./auth-utils.js";
 import {
   PublicKey,
   Transaction,
@@ -104,7 +105,7 @@ export async function handleAgentBuildRepay(req) {
   }
   const auth = req.headers["x-internal-token"] || req.headers["authorization"] || "";
   const presented = String(auth).replace(/^Bearer\s+/i, "");
-  if (presented !== INTERNAL_API_TOKEN) {
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
     return { status: 401, body: { error: "unauthorized" } };
   }
 
