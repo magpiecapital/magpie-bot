@@ -49,7 +49,10 @@ function pickNextDistributionDelay() {
 function loadLenderKeypair() {
   const b58 = process.env.LENDER_PRIVATE_KEY;
   if (b58) return Keypair.fromSecretKey(bs58.decode(b58));
-  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+  const kpPath = process.env.LENDER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error("LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing the CWD-relative fallback. Set the env var.");
+  }
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }

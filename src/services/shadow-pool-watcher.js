@@ -19,19 +19,23 @@
 import { PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 
-// LendingPool struct (from bagbank-program/programs/magpie/src/state.rs):
+// LendingPool struct. The first non-discriminator field is named
+// `authority` in the live magpie_lending IDL (NOT `lender` — the
+// off-chain code calls the operator wallet "lender" colloquially,
+// but the on-chain field name is `authority`). The two are the same
+// account; the rename is documentation hygiene only.
 //   8  bytes  Anchor discriminator
-//   32 bytes  lender              <- the field we check
-//   32 bytes  loan_token_vault
-//   32 bytes  fee_wallet
-//   8  bytes  total_loans_issued
-//   8  bytes  total_liquidations
-//   1  byte   bump
-// Total: 121 bytes
+//   32 bytes  authority           <- the field we check (canonical pool's = LENDER_PUBKEY)
+//   ...       (further fields — actual on-chain size is 159 bytes,
+//              not the hand-rolled 121 that the original LENDING_POOL_ACCOUNT_SIZE
+//              constant assumed; we no longer filter by dataSize, see PR #50)
 const LENDING_POOL_DISCRIMINATOR = Buffer.from([208, 40, 242, 82, 186, 18, 75, 36]);
-const LENDER_OFFSET = 8;
-const LENDER_LEN = 32;
-const LENDING_POOL_ACCOUNT_SIZE = 121;
+const AUTHORITY_OFFSET = 8;
+const AUTHORITY_LEN = 32;
+// Legacy aliases for any importer — TODO: remove after the next pass through
+// shadow-pool callers.
+const LENDER_OFFSET = AUTHORITY_OFFSET;
+const LENDER_LEN = AUTHORITY_LEN;
 
 const POLL_INTERVAL_MS = Math.max(60_000, Number(process.env.SHADOW_POOL_POLL_MS) || 90_000);
 const PROGRAM_ID_STR = process.env.PROGRAM_ID;
