@@ -12,7 +12,7 @@ import { ensureWallet } from "../services/wallet.js";
 import {
   getHolderInfoByWallet,
   getHolderPoolState,
-  HOLDER_REWARD_BPS,
+  getHolderRewardBps,
 } from "../services/magpie-holder-rewards.js";
 
 const MAGPIE_PUMP_URL = "https://pump.fun/coin/9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump";
@@ -35,12 +35,13 @@ export async function handleHolders(ctx) {
   const user = await upsertUser(tgUser.id, tgUser.username);
   const wallet = await ensureWallet(user.id);
 
-  const [info, pool] = await Promise.all([
+  const [info, pool, liveBps] = await Promise.all([
     getHolderInfoByWallet(wallet.publicKey),
     getHolderPoolState(),
+    getHolderRewardBps(),
   ]);
 
-  const pct = (HOLDER_REWARD_BPS / 100).toFixed(0);
+  const pct = (liveBps / 100).toFixed(0);
   const lines = [
     "*$MAGPIE Holder Rewards*",
     "",
@@ -49,7 +50,10 @@ export async function handleHolders(ctx) {
     "*Your Magpie wallet:*",
     `\`${wallet.publicKey}\``,
     "",
-    `Balance: *${fmtMagpie(info.balance_raw)} MAGPIE*`,
+    `Balance: *${fmtMagpie(info.balance_raw)} MAGPIE*`
+      + (BigInt(info.collateralized_raw ?? "0") > 0n
+          ? `  (held \`${fmtMagpie(info.held_raw)}\` + on-loan \`${fmtMagpie(info.collateralized_raw)}\`)`
+          : ""),
     "",
     "*Your rewards:*",
     `• Lifetime received: \`${fmtSol(info.paid_lamports)} SOL\``,
