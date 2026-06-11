@@ -145,10 +145,145 @@ async function verifyMintOnChain(mintStr) {
     } catch {
       // Library version difference — ignore, treat as not-paused
     }
-    return { ok: true, issuer, paused, decimals: m.decimals, mintAuthority: authStr };
+
+    // Comprehensive Token-2022 extension audit. A scam can copy the
+    // xStock shape but the authority addresses would be different.
+    const audit = await auditRwaExtensions(m);
+    if (!audit.safe) {
+      return { ok: false, error: `extension_audit_failed: ${audit.reason}`, audit };
+    }
+
+    return { ok: true, issuer, paused, decimals: m.decimals, mintAuthority: authStr, audit };
   } catch (err) {
     return { ok: false, error: err.message };
   }
+}
+
+// ─── RWA Token-2022 extension audit ──────────────────────────────────────
+//
+// A scammer can structure a malicious token to LOOK like a Backed xStock
+// (same extensions, same on-chain shape) but with the authority addresses
+// pointing at their own wallet. Defense: allowlist the specific authority
+// addresses real Backed xStocks use. The scammer doesn't have Backed's
+// private keys; they can't fake the authorities.
+//
+// Env-driven allowlists (comma-separated, set in Railway):
+//   RWA_FREEZE_AUTHORITIES         — JDq14BW... for Backed xStocks
+//   RWA_PERMANENT_DELEGATES        — 5aMNNLQ... for Backed compliance
+//   RWA_TRANSFER_HOOK_PROGRAMS     — System program (placeholder)
+//   RWA_TRANSFER_HOOK_AUTHORITIES  — 5aMNNLQ... for Backed compliance
+//   RWA_TRANSFER_FEE_AUTHORITIES   — typically empty (Backed charges 0)
+//   RWA_MAX_TRANSFER_FEE_BPS       — hard cap, default 0
+const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+const RWA_FREEZE_AUTHORITIES = new Set(
+  (process.env.RWA_FREEZE_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+const RWA_PERMANENT_DELEGATES = new Set(
+  (process.env.RWA_PERMANENT_DELEGATES || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+const RWA_TRANSFER_HOOK_PROGRAMS = new Set(
+  [SYSTEM_PROGRAM_ID, ...(process.env.RWA_TRANSFER_HOOK_PROGRAMS || "").split(",").map((s) => s.trim()).filter(Boolean)],
+);
+const RWA_TRANSFER_HOOK_AUTHORITIES = new Set(
+  (process.env.RWA_TRANSFER_HOOK_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+const RWA_TRANSFER_FEE_AUTHORITIES = new Set(
+  (process.env.RWA_TRANSFER_FEE_AUTHORITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+const RWA_MAX_TRANSFER_FEE_BPS = Number(process.env.RWA_MAX_TRANSFER_FEE_BPS || 0);
+
+async function auditRwaExtensions(mint) {
+  const spl = await import("@solana/spl-token");
+  const {
+    ExtensionType: ET,
+    getTransferFeeConfig, getTransferHook, getPermanentDelegate,
+    getMintCloseAuthority, getInterestBearingMintConfigState, getDefaultAccountState,
+  } = spl;
+  const isSet = (pk) => pk && !pk.equals(PublicKey.default);
+  const b58 = (pk) => (pk ? pk.toBase58() : null);
+
+  // Freeze authority is REQUIRED on Backed xStocks (compliance pause).
+  // Must be in the trusted allowlist — random freeze authority can
+  // freeze the bot's collateral vault after the loan is accepted.
+  if (isSet(mint.freezeAuthority)) {
+    const addr = b58(mint.freezeAuthority);
+    if (!RWA_FREEZE_AUTHORITIES.has(addr)) {
+      return { safe: false, reason: `freeze_authority_not_trusted: ${addr.slice(0, 8)}…` };
+    }
+  }
+
+  const extTypes = mint.tlvData?.length ? getExtensionTypes(mint.tlvData) : [];
+
+  // NonTransferable: can't move at all → can't liquidate.
+  if (ET.NonTransferable !== undefined && extTypes.includes(ET.NonTransferable)) {
+    return { safe: false, reason: "NonTransferable extension present" };
+  }
+
+  // PermanentDelegate: a fixed address can move anyone's tokens at any
+  // time. Backed uses their compliance authority — must match allowlist.
+  const delegate = getPermanentDelegate(mint);
+  if (delegate && isSet(delegate.delegate)) {
+    const addr = b58(delegate.delegate);
+    if (!RWA_PERMANENT_DELEGATES.has(addr)) {
+      return { safe: false, reason: `permanent_delegate_not_trusted: ${addr.slice(0, 8)}…` };
+    }
+  }
+
+  // TransferHook: a program runs on every transfer and can reject. Backed
+  // uses System Program as placeholder (no hook). Scam could point at a
+  // malicious program that blocks bot withdrawals.
+  const hook = getTransferHook(mint);
+  if (hook) {
+    if (isSet(hook.programId)) {
+      const prog = b58(hook.programId);
+      if (!RWA_TRANSFER_HOOK_PROGRAMS.has(prog)) {
+        return { safe: false, reason: `transfer_hook_program_not_trusted: ${prog.slice(0, 8)}…` };
+      }
+    }
+    if (isSet(hook.authority)) {
+      const auth = b58(hook.authority);
+      if (!RWA_TRANSFER_HOOK_AUTHORITIES.has(auth)) {
+        return { safe: false, reason: `transfer_hook_authority_not_trusted: ${auth.slice(0, 8)}…` };
+      }
+    }
+  }
+
+  // TransferFee: Backed charges 0. Hard cap via env (default 0 = strict).
+  const fee = getTransferFeeConfig(mint);
+  if (fee) {
+    const newerBps = fee.newerTransferFee?.transferFeeBasisPoints ?? 0;
+    const olderBps = fee.olderTransferFee?.transferFeeBasisPoints ?? 0;
+    const maxBps = Math.max(newerBps, olderBps);
+    if (maxBps > RWA_MAX_TRANSFER_FEE_BPS) {
+      return { safe: false, reason: `transfer_fee_too_high: ${(maxBps / 100).toFixed(2)}% > ${RWA_MAX_TRANSFER_FEE_BPS / 100}%` };
+    }
+    if (isSet(fee.transferFeeConfigAuthority)) {
+      const addr = b58(fee.transferFeeConfigAuthority);
+      if (!RWA_TRANSFER_FEE_AUTHORITIES.has(addr)) {
+        return { safe: false, reason: `transfer_fee_authority_not_trusted: ${addr.slice(0, 8)}…` };
+      }
+    }
+  }
+
+  // MintCloseAuthority: holder can close the mint, stranding all accounts.
+  const close = getMintCloseAuthority?.(mint);
+  if (close && isSet(close.closeAuthority)) {
+    return { safe: false, reason: "mint_close_authority_set" };
+  }
+
+  // InterestBearing: rate authority can change interest rate at any time.
+  const interest = getInterestBearingMintConfigState?.(mint);
+  if (interest && isSet(interest.rateAuthority)) {
+    return { safe: false, reason: "interest_bearing_rate_authority_set" };
+  }
+
+  // DefaultAccountState: state 2 = Frozen → every new account is frozen.
+  const def = getDefaultAccountState?.(mint);
+  if (def?.state === 2) {
+    return { safe: false, reason: "default_account_state_frozen" };
+  }
+
+  return { safe: true };
 }
 
 // ─── Classification ──────────────────────────────────────────────────────
