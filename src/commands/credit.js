@@ -7,20 +7,13 @@
 import { getCreditScore, getScoreHistory, tierBenefits } from "../services/credit-score.js";
 import { findUserByTelegramId } from "../services/users.js";
 
-const TIER_EMOJI = {
-  bronze: "🥉",
-  silver: "🥈",
-  gold: "🥇",
-  platinum: "💎",
-};
-
 function factorBar(value, max = 100) {
   const filled = Math.round((value / max) * 10);
   return "█".repeat(filled) + "░".repeat(10 - filled);
 }
 
 function tierLabel(tier) {
-  return `${TIER_EMOJI[tier] || ""} ${tier.charAt(0).toUpperCase() + tier.slice(1)}`;
+  return tier.charAt(0).toUpperCase() + tier.slice(1);
 }
 
 /**
@@ -31,8 +24,8 @@ function tierLabel(tier) {
  */
 function creditCoachLine(score, trendStr) {
   const s = score.score;
-  const trendingUp = trendStr.includes("+");
-  const trendingDown = trendStr.includes("📉");
+  const trendingUp = trendStr.includes("up");
+  const trendingDown = trendStr.includes("down");
   if (s >= 800) {
     return trendingDown
       ? `Elite tier, but trending down — one liquidation can move you fast at this level. Stay defensive.`
@@ -72,8 +65,8 @@ export async function handleCredit(ctx) {
     const score = await getCreditScore(user.id);
     if (!score) {
       return ctx.reply(
-        "📊 <b>Credit Score</b>\n\n" +
-        "No credit history yet. Take out a loan and repay it to start building your score!",
+        "<b>Credit Score</b>\n\n" +
+        "No credit history yet. Take out a loan and repay it to start building your score.",
         { parse_mode: "HTML" },
       );
     }
@@ -85,7 +78,7 @@ export async function handleCredit(ctx) {
     let trend = "";
     if (history.length >= 2) {
       const diff = score.score - history[history.length - 1].score;
-      trend = diff > 0 ? `📈 +${diff}` : diff < 0 ? `📉 ${diff}` : "➡️ stable";
+      trend = diff > 0 ? `up +${diff}` : diff < 0 ? `down ${diff}` : "stable";
     }
 
     // Pip's read of the score — short, warm, scored to the actual number.
@@ -94,10 +87,10 @@ export async function handleCredit(ctx) {
     const coachLine = creditCoachLine(score, trend);
 
     const msg = [
-      `📊 <b>Magpie Credit Score</b>`,
+      `<b>Magpie Credit Score</b>`,
       ``,
-      `<b>${score.score}</b> / 850  ${tierLabel(score.tier)}  ${trend}`,
-      coachLine ? `<i>🦅 ${coachLine}</i>` : null,
+      `<b>${score.score}</b> / 850 · ${tierLabel(score.tier)} tier${trend ? ` · ${trend}` : ""}`,
+      coachLine ? `<i>Pip: ${coachLine}</i>` : null,
       ``,
       `<b>Factor Breakdown:</b>`,
       `Repayment History (35%)`,

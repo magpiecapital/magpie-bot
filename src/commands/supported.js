@@ -29,7 +29,7 @@ export async function handleSupported(ctx) {
   );
 
   if (top.length === 0) {
-    return ctx.reply("📭 No supported collateral mints right now.");
+    return ctx.reply("No supported collateral mints right now.");
   }
 
   // Batch price fetch — 1-2 Jupiter calls total instead of N per-mint calls.
@@ -41,9 +41,8 @@ export async function handleSupported(ctx) {
   }
 
   const lines = [
-    `🪙 *Top ${top.length} supported tokens* (of ${totalCount} approved)`,
-    "",
-    "Sorted by liquidity. Prices in SOL.",
+    `*Top ${top.length} supported tokens* — ${totalCount} approved total`,
+    "_Sorted by liquidity · prices in SOL._",
     "",
   ];
 
@@ -61,8 +60,8 @@ export async function handleSupported(ctx) {
   const kb = new InlineKeyboard()
     .url("View all tokens", "https://www.magpie.capital/tokens")
     .row()
-    .text("💰 Borrow", "start:borrow")
-    .text("📋 Simulate", "fallback:simulate");
+    .text("Borrow", "start:borrow")
+    .text("Simulate", "fallback:simulate");
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", reply_markup: kb, disable_web_page_preview: true });
 }
