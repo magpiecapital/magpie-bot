@@ -104,6 +104,11 @@ export async function handleAgentLimitCloseArm(req) {
   const sellDestination  = String(body?.sell_destination ?? "sol").toLowerCase();
   const expiresAt        = body?.expires_at ? String(body.expires_at) : null;
   const x402TxSignature  = String(body?.x402_tx_signature ?? "");
+  const autoEscalateRaw  = body?.auto_escalate_slippage;
+  // Coerce to strict boolean — accept true/false explicitly, anything else
+  // is treated as false. We don't want truthy strings like "yes" sneaking
+  // in and flipping the behavior.
+  const autoEscalate     = autoEscalateRaw === true;
 
   // ── Shape validation ─────────────────────────────────────────
   if (!isValidPubkey(userWallet))  return bad("invalid_user_wallet");
@@ -236,6 +241,20 @@ export async function handleAgentLimitCloseArm(req) {
   }
 
   // ── INSERT — UNIQUE partial index catches dup-arm races ──────
+  //
+  // For auto-escalation we snapshot the borrower's delegation cap into
+  // max_slippage_bps_cap at arm time. If the borrower later tightens
+  // the delegation (revoke + re-authorize with a lower cap), the engine
+  // still honors THIS order's original ceiling — preventing a surprise
+  // mid-flight tightening from breaking an order the borrower already
+  // consented to.
+  //
+  // If auto_escalate is false, we still set max_slippage_bps_cap to the
+  // initial slippage (i.e. no headroom for escalation). The engine
+  // treats current == cap as "no further escalation possible" which is
+  // exactly the non-escalating behavior.
+  const capBps = autoEscalate ? delegation.max_slippage_bps : slippageBps;
+
   let inserted;
   try {
     inserted = await query(
@@ -243,15 +262,19 @@ export async function handleAgentLimitCloseArm(req) {
          (user_id, loan_id, trigger_kind, trigger_value_micro,
           slippage_bps, sell_destination, expires_at,
           source, source_agent_pubkey, status, armed_at,
+          auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
           notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7,
                'agent_x402', $8, 'armed', NOW(),
-               $9)
+               $9, $10, $11,
+               $12)
        RETURNING id, armed_at`,
       [delegation.user_id, loan.id, triggerKind, triggerValueMicro.toString(),
        slippageBps, sellDestination, expiresAt,
        agentPubkey,
-       `armed via x402 tx ${x402TxSignature.slice(0, 16)}...`],
+       autoEscalate, capBps, slippageBps,
+       `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; ` +
+       `auto_escalate=${autoEscalate} cap=${capBps}bps`],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message)) {
@@ -299,6 +322,9 @@ export async function handleAgentLimitCloseArm(req) {
       expires_at: expiresAt,
       source: "agent_x402",
       source_agent_pubkey: agentPubkey,
+      auto_escalate_slippage: autoEscalate,
+      max_slippage_bps_cap: capBps,
+      initial_slippage_bps: slippageBps,
     },
   };
 }
@@ -337,7 +363,9 @@ export async function handleAgentLimitCloseGet(req, params) {
             lc.proceeds_lamports::text AS proceeds_lamports,
             lc.protocol_fee_lamports::text AS protocol_fee_lamports,
             lc.net_to_user_lamports::text AS net_to_user_lamports,
-            lc.failure_reason, lc.cancellation_reason,
+            lc.failure_reason, lc.cancellation_reason, lc.failure_count,
+            lc.auto_escalate_slippage, lc.max_slippage_bps_cap,
+            lc.initial_slippage_bps, lc.slippage_escalations,
             l.loan_id AS chain_loan_id
        FROM limit_close_orders lc
        JOIN loans l ON l.id = lc.loan_id
@@ -373,6 +401,9 @@ export async function handleAgentLimitCloseList(req, params) {
             lc.trigger_value_micro::text AS trigger_value_micro,
             lc.slippage_bps, lc.sell_destination, lc.status,
             lc.armed_at, lc.expires_at,
+            lc.auto_escalate_slippage, lc.max_slippage_bps_cap,
+            lc.initial_slippage_bps, lc.slippage_escalations,
+            lc.failure_count,
             l.loan_id AS chain_loan_id,
             l.collateral_mint
        FROM limit_close_orders lc
