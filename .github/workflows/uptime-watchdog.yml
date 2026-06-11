@@ -78,11 +78,17 @@ jobs:
       - name: Send Telegram alert on failure
         if: steps.probe.outputs.ok == 'false'
         env:
-          TG_BOT_TOKEN: ${{ secrets.MAGPIE_BOT_TOKEN }}
+          # Prefer the dedicated alert bot's token. Falls back to the
+          # production bot's token if ALERT_BOT_TOKEN isn't set yet.
+          # See magpie-site PR for rationale: isolate Vercel/GitHub
+          # secret surface from the production bot's custodial keys.
+          TG_BOT_TOKEN_ALERT: ${{ secrets.ALERT_BOT_TOKEN }}
+          TG_BOT_TOKEN_PROD: ${{ secrets.MAGPIE_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.OPERATOR_TG_CHAT_ID }}
         run: |
+          TG_BOT_TOKEN="${TG_BOT_TOKEN_ALERT:-$TG_BOT_TOKEN_PROD}"
           if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "::warning::watchdog secrets not configured — set MAGPIE_BOT_TOKEN + OPERATOR_TG_CHAT_ID in repo secrets to enable alerts"
+            echo "::warning::watchdog secrets not configured — set ALERT_BOT_TOKEN (preferred) or MAGPIE_BOT_TOKEN + OPERATOR_TG_CHAT_ID in repo secrets to enable alerts"
             exit 0
           fi
           STATUS="${{ steps.probe.outputs.status }}"
