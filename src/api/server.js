@@ -1462,6 +1462,11 @@ const PUBLIC_ROUTES = new Set([
   // handler level (same pattern as the agent endpoints), so we list
   // it as "public" at the API-key layer to bypass the API-key gate.
   "/api/v1/internal/x402/record",
+  // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
+  // so the on-chain feed is fresh by the time the wallet simulates the
+  // tx — closes the window where Phantom rejects with StalePriceAttestation
+  // before the user can even sign.
+  "/api/v1/price/refresh",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1708,6 +1713,11 @@ async function router(req, res) {
       case "/api/v1/internal/x402/record": {
         const { handleX402Record } = await import("./x402-metrics.js");
         result = await handleX402Record(req);
+        break;
+      }
+      case "/api/v1/price/refresh": {
+        const { handlePriceRefresh } = await import("./price-refresh.js");
+        result = await handlePriceRefresh(req);
         break;
       }
       case "/api/v1/tokens":
