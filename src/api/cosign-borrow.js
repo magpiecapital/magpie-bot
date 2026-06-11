@@ -116,7 +116,16 @@ function loadLenderKeypair() {
     const decode = bs58.decode || (bs58.default && bs58.default.decode);
     return Keypair.fromSecretKey(decode(b58));
   }
-  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+  // Fail closed when neither env var is set. The previous behavior fell
+  // back to ./lender-keypair.json in CWD, which is a defaultable path —
+  // a misconfigured deploy from a different CWD could silently load the
+  // wrong keypair (or a stray file someone planted). Explicit is safer.
+  const kpPath = process.env.LENDER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error(
+      "[cosign-borrow] LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing to fall back to a CWD-relative default",
+    );
+  }
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }

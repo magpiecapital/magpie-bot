@@ -57,7 +57,14 @@ function loadLenderKeypair() {
   if (b58) {
     return Keypair.fromSecretKey(bs58.decode(b58));
   }
-  const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+  // Fail closed if neither env var is set — never fall back to a CWD-
+  // relative default path. See cosign-borrow.js for the same pattern.
+  const kpPath = process.env.LENDER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error(
+      "[credit-attest] LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing to fall back to a CWD-relative default",
+    );
+  }
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }

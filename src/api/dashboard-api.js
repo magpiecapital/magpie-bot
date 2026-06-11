@@ -185,7 +185,10 @@ export async function handleDashboardAggregate(req, url) {
       asset: r.asset,
       raw_amount: r.amount,
       decimals: r.decimals,
-      to: r.to_pubkey,
+      // to_pubkey deliberately stripped — leaking the destination of every
+      // recent site-withdraw to anyone who knows one of the user's wallets
+      // makes their counterparty graph readable. The wallet owner can
+      // re-derive destinations from their own tx history if they need them.
       status: r.status,
       tx_signature: r.tx_signature,
     });
@@ -200,7 +203,13 @@ export async function handleDashboardAggregate(req, url) {
       // is in PUBLIC_ROUTES and anyone with the wallet pubkey can read
       // it — exposing the TG handle here was a real leak. The site
       // doesn't display the handle anyway; matches link/status policy.
-      active_custodial_wallet: activeCustodial?.public_key ?? null,
+      //
+      // active_custodial_wallet was previously returned here but it
+      // surfaces operator-internal routing (which managed wallet the
+      // user is currently active on). The dashboard's CustodialWithdraw
+      // widget fetches this via its own signed flow when needed; do not
+      // surface it on the unsigned aggregate.
+      has_active_custodial_wallet: !!activeCustodial?.public_key,
       prefs: {
         auto_protect: !!prefs.auto_protect,
         auto_repay: !!prefs.auto_repay,
