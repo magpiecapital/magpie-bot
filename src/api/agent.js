@@ -38,6 +38,7 @@
  *   - Bypass any anti-exploit gate
  */
 import { createHash } from "node:crypto";
+import { constantTimeEqual } from "./auth-utils.js";
 import {
   PublicKey,
   Transaction,
@@ -364,7 +365,7 @@ export async function handleAgentBuildBorrow(req) {
   }
   const auth = req.headers["x-internal-token"] || req.headers["authorization"] || "";
   const presented = String(auth).replace(/^Bearer\s+/i, "");
-  if (presented !== INTERNAL_API_TOKEN) {
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
     return { status: 401, body: { error: "unauthorized" } };
   }
 

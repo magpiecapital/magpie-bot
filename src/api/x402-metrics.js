@@ -11,6 +11,7 @@
  * agent-revenue numbers.
  */
 import { query } from "../db/pool.js";
+import { constantTimeEqual } from "./auth-utils.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
@@ -44,7 +45,7 @@ export async function handleX402Record(req) {
     };
   }
   const presented = req.headers["x-internal-token"];
-  if (presented !== INTERNAL_API_TOKEN) {
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
     return { status: 401, body: { error: "Invalid or missing API key" } };
   }
 

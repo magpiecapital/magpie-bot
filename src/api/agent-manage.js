@@ -17,6 +17,7 @@
  * The on-chain program's extend/add-collateral/partial-repay ixs are
  * all borrower-only.
  */
+import { constantTimeEqual } from "./auth-utils.js";
 import {
   PublicKey,
   Transaction,
@@ -93,7 +94,8 @@ async function commonPreflight(req, requiredFields = []) {
     return { error: { status: 500, body: { error: "Agent API not configured (server-side)" } } };
   }
   const auth = req.headers["x-internal-token"] || req.headers["authorization"] || "";
-  if (String(auth).replace(/^Bearer\s+/i, "") !== INTERNAL_API_TOKEN) {
+  const presented = String(auth).replace(/^Bearer\s+/i, "");
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
     return { error: { status: 401, body: { error: "unauthorized" } } };
   }
 
