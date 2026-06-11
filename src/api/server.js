@@ -1462,6 +1462,16 @@ const PUBLIC_ROUTES = new Set([
   // handler level (same pattern as the agent endpoints), so we list
   // it as "public" at the API-key layer to bypass the API-key gate.
   "/api/v1/internal/x402/record",
+  // Internal agent-limit-close arm/read/cancel — same INTERNAL_API_TOKEN
+  // model. The x402 service is the only legitimate caller; it has
+  // already verified the agent's x402 payment and proven (via the
+  // payer pubkey on-chain) the agent_pubkey it forwards. We trust
+  // the inbound agent_pubkey on this path BECAUSE the token gate
+  // proves it came from the x402 service.
+  "/api/v1/internal/agent/limit-close/arm",
+  "/api/v1/internal/agent/limit-close",
+  "/api/v1/internal/agent/limit-close/list",
+  "/api/v1/internal/agent/limit-close/delegations",
   // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
   // so the on-chain feed is fresh by the time the wallet simulates the
   // tx — closes the window where Phantom rejects with StalePriceAttestation
@@ -1713,6 +1723,30 @@ async function router(req, res) {
       case "/api/v1/internal/x402/record": {
         const { handleX402Record } = await import("./x402-metrics.js");
         result = await handleX402Record(req);
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/arm": {
+        const { handleAgentLimitCloseArm } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitCloseArm(req);
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/list": {
+        const { handleAgentLimitCloseList } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitCloseList(req, Object.fromEntries(url.searchParams));
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/delegations": {
+        const { handleAgentLimitCloseListDelegations } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitCloseListDelegations(req, Object.fromEntries(url.searchParams));
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close": {
+        const m = await import("./internal-agent-limitclose.js");
+        if (req.method === "DELETE") {
+          result = await m.handleAgentLimitCloseDelete(req, Object.fromEntries(url.searchParams));
+        } else {
+          result = await m.handleAgentLimitCloseGet(req, Object.fromEntries(url.searchParams));
+        }
         break;
       }
       case "/api/v1/price/refresh": {

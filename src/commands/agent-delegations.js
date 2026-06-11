@@ -1,12 +1,12 @@
 /**
  * Agent delegations — TG commands.
  *
- *   /agent-authorize <agent_pubkey> limit_close [max_per_order_sol=10]
+ *   /agent_authorize <agent_pubkey> limit_close [max_per_order_sol=10]
  *                                                [max_active=5]
  *                                                [max_slippage_bps=500]
  *                                                [expires=30d]
- *   /agent-revoke <agent_pubkey> [action]
- *   /agent-list
+ *   /agent_revoke <agent_pubkey> [action]
+ *   /agent_list
  *
  * The user is the SOURCE OF TRUTH for what an agent can do on their
  * behalf. Every constraint here flows into agent_delegations and is
@@ -51,16 +51,16 @@ function parseSolToLamports(s) {
   return BigInt(Math.round(n * 1e9));
 }
 
-/* ─── /agent-authorize ─────────────────────────────────────────── */
+/* ─── /agent_authorize ─────────────────────────────────────────── */
 
 export async function handleAgentAuthorize(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
   const text = ctx.message?.text || "";
-  const tokens = text.trim().split(/\s+/).slice(1); // strip /agent-authorize
+  const tokens = text.trim().split(/\s+/).slice(1); // strip /agent_authorize
   if (tokens.length < 2) {
     return ctx.reply(
-      "Usage: `/agent-authorize <agent_pubkey> limit_close [max_per_order_sol=10] [max_active=5] [max_slippage_bps=500] [expires=30d]`",
+      "Usage: `/agent_authorize <agent_pubkey> limit_close [max_per_order_sol=10] [max_active=5] [max_slippage_bps=500] [expires=30d]`",
       { parse_mode: "Markdown" },
     );
   }
@@ -134,7 +134,7 @@ export async function handleAgentAuthorize(ctx) {
          max_active_orders      = EXCLUDED.max_active_orders,
          max_slippage_bps       = EXCLUDED.max_slippage_bps,
          expires_at             = EXCLUDED.expires_at,
-         notes                  = COALESCE(agent_delegations.notes, '') || '\nupdated via /agent-authorize ' || NOW()::text`,
+         notes                  = COALESCE(agent_delegations.notes, '') || '\nupdated via /agent_authorize ' || NOW()::text`,
       [user.id, userWallet.publicKey, agentPubkeyRaw, action,
        maxPerOrderLamports.toString(), maxActiveOrders, maxSlippageBps,
        expiresAt],
@@ -157,13 +157,13 @@ export async function handleAgentAuthorize(ctx) {
       expiryLabel,
       ``,
       `The agent can now arm \`${action}\` orders on your custodial wallet within these bounds.`,
-      `Revoke any time: \`/agent-revoke ${agentPubkeyRaw.slice(0, 8)}…\``,
+      `Revoke any time: \`/agent_revoke ${agentPubkeyRaw.slice(0, 8)}…\``,
     ].join("\n"),
     { parse_mode: "Markdown" },
   );
 }
 
-/* ─── /agent-revoke ───────────────────────────────────────────── */
+/* ─── /agent_revoke ───────────────────────────────────────────── */
 
 export async function handleAgentRevoke(ctx) {
   const tgUser = ctx.from;
@@ -171,7 +171,7 @@ export async function handleAgentRevoke(ctx) {
   const text = ctx.message?.text || "";
   const tokens = text.trim().split(/\s+/).slice(1);
   if (tokens.length < 1) {
-    return ctx.reply("Usage: `/agent-revoke <agent_pubkey> [action]`", { parse_mode: "Markdown" });
+    return ctx.reply("Usage: `/agent_revoke <agent_pubkey> [action]`", { parse_mode: "Markdown" });
   }
   const agentPubkey = tokens[0];
   const action = tokens[1] || null;
@@ -202,7 +202,7 @@ export async function handleAgentRevoke(ctx) {
   await ctx.reply(`Revoked ${result.rows.length} grant(s) for agent \`${agentPubkey.slice(0, 8)}…\`: ${list}`, { parse_mode: "Markdown" });
 }
 
-/* ─── /agent-list ─────────────────────────────────────────────── */
+/* ─── /agent_list ─────────────────────────────────────────────── */
 
 export async function handleAgentList(ctx) {
   const tgUser = ctx.from;
@@ -217,7 +217,7 @@ export async function handleAgentList(ctx) {
     [user.id],
   );
   if (rows.length === 0) {
-    return ctx.reply("No active agent delegations. Grant one with `/agent-authorize`.", { parse_mode: "Markdown" });
+    return ctx.reply("No active agent delegations. Grant one with `/agent_authorize`.", { parse_mode: "Markdown" });
   }
   const lines = [`*Active agent delegations* (${rows.length})`, ``];
   for (const r of rows) {
@@ -225,6 +225,6 @@ export async function handleAgentList(ctx) {
     const capSol = (Number(r.cap) / 1e9).toFixed(2);
     lines.push(`\`${r.agent_pubkey.slice(0, 8)}…\`  ${r.action}  cap=${capSol} SOL  max_active=${r.max_active_orders}  slip≤${(r.max_slippage_bps / 100).toFixed(1)}%${expiry}`);
   }
-  lines.push(``, `Revoke: \`/agent-revoke <agent_pubkey>\``);
+  lines.push(``, `Revoke: \`/agent_revoke <agent_pubkey>\``);
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
