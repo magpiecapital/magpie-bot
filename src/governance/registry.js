@@ -65,6 +65,11 @@ export const PROPOSALS = {
     quorum_pct: 10.0,
     threshold_pct: 66.6,
     snapshot_id: "MGP-002",
+    // Canonical sha256 of the snapshot file captured at activation. The
+    // pipeline rejects the run if the on-disk file's hash doesn't match —
+    // an attacker who tampered with the snapshot between activation and
+    // tally would be detected here. Set at activation time; never edited.
+    snapshot_sha256: "f217caef513729bc37e8f89d1205ba6d641640f05f314127a606d856fc0abc69",
     // The implementation_plan below is the autopilot's task list IF MGP-002 passes.
     // Order matters — actions execute sequentially; failure halts the rest.
     implementation_plan: [
