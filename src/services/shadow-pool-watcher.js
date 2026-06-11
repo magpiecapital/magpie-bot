@@ -90,9 +90,16 @@ async function tick() {
 
   let accounts;
   try {
+    // Filter by discriminator ONLY — not by dataSize. The original watcher
+    // used dataSize=121 based on a hand-computed LendingPool struct size,
+    // but the actual on-chain account is 159 bytes (Anchor pads + future-
+    // proofs the layout). With the wrong dataSize, getProgramAccounts
+    // returned zero matches — including the canonical pool — making the
+    // watcher silently useless since deployment. Matching by discriminator
+    // is the durable choice: even if Backed-style upgrades grow the struct,
+    // the discriminator stays the same.
     accounts = await connection.getProgramAccounts(programId, {
       filters: [
-        { dataSize: LENDING_POOL_ACCOUNT_SIZE },
         {
           memcmp: {
             offset: 0,
@@ -109,6 +116,10 @@ async function tick() {
 
   const shadows = [];
   for (const { pubkey, account } of accounts) {
+    // Length sanity — every LendingPool has at least discriminator + lender.
+    // Reject anything too short to avoid out-of-bounds reads on a malformed
+    // account that happens to start with the discriminator bytes.
+    if (account.data.length < LENDER_OFFSET + LENDER_LEN) continue;
     const lenderBytes = account.data.subarray(LENDER_OFFSET, LENDER_OFFSET + LENDER_LEN);
     const lender = new PublicKey(lenderBytes);
     if (!lender.equals(canonicalLender)) {
