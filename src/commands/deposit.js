@@ -10,7 +10,7 @@ export async function handleDeposit(ctx) {
   const { publicKey } = await ensureWallet(user.id);
 
   const msg = [
-    "💰 *Your Magpie wallet*",
+    "*Your Magpie wallet*",
     "",
     `\`${publicKey}\``,
     "",
@@ -24,10 +24,10 @@ export async function handleDeposit(ctx) {
   ].join("\n");
 
   const kb = new InlineKeyboard()
-    .text("💰 Borrow now", "start:borrow")
+    .text("Borrow now", "start:borrow")
     .row()
-    .text("📋 Supported tokens", "start:supported")
-    .text("🏠 Home", "start:home");
+    .text("Supported tokens", "start:supported")
+    .text("Home", "start:home");
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }

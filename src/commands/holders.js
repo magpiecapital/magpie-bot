@@ -1,9 +1,10 @@
 /**
  * /holders — $MAGPIE holder dashboard inside Telegram.
  *
- * Holders earn 10% of every loan fee, distributed AUTOMATICALLY every
- * 7 days as SOL directly to their wallet. No claim button — the bot
- * sends SOL during the snapshot itself.
+ * Holders earn a share of every loan fee (currently 10%; MGP-001 proposes
+ * 70%) distributed AUTOMATICALLY on a randomized cadence as SOL directly
+ * to their wallet. No claim button — the bot sends SOL during the
+ * snapshot itself.
  */
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
@@ -41,7 +42,7 @@ export async function handleHolders(ctx) {
 
   const pct = (HOLDER_REWARD_BPS / 100).toFixed(0);
   const lines = [
-    "💎 *$MAGPIE Holder Rewards*",
+    "*$MAGPIE Holder Rewards*",
     "",
     `*${pct}% of every loan fee* is auto-distributed to $MAGPIE holders. SOL hits your wallet directly — no claim, no signing.`,
     "",
@@ -77,7 +78,7 @@ export async function handleHolders(ctx) {
   if (info.pending_lamports > 0n) {
     lines.push(
       "",
-      `⚠️ *Pending payout:* \`${fmtSol(info.pending_lamports)} SOL\` from a previous distribution will be retried automatically.`,
+      `*Pending payout:* \`${fmtSol(info.pending_lamports)} SOL\` from a previous distribution will be retried automatically.`,
     );
   }
 
@@ -85,7 +86,7 @@ export async function handleHolders(ctx) {
   if (!info.has_balance) {
     kb.url("Buy $MAGPIE on pump.fun", MAGPIE_PUMP_URL).row();
   }
-  kb.text("🏠 Home", "start:home");
+  kb.text("Home", "start:home");
 
   await ctx.reply(lines.join("\n"), {
     parse_mode: "Markdown",
