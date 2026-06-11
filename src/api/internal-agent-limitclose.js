@@ -27,6 +27,7 @@
  */
 import { query } from "../db/pool.js";
 import { constantTimeEqual } from "./auth-utils.js";
+import { runArmPreflight } from "../services/limit-close-preflight.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
@@ -167,6 +168,7 @@ export async function handleAgentLimitCloseArm(req) {
     `SELECT l.id, l.loan_id, l.status,
             l.original_loan_amount_lamports::text AS owed,
             l.collateral_mint,
+            l.collateral_amount::text AS collateral_amount_raw,
             u.id AS owner_user_id
        FROM loans l
        JOIN users u ON u.id = l.user_id
@@ -240,6 +242,50 @@ export async function handleAgentLimitCloseArm(req) {
     };
   }
 
+  // ── Pre-flight liquidity check (Layer 1) ─────────────────────
+  //
+  // Quote Jupiter at current state. If the order can't clear at the
+  // user's slippage right now, reject with a suggested slippage. This
+  // catches "you typed 1% but your collateral trades at 12% impact"
+  // BEFORE the user is armed and silently failing weeks later when
+  // their trigger hits.
+  //
+  // The check is fail-open on Jupiter outages (advisory) — the engine's
+  // runtime safety floor is the actual guarantee. Layer 2 (TWAP) and
+  // Layer 3 (intervention) handle the dynamic-liquidity case at fire
+  // time.
+  const preflightCap = autoEscalate ? delegation.max_slippage_bps : slippageBps;
+  const preflight = await runArmPreflight({
+    collateralMint: loan.collateral_mint,
+    collateralAmountRaw: loan.collateral_amount_raw,
+    sellDestination,
+    // Use the EFFECTIVE max we could ever clear at — that's the cap if
+    // auto-escalate is on, the literal slippage otherwise. Catches the
+    // case "even at the cap we can't fill" while NOT rejecting "you
+    // can't fill at 200 bps but you opted into escalating to 500".
+    slippageBps: preflightCap,
+    loanOwedLamports: loan.owed,
+    protocolFeeBps: 100,
+  });
+  if (!preflight.ok) {
+    return {
+      status: 409,
+      body: {
+        error: preflight.reason,
+        detail: preflight.detail,
+        suggested_slippage_bps: preflight.suggestedSlippageBps,
+        your_slippage_bps: preflight.yourSlippageBps,
+        cap_used_for_check_bps: preflightCap,
+      },
+    };
+  }
+  // Pre-flight passed (or advisory-passed when Jupiter unreachable).
+  // Persist what we saw so we can later detect "liquidity has gotten
+  // worse since arm" in the engine's failure-reason notes.
+  const preflightSlippageQuotedBps = preflight.advisory ? null : preflightCap;
+  const preflightProceedsLamports  = preflight.advisory ? null : (preflight.proceedsLamports || null);
+  const preflightQuotedAtIso       = preflight.advisory ? null : (preflight.quotedAtIso || new Date().toISOString());
+
   // ── INSERT — UNIQUE partial index catches dup-arm races ──────
   //
   // For auto-escalation we snapshot the borrower's delegation cap into
@@ -263,18 +309,22 @@ export async function handleAgentLimitCloseArm(req) {
           slippage_bps, sell_destination, expires_at,
           source, source_agent_pubkey, status, armed_at,
           auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
+          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
           notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7,
                'agent_x402', $8, 'armed', NOW(),
                $9, $10, $11,
-               $12)
+               $12, $13, $14,
+               $15)
        RETURNING id, armed_at`,
       [delegation.user_id, loan.id, triggerKind, triggerValueMicro.toString(),
        slippageBps, sellDestination, expiresAt,
        agentPubkey,
        autoEscalate, capBps, slippageBps,
+       preflightSlippageQuotedBps, preflightProceedsLamports, preflightQuotedAtIso,
        `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; ` +
-       `auto_escalate=${autoEscalate} cap=${capBps}bps`],
+       `auto_escalate=${autoEscalate} cap=${capBps}bps; ` +
+       `preflight=${preflight.advisory ? "advisory" : "passed"}`],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message)) {

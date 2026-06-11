@@ -55,6 +55,29 @@ function agentAttribution(p) {
   return `Armed by your authorized agent \`${pk.slice(0, 8)}...${pk.slice(-4)}\`. Revoke with /agent_revoke if unexpected.`;
 }
 
+/**
+ * Render the Layer 3 intervention DM. The bot's send-tick wraps this
+ * with an inline keyboard since notification-sender is the only
+ * place we have the TG client.
+ */
+function renderLimitCloseIntervention(p) {
+  const agentLine = agentAttribution(p);
+  const suggestedPct = (p.suggested_slippage_bps / 100).toFixed(2);
+  const currentCapPct = (p.current_cap_bps / 100).toFixed(2);
+  return [
+    `*Limit-close needs your call* — order #${p.order_id}`,
+    ``,
+    `Trigger hit, but the swap can't fill within your cap.`,
+    `Current cap: \`${currentCapPct}%\` slippage`,
+    `Would clear at: \`${suggestedPct}%\` (current liquidity)`,
+    ``,
+    `Allow \`${suggestedPct}%\` to fill now, or wait for deeper liquidity.`,
+    `(Decision window: 1 hour.)`,
+    agentLine ? `` : null,
+    agentLine,
+  ].filter((s) => s !== null).join("\n");
+}
+
 function renderLimitCloseArmed(p) {
   const agentLine = agentAttribution(p);
   return [
@@ -113,10 +136,11 @@ function renderLimitCloseCancelled(p) {
 }
 
 const RENDERERS = {
-  limit_close_armed:     renderLimitCloseArmed,
-  limit_close_fired:     renderLimitCloseFired,
-  limit_close_failed:    renderLimitCloseFailed,
-  limit_close_cancelled: renderLimitCloseCancelled,
+  limit_close_armed:        renderLimitCloseArmed,
+  limit_close_fired:        renderLimitCloseFired,
+  limit_close_failed:       renderLimitCloseFailed,
+  limit_close_cancelled:    renderLimitCloseCancelled,
+  limit_close_intervention: renderLimitCloseIntervention,
 };
 
 function renderPayload(kind, payload) {
@@ -173,9 +197,28 @@ async function tick(bot) {
           if (!u?.telegram_id) {
             lastError = `user_has_no_telegram_id`;
           } else {
+            // Layer 3 — limit-close intervention needs an inline
+            // keyboard so the borrower can tap a response. Keyboard
+            // callback IDs encode the order id + the suggested
+            // slippage_bps to widen to so the callback handler can
+            // verify the action against the row.
+            let extra = {};
+            if (row.kind === "limit_close_intervention") {
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard()
+                .text(`Allow ${(row.payload.suggested_slippage_bps / 100).toFixed(1)}%`,
+                      `lcint:approve:${row.payload.order_id}:${row.payload.suggested_slippage_bps}`)
+                .row()
+                .text("Wait",
+                      `lcint:decline:${row.payload.order_id}`)
+                .text("Cancel order",
+                      `lcint:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
+            }
             await bot.api.sendMessage(Number(u.telegram_id), text, {
               parse_mode: "Markdown",
               disable_web_page_preview: true,
+              ...extra,
             });
             success = true;
           }
