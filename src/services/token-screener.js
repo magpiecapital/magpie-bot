@@ -156,6 +156,20 @@ function detectCategory(symbol, name, onChain = null) {
   const sym = (symbol || "").toUpperCase();
   const nm = (name || "").toLowerCase();
 
+  // Hard rule: pump.fun memecoin mints can NEVER be classified as
+  // stock/etf/metal regardless of name or mint authority. Real Backed
+  // xStocks use the Token-2022 standard with mint addresses starting
+  // with 'Xs...'. pump.fun mints always end in 'pump' and are
+  // exclusively memecoins. Without this guard, a memecoin named
+  // "FATHER of Nvidia" could pass the name-pattern gate. The DB-side
+  // CHECK constraint added in migration 019 catches it as a backstop;
+  // this rejects earlier so the rest of the pipeline never sees a
+  // pump.fun mint with stock intent.
+  const mint = onChain?.mint ?? null;
+  if (typeof mint === "string" && mint.endsWith("pump")) {
+    return "memecoin";
+  }
+
   // Gate 1: does the name/symbol SUGGEST RWA?
   const patternSuggestsStock =
     (sym.startsWith("X") && STOCK_TICKERS.includes(sym.slice(1))) ||
