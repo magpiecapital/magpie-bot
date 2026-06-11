@@ -132,6 +132,20 @@ async function verifyMintOnChain(mintStr) {
     }
     const m = await getMint(connection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
     const authStr = m.mintAuthority?.toBase58() ?? null;
+
+    // Hard reject if the mint authority is on the operator-curated
+    // deny-list. This catches RWA-shaped tokens we explicitly DO NOT
+    // want to onboard even if the rest of their shape passes —
+    // currently used to block PreStocks-class issuers whose underlying
+    // SPVs are repudiated by the underlying companies (see comment
+    // on RWA_DENIED_ISSUER_AUTHORITIES below for context).
+    if (authStr && RWA_DENIED_ISSUER_AUTHORITIES.has(authStr)) {
+      return {
+        ok: false,
+        error: `RWA_UNVERIFIED_SPV: issuer ${authStr.slice(0, 8)}… is on the operator deny-list (likely PreStocks-class unverified SPV)`,
+      };
+    }
+
     const issuer = authStr ? KNOWN_ISSUERS.get(authStr) ?? null : null;
 
     // Pausable: read pause state if extension present
@@ -206,6 +220,38 @@ const RWA_TRANSFER_HOOK_PROGRAMS = new Set([
 ]);
 const RWA_TRANSFER_HOOK_AUTHORITIES = _parseAllowlist("RWA_TRANSFER_HOOK_AUTHORITIES", process.env.RWA_TRANSFER_HOOK_AUTHORITIES);
 const RWA_TRANSFER_FEE_AUTHORITIES = _parseAllowlist("RWA_TRANSFER_FEE_AUTHORITIES", process.env.RWA_TRANSFER_FEE_AUTHORITIES);
+
+// Issuer deny-list. Mint authorities here are HARD-REJECTED by the RWA
+// audit regardless of whether the rest of the token shape passes.
+//
+// Use for issuers whose token economics are structurally broken even
+// when the on-chain shape looks correct. The current motivating case
+// (post 2026-06-11 RWA research):
+//
+//   PreStocks (https://prestocks.com) — issues pre-IPO equity tokens
+//   like ANTHRP, OPENAI, SPACEX, etc. May 13 2026: Anthropic AND
+//   OpenAI publicly stated unauthorized SPV transfers may be invalid
+//   and confer no shareholder rights. Tokens dropped 39%/34% in 7
+//   days. Pricing decoupled from underlying (ANTHRP traded at 2.5x
+//   the issuer-stated NAV). Operator's own legal text says tokens
+//   "confer no ownership, voting, dividend, information, or other
+//   legal rights." Closer to a memecoin than to a backed RWA.
+//
+// Env format: comma-separated base58 pubkeys (same as the allowlists).
+// PreStocks mint authority should be added here as it's discovered
+// on-chain — we don't pre-seed because the deny-list is operator-
+// curated and the on-chain authority isn't reliably documented.
+//
+// Even without specific entries, the screener's primary defense
+// already handles this case: a token whose mint authority is NOT in
+// KNOWN_ISSUERS gets rejected as "unknown issuer". This list is
+// defense-in-depth — an explicit deny gives a clean log signal and
+// catches cases where someone manually tries to enable a PreStocks
+// mint via /enablemint.
+const RWA_DENIED_ISSUER_AUTHORITIES = _parseAllowlist(
+  "RWA_DENIED_ISSUER_AUTHORITIES",
+  process.env.RWA_DENIED_ISSUER_AUTHORITIES,
+);
 
 // Transfer-fee cap with sanity ceiling. Backed Finance charges 0, so 0
 // is the strict-by-default value. Operator can raise it via env if a
