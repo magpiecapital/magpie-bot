@@ -509,6 +509,13 @@ bot.start({
     import("./services/governance-reminder-scheduler.js").then((m) =>
       m.startGovernanceReminderScheduler(),
     );
+    // Shadow-LendingPool detective control — polls mainnet for non-canonical
+    // LendingPool inits on the live program (the exploit-prep signature for
+    // the loan-pool-substitution drain found in the 2026-06-10 audit) and
+    // DMs the operator on first detection per shadow pool. Read-only.
+    import("./services/shadow-pool-watcher.js").then((m) =>
+      m.startShadowPoolWatcher(),
+    );
     setTimeout(() => startDailyOpsReport(bot), 60_000);
     startUsedNoncesCleaner();
     // startDepositWatcher(bot);
