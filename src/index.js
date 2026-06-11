@@ -605,8 +605,37 @@ bot.start({
           console.log(`[migrations] applied ${res.applied.length} new migration(s): ${res.applied.join(", ")}`);
         }
       } catch (err) {
-        console.error("[bot] migrations FAILED — crashing:", err.message);
-        process.exit(1);
+        // CHANGED 2026-06-11: previously we process.exit(1) on migration
+        // failure, the reasoning being "a half-migrated DB is worse than
+        // a visibly-down bot." That trade-off ate us at 21:04Z when a
+        // ledger desync caused 027 to re-run + ADD CONSTRAINT fail; the
+        // bot crashloop took the whole site + Pip down for ~30 minutes
+        // while users couldn't /borrow or /repay anything.
+        //
+        // New trade-off: log + alert operator + KEEP SERVING the API.
+        // The API server already started at line 553, and the previous
+        // schema is functional for everything that was working before
+        // the failed migration. The only thing that breaks is what the
+        // NEW migration was supposed to add — which is feature work,
+        // not core functionality.
+        //
+        // We page the operator via the security-alerts DM so they know
+        // a migration is stuck and can intervene. We also set a process
+        // env flag DB_MIGRATIONS_FAILED so admin commands can check it.
+        console.error("[bot] migrations FAILED — CONTINUING in degraded mode:", err.message);
+        process.env.DB_MIGRATIONS_FAILED = err.message?.slice(0, 500) || "unknown";
+        try {
+          const { sendSecurityAlert } = await import("./services/security-alerts.js");
+          await sendSecurityAlert(
+            `🚨 BOT MIGRATIONS FAILED on boot — running in DEGRADED mode.\n\n` +
+            `error: ${err.message?.slice(0, 300)}\n\n` +
+            `Core /borrow + /repay + site still serving the EXISTING schema.\n` +
+            `Investigate the migration manually: Railway shell -> psql -> check the failing migration's SQL.\n` +
+            `Then either fix the file + redeploy, or run the SQL + INSERT INTO schema_migrations.`,
+          );
+        } catch (alertErr) {
+          console.error("[bot] couldn't even DM the migration alert:", alertErr.message);
+        }
       }
       try {
         const pool = await import("./db/pool.js");
