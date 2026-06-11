@@ -177,22 +177,53 @@ async function checkLoan(bot, row) {
       .text("⏱ Extend", `extend:loan:${row.id}`);
   }
 
+  // ── Build the alert with clearer surface ──
+  // 1. Symbol on the loan line so the user immediately sees WHICH token
+  //    is at risk (operator complaint 2026-06-11 — alert didn't say
+  //    what token).
+  // 2. Loan number is a Markdown link that drops the user directly on
+  //    the loan card in the dashboard. The dashboard reads ?loan=<id>
+  //    on mount and scrolls + highlights that card.
+  // 3. If the user has multiple wallets we surface which one this loan
+  //    belongs to. Single-wallet users see no wallet line.
+  const symbol = row.symbol || row.collateral_mint?.slice(0, 4) + "…";
+  // Deep link to the dashboard with the on-chain loan_id. The site
+  // reads ?loan= and scrolls to the card with matching loan_id.
+  const dashUrl = `https://magpie.capital/dashboard?loan=${encodeURIComponent(row.loan_id)}`;
+  const loanLine = `[Loan #${row.loan_id}](${dashUrl}) — ${symbol} — health *${ratio.toFixed(2)}x*`;
+
+  // Wallet line — only for multi-wallet users.
+  let walletLine = null;
+  if ((row.wallet_count ?? 1) > 1) {
+    const label = row.wallet_label || "Magpie wallet";
+    const shortPk = row.borrower_wallet
+      ? `${row.borrower_wallet.slice(0, 4)}…${row.borrower_wallet.slice(-4)}`
+      : null;
+    walletLine = shortPk
+      ? `Wallet: \`${label} (${shortPk})\``
+      : `Wallet: \`${label}\``;
+  }
+
   const msg = [
     `${alert.emoji} *Loan health alert*`,
     "",
     `${alert.label}`,
     "",
-    `Loan #${row.loan_id} — health *${ratio.toFixed(2)}x*`,
+    loanLine,
+    walletLine,
     `Collateral value: \`${(valueLamports / 1e9).toFixed(4)} SOL\``,
     `Owed: \`${(owed / 1e9).toFixed(4)} SOL\``,
     "",
     rec ? `*Recommended:* ${rec.text}` : "Options: /repay · /partialrepay · /topup collateral · /extend",
-  ].join("\n");
+  ].filter((s) => s !== null).join("\n");
 
   try {
     await bot.api.sendMessage(row.telegram_id, msg, {
       parse_mode: "Markdown",
       reply_markup: kb,
+      // Suppress the big card from the magpie.capital dashboard link
+      // so the alert stays compact.
+      disable_web_page_preview: true,
     });
     await query(`UPDATE loans SET last_health_alert = $2 WHERE id = $1`, [
       row.id,
@@ -212,12 +243,25 @@ export function startHealthWatcher(bot) {
     running = true;
     try {
       const { rows } = await query(
+        // wallet_count + wallet_label / wallet_pubkey: lets the alert say
+        // which wallet a loan belongs to when the user has more than one.
+        // For multi-wallet users we surface either the user-set label OR
+        // (when labels are all the default 'Magpie wallet') a short pubkey
+        // prefix so they can tell wallets apart. Single-wallet users see
+        // no wallet line — would be noise.
+        // sm.symbol: collateral token symbol so the user can immediately
+        // see what's at risk without having to look up the mint.
         `SELECT l.id, l.loan_id, l.user_id, l.collateral_mint, l.collateral_amount,
                 l.original_loan_amount_lamports, l.last_health_alert,
-                u.telegram_id, sm.decimals
+                l.borrower_wallet,
+                u.telegram_id,
+                sm.decimals, sm.symbol,
+                w.label AS wallet_label,
+                (SELECT COUNT(*)::int FROM wallets ww WHERE ww.user_id = u.id) AS wallet_count
          FROM loans l
          JOIN users u ON u.id = l.user_id
          LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+         LEFT JOIN wallets w ON w.user_id = u.id AND w.public_key = l.borrower_wallet
          WHERE l.status = 'active'`,
       );
       // Serialise per-loan checks so we don't hammer the price API.
