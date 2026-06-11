@@ -735,7 +735,8 @@ export async function handleFundPool(ctx) {
     if (process.env.LENDER_PRIVATE_KEY) {
       lender = Keypair.fromSecretKey(bs58.decode(process.env.LENDER_PRIVATE_KEY));
     } else {
-      const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+      const kpPath = process.env.LENDER_KEYPAIR_PATH;
+      if (!kpPath) throw new Error("LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing the CWD-relative fallback.");
       lender = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(kpPath, "utf-8"))));
     }
 
@@ -973,7 +974,8 @@ export async function handleDistribute(ctx) {
   if (process.env.LENDER_PRIVATE_KEY) {
     lender = Keypair.fromSecretKey(bs58.decode(process.env.LENDER_PRIVATE_KEY));
   } else {
-    const kpPath = process.env.LENDER_KEYPAIR_PATH || path.resolve("lender-keypair.json");
+    const kpPath = process.env.LENDER_KEYPAIR_PATH;
+    if (!kpPath) throw new Error("LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing the CWD-relative fallback.");
     lender = Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(kpPath, "utf-8"))));
   }
   const { connection } = await import("../solana/connection.js");

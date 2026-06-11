@@ -83,9 +83,16 @@ export async function handleGovernanceTally(req, url) {
       capFraction: 0.02,
     });
   } catch (err) {
+    // Internal error details are NEVER bubbled to the public response.
+    // Node's fs.readFileSync error messages include the absolute path
+    // (e.g. "ENOENT: no such file or directory, open
+    // '/Users/<operator>/.magpie-private/snapshots/MGP-001-…json'")
+    // — that leaks both the operator-internal snapshot directory and
+    // the operator's local username. Log server-side, respond opaquely.
+    console.error("[gov-tally] failed:", err);
     return {
       status: 500,
-      body: { error: "Tally failed", detail: err.message?.slice(0, 200) },
+      body: { error: "Tally failed" },
     };
   }
 

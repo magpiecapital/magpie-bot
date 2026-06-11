@@ -129,15 +129,21 @@ export async function handleBackfillWalletLoans(req) {
   }
   lastByWallet.set(walletStr, now);
 
-  // Resolve user_id (required for recordLoan)
+  // Resolve user_id (required for recordLoan). Return a UNIFORM
+  // "nothing-to-do" response when the wallet isn't linked — never
+  // differentiate that case in the public response or an attacker
+  // can spray random pubkeys to learn the wallet↔Magpie-account
+  // mapping (same fix pattern as sync-loan PR #52). Log internally
+  // for ops visibility but stay opaque to the caller.
   const { rows: [walletRow] } = await query(
     `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
     [walletStr],
   );
   if (!walletRow) {
+    console.error(`[backfill] wallet ${walletStr.slice(0, 8)}... not linked — returning generic noop`);
     return {
-      status: 404,
-      body: { error: "Wallet not linked to any Magpie account" },
+      status: 200,
+      body: { ok: true, action: "noop", scanned: 0, inserted: 0 },
     };
   }
 

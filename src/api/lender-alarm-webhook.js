@@ -34,7 +34,15 @@ export function setLenderAlarmBot(bot) {
   botRef = bot;
 }
 
-const LENDER = "4JSSSaG3xRomQsrxmdQEsahfyFjBVjvuoBKJUUZgzPAx";
+// Lender pubkey is read from env, not hardcoded. If you ever rotate
+// the authority (e.g. v3 deploy with a new authority, key-compromise
+// rotation), a hardcoded constant would silently keep watching the
+// OLD address while attacker drains the NEW one. The startup check
+// below makes a missing env crash the boot rather than fail-quiet.
+const LENDER = process.env.LENDER_PUBKEY;
+if (!LENDER) {
+  console.error("[lender-alarm-webhook] CRITICAL: LENDER_PUBKEY is unset — drain alarm will never fire. Set in Railway env.");
+}
 const THRESHOLD = BigInt(process.env.LENDER_ALARM_THRESHOLD_LAMPORTS || "10000000"); // 0.01 SOL
 const WEBHOOK_SECRET = process.env.LENDER_ALARM_WEBHOOK_SECRET;
 
