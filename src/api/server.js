@@ -94,6 +94,7 @@ import {
 import { handleVotingPowerQuery } from "./governance-voting-power-api.js";
 import { handleDistributionQuery } from "./governance-distribution-api.js";
 import { handleDistributionsListQuery } from "./governance-distributions-list-api.js";
+import { handleGovernanceTally } from "./governance-tally-api.js";
 import { handleActivity } from "./activity-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handlePipSession } from "./pip-session.js";
@@ -1499,6 +1500,10 @@ const PUBLIC_ROUTES = new Set([
   // v0 GOVERNANCE.md commitment.
   "/api/v1/governance/vote",
   "/api/v1/governance/votes",
+  // Live aggregate WEIGHTS for the on-page live-results bar. Aggregate-
+  // only; no per-wallet detail; no snapshot file publication. Server-
+  // side cached 30s.
+  "/api/v1/governance/tally",
   // Voting-power and distribution lookups — per-wallet eligibility +
   // expected SOL allocation. Public read; both surface info that's
   // either derivable from the public snapshot or specifically meant
@@ -1825,6 +1830,9 @@ async function router(req, res) {
         break;
       case "/api/v1/governance/votes":
         result = await handleGovernanceVotesAggregate(req, url);
+        break;
+      case "/api/v1/governance/tally":
+        result = await handleGovernanceTally(req, url);
         break;
       case "/api/v1/governance/voting-power":
         result = await handleVotingPowerQuery(req, url);

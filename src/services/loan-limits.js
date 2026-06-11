@@ -12,11 +12,12 @@ import { query } from "../db/pool.js";
 // Gold-credit user with only 1 on-time repay still gets Gold limits.
 //
 // Tier progression (operator-set 2026-06-08, Gold/Platinum cap raised
-// to 40 SOL the same day — rewarding sustained on-time repayers):
+// to 40 SOL the same day; raised again 2026-06-11 to 50 SOL per-loan
+// and 50 SOL outstanding for both top tiers):
 //   new      — 3 SOL / 3 SOL    (zero repay history)
 //   trusted  — 5 SOL / 10 SOL   (3+ on-time repays; pre-Gold credit)
-//   gold     — 10 SOL / 40 SOL  (credit score 650+)
-//   platinum — 10 SOL / 40 SOL  (credit score 750+)
+//   gold     — 50 SOL / 50 SOL  (credit score 650+)
+//   platinum — 50 SOL / 50 SOL  (credit score 750+)
 //
 // Outstanding cap is per-USER (aggregated across every linked wallet),
 // not per-wallet — matches our credit-scoring aggregation model.
@@ -25,8 +26,8 @@ const SOL = 1_000_000_000n;
 const LIMIT_TIERS = {
   new:      { maxPerLoan: 3n  * SOL, maxOutstanding: 3n  * SOL, minOnTimeRepays: 0 },
   trusted:  { maxPerLoan: 5n  * SOL, maxOutstanding: 10n * SOL, minOnTimeRepays: 3 },
-  gold:     { maxPerLoan: 10n * SOL, maxOutstanding: 40n * SOL, minOnTimeRepays: 0 },
-  platinum: { maxPerLoan: 10n * SOL, maxOutstanding: 40n * SOL, minOnTimeRepays: 0 },
+  gold:     { maxPerLoan: 50n * SOL, maxOutstanding: 50n * SOL, minOnTimeRepays: 0 },
+  platinum: { maxPerLoan: 50n * SOL, maxOutstanding: 50n * SOL, minOnTimeRepays: 0 },
 };
 
 /**
