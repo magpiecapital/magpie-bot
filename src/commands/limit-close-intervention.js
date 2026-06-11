@@ -134,12 +134,20 @@ export function registerLimitCloseInterventionCallbacks(bot) {
     }
 
     if (action === "decline") {
+      // Set a cooldown so the engine doesn't re-request intervention
+      // within the next 15 minutes. The engine's requestIntervention
+      // WHERE clause checks intervention_decline_cooldown_until — a
+      // future timestamp here blocks re-requests until it elapses.
+      // Without this guard, the same failure condition reappearing
+      // 30s later (next watcher tick) would fire ANOTHER DM, then
+      // another, then another — DM-spam loop.
       const r = await query(
         `UPDATE limit_close_orders
             SET status = 'armed',
                 intervention_state = 'declined',
                 intervention_response = 'decline',
-                intervention_response_at = NOW()
+                intervention_response_at = NOW(),
+                intervention_decline_cooldown_until = NOW() + INTERVAL '15 minutes'
           WHERE id = $1
             AND user_id = $2
             AND status = 'awaiting_user'
