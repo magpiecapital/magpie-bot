@@ -41,6 +41,17 @@ async function executeDbConfigUpdate(action, proposalId) {
     [newValueJson, proposalId, key],
   );
 
+  // Invalidate the runtime-config cache so the new value is visible to
+  // every consumer on the next read instead of waiting up to the cache
+  // TTL. Critical when MGP-001 flips holder_reward_bps from 1000 → 7000:
+  // accrual on the very next loan fee should use 70%, not 10%.
+  try {
+    const { invalidateRuntimeConfig } = await import("../services/runtime-config.js");
+    invalidateRuntimeConfig(key);
+  } catch (err) {
+    console.warn("[implementation] runtime-config cache flush failed:", err.message);
+  }
+
   return {
     ok: true,
     detail: {

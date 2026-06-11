@@ -40,7 +40,27 @@ export const MAGPIE_MINT = new PublicKey(
 // All ATA derivations and program-account scans for $MAGPIE must use
 // TOKEN_2022_PROGRAM_ID, NOT TOKEN_PROGRAM_ID.
 export const MAGPIE_TOKEN_PROGRAM = TOKEN_2022_PROGRAM_ID;
-export const HOLDER_REWARD_BPS = 1_000; // 10% of every loan fee
+// FALLBACK value used when governance_config.holder_reward_bps can't
+// be read (DB unreachable, first boot before migration, etc). The
+// live value is read at runtime via getHolderRewardBps() — which the
+// governance autopilot flips to 7000 when MGP-001 ratifies.
+export const HOLDER_REWARD_BPS_FALLBACK = 1_000; // 10%
+// Backwards-compat alias for callers that previously imported the
+// hardcoded const for DISPLAY. They'll see the pre-MGP-001 default
+// until they migrate to the async getter. Eventually-consistent.
+export const HOLDER_REWARD_BPS = HOLDER_REWARD_BPS_FALLBACK;
+
+/**
+ * Read the current holder-reward bps from governance_config, falling
+ * back to the hardcoded default. Every accrual + every display call
+ * should go through this so a passed MGP-001 (autopilot writes 7000
+ * to governance_config.holder_reward_bps) takes effect everywhere
+ * within the runtime-config cache TTL (default 60s).
+ */
+export async function getHolderRewardBps() {
+  const { getRuntimeConfigBps } = await import("./runtime-config.js");
+  return getRuntimeConfigBps("holder_reward_bps", HOLDER_REWARD_BPS_FALLBACK);
+}
 export const MIN_HOLDER_CLAIM_LAMPORTS = 5_000_000n; // 0.005 SOL
 export const MIN_HOLDER_BALANCE_RAW = 1n; // require at least 1 raw unit ($MAGPIE has 6 decimals → 0.000001)
 export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL safety floor
@@ -118,7 +138,12 @@ function loadLenderKeypair() {
 export async function accrueToHolderPool(feeLamports) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
-  const reward = (fee * BigInt(HOLDER_REWARD_BPS)) / 10_000n;
+  // Read the LIVE bps from governance_config (autopilot will flip
+  // this from 10% to 70% the moment MGP-001 ratifies — accrual on
+  // every subsequent fee event picks up the new rate without a
+  // code deploy).
+  const liveBps = await getHolderRewardBps();
+  const reward = (fee * BigInt(Math.round(liveBps))) / 10_000n;
   if (reward <= 0n) return null;
   try {
     await query(
@@ -176,12 +201,13 @@ export async function getHolderPoolState() {
 export async function getHolderInfoByWallet(walletAddress) {
   if (!walletAddress) return null;
 
-  // 1. On-chain balance (source of truth — DB doesn't track every wallet).
-  //    Sum across ALL token accounts owned by this wallet for $MAGPIE,
-  //    not just the ATA — some users hold via non-ATA accounts (legacy
-  //    from before ATAs were standard, or multi-account positions).
-  //    Matches the snapshot logic exactly.
-  let balanceRaw = 0n;
+  // 1. On-chain in-wallet balance (source of truth — DB doesn't
+  //    track every wallet). Sum across ALL token accounts owned by
+  //    this wallet for $MAGPIE, not just the ATA — some users hold
+  //    via non-ATA accounts (legacy from before ATAs were standard,
+  //    or multi-account positions). Matches the snapshot logic
+  //    exactly.
+  let heldRaw = 0n;
   let exists = false;
   try {
     const accounts = await connection.getTokenAccountsByOwner(
@@ -192,12 +218,36 @@ export async function getHolderInfoByWallet(walletAddress) {
     for (const a of accounts.value) {
       const data = a.account.data;
       if (data.length < 72) continue;
-      balanceRaw += data.readBigUInt64LE(64);
+      heldRaw += data.readBigUInt64LE(64);
     }
     exists = accounts.value.length > 0;
   } catch {
     /* malformed wallet → return zero state */
   }
+
+  // 1b. Collateralized $MAGPIE — active loans where the borrower's
+  //     wallet matches AND collateral mint is $MAGPIE. The actual
+  //     holder-rewards snapshot (snapshotMagpieHolders) credits this,
+  //     so the live "EST NEXT PAYOUT" estimate must include it too —
+  //     otherwise the user sees a smaller estimate than they'll
+  //     actually receive. Same principle as governance voting weight:
+  //     using the protocol doesn't reduce your share.
+  let collateralizedRaw = 0n;
+  try {
+    const { rows } = await query(
+      `SELECT COALESCE(SUM(collateral_amount::numeric), 0)::text AS total
+         FROM loans
+        WHERE collateral_mint = $1
+          AND status = 'active'
+          AND borrower_wallet = $2`,
+      [MAGPIE_MINT.toBase58(), walletAddress],
+    );
+    collateralizedRaw = BigInt(rows[0]?.total ?? "0");
+  } catch {
+    /* if loans table unreachable, fall back to in-wallet only */
+  }
+  const balanceRaw = heldRaw + collateralizedRaw;
+  if (collateralizedRaw > 0n) exists = true;
 
   // 2. Reward history (lifetime received + per-distribution count)
   const { rows: totals } = await query(
@@ -223,6 +273,7 @@ export async function getHolderInfoByWallet(walletAddress) {
   //    will be paid — that timing stays private to prevent dump-after-snapshot
   //    behavior.
   let estimatedNextPayout = 0n;
+  let estimatedNextPayoutLive = 0n; // before adding planned-future
   try {
     const [poolState, lastSnap] = await Promise.all([
       getHolderPoolState(),
@@ -231,28 +282,58 @@ export async function getHolderInfoByWallet(walletAddress) {
           ORDER BY snapshot_at DESC LIMIT 1`,
       ),
     ]);
-    const pool = poolState.accrued_lamports;
-    if (pool > 0n && balanceRaw > 0n) {
+    // The pool the user's slice is computed against. Two components:
+    //   - accrued_lamports: real, already-collected fees sitting in
+    //     the pool right now.
+    //   - planned addition (HOLDER_REWARD_POOL_PLANNED_ADD_LAMPORTS):
+    //     an operator-committed future top-up. When the operator
+    //     plans to add ~10 SOL to the pool before the next
+    //     distribution, setting this env to 10_000_000_000 lets the
+    //     dashboard reflect that promise in the user's estimate.
+    //     Default 0 — no promise, no inflated estimate.
+    let planned = 0n;
+    try {
+      const raw = process.env.HOLDER_REWARD_POOL_PLANNED_ADD_LAMPORTS;
+      if (raw) {
+        const parsed = BigInt(raw);
+        if (parsed >= 0n) planned = parsed;
+      }
+    } catch {
+      /* invalid env value → 0 */
+    }
+    const effectivePool = poolState.accrued_lamports + planned;
+    if (effectivePool > 0n && balanceRaw > 0n) {
       const totalBalance = lastSnap.rows[0]
         ? BigInt(lastSnap.rows[0].total_balance)
         : await getEffectiveEligibleSupply().catch(() => 0n);
       if (totalBalance > 0n) {
-        estimatedNextPayout = (pool * balanceRaw) / totalBalance;
+        estimatedNextPayout = (effectivePool * balanceRaw) / totalBalance;
+        // Also surface the "live-pool-only" estimate so callers can
+        // tell the user what they'd get RIGHT NOW vs after the planned
+        // addition lands. If planned == 0, these are equal.
+        estimatedNextPayoutLive = (poolState.accrued_lamports * balanceRaw) / totalBalance;
       }
     }
   } catch {
     /* best-effort estimate — fall through with 0 */
   }
 
+  // Live bps for downstream display ("rewards earn at X% of every fee").
+  const liveBps = await getHolderRewardBps();
+
   return {
     wallet: walletAddress,
     balance_raw: balanceRaw.toString(),
+    held_raw: heldRaw.toString(),
+    collateralized_raw: collateralizedRaw.toString(),
     has_balance: exists && balanceRaw > 0n,
     lifetime_lamports: BigInt(totals[0]?.lifetime ?? "0"),
     paid_lamports: BigInt(totals[0]?.paid ?? "0"),
     pending_lamports: BigInt(totals[0]?.pending ?? "0"),
     distributions_count: totals[0]?.distributions_count ?? 0,
     estimated_next_payout_lamports: estimatedNextPayout,
+    estimated_next_payout_live_lamports: estimatedNextPayoutLive,
+    holder_reward_bps_live: liveBps,
   };
 }
 
