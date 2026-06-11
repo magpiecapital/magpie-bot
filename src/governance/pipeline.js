@@ -65,6 +65,8 @@ async function findReadyProposals() {
   for (const id of ids) {
     const p = getProposal(id);
     if (!p?.voting_ends_at_iso) continue;
+    // Inert proposal types — no autopilot processing.
+    if (p.proposal_type === "snapshot_only" || p.proposal_type === "withdrawn") continue;
     const endsAt = new Date(p.voting_ends_at_iso);
     if (endsAt > now) continue;
 
