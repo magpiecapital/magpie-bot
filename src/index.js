@@ -419,37 +419,37 @@ bot.catch(async (err) => {
 async function registerBotCommands() {
   try {
     await bot.api.setMyCommands([
-      { command: "home", description: "🏠 Home / main menu" },
-      { command: "wallet", description: "💼 Your wallet + SOL balance" },
-      { command: "wallets", description: "🔀 Switch between your wallets" },
-      { command: "unlock", description: "🔓 See your borrow potential" },
-      { command: "borrow", description: "💰 Take a loan" },
-      { command: "positions", description: "📊 Active loans" },
-      { command: "calendar", description: "📅 Loans sorted by due date" },
-      { command: "health", description: "🩺 Loan health snapshot" },
-      { command: "autoprotect", description: "🛡 Auto-Protect (anti-liquidation)" },
-      { command: "repay", description: "✅ Repay a loan" },
-      { command: "deposit", description: "📥 Show deposit address" },
-      { command: "withdraw", description: "📤 Withdraw SOL" },
-      { command: "supported", description: "🪙 Approved collateral tokens" },
-      { command: "credit", description: "⭐ Your credit score + points" },
-      { command: "history", description: "📜 Loan history" },
-      { command: "refer", description: "🎁 Earn 5% of friends' loan fees" },
-      { command: "share", description: "📤 Flex your loan / streak on Twitter" },
+      { command: "home", description: "Home / main menu" },
+      { command: "wallet", description: "Your wallet + SOL balance" },
+      { command: "wallets", description: "Switch between your wallets" },
+      { command: "unlock", description: "See your borrow potential" },
+      { command: "borrow", description: "Take a loan" },
+      { command: "positions", description: "Active loans" },
+      { command: "calendar", description: "Loans sorted by due date" },
+      { command: "health", description: "Loan health snapshot" },
+      { command: "autoprotect", description: "Auto-Protect (anti-liquidation)" },
+      { command: "repay", description: "Repay a loan" },
+      { command: "deposit", description: "Show deposit address" },
+      { command: "withdraw", description: "Withdraw SOL" },
+      { command: "supported", description: "Approved collateral tokens" },
+      { command: "credit", description: "Your credit score + points" },
+      { command: "history", description: "Loan history" },
+      { command: "refer", description: "Earn 5% of friends' loan fees" },
+      { command: "share", description: "Flex your loan / streak on Twitter" },
       { command: "holders", description: "$MAGPIE holder rewards" },
       { command: "distributions", description: "Your full distribution history" },
-      { command: "submit", description: "➕ Submit a new token" },
-      { command: "magpie", description: "✨ $MAGPIE token info" },
-      { command: "support", description: "🛟 Self-serve help / message the team" },
-      { command: "mytickets", description: "🎫 Your support tickets + status" },
-      { command: "community", description: "💬 Join the public @magpietalk group" },
-      { command: "site", description: "🌐 Open magpie.capital" },
-      { command: "security", description: "🔐 Account security view + lock buttons" },
-      { command: "privacy", description: "🔒 What we store + your controls" },
-      { command: "lock", description: "🚨 Emergency pause on site signed actions" },
-      { command: "exportdata", description: "📦 DM yourself a JSON file of your account" },
-      { command: "tx", description: "🔍 Lookup any Solana tx by signature" },
-      { command: "help", description: "ℹ️ Full command list" },
+      { command: "submit", description: "Submit a new token" },
+      { command: "magpie", description: "$MAGPIE token info" },
+      { command: "support", description: "Self-serve help / message the team" },
+      { command: "mytickets", description: "Your support tickets + status" },
+      { command: "community", description: "Join the public @magpietalk group" },
+      { command: "site", description: "Open magpie.capital" },
+      { command: "security", description: "Account security view + lock buttons" },
+      { command: "privacy", description: "What we store + your controls" },
+      { command: "lock", description: "Emergency pause on site signed actions" },
+      { command: "exportdata", description: "DM yourself a JSON file of your account" },
+      { command: "tx", description: "Lookup any Solana tx by signature" },
+      { command: "help", description: "Full command list" },
     ]);
     await bot.api.setChatMenuButton({
       menu_button: { type: "commands" },
@@ -459,7 +459,7 @@ async function registerBotCommands() {
   }
 }
 
-console.log("🏦 Magpie bot starting...");
+console.log("Magpie bot starting...");
 bot.start({
   onStart: (info) => {
     console.log(`Running as @${info.username}`);
