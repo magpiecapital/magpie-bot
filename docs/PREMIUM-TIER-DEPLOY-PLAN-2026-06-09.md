@@ -74,7 +74,7 @@ Only the top-tier Solana memecoins with verified depth, multiple oracle sources,
 
 - **Liquidation gauntlet:** existing TWAP + cross-source + post-borrow watcher + v3's on-chain TWAP. No new defenses; layered application.
 - **Liquidation reward:** same `keeper_reward_bps` as v1. No change to liquidator economics.
-- **Fee split (Premium pool):** per MGP-001 outcome (60% holders / 30% Premium-LPs / 5% referrer / 2% LP loyalty / 3% protocol if it passes; otherwise current 80/10/5/2/3). Premium LPs earn pro-rata to their Premium-pool deposit share. Both tracks deposit into the same Premium pool — separate-from-v1 risk isolation is at the v1/v3 boundary, not at the track boundary.
+- **Fee split (Premium pool):** per MGP-001 outcome (70% holders / 10% Premium-LPs / 10% referrer / 10% protocol reserve if it passes; otherwise current 80/10/5/2/3). Premium LPs earn pro-rata to their Premium-pool deposit share. Both tracks deposit into the same Premium pool — separate-from-v1 risk isolation is at the v1/v3 boundary, not at the track boundary.
 - **Allowed borrower wallet states:** per existing bot gates (anti-exploit gauntlet still applies). No relaxation.
 
 Why 45% LTV on 15-day vs 40% on 30-day: shorter time-at-risk allows a more aggressive LTV at the same expected liquidation rate. Empirical traditional-margin parallel: brokerages allow higher initial margin on shorter holding periods.
@@ -312,7 +312,7 @@ Both `community-pip.js` and `ai-support.js` need:
 2. **Premium-tier eligibility explanation** so Pip can answer "why can't I get Premium?" questions. Same content as Screener gates 1–8, paraphrased for end-user readability.
 3. **The "tokenized stocks only" constraint** at launch, with the messaging "memecoin Premium may come later after 90 days of operating data."
 4. **The two-pool structure** so Pip can answer "where do I deposit to earn Premium yield?" questions — clear distinction between Standard Pool and Premium Pool.
-5. **Updated fee-split table** if MGP-001 has passed by Premium launch (60% holders / 30% LPs) — apply to BOTH pools.
+5. **Updated fee-split table** if MGP-001 has passed by Premium launch (70/10/10/10 — 70% holders / 10% LPs / 10% referrers / 10% protocol reserve) — apply to BOTH pools.
 
 Per the existing memory rules:
 - Pip's stale "0 ever liquidations" claim was fixed during the prior audit pass — keep that fix.
