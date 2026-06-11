@@ -145,7 +145,7 @@ export async function screenPremiumBorrow(opts) {
   // ── Gate 2: Premium whitelist gate ───────────────────────────────
   t = Date.now();
   const { rows: [wlRow] } = await query(
-    `SELECT mint, max_open_lamports
+    `SELECT mint, max_open_lamports, tier, max_ltv_bps
        FROM premium_tier_whitelist
        WHERE mint = $1 AND enabled = TRUE`,
     [opts.collateralMint],
@@ -155,6 +155,28 @@ export async function screenPremiumBorrow(opts) {
   if (!wlRow) {
     return refused("not_on_premium_whitelist",
       "This stock isn't yet on the Premium-tier whitelist. The operator adds stocks via governance proposals (see magpie.capital/governance). For now, use a shorter-tier loan.");
+  }
+
+  // ── Gate 2b: tier-aware max LTV ──────────────────────────────────
+  // The 90-day vol analysis (2026-06-10) showed crypto-adjacent
+  // equities (COINx, MSTRx, HOODx, CRCLx) realize ~2.5x the volatility
+  // of pure equities + ETFs. Migration 018 split the whitelist into
+  // two tiers with different max LTV caps to match. If the caller
+  // didn't pass a proposed LTV, this gate is a no-op — let the borrow
+  // flow handle LTV selection independently.
+  if (opts.proposedLtvBps != null) {
+    const maxLtvBps = Number(wlRow.max_ltv_bps);
+    if (!Number.isFinite(maxLtvBps) || maxLtvBps <= 0) {
+      return refused("tier_max_ltv_missing",
+        "This stock's Premium-tier max LTV isn't configured. Contact support — the operator needs to update the whitelist row.");
+    }
+    if (opts.proposedLtvBps > maxLtvBps) {
+      const tierLabel = wlRow.tier === "crypto_adjacent"
+        ? "crypto-adjacent equity (higher realized volatility)"
+        : "blue-chip equity / ETF";
+      return refused("ltv_exceeds_tier_cap",
+        `This stock is in the Premium-tier *${tierLabel}* bucket, which caps LTV at ${(maxLtvBps / 100).toFixed(0)}%. You requested ${(opts.proposedLtvBps / 100).toFixed(0)}%. Lower your collateral amount or use a longer-term Express/Quick/Standard tier instead.`);
+    }
   }
 
   // ── Gate 3: institutional price feed gate ────────────────────────
