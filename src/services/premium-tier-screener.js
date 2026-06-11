@@ -161,22 +161,33 @@ export async function screenPremiumBorrow(opts) {
   // The 90-day vol analysis (2026-06-10) showed crypto-adjacent
   // equities (COINx, MSTRx, HOODx, CRCLx) realize ~2.5x the volatility
   // of pure equities + ETFs. Migration 018 split the whitelist into
-  // two tiers with different max LTV caps to match. If the caller
-  // didn't pass a proposed LTV, this gate is a no-op — let the borrow
-  // flow handle LTV selection independently.
-  if (opts.proposedLtvBps != null) {
-    const maxLtvBps = Number(wlRow.max_ltv_bps);
-    if (!Number.isFinite(maxLtvBps) || maxLtvBps <= 0) {
-      return refused("tier_max_ltv_missing",
-        "This stock's Premium-tier max LTV isn't configured. Contact support — the operator needs to update the whitelist row.");
-    }
-    if (opts.proposedLtvBps > maxLtvBps) {
-      const tierLabel = wlRow.tier === "crypto_adjacent"
-        ? "crypto-adjacent equity (higher realized volatility)"
-        : "blue-chip equity / ETF";
-      return refused("ltv_exceeds_tier_cap",
-        `This stock is in the Premium-tier *${tierLabel}* bucket, which caps LTV at ${(maxLtvBps / 100).toFixed(0)}%. You requested ${(opts.proposedLtvBps / 100).toFixed(0)}%. Lower your collateral amount or use a longer-term Express/Quick/Standard tier instead.`);
-    }
+  // two tiers with different max LTV caps to match.
+  //
+  // proposedLtvBps is REQUIRED. A previous version made this optional
+  // ("if not passed, no-op") — but every borrow path that calls this
+  // function has an LTV; making it optional just meant a caller bug
+  // (forgot to pass the field) silently disabled the entire tier-LTV
+  // check and let a 70% LTV crypto-adjacent loan through against a
+  // 50%-capped position. Fail closed.
+  if (opts.proposedLtvBps == null) {
+    return refused("proposed_ltv_missing",
+      "Premium-tier screening requires a proposed LTV. Internal error — caller did not supply opts.proposedLtvBps.");
+  }
+  if (!Number.isInteger(opts.proposedLtvBps) || opts.proposedLtvBps <= 0 || opts.proposedLtvBps > 10_000) {
+    return refused("proposed_ltv_invalid",
+      `Premium-tier screening received an invalid proposed LTV (${opts.proposedLtvBps}). Expected an integer in bps between 1 and 10000.`);
+  }
+  const maxLtvBps = Number(wlRow.max_ltv_bps);
+  if (!Number.isFinite(maxLtvBps) || maxLtvBps <= 0) {
+    return refused("tier_max_ltv_missing",
+      "This stock's Premium-tier max LTV isn't configured. Contact support — the operator needs to update the whitelist row.");
+  }
+  if (opts.proposedLtvBps > maxLtvBps) {
+    const tierLabel = wlRow.tier === "crypto_adjacent"
+      ? "crypto-adjacent equity (higher realized volatility)"
+      : "blue-chip equity / ETF";
+    return refused("ltv_exceeds_tier_cap",
+      `This stock is in the Premium-tier *${tierLabel}* bucket, which caps LTV at ${(maxLtvBps / 100).toFixed(0)}%. You requested ${(opts.proposedLtvBps / 100).toFixed(0)}%. Lower your collateral amount or use a longer-term Express/Quick/Standard tier instead.`);
   }
 
   // ── Gate 3: institutional price feed gate ────────────────────────

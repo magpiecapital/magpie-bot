@@ -54,9 +54,11 @@ function sha256(s) {
   );
 }
 
-async function appliedFilenames() {
-  const { rows } = await query(`SELECT filename FROM schema_migrations`);
-  return new Set(rows.map((r) => r.filename));
+async function appliedLedger() {
+  const { rows } = await query(`SELECT filename, checksum_sha256 FROM schema_migrations`);
+  const map = new Map();
+  for (const r of rows) map.set(r.filename, r.checksum_sha256);
+  return map;
 }
 
 function listMigrationFiles() {
@@ -70,53 +72,112 @@ function listMigrationFiles() {
   return entries.filter((f) => /^\d+_.+\.sql$/.test(f)).sort();
 }
 
+// Postgres advisory-lock key dedicated to the migration runner. Stable
+// 32-bit int so concurrent bot instances (during Railway redeploys when
+// old + new run briefly together) serialize through the same lock and
+// only one applies pending migrations at a time. The lock is auto-released
+// on session end so a crashing bot doesn't strand the lock.
+const MIGRATIONS_ADVISORY_LOCK_KEY = 0x6D470A11; // "mGr\n!" magic — arbitrary but stable
+
+// Migration content must not contain invisible / bidi-override characters.
+// Catches a malicious PR that hides DROP / TRUNCATE / DELETE inside a
+// zero-width-joiner or right-to-left-override that wouldn't surface in
+// code review. Legitimate Unicode (em-dash, smart quotes, accented
+// letters in comments) is allowed — only the specific code-points used
+// to hide text are rejected.
+//   U+200B–U+200F  zero-width space, ZWJ, ZWNJ, LRM, RLM
+//   U+202A–U+202E  bidi embedding / override
+//   U+2060–U+2069  word joiner, invisible plus, invisible times, invisible separators
+//   U+FEFF         BOM / ZWNBSP
+const DANGEROUS_UNICODE_RE = /[​-‏‪-‮⁠-⁩﻿]/;
+
 /**
  * Apply all pending migrations. Returns { applied: string[], skipped: string[] }.
  * Throws if any migration fails — caller decides what to do.
+ *
+ * Multi-instance safety: takes a session-level Postgres advisory lock
+ * for the duration of the apply loop. During Railway redeploys both
+ * old + new bot instances briefly run together; without the lock both
+ * race to apply the same files, with the second hitting a primary-key
+ * conflict on schema_migrations.filename (best case) or executing
+ * partially-non-idempotent SQL twice (worst case). The advisory lock
+ * serializes through Postgres so only one runner applies at a time;
+ * the other blocks until the first commits, then no-ops because the
+ * ledger now lists all files as applied.
  */
 export async function applyPendingMigrations() {
   await ensureLedger();
   const all = listMigrationFiles();
   if (all.length === 0) return { applied: [], skipped: [] };
 
-  const already = await appliedFilenames();
+  const client = await pool.connect();
   const applied = [];
   const skipped = [];
 
-  for (const filename of all) {
-    if (already.has(filename)) {
-      skipped.push(filename);
-      continue;
-    }
-    const path = join(MIGRATIONS_DIR, filename);
-    const sql = readFileSync(path, "utf-8");
-    const checksum = await sha256(sql);
+  try {
+    // Lock for the duration of this session — released on .release().
+    await client.query("SELECT pg_advisory_lock($1)", [MIGRATIONS_ADVISORY_LOCK_KEY]);
 
-    const client = await pool.connect();
-    const t0 = Date.now();
-    try {
-      await client.query("BEGIN");
-      await client.query(sql);
-      await client.query(
-        `INSERT INTO schema_migrations (filename, checksum_sha256, duration_ms)
-         VALUES ($1, $2, $3)`,
-        [filename, checksum, Date.now() - t0],
-      );
-      await client.query("COMMIT");
-      console.log(`[migrations] APPLIED ${filename} (${Date.now() - t0}ms)`);
-      applied.push(filename);
-    } catch (err) {
-      await client.query("ROLLBACK").catch(() => {});
-      // Failing a migration leaves the system in a known-bad state.
-      // Bubble the error so the bot crashes visibly rather than running
-      // against a half-migrated schema and producing weird runtime errors.
-      const msg = `[migrations] FAILED ${filename}: ${err.message}`;
-      console.error(msg);
-      throw new Error(msg);
-    } finally {
-      client.release();
+    // Re-read ledger AFTER taking the lock (another instance may have
+    // applied files while we were waiting for the lock).
+    const already = await appliedLedger();
+
+    for (const filename of all) {
+      const path = join(MIGRATIONS_DIR, filename);
+      const sql = readFileSync(path, "utf-8");
+      const checksum = await sha256(sql);
+
+      // Hidden-Unicode check applies only when APPLYING a migration —
+      // already-applied historical files are trusted (operator review
+      // surfaced no issues at the time they ran) and we don't want a
+      // ZWJ-in-a-comment in a year-old migration to start blocking
+      // bot startup. New migrations being applied for the first time
+      // get the full check.
+      if (!already.has(filename) && DANGEROUS_UNICODE_RE.test(sql)) {
+        throw new Error(`[migrations] ${filename} contains hidden Unicode characters (zero-width or bidi-override) — refusing to apply. Strip them and re-stage.`);
+      }
+
+      if (already.has(filename)) {
+        // Already applied. Verify the file hasn't been edited post-apply.
+        const recorded = already.get(filename);
+        if (recorded && recorded !== checksum) {
+          throw new Error(
+            `[migrations] ${filename} was edited after apply ` +
+            `(recorded sha256 ${recorded.slice(0, 12)}..., current ${checksum.slice(0, 12)}...). ` +
+            `Editing applied migrations is unsafe — create a new migration file instead.`,
+          );
+        }
+        skipped.push(filename);
+        continue;
+      }
+
+      const t0 = Date.now();
+      try {
+        await client.query("BEGIN");
+        await client.query(sql);
+        await client.query(
+          `INSERT INTO schema_migrations (filename, checksum_sha256, duration_ms)
+           VALUES ($1, $2, $3)`,
+          [filename, checksum, Date.now() - t0],
+        );
+        await client.query("COMMIT");
+        console.log(`[migrations] APPLIED ${filename} (${Date.now() - t0}ms)`);
+        applied.push(filename);
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        const msg = `[migrations] FAILED ${filename}: ${err.message}`;
+        console.error(msg);
+        throw new Error(msg);
+      }
     }
+  } finally {
+    // Release lock + client. Lock is also released automatically on
+    // session close (advisory locks are session-scoped) so a process
+    // crash mid-apply doesn't strand the lock.
+    try { await client.query("SELECT pg_advisory_unlock($1)", [MIGRATIONS_ADVISORY_LOCK_KEY]); } catch {}
+    client.release();
   }
+
   return { applied, skipped };
 }
 
@@ -140,7 +201,7 @@ export async function applyPendingMigrations() {
 export async function backfillLedger() {
   await ensureLedger();
   const all = listMigrationFiles();
-  const already = await appliedFilenames();
+  const already = await appliedLedger();
   let recorded = 0;
   for (const filename of all) {
     if (already.has(filename)) continue;
