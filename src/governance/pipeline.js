@@ -13,7 +13,8 @@
  * prevent two scheduler ticks from racing.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { query } from "../db/pool.js";
 import { getProposal, listProposalIds } from "./registry.js";
 import { tallyProposal } from "./tally.js";
@@ -81,7 +82,6 @@ async function findReadyProposals() {
  * Find the most recent snapshot file matching the proposal's snapshot_id.
  */
 function findSnapshotFile(snapshotId) {
-  const { readdirSync } = require("node:fs");
   try {
     const files = readdirSync(SNAPSHOT_DIR)
       .filter((f) => f.startsWith(snapshotId + "-") && f.endsWith(".json"))
@@ -168,14 +168,46 @@ export async function processProposal(proposal) {
   let anomaly;
   {
     const t0 = Date.now();
-    const { createHash } = await import("node:crypto");
-    const { readFileSync } = await import("node:fs");
-    const expectedHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+    // Canonical hash comes from the registry (set at activation time, never
+    // edited). The pipeline rejects the run if the on-disk snapshot's hash
+    // doesn't match — an attacker who tampered with the snapshot file
+    // between activation and tally is detected here. If a proposal lacks a
+    // canonical hash, fail closed rather than computing-and-comparing the
+    // file to itself (which is a tautology).
+    if (!proposal.snapshot_sha256) {
+      await log(
+        "anomaly",
+        "halted",
+        { proposal_id: proposalId },
+        "snapshot_sha256_missing_in_registry",
+        Date.now() - t0,
+      );
+      await markPipelineError(proposalId, "snapshot_sha256_missing_in_registry");
+      await operatorDm(
+        `AUTOPILOT HALT: ${proposalId} has no canonical snapshot_sha256 in the registry. Add it before the pipeline can verify snapshot integrity.`,
+      );
+      return "pipeline_error";
+    }
+    const actualHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+    if (actualHash !== proposal.snapshot_sha256) {
+      await log(
+        "anomaly",
+        "halted",
+        { expected: proposal.snapshot_sha256, actual: actualHash, snapshot_path: snapshotPath },
+        "snapshot_hash_mismatch",
+        Date.now() - t0,
+      );
+      await markPipelineError(proposalId, "snapshot_hash_mismatch");
+      await operatorDm(
+        `AUTOPILOT HALT: ${proposalId} snapshot hash MISMATCH.\nExpected: ${proposal.snapshot_sha256}\nActual:   ${actualHash}\nThe on-disk snapshot has been altered since activation — manual review required.`,
+      );
+      return "pipeline_error";
+    }
     anomaly = await runAnomalyChecks({
       proposalId,
       tally,
       snapshotPath,
-      expectedSnapshotHash: expectedHash,
+      expectedSnapshotHash: proposal.snapshot_sha256,
       windowEndsAtIso: proposal.voting_ends_at_iso,
     });
     if (!anomaly.ok) {
@@ -254,8 +286,6 @@ export async function processProposal(proposal) {
   // ── STEP 7: ANNOUNCE — only after audit passes ──────────────────
   if (proposal.announcement_template && COMMUNITY_CHAT_ID && BOT_TOKEN) {
     const t0 = Date.now();
-    const { createHash } = await import("node:crypto");
-    const { readFileSync } = await import("node:fs");
     const snapshotHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
     const variables = buildVariables({ proposal, tally, outcome, snapshotHash });
     const renderedText = renderTemplate(proposal.announcement_template, variables);

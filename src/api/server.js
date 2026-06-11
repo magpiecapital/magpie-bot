@@ -133,13 +133,50 @@ function checkRateLimit(keyHash, limitRpm) {
   return true;
 }
 
-// Clean up rate limit store every 5 minutes
+// Per-IP rate limiter for PUBLIC routes — API-key gate doesn't apply, but
+// we still don't want a single source enumerating per-wallet endpoints
+// (governance distribution lookups, voting power, holder rewards) at scrape
+// speed. Default 240 req/min/IP — well above legitimate dashboard polling,
+// well below a useful scraper. Tunable per route below.
+const ipRateLimitStore = new Map();
+const PUBLIC_IP_LIMIT_RPM = parseInt(process.env.PUBLIC_IP_LIMIT_RPM || "240", 10);
+
+function extractClientIp(req) {
+  // Trust the leftmost x-forwarded-for value when behind Railway's proxy.
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.length > 0) {
+    return xff.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+function checkIpRateLimit(ip, limitRpm) {
+  const now = Date.now();
+  const windowMs = 60_000;
+  if (!ipRateLimitStore.has(ip)) {
+    ipRateLimitStore.set(ip, []);
+  }
+  const timestamps = ipRateLimitStore.get(ip).filter((t) => now - t < windowMs);
+  if (timestamps.length >= limitRpm) {
+    return false;
+  }
+  timestamps.push(now);
+  ipRateLimitStore.set(ip, timestamps);
+  return true;
+}
+
+// Clean up rate limit stores every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [key, timestamps] of rateLimitStore) {
     const valid = timestamps.filter(t => now - t < 60_000);
     if (valid.length === 0) rateLimitStore.delete(key);
     else rateLimitStore.set(key, valid);
+  }
+  for (const [ip, timestamps] of ipRateLimitStore) {
+    const valid = timestamps.filter((t) => now - t < 60_000);
+    if (valid.length === 0) ipRateLimitStore.delete(ip);
+    else ipRateLimitStore.set(ip, valid);
   }
 }, 300_000);
 
@@ -1602,8 +1639,16 @@ async function router(req, res) {
     }));
   }
 
-  // Auth required for all other routes
-  if (!PUBLIC_ROUTES.has(path)) {
+  // Per-IP rate limit for public routes — auth-gated routes use the
+  // per-API-key limiter inside authenticateRequest() instead.
+  if (PUBLIC_ROUTES.has(path)) {
+    const clientIp = extractClientIp(req);
+    if (!checkIpRateLimit(clientIp, PUBLIC_IP_LIMIT_RPM)) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Rate limit exceeded" }));
+    }
+  } else {
+    // Auth required for all other routes
     const auth = await authenticateRequest(req);
     if (!auth) {
       res.writeHead(401, { "Content-Type": "application/json" });
