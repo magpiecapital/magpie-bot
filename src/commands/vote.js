@@ -70,6 +70,12 @@ export async function handleVotingPower(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
 
+  if (ctx.chat?.type !== "private") {
+    return ctx.reply(
+      "Your voting weight is private. DM me to see it — run /votingpower in a direct message with @magpie_capital_bot.",
+    );
+  }
+
   const user = await upsertUser(tgUser.id, tgUser.username);
   let wallet;
   try {

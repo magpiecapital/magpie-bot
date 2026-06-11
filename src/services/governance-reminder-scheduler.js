@@ -14,6 +14,19 @@ let _timer = null;
 export function startGovernanceReminderScheduler() {
   if (_timer) return;
 
+  // Heartbeat reminders broadcast to GOVERNANCE_BROADCAST_CHAT_ID without a
+  // per-broadcast operator green light. The autopilot's one-shot post-vote
+  // announcement is explicitly authorized; these midstream reminders are NOT,
+  // and the operator's voter-fatigue rule says don't autonomously broadcast.
+  // Require explicit opt-in to enable. When disabled, the autopilot announcement
+  // path is unaffected.
+  if (process.env.ENABLE_GOV_HEARTBEAT_REMINDERS !== "true") {
+    console.log(
+      "[gov-reminders] scheduler DISABLED — set ENABLE_GOV_HEARTBEAT_REMINDERS=true to enable autonomous milestone reminders to the broadcast chat.",
+    );
+    return;
+  }
+
   setTimeout(async () => {
     await tick();
     _timer = setInterval(tick, TICK_INTERVAL_MS);
