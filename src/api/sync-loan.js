@@ -188,11 +188,18 @@ export async function handleSyncLoan(req) {
     if (!walletRow) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
       // agent borrow whose synthetic user was already created by the
-      // agent endpoint. Still surface clearly rather than panicking.
+      // agent endpoint. Log internally with the wallet string, but
+      // return a GENERIC 404 to the caller. Distinguishing "wallet
+      // not linked" from "loan not found" would let anyone probe
+      // arbitrary wallets to learn if they're Magpie users (since
+      // the loan PDA's on-chain borrower field is publicly readable,
+      // the marginal leak is the wallet↔user-id mapping). The site
+      // never legitimately hits this branch — site flows always have
+      // a linked wallet — so a generic 404 doesn't hurt UX.
       console.error(`[sync-loan] borrower wallet ${borrowerStr} not in wallets table — loan ${loan_pda.slice(0, 8)}... cannot be attributed`);
       return {
         status: 404,
-        body: { error: "borrower wallet not linked to any Magpie user", borrower: borrowerStr },
+        body: { error: "loan_pda not found" },
       };
     }
     console.error(`[sync-loan] inserting new loan ${loan_pda.slice(0, 8)}... user=${walletRow.user_id} borrower=${borrowerStr.slice(0, 8)}...`);
