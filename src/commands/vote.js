@@ -17,10 +17,9 @@ function activeProposals() {
     .map(getProposal)
     .filter((p) => {
       if (!p?.voting_started_at_iso || !p?.voting_ends_at_iso) return false;
-      // Skip snapshot-only proposals (MGP-001 etc.) — they're not votes,
-      // they're eligibility-snapshot records for a distribution. Showing
-      // them with a "Cast your vote" button confuses users.
-      if (p.proposal_type === "snapshot_only") return false;
+      // Skip inert proposal types — snapshot-only (distribution eligibility
+      // records, not votes) and withdrawn (reconsolidated or retracted).
+      if (p.proposal_type === "snapshot_only" || p.proposal_type === "withdrawn") return false;
       const start = new Date(p.voting_started_at_iso);
       const end = new Date(p.voting_ends_at_iso);
       return now >= start && now <= end;
