@@ -6,6 +6,7 @@ import { getSolBalance } from "../services/deposits.js";
 import { executePartialRepay, recordPartialRepay, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
+import { formatLoanButtonLabel, totalOwedSol, countDueWithin } from "../services/loan-display.js";
 
 const pending = new Map();
 
@@ -30,7 +31,7 @@ export async function handlePartialRepay(ctx) {
   );
 
   if (rows.length === 0) {
-    return ctx.reply("📭 No active loans.");
+    return ctx.reply("No active loans.");
   }
 
   const { filtered: scopedRows, otherWalletCount } =
@@ -38,7 +39,7 @@ export async function handlePartialRepay(ctx) {
 
   if (scopedRows.length === 0) {
     return ctx.reply(
-      `📭 No active loans on your *current* wallet.` +
+      `No active loans on your *current* wallet.` +
       (otherWalletCount > 0
         ? `\n\n${otherWalletCount} loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets — /wallets to switch.`
         : ""),
@@ -52,24 +53,31 @@ export async function handlePartialRepay(ctx) {
   const kb = new InlineKeyboard();
   scopedRows.forEach((loan, i) => {
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · owe ${fmtSol(liveAmounts[i])} SOL`,
+      formatLoanButtonLabel(loan, liveAmounts[i], i + 1),
       `prepay:loan:${loan.id}`,
     ).row();
   });
-  kb.text("✕ Cancel", "prepay:cancel");
+  kb.text("Cancel", "prepay:cancel");
 
-  const header = "*Partial repay* (collateral stays locked until full payoff)\n\nPick a loan:" +
-    (otherWalletCount > 0
-      ? `\n_${otherWalletCount} more on other wallets — /wallets to switch._`
-      : "");
-  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
+  const totalSol = totalOwedSol(liveAmounts);
+  const dueSoonCount = countDueWithin(scopedRows, 24);
+  const summaryParts = [`${scopedRows.length} active`, `${totalSol} SOL owed total`];
+  if (dueSoonCount > 0) summaryParts.push(`${dueSoonCount} due within 24h`);
+  const headerLines = [
+    "*Partial repay* — collateral stays locked until full payoff.",
+    `_${summaryParts.join(" · ")} · sorted by due date_`,
+  ];
+  if (otherWalletCount > 0) {
+    headerLines.push("", `_+${otherWalletCount} more on other wallets — /wallets to switch._`);
+  }
+  await ctx.reply(headerLines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerPartialRepayCallbacks(bot) {
   bot.callbackQuery(/^prepay:cancel$/, async (ctx) => {
     pending.delete(ctx.chat.id);
     await ctx.answerCallbackQuery("Cancelled");
-    await ctx.editMessageText("❌ Partial repay cancelled.");
+    await ctx.editMessageText("Partial repay cancelled.");
   });
 
   bot.callbackQuery(/^prepay:loan:(\d+)$/, async (ctx) => {
@@ -92,7 +100,7 @@ export function registerPartialRepayCallbacks(bot) {
     if (loan.suspended) {
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(
-        "⚠️ This loan is under review and cannot be modified. Contact support.",
+        "This loan is under review and cannot be modified. Contact support.",
       );
       return;
     }
@@ -106,7 +114,7 @@ export function registerPartialRepayCallbacks(bot) {
     if (available <= 0) {
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(
-        `📭 Not enough SOL in wallet.\n\nDeposit SOL to:\n\`${publicKey}\``,
+        `Not enough SOL in wallet.\n\nDeposit SOL to:\n\`${publicKey}\``,
         { parse_mode: "Markdown" },
       );
       return;
@@ -118,7 +126,7 @@ export function registerPartialRepayCallbacks(bot) {
       .text("25%", "prepay:pct:25").text("50%", "prepay:pct:50")
       .text("75%", "prepay:pct:75")
       .row().text("✏️ Custom %", "prepay:custom")
-      .row().text("✕ Cancel", "prepay:cancel");
+      .row().text("Cancel", "prepay:cancel");
 
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
@@ -256,7 +264,7 @@ async function submitPartialRepay(ctx, state, repayLamports) {
     );
   }
 
-  await ctx.reply("⏳ Submitting partial repay on-chain...");
+  await ctx.reply("Submitting partial repay on-chain...");
 
   try {
     const result = await executePartialRepay({
@@ -270,7 +278,7 @@ async function submitPartialRepay(ctx, state, repayLamports) {
     const remaining = state.owed - repayLamports;
     await ctx.reply(
       [
-        "✅ *Partial repay submitted*",
+        "*Partial repay submitted*",
         "",
         `Paid: ${fmtSol(repayLamports)} SOL`,
         `Remaining: ${fmtSol(remaining)} SOL`,

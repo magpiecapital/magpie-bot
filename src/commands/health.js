@@ -13,16 +13,18 @@ import { query } from "../db/pool.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLiveOwedLamports } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
+import { formatTimeToDueLong, formatHealthLabel } from "../services/loan-display.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
 }
 
-function healthBadge(ratio) {
-  if (ratio >= 1.5) return { emoji: "🟢", label: "Healthy", color: "green" };
-  if (ratio >= 1.3) return { emoji: "🟡", label: "Watch", color: "yellow" };
-  if (ratio >= 1.1) return { emoji: "🟠", label: "Tight", color: "orange" };
-  return { emoji: "🔴", label: "Imminent liquidation", color: "red" };
+function healthHeadline(ratio) {
+  if (ratio == null || !Number.isFinite(ratio)) return "Unknown";
+  if (ratio >= 1.5) return "Healthy";
+  if (ratio >= 1.3) return "Watch";
+  if (ratio >= 1.1) return "Tight";
+  return "AT RISK — liquidation imminent";
 }
 
 function advice(ratio) {
@@ -123,16 +125,20 @@ export async function handleHealth(ctx) {
 
 async function renderHealth(ctx, loan, snap, multiple, otherWalletCount = 0) {
   const ratio = snap.ratio;
-  const badge = ratio != null ? healthBadge(ratio) : { emoji: "⚪", label: "Unknown" };
+  const symbol = loan.symbol ?? "?";
+  const headline = healthHeadline(ratio);
+  const timeStr = formatTimeToDueLong(loan.due_timestamp);
+  const healthBand = ratio != null ? formatHealthLabel(ratio) : "—";
 
   const lines = [
-    `${badge.emoji} *Loan #${loan.loan_id} — ${badge.label}*`,
+    `*${symbol} loan — ${headline}*`,
+    `_${timeStr} · ${loan.ltv_percentage}% LTV · ${loan.duration_days}d term_`,
     "",
-    `Collateral: \`${snap.tokens.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${loan.symbol ?? "?"}\``,
+    `Collateral: \`${snap.tokens.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${symbol}\``,
     snap.collateralLamports != null ? `  Value: \`${fmtSol(snap.collateralLamports)} SOL\`` : "  Value: _price feed unavailable_",
     `Owed:       \`${fmtSol(snap.liveOwed)} SOL\``,
-    ratio != null ? `Health:     *${ratio.toFixed(2)}x*` : "Health:     _unknown_",
-    snap.liqPriceSol != null ? `Liq. price: \`${snap.liqPriceSol.toFixed(9)} SOL/${loan.symbol ?? "token"}\`` : "",
+    ratio != null ? `Health:     *${ratio.toFixed(2)}× (${healthBand})*` : "Health:     _unknown_",
+    snap.liqPriceSol != null ? `Liq. price: \`${snap.liqPriceSol.toFixed(9)} SOL/${symbol === "?" ? "token" : symbol}\`` : "",
     "",
     ratio != null ? advice(ratio) : "Couldn't compute health right now — try /health again in 15s.",
   ].filter(Boolean);
@@ -145,11 +151,11 @@ async function renderHealth(ctx, loan, snap, multiple, otherWalletCount = 0) {
   }
 
   const kb = new InlineKeyboard()
-    .text("🔧 Repay", `repay:loan:${loan.id}`)
-    .text("➕ Top up", `topup:loan:${loan.id}`)
+    .text("Repay", `repay:loan:${loan.id}`)
+    .text("Top up", `topup:loan:${loan.id}`)
     .row()
-    .text("⏱ Extend", `extend:loan:${loan.id}`)
-    .text("💰 Partial", `partialrepay:loan:${loan.id}`);
+    .text("Extend", `extend:loan:${loan.id}`)
+    .text("Partial repay", `partialrepay:loan:${loan.id}`);
 
   await ctx.reply(lines.join("\n"), {
     parse_mode: "Markdown",

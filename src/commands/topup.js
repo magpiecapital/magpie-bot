@@ -3,9 +3,10 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { query } from "../db/pool.js";
 import { getTokenBalance } from "../services/deposits.js";
-import { executeAddCollateral, recordAddCollateral, checkLoanOwnership } from "../services/loans.js";
+import { executeAddCollateral, recordAddCollateral, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
+import { formatLoanButtonLabel, countDueWithin } from "../services/loan-display.js";
 
 const pending = new Map();
 
@@ -29,7 +30,7 @@ export async function handleTopup(ctx) {
   );
 
   if (rows.length === 0) {
-    return ctx.reply("📭 No active loans. Use /borrow to open one.");
+    return ctx.reply("No active loans. Use /borrow to open one.");
   }
 
   // Scope to active wallet (multi-wallet users were seeing loans they
@@ -39,7 +40,7 @@ export async function handleTopup(ctx) {
 
   if (scopedRows.length === 0) {
     return ctx.reply(
-      `📭 No active loans on your *current* wallet.\n\n` +
+      `No active loans on your *current* wallet.\n\n` +
       (otherWalletCount > 0
         ? `You have *${otherWalletCount}* loan${otherWalletCount === 1 ? "" : "s"} on other linked wallets. Use /wallets to switch first.`
         : `Use /borrow to open one.`),
@@ -47,28 +48,38 @@ export async function handleTopup(ctx) {
     );
   }
 
+  // Live owed amounts for the button labels so users see what's
+  // outstanding alongside the time-to-due (matches /repay's UI).
+  const liveAmounts = await Promise.all(scopedRows.map(getLiveOwedLamports));
+
   const kb = new InlineKeyboard();
-  for (const loan of scopedRows) {
-    const human = fmtAmount(loan.collateral_amount, loan.decimals ?? 9);
+  scopedRows.forEach((loan, i) => {
     kb.text(
-      `#${loan.loan_id} · ${loan.symbol ?? "?"} · ${human.toLocaleString()}`,
+      formatLoanButtonLabel(loan, liveAmounts[i], i + 1),
       `topup:loan:${loan.id}`,
     ).row();
-  }
-  kb.text("✕ Cancel", "topup:cancel");
+  });
+  kb.text("Cancel", "topup:cancel");
 
-  const header = `*Add collateral* (improves health ratio, no fee)\n\nPick a loan:` +
-    (otherWalletCount > 0
-      ? `\n_Showing loans on your active wallet. ${otherWalletCount} more on other wallets — /wallets to switch._`
-      : "");
-  await ctx.reply(header, { parse_mode: "Markdown", reply_markup: kb });
+  const dueSoonCount = countDueWithin(scopedRows, 24);
+  const headerLines = [
+    `*Add collateral* — improves health, no fee.`,
+    `_${scopedRows.length} active${dueSoonCount > 0 ? ` · ${dueSoonCount} due within 24h` : ""} · sorted by due date_`,
+  ];
+  if (otherWalletCount > 0) {
+    headerLines.push(
+      "",
+      `_+${otherWalletCount} more on other wallets — /wallets to switch._`,
+    );
+  }
+  await ctx.reply(headerLines.join("\n"), { parse_mode: "Markdown", reply_markup: kb });
 }
 
 export function registerTopupCallbacks(bot) {
   bot.callbackQuery(/^topup:cancel$/, async (ctx) => {
     pending.delete(ctx.chat.id);
     await ctx.answerCallbackQuery("Cancelled");
-    await ctx.editMessageText("❌ Top-up cancelled.");
+    await ctx.editMessageText("Top-up cancelled.");
   });
 
   bot.callbackQuery(/^topup:loan:(\d+)$/, async (ctx) => {
@@ -93,7 +104,7 @@ export function registerTopupCallbacks(bot) {
     if (!balance || BigInt(balance.rawAmount) === 0n) {
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(
-        `📭 No ${loan.symbol ?? "tokens"} in your wallet to add as collateral.\n\nDeposit to:\n\`${publicKey}\``,
+        `No ${loan.symbol ?? "tokens"} in your wallet to add as collateral.\n\nDeposit to:\n\`${publicKey}\``,
         { parse_mode: "Markdown" },
       );
       return;
@@ -104,14 +115,14 @@ export function registerTopupCallbacks(bot) {
     const kb = new InlineKeyboard()
       .text("25%", "topup:pct:25").text("50%", "topup:pct:50")
       .text("75%", "topup:pct:75").text("100%", "topup:pct:100")
-      .row().text("✏️ Custom %", "topup:custom")
-      .row().text("✕ Cancel", "topup:cancel");
+      .row().text("Custom %", "topup:custom")
+      .row().text("Cancel", "topup:cancel");
 
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
-        `Loan #${loan.loan_id} · ${loan.symbol ?? "?"}`,
-        `Current collateral: ${fmtAmount(loan.collateral_amount, loan.decimals ?? 9).toLocaleString()}`,
+        `${loan.symbol ?? "?"} loan`,
+        `Current collateral: ${fmtAmount(loan.collateral_amount, loan.decimals ?? 9).toLocaleString()} ${loan.symbol ?? ""}`,
         `Wallet balance: ${balance.humanAmount.toLocaleString()} ${loan.symbol ?? ""}`,
         "",
         "*How much to add?*",
@@ -132,7 +143,7 @@ export function registerTopupCallbacks(bot) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
-        `Loan #${state.loan.loan_id} · ${state.loan.symbol ?? "?"}`,
+        `${state.loan.symbol ?? "?"} loan`,
         `Wallet balance: ${state.balance.humanAmount.toLocaleString()} ${state.loan.symbol ?? ""}`,
         "",
         `Type the *%* of your wallet balance to add as collateral.`,
@@ -211,7 +222,7 @@ async function submitTopup(ctx, state, rawBig) {
     );
   }
 
-  await ctx.reply("⏳ Adding collateral on-chain...");
+  await ctx.reply("Adding collateral on-chain...");
 
   try {
     const result = await executeAddCollateral({
@@ -225,10 +236,10 @@ async function submitTopup(ctx, state, rawBig) {
     const addedHuman = Number(rawBig) / Math.pow(10, state.loan.decimals ?? 9);
     await ctx.reply(
       [
-        "✅ *Collateral added*",
+        "*Collateral added*",
         "",
         `Added: ${addedHuman.toLocaleString()} ${state.loan.symbol ?? ""}`,
-        `Loan #${state.loan.loan_id} health improved.`,
+        `${state.loan.symbol ?? "?"} loan health improved.`,
         "",
         `[View tx](https://solscan.io/tx/${result.signature})`,
         "",
