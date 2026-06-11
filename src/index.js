@@ -530,18 +530,31 @@ bot.start({
     // in prod for several hours after PR-merge today because there was
     // no auto-runner — manual psql was the previous workflow. We crash
     // on failure: a half-migrated DB is worse than a visibly-down bot.
-    import("./db/migrations-runner.js").then((m) => m.applyPendingMigrations()).then((res) => {
-      if (res.applied.length > 0) {
-        console.log(`[migrations] applied ${res.applied.length} new migration(s): ${res.applied.join(", ")}`);
+    //
+    // Sequencing matters: the previous version kicked both
+    // applyPendingMigrations and applyStartupPatches off as parallel
+    // .then() chains, which meant startup-patches could race against
+    // the migration runner during a clean deploy — patches could land
+    // on a pre-migration schema (and either fail or no-op the wrong
+    // version of the table). The IIFE serializes them.
+    (async () => {
+      try {
+        const runner = await import("./db/migrations-runner.js");
+        const res = await runner.applyPendingMigrations();
+        if (res.applied.length > 0) {
+          console.log(`[migrations] applied ${res.applied.length} new migration(s): ${res.applied.join(", ")}`);
+        }
+      } catch (err) {
+        console.error("[bot] migrations FAILED — crashing:", err.message);
+        process.exit(1);
       }
-    }).catch((err) => {
-      console.error("[bot] migrations FAILED — crashing:", err.message);
-      process.exit(1);
-    });
-    // Apply idempotent schema patches AFTER file-based migrations.
-    import("./db/pool.js").then((m) => m.applyStartupPatches()).catch((err) => {
-      console.warn("[bot] applyStartupPatches failed (continuing):", err.message);
-    });
+      try {
+        const pool = await import("./db/pool.js");
+        await pool.applyStartupPatches();
+      } catch (err) {
+        console.warn("[bot] applyStartupPatches failed (continuing):", err.message);
+      }
+    })();
     startDbHealth(bot); // Start immediately — monitors DB connectivity
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1

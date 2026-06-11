@@ -101,7 +101,26 @@ async function attemptAutoProtect(bot, row) {
   } catch {
     return; // pricing blip, skip this tick
   }
-  const owed = Number(row.original_loan_amount_lamports);
+  // Use the on-chain owed amount, not row.original_loan_amount_lamports
+  // directly. The DB column is supposed to track partial repays via
+  // recordPartialRepay, but that write can fail silently (see the
+  // comment above getLiveOwedLamports in loans.js) — leaving the DB
+  // stale while on-chain truth has moved on. Auto-protect using the
+  // stale DB value would over-repay (chasing a debt that's been
+  // partially settled) or, worse, mis-classify a healthy loan as in
+  // danger and burn through MAX_ACTIONS_PER_LOAN_PER_DAY needlessly.
+  // getLiveOwedLamports also self-heals the DB drift opportunistically.
+  let owedBig;
+  try {
+    owedBig = await getLiveOwedLamports(row);
+  } catch {
+    // RPC blip — fall back to the DB value rather than skipping the
+    // tick entirely. If on-chain is healthier than DB thinks, we
+    // might over-act; if on-chain is sicker, we'd under-act. Either
+    // way, the next tick will reconcile.
+    owedBig = BigInt(row.original_loan_amount_lamports);
+  }
+  const owed = Number(owedBig);
   if (owed <= 0) return;
   const healthBefore = collateralLamports / owed;
   if (healthBefore >= DANGER_THRESHOLD) return; // healthy — nothing to do

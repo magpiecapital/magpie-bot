@@ -280,14 +280,34 @@ export async function collateralValueLamports(mint, rawAmount, decimals) {
 // active at newer_multiplier_effective_timestamp. We pick whichever the
 // current wall-clock says is in force.
 
-const SCALED_UI_CACHE = new Map(); // mint → { multiplier, expires_at_ms }
+const SCALED_UI_CACHE = new Map(); // mint → { multiplier, expires_at_ms, fetched_at_ms, was_extension_observed }
 const SCALED_UI_TTL_MS = 15 * 60 * 1000;
 const SCALED_UI_NEGATIVE_TTL_MS = 60 * 60 * 1000; // 1h cache that "no extension exists"
+// Last-known-good staleness ceiling. We'll serve a stale multiplier
+// from cache during sustained RPC outages, but if we haven't been
+// able to refresh in this long we log a loud warning every fetch so
+// the operator sees something is broken. Backed updates multipliers
+// at most a few times per year; a 24-hour gap is still safe but
+// definitely needs attention.
+const SCALED_UI_STALE_WARN_MS = 24 * 60 * 60 * 1000;
+// Wall-clock boundary buffer for the newer-multiplier flip. If the
+// effective timestamp is within this window of "now", pick the lower
+// of older/newer (conservative — under-valuing collateral is safer
+// for the protocol than over-valuing it). Catches clocks skewed up
+// to 5 minutes vs on-chain consensus time.
+const SCALED_UI_EFFECTIVE_TS_BUFFER_SEC = 5 * 60;
 
 /**
  * Returns the live ScaledUiAmount multiplier for a mint. For mints
  * without the extension (every non-Token-2022 token + most Token-2022
  * tokens), returns 1.0. Cached.
+ *
+ * Outage behavior: during a sustained RPC outage we serve the
+ * last-known-good multiplier from cache rather than degrading to
+ * 1.0. Falling back to 1.0 under-values Backed xStocks (currently
+ * ~0.26% for SPYx) and would compound after every dividend update —
+ * a long outage could push a borrower over the liquidation threshold
+ * from a stale-multiplier under-valuation alone.
  */
 export async function getScaledUiMultiplier(mint) {
   const now = Date.now();
@@ -295,6 +315,8 @@ export async function getScaledUiMultiplier(mint) {
   if (cached && cached.expires_at_ms > now) return cached.multiplier;
 
   let multiplier = 1.0;
+  let extensionObserved = false;
+  let fetchFailed = false;
   try {
     const { PublicKey } = await import("@solana/web3.js");
     const spl = await import("@solana/spl-token");
@@ -308,34 +330,78 @@ export async function getScaledUiMultiplier(mint) {
         ? getExtensionData(ExtensionType.ScaledUiAmountConfig, m.tlvData)
         : null;
       if (scalData && scalData.length >= 56) {
+        extensionObserved = true;
         // Layout: authority(32) + multiplier(f64=8) +
         //         newer_multiplier_effective_timestamp(i64=8) + newer_multiplier(f64=8)
         const older = scalData.readDoubleLE(32);
         const newerEffectiveTs = scalData.readBigInt64LE(40);
         const newer = scalData.readDoubleLE(48);
         const nowSec = Math.floor(Date.now() / 1000);
-        multiplier = nowSec >= Number(newerEffectiveTs) && Number.isFinite(newer) && newer > 0
-          ? newer
-          : older;
+        const newerValid = Number.isFinite(newer) && newer > 0;
+        const olderValid = Number.isFinite(older) && older > 0;
+        const tsNum = Number(newerEffectiveTs);
+        // Conservative selection during the boundary window: if the
+        // wall clock is within SCALED_UI_EFFECTIVE_TS_BUFFER_SEC of
+        // the effective timestamp AND both multipliers are valid,
+        // pick the LOWER one. This makes wall-clock skew under-value
+        // rather than over-value collateral — safer for the protocol
+        // than the reverse (an early flip could over-value, leading
+        // to under-collateralized loans).
+        if (newerValid && olderValid && Math.abs(nowSec - tsNum) <= SCALED_UI_EFFECTIVE_TS_BUFFER_SEC) {
+          multiplier = Math.min(older, newer);
+        } else if (nowSec >= tsNum && newerValid) {
+          multiplier = newer;
+        } else {
+          multiplier = older;
+        }
         // Defensive: never apply a non-finite or non-positive multiplier.
-        // Better to value the collateral at "raw / 10^decimals" (pre-multiplier)
-        // than to multiply by NaN and silently zero everything out.
         if (!Number.isFinite(multiplier) || multiplier <= 0) {
           console.warn(`[price] ScaledUiAmount multiplier for ${mint.slice(0, 8)} is non-finite (${multiplier}); falling back to 1.0`);
           multiplier = 1.0;
+          extensionObserved = false;
         }
       }
     }
     SCALED_UI_CACHE.set(mint, {
       multiplier,
       expires_at_ms: now + (multiplier === 1.0 ? SCALED_UI_NEGATIVE_TTL_MS : SCALED_UI_TTL_MS),
+      fetched_at_ms: now,
+      was_extension_observed: extensionObserved,
     });
   } catch (err) {
-    // Fail-safe: 1.0 means the formula degrades to the pre-existing
-    // (correct for non-ScaledUiAmount tokens) behavior. Cache briefly
-    // so a transient RPC blip doesn't hammer the chain on every loan.
+    fetchFailed = true;
+    // Sustained-outage degradation defense. Behavior matrix:
+    //   - cached value exists + extension was observed → serve stale,
+    //     warn if older than SCALED_UI_STALE_WARN_MS.
+    //   - cached value exists + extension was never observed → keep
+    //     1.0 (correct for non-RWA tokens; transient RPC blip on a
+    //     plain SPL token should not become a warning storm).
+    //   - no cache → 1.0 for this call but cache it only briefly so
+    //     we retry soon (don't poison the cache with 1.0 for 15min
+    //     on a one-off RPC blip mid-loan).
     console.warn(`[price] getScaledUiMultiplier failed for ${mint.slice(0, 8)}: ${err.message}`);
-    SCALED_UI_CACHE.set(mint, { multiplier: 1.0, expires_at_ms: now + 60_000 });
+    if (cached && cached.was_extension_observed) {
+      const staleMs = now - (cached.fetched_at_ms || 0);
+      if (staleMs > SCALED_UI_STALE_WARN_MS) {
+        console.warn(
+          `[price] CRITICAL: ScaledUiAmount cache for ${mint.slice(0, 8)} is ${Math.round(staleMs / 3_600_000)}h stale ` +
+          `and RPC is failing. Collateral valuation may be off-by-dividend. Investigate RPC health.`,
+        );
+      }
+      // Extend the existing entry briefly but DON'T overwrite
+      // fetched_at_ms — we want the staleness clock to keep ticking.
+      SCALED_UI_CACHE.set(mint, {
+        ...cached,
+        expires_at_ms: now + 60_000,
+      });
+      return cached.multiplier;
+    }
+    SCALED_UI_CACHE.set(mint, {
+      multiplier: 1.0,
+      expires_at_ms: now + 60_000,
+      fetched_at_ms: cached?.fetched_at_ms ?? 0,
+      was_extension_observed: false,
+    });
   }
   return multiplier;
 }
