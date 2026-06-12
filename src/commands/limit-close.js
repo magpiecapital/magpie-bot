@@ -27,6 +27,7 @@
 import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
 import { runArmPreflight } from "../services/limit-close-preflight.js";
+import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
 
 const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL eligibility floor
 const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -282,204 +283,112 @@ export async function handleLimitClose(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
-  // 1. Loan must belong to this user, be active, and meet min size.
-  const { rows: [loan] } = await query(
-    `SELECT id, loan_id, status,
-            original_loan_amount_lamports::text AS owed,
-            collateral_mint, collateral_amount::text AS coll_amount,
-            collateral_amount::text AS collateral_amount_raw
-       FROM loans
-      WHERE user_id = $1 AND loan_id = $2`,
-    [user.id, loan_id],
-  );
-  if (!loan) {
-    return ctx.reply(`Loan #${loan_id} not found in your account.`);
-  }
-  if (loan.status !== "active") {
-    return ctx.reply(`Loan #${loan_id} is ${loan.status}, not active. Limit-close orders require an active loan.`);
-  }
-  if (BigInt(loan.owed) < MIN_LOAN_LAMPORTS) {
-    return ctx.reply(`Loan is below the 1 SOL minimum for limit-close orders.`);
-  }
-
-  // 2. Collateral must be on the limit-close allowlist (operator-controlled
-  //    column on supported_mints; default true for memecoins, false for RWAs
-  //    until v1.1 ships).
-  const { rows: [mintRow] } = await query(
-    `SELECT enabled, category, symbol, COALESCE(limit_close_enabled, FALSE) AS limit_close_enabled
-       FROM supported_mints WHERE mint = $1`,
-    [loan.collateral_mint],
-  );
-  if (!mintRow || !mintRow.enabled) {
-    return ctx.reply(`Collateral token is not currently enabled in the protocol.`);
-  }
-  // limit_close_enabled column doesn't exist yet — falls back to category-based default.
-  // For v1: memecoins eligible, RWAs (stock/etf/metal) deferred to v1.1.
-  if (["stock", "etf", "metal"].includes(mintRow.category)) {
-    return ctx.reply(
-      `Limit-close is not available on RWA collateral (xStocks/metals) in v1. ` +
-      `Memecoin collateral only for now. Coming in v1.1.`,
-    );
-  }
-
-  // 3. Per-user concurrency cap.
-  const { rows: [activeCount] } = await query(
-    `SELECT COUNT(*)::int AS n FROM limit_close_orders
-       WHERE user_id = $1 AND status = 'armed'`,
-    [user.id],
-  );
-  if (activeCount.n >= MAX_ACTIVE_ORDERS_PER_USER) {
-    return ctx.reply(`You have ${activeCount.n} active limit orders (max ${MAX_ACTIVE_ORDERS_PER_USER}). Cancel one with /cancellimitorder first.`);
-  }
-
-  // 3b. Resolve the natural-language "at <N>x" multiplier to a concrete
-  //     USD price target. The user said "sell at 2x" — we lock in
-  //     2× the CURRENT live USD price as the trigger so the meaning is
-  //     stable regardless of when the engine actually evaluates.
-  //
-  //     Skipped when trigger_value_micro is already set from explicit
-  //     mc=/price= syntax.
-  // Same module the health watcher + risk engine use — cross-sourced
-  // for accuracy + drift detection.
+  // Multiplier path: resolve "at 2x" to a concrete USD micros price BEFORE
+  // calling armOrder. armOrder takes a concrete trigger_value_micro — the
+  // multiplier-to-price resolution is a TG-specific UX concern.
   let multiplierContextLine = null;
   if (multiplier != null && trigger_value_micro == null) {
-    try {
-      const { getPriceInUsdCrossSourced } = await import("../services/price.js");
-      const currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
-      if (!currentUsdPerToken || currentUsdPerToken <= 0) {
-        return ctx.reply(
-          `Couldn't fetch current USD price for ${mintRow.symbol || "collateral"} to resolve "at ${multiplier}×". Try again, or use \`at $<usd_price>\` instead.`,
-          { parse_mode: "Markdown" },
-        );
-      }
-      const targetUsdPerToken = currentUsdPerToken * multiplier;
-      // price_usd micros = USD × 1e6
-      trigger_value_micro = BigInt(Math.round(targetUsdPerToken * 1e6));
-      if (trigger_value_micro < MIN_TRIGGER_VALUE_MICRO || trigger_value_micro > MAX_TRIGGER_VALUE_MICRO) {
-        return ctx.reply(`Resolved target is out of range. Try a smaller multiplier or an explicit \`at $<usd_price>\`.`);
-      }
-      const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
-      multiplierContextLine =
-        `Current: $${fmt(currentUsdPerToken)} → target: $${fmt(targetUsdPerToken)} (${multiplier}×)`;
-    } catch (err) {
-      console.warn("[limit-close] multiplier resolve failed:", err.message);
-      return ctx.reply(
-        `Couldn't resolve "at ${multiplier}×" right now. Try \`at $<usd_price>\` instead, or try again in a moment.`,
-        { parse_mode: "Markdown" },
-      );
+    // We need the collateral mint to resolve. armOrder will re-fetch this
+    // anyway, but at this stage we only need a cheap loans-table lookup.
+    const { rows: [loanForMint] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id = $2`,
+      [user.id, loan_id],
+    );
+    if (!loanForMint) {
+      // armOrder will surface this same error anyway, but a friendly
+      // pre-emptive message reads better than the resolveMultiplier
+      // error.
+      return ctx.reply(`Loan #${loan_id} not found in your account.`);
     }
+    const r = await resolveMultiplierToPrice(loanForMint.collateral_mint, multiplier);
+    if (!r.ok) {
+      return ctx.reply(r.error, { parse_mode: "Markdown" });
+    }
+    trigger_value_micro = r.triggerValueMicro;
+    trigger_kind = "price_usd";
+    const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+    multiplierContextLine = `Current: $${fmt(r.currentUsd)} → target: $${fmt(r.targetUsd)} (${multiplier}×)`;
   }
 
-  // 4. Pre-flight liquidity check (Layer 1).
-  //    Quote Jupiter at current state. If the order can't clear at the
-  //    user's slippage right now, refuse with a friendly suggestion.
-  //    Fail-open on Jupiter outages — advisory not gating.
-  const preflight = await runArmPreflight({
-    collateralMint: loan.collateral_mint,
-    collateralAmountRaw: loan.collateral_amount_raw,
-    sellDestination: dest,
+  // Hand off to arm-core. This consolidates loan ownership, mint
+  // allowlist + RWA exclusion, concurrency cap, fill-guarantee defaults
+  // (autoEscalate=true, derived cap), liquidity-aware initial bump,
+  // direction sanity check, INSERT, and the unique-index race guard.
+  // Any future hardening in arm-core lands here automatically.
+  const armed = await armOrder({
+    userId: user.id,
+    source: "tg",
+    loanIdChain: String(loan_id),
+    triggerKind: trigger_kind,
+    triggerValueMicro: trigger_value_micro.toString(),
     slippageBps: slippage_bps,
-    loanOwedLamports: loan.owed,
-    protocolFeeBps: 100,
+    sellDestination: dest,
+    expiresAt: expire_iso,
   });
-  if (!preflight.ok) {
-    if (preflight.reason === "slippage_too_low" && preflight.suggestedSlippageBps) {
-      return ctx.reply(
-        [
-          `*Order would not fill right now.*`,
-          ``,
-          `At current liquidity, ${(slippage_bps / 100).toFixed(2)}% slippage can't cover the loan + fee.`,
-          `A setting of *${(preflight.suggestedSlippageBps / 100).toFixed(2)}%* would clear at current prices.`,
-          ``,
-          `Re-run with \`slip=${(preflight.suggestedSlippageBps / 100).toFixed(2)}%\` or wait for deeper liquidity.`,
-        ].join("\n"),
-        { parse_mode: "Markdown" },
-      );
-    }
-    if (preflight.reason === "liquidity_insufficient") {
-      return ctx.reply(
-        `*Can't arm this order.*\n\n` +
-        `Even at 10% slippage, current Jupiter routes can't cover the loan + fee. ` +
-        `Consider a smaller collateral position, lowering your trigger, or waiting for deeper liquidity.`,
-        { parse_mode: "Markdown" },
-      );
-    }
-    if (preflight.reason === "no_route_for_collateral") {
-      return ctx.reply(
-        `Jupiter can't route a swap for this collateral right now. ` +
-        `Wait a few minutes and try again.`,
-      );
-    }
-    return ctx.reply(
-      `Couldn't pre-check the order: ${preflight.reason}. Please try again.`,
-    );
-  }
-  const preflightAdvisory = !!preflight.advisory;
 
-  // Fill-guarantee defaults — match arm-core's derivation so TG orders
-  // get the same escalation headroom as site / agent paths. Operator
-  // mandate: "the order MUST execute." Cap = max(2500, slip * 8) capped
-  // at 5000 bps. Engine walks UNDER the cap on revert; never above.
-  const derivedCapBps = Math.min(5000, Math.max(2500, slippage_bps * 8));
-
-  // Liquidity-aware initial slippage — mirrors arm-core. Bumps the
-  // INITIAL up to a token-liquidity-appropriate floor for thin tokens
-  // so the engine's first attempt is more likely to fill (saves a 30s
-  // retry cycle on auto-escalation). Treats liquidity_usd <= 0 as
-  // UNKNOWN (no bump) — bumping on missing screener data would surprise
-  // the user. Cap is unchanged.
-  const liqUsd = Number(mintRow.liquidity_usd ?? 0);
-  let liquidityFloorBps = 0;
-  if (liqUsd <= 0) liquidityFloorBps = 0;
-  else if (liqUsd >= 100_000) liquidityFloorBps = 0;
-  else if (liqUsd >= 25_000) liquidityFloorBps = 300;
-  else if (liqUsd >= 5_000) liquidityFloorBps = 500;
-  else liquidityFloorBps = 1000;
-  const originalInitialBps = slippage_bps;
-  const appliedInitialBps = liquidityFloorBps > 0 && slippage_bps < liquidityFloorBps
-    ? Math.min(liquidityFloorBps, derivedCapBps)
-    : slippage_bps;
-
-  // 5. Insert. The UNIQUE partial index on (loan_id WHERE status='armed')
-  //    makes "two orders on the same loan" physically impossible at the
-  //    storage layer.
-  let insertResult;
-  try {
-    insertResult = await query(
-      `INSERT INTO limit_close_orders
-         (user_id, loan_id, trigger_kind, trigger_value_micro,
-          slippage_bps, sell_destination, expires_at, source, status, armed_at,
-          initial_slippage_bps, auto_escalate_slippage, max_slippage_bps_cap,
-          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
-          notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'tg', 'armed', NOW(),
-               $8, TRUE, $9,
-               $10, $11, $12, $13)
-       RETURNING id`,
-      [user.id, loan.id, trigger_kind, trigger_value_micro.toString(),
-       appliedInitialBps, dest, expire_iso,
-       appliedInitialBps, derivedCapBps,
-       preflightAdvisory ? null : appliedInitialBps,
-       preflightAdvisory ? null : (preflight.proceedsLamports || null),
-       preflightAdvisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
-       appliedInitialBps !== originalInitialBps
-         ? `armed via tg; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
-         : "armed via tg"],
-    );
-  } catch (err) {
-    if (/duplicate key value violates unique constraint/i.test(err.message)) {
-      return ctx.reply(`This loan already has an active limit order. Cancel it first with /cancellimitorder.`);
-    }
-    console.error("[limit-close] insert failed:", err.message);
-    return ctx.reply(`Couldn't arm the order. Try again.`);
+  if (!armed.ok) {
+    // Translate arm-core error codes to TG-friendly copy. Anything
+    // unrecognized falls through to a generic message rather than
+    // echoing the internal code.
+    const m = (() => {
+      switch (armed.error) {
+        case "loan_not_found_for_user":
+          return `Loan #${loan_id} not found in your account.`;
+        case "loan_not_active":
+          return `Loan #${loan_id} is ${armed.detail || "not active"}, not active. Limit-close orders require an active loan.`;
+        case "loan_below_minimum_size":
+          return `Loan is below the 1 SOL minimum for limit-close orders.`;
+        case "collateral_not_enabled":
+          return `Collateral token is not currently enabled in the protocol.`;
+        case "rwa_collateral_not_supported_in_v1":
+          return `Limit-close is not available on RWA collateral (xStocks/metals) in v1. Memecoin collateral only for now. Coming in v1.1.`;
+        case "user_concurrency_cap_reached":
+          return `You have ${armed.detail?.active} active limit orders (max ${armed.detail?.cap}). Cancel one with /cancellimitorder first.`;
+        case "loan_already_has_active_order":
+          return `This loan already has an active limit order. Cancel it first with /cancellimitorder.`;
+        case "slippage_too_low":
+          return [
+            `*Order would not fill right now.*`,
+            ``,
+            `At current liquidity, ${(slippage_bps / 100).toFixed(2)}% slippage can't cover the loan + fee.`,
+            armed.suggestedSlippageBps
+              ? `A setting of *${(armed.suggestedSlippageBps / 100).toFixed(2)}%* would clear at current prices.`
+              : "",
+            ``,
+            armed.suggestedSlippageBps
+              ? `Re-run with \`slip=${(armed.suggestedSlippageBps / 100).toFixed(2)}%\` or wait for deeper liquidity.`
+              : "Wait for deeper liquidity or pick a smaller collateral position.",
+          ].filter(Boolean).join("\n");
+        case "liquidity_insufficient":
+          return `*Can't arm this order.*\n\nEven at the protocol's maximum slippage, current Jupiter routes can't cover the loan + fee. Consider a smaller collateral position, lowering your trigger, or waiting for deeper liquidity.`;
+        case "no_route_for_collateral":
+          return `Jupiter can't route a swap for this collateral right now. Wait a few minutes and try again.`;
+        case "trigger_below_current":
+        case "trigger_above_current":
+          return `${armed.detail || "Trigger is on the wrong side of the current price."}`;
+        default:
+          console.error(`[limit-close] arm-core returned unrecognized error: ${armed.error}`, armed);
+          return `Couldn't arm the order: ${armed.error}. Please try again.`;
+      }
+    })();
+    return ctx.reply(m, { parse_mode: "Markdown" });
   }
 
-  const orderId = insertResult.rows[0].id;
+  // Success — render the confirmation. arm-core surfaces any liquidity
+  // bump via initialSlippageBpsRequested vs initialSlippageBpsApplied
+  // so we can show the bump line when relevant.
+  const orderId = armed.orderId;
+  const loan = armed.loan;
+  const mintRow = armed.mint;
   const triggerLabel = fmtTrigger(trigger_kind, trigger_value_micro);
   const owedSol = (Number(loan.owed) / 1e9).toFixed(4);
   const expiryLabel = expire_iso ? ` (expires ${expire_iso.slice(0, 10)})` : "";
-
   const symbol = mintRow.symbol || "your collateral";
+
+  const appliedInitial = armed.initialSlippageBpsApplied ?? slippage_bps;
+  const originalInitial = armed.initialSlippageBpsRequested ?? slippage_bps;
+  const bumped = appliedInitial !== originalInitial;
+
   await ctx.reply(
     [
       `*Take-profit armed* — order #${orderId}${expiryLabel}`,
@@ -487,9 +396,9 @@ export async function handleLimitClose(ctx) {
       `Loan: #${loan.loan_id} (${symbol})`,
       `Trigger: ${triggerLabel}`,
       multiplierContextLine ? `_${multiplierContextLine}_` : null,
-      `Slippage: ${(appliedInitialBps / 100).toFixed(2)}%${
-        appliedInitialBps !== originalInitialBps
-          ? ` _(bumped from ${(originalInitialBps / 100).toFixed(2)}% — ${symbol} has thin liquidity)_`
+      `Slippage: ${(appliedInitial / 100).toFixed(2)}%${
+        bumped
+          ? ` _(bumped from ${(originalInitial / 100).toFixed(2)}% — ${symbol} has thin liquidity)_`
           : ""
       }`,
       `Destination: ${dest.toUpperCase()}`,
