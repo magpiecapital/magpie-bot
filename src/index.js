@@ -547,12 +547,12 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
-    // Raid monitor — polls the curated influencer list (raid_targets)
-    // every 90s. Posts new tweets to @magpietalk with a raid CTA and
-    // tracks /raided claims against a per-event goal. Prefers X API
-    // when X_BEARER_TOKEN is set, falls back to Nitter RSS otherwise.
-    // RAID_MONITOR_DISABLED=true on Railway hard-stops the poller.
-    import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
+    // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
+    // upstream instances die constantly and the X API requires a paid
+    // bearer token; alerts about "data sources offline" were noise.
+    // To re-enable: uncomment the line below + supply X_BEARER_TOKEN
+    // on Railway. Code lives in src/services/raid-monitor.js untouched.
+    // import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
     // Notification sender — drains pending_notifications and DMs users.
     // Used by the private limit-close engine to talk back to TG users.
     import("./services/notification-sender.js").then((m) => m.startNotificationSender(bot));
