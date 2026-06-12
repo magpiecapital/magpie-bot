@@ -36,11 +36,20 @@
  *   monitor must NEVER cause the bot to crash. Better to silently
  *   miss an alert than take down the very thing we're monitoring.
  */
+import { PublicKey } from "@solana/web3.js";
 import { query, pool } from "../db/pool.js";
+import { connection } from "../solana/connection.js";
 import { notifyAdmin } from "./admin-notify.js";
 
 const TICK_MS = 60_000;
 const ALERT_COOLDOWN_MS = 15 * 60_000; // 15 min between same-kind alerts
+
+// Floor at which the engine topup wallet is considered low. ~15 topups
+// at 0.03 SOL each — enough headroom that the operator gets a DM well
+// before any order fails for lack of topup funds. Override via env.
+const ENGINE_TOPUP_LOW_LAMPORTS = BigInt(
+  process.env.ENGINE_TOPUP_LOW_LAMPORTS || "500000000", // 0.5 SOL
+);
 
 // In-memory state. Reset on bot restart, which is fine: restart =
 // fresh start = no prior context to track.
@@ -233,6 +242,47 @@ async function probeTwapWatchdogMisses(bot) {
   }
 }
 
+/**
+ * Engine topup wallet — the operator wallet that funds the small SOL
+ * reserve the limit-close engine pushes to borrower wallets at fire
+ * time. If this wallet drains, every subsequent take-profit fires with
+ * topup_failed and reverts to armed forever. Per the operator-stated
+ * "MUST execute" reliability mandate, we DM well before that point.
+ *
+ * The probe reads the PUBLIC KEY from env (the secret stays in the
+ * engine's env only). A missing env var silently no-ops — engines
+ * running pre-topup-PR or non-prod environments shouldn't alert.
+ */
+async function probeEngineTopupWallet(bot) {
+  const KIND = "engine_topup_low";
+  const pubkeyStr = process.env.ENGINE_TOPUP_PUBKEY;
+  if (!pubkeyStr) return; // not configured yet, silent skip
+  let pk;
+  try { pk = new PublicKey(pubkeyStr); } catch { return; }
+  let balance;
+  try {
+    balance = BigInt(await connection.getBalance(pk, "confirmed"));
+  } catch (err) {
+    // RPC blip — treat as recoverable, do not alert. Real drains
+    // persist across many ticks; one missed read is noise.
+    console.warn("[self-monitor] engine_topup balance read failed:", err.message);
+    return;
+  }
+  const isBad = balance < ENGINE_TOPUP_LOW_LAMPORTS;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    const sol = (Number(balance) / 1e9).toFixed(3);
+    const floor = (Number(ENGINE_TOPUP_LOW_LAMPORTS) / 1e9).toFixed(3);
+    const sev = balance < ENGINE_TOPUP_LOW_LAMPORTS / 5n ? "crit" : "warn";
+    await alertIfNew(bot, KIND,
+      `Engine topup wallet at ${sol} SOL (floor ${floor}). Take-profit fills will start failing once this drains. Top it up: ${pubkeyStr}`,
+      sev,
+    );
+  } else {
+    await alertRecovery(bot, KIND, `Engine topup wallet refilled.`);
+  }
+}
+
 /* ─── Tick loop ──────────────────────────────────────────────── */
 
 let _timer = null;
@@ -245,6 +295,7 @@ async function tick(bot) {
       probeStuckOrders(bot).catch((e) => console.warn("[self-monitor] stuck_orders probe threw:", e.message)),
       probeMigrationsFailed(bot).catch((e) => console.warn("[self-monitor] migrations probe threw:", e.message)),
       probeTwapWatchdogMisses(bot).catch((e) => console.warn("[self-monitor] twap_watchdog probe threw:", e.message)),
+      probeEngineTopupWallet(bot).catch((e) => console.warn("[self-monitor] engine_topup probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
