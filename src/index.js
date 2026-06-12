@@ -547,12 +547,12 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
-    // Raid monitor — polls the curated influencer list (raid_targets)
-    // every 90s. Posts new tweets to @magpietalk with a raid CTA and
-    // tracks /raided claims against a per-event goal. Prefers X API
-    // when X_BEARER_TOKEN is set, falls back to Nitter RSS otherwise.
-    // RAID_MONITOR_DISABLED=true on Railway hard-stops the poller.
-    import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
+    // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
+    // upstream instances die constantly and the X API requires a paid
+    // bearer token; alerts about "data sources offline" were noise.
+    // To re-enable: uncomment the line below + supply X_BEARER_TOKEN
+    // on Railway. Code lives in src/services/raid-monitor.js untouched.
+    // import("./services/raid-monitor.js").then((m) => m.startRaidMonitor(bot));
     // Notification sender — drains pending_notifications and DMs users.
     // Used by the private limit-close engine to talk back to TG users.
     import("./services/notification-sender.js").then((m) => m.startNotificationSender(bot));
@@ -671,6 +671,12 @@ bot.start({
     // first take-profit fills by surfacing the opportunity the moment it
     // exists, instead of waiting for the user to think to check.
     import("./services/upside-watcher.js").then((m) => m.startUpsideWatcher());
+    // Credit-events auto-healer — every 6h, scans for loans missing
+    // canonical credit_events and backfills them. Belt-and-suspenders
+    // for the live recordLoan / markLoanRepaid writers; any future bug
+    // that drops an event has its impact bounded to one healer cycle.
+    // Self-monitor's stale_credit probe DMs the operator faster.
+    import("./services/credit-events-healer.js").then((m) => m.startCreditEventsHealer());
     // Downside Watcher — symmetric to upside. Pip DMs at -20% / -35% /
     // -50% depreciation with concrete derisk options BEFORE the
     // health-watcher's liquidation tiers escalate.
