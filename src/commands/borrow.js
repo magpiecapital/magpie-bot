@@ -13,11 +13,15 @@ import { renderRiskBlock } from "../services/token-risk-preview.js";
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 
-const LTV_TIERS = [
-  { option: 0, ltv: 30, days: 2, feeBps: 300, label: "30% LTV · 2d · 3% fee (Express)" },
-  { option: 1, ltv: 25, days: 3, feeBps: 200, label: "25% LTV · 3d · 2% fee (Quick)" },
-  { option: 2, ltv: 20, days: 7, feeBps: 150, label: "20% LTV · 7d · 1.5% fee (Standard)" },
-];
+// Tier schedule is category-aware as of 2026-06-12 migration 040.
+// Memecoins use the legacy 30/25/20 LTV ladder; RWA collateral
+// (stock/etf/metal) uses the higher-LTV / longer-term / higher-fee
+// schedule seeded into rwa_loan_tiers. See ../services/loan-tier-resolver.js.
+//
+// LTV_TIERS kept here as a synchronous fallback for the rare path that
+// can't await (currently none); resolver returns an equivalent set for
+// memecoin category, so both paths agree on the memecoin numbers.
+import { getEligibleTiers, getTierByOption, MEMECOIN_TIERS as LTV_TIERS } from "../services/loan-tier-resolver.js";
 
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
 const pending = new Map();
@@ -223,8 +227,12 @@ export function registerBorrowCallbacks(bot) {
     state.quotedAt = Date.now();
     pending.set(ctx.chat.id, state);
 
+    // Resolve tier schedule based on the selected mint's category.
+    // RWA collateral (stock/etf/metal) lands the higher-LTV ladder
+    // out of rwa_loan_tiers; memecoin (and uncategorized) get MEMECOIN_TIERS.
+    const tiers = await getEligibleTiers({ category: state.selected.category });
     const kb = new InlineKeyboard();
-    for (const t of LTV_TIERS) {
+    for (const t of tiers) {
       const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
       const fee = loanSol * (t.feeBps / 10_000);
       const receive = loanSol - fee;
@@ -275,8 +283,10 @@ export function registerBorrowCallbacks(bot) {
     state.quotedAt = Date.now();
     pending.set(ctx.chat.id, state);
 
+    // Same category-aware tier resolution as the prior flow.
+    const tiers = await getEligibleTiers({ category: state.selected.category });
     const kb = new InlineKeyboard();
-    for (const t of LTV_TIERS) {
+    for (const t of tiers) {
       const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
       const fee = loanSol * (t.feeBps / 10_000);
       const receive = loanSol - fee;
@@ -307,8 +317,9 @@ export function registerBorrowCallbacks(bot) {
 
   bot.callbackQuery(/^borrow:tier:(\d+)$/, async (ctx) => {
     const option = Number(ctx.match[1]);
-    const tier = LTV_TIERS.find((t) => t.option === option);
     const state = pending.get(ctx.chat.id);
+    // Resolve from the same tier set the user picked from — by category.
+    const tier = await getTierByOption({ category: state?.selected?.category, option });
     if (!state || !tier) {
       await ctx.answerCallbackQuery("Session expired");
       return;

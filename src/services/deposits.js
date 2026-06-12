@@ -32,7 +32,7 @@ export async function getSupportedBalances(walletPubkey) {
 
   const mints = [...byMint.keys()];
   const { rows } = await query(
-    `SELECT mint, symbol, name, decimals FROM supported_mints
+    `SELECT mint, symbol, name, decimals, category FROM supported_mints
      WHERE enabled = TRUE AND mint = ANY($1)`,
     [mints],
   );
@@ -44,6 +44,10 @@ export async function getSupportedBalances(walletPubkey) {
       symbol: r.symbol,
       name: r.name,
       decimals: r.decimals,
+      // category drives loan-tier-resolver: RWA mints get the higher-LTV
+      // / longer-term / higher-fee tier schedule from rwa_loan_tiers,
+      // memecoin (and uncategorized) get the existing MEMECOIN_TIERS.
+      category: r.category,
       rawAmount: bal.rawAmount.toString(),
       humanAmount: Number(bal.rawAmount) / 10 ** r.decimals,
     };
