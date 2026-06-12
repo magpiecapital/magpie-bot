@@ -363,7 +363,10 @@ export async function handleSiteLimitCloseArm(req) {
   }
 
   const slippageBps = fields.Slippage ? Number(fields.Slippage) : 200;
-  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > 1000) {
+  // Upper bound matches arm-core's MAX_INITIAL_SLIPPAGE_BPS (2500 = 25%) so
+  // moon-pump UX can request a wide initial slippage when the user knows the
+  // token is thin. Arm-core then auto-derives a wider cap on top.
+  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > 2500) {
     return { status: 400, body: { error: "invalid_slippage" } };
   }
   const dest = (fields.Dest || "sol").toLowerCase();
