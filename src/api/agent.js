@@ -81,13 +81,35 @@ import { Keypair } from "@solana/web3.js";
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
-// Tier index → (LTV%, duration days, fee bps). Matches the on-chain
-// program's TIER_LTV_BPS / TIER_DURATION_DAYS / TIER_FEE_BPS.
+// Legacy memecoin tier map — kept for back-compat callers that still
+// import TIERS directly. NEW code should use the category-aware
+// resolveTierForAgent helper below, which picks the right schedule
+// (memecoin vs RWA) based on the collateral's supported_mints.category.
+//
+// On-chain program's TIER_LTV_BPS / TIER_DURATION_DAYS / TIER_FEE_BPS
+// were derived from these defaults at v1; RWA borrows on V2 use the
+// resolver so the higher 50/60/70% RWA tiers flow through correctly.
 export const TIERS = {
-  0: { ltv: 30, days: 2, feeBps: 300 }, // express
-  1: { ltv: 25, days: 3, feeBps: 200 }, // quick
-  2: { ltv: 20, days: 7, feeBps: 150 }, // standard
+  0: { ltv: 30, days: 2, feeBps: 300 }, // express (memecoin)
+  1: { ltv: 25, days: 3, feeBps: 200 }, // quick (memecoin)
+  2: { ltv: 20, days: 7, feeBps: 150 }, // standard (memecoin)
 };
+
+import { getTierByOption } from "../services/loan-tier-resolver.js";
+
+/**
+ * Resolve a tier from (category, option). Returns shape compatible with
+ * the legacy TIERS map entries: { ltv, days, feeBps }. RWA categories
+ * route to rwa_loan_tiers; memecoin path matches the legacy TIERS map.
+ *
+ * Used by buildBorrowTx so x402 agent borrows respect the same
+ * category-aware tier schedule as TG /borrow.
+ */
+export async function resolveTierForAgent({ category, option }) {
+  const tier = await getTierByOption({ category, option });
+  if (!tier) return null;
+  return { ltv: tier.ltv, days: tier.days, feeBps: tier.feeBps };
+}
 
 /**
  * Deterministic synthetic telegram_id for a wallet pubkey.
@@ -145,7 +167,14 @@ export async function buildBorrowTx({
   userId,                // already resolved
   mintRow,               // already resolved from supported_mints
 }) {
-  const tierCfg = TIERS[Number(tier)];
+  // Category-aware tier resolution. RWA mints get the higher-LTV
+  // schedule out of rwa_loan_tiers; memecoin falls back to TIERS.
+  // Defense-in-depth: if resolver returns null (bad option), surface
+  // an error rather than silently picking the wrong tier.
+  const tierCfg = (await resolveTierForAgent({ category: mintRow?.category, option: Number(tier) })) ?? TIERS[Number(tier)];
+  if (!tierCfg) {
+    return { blocked: true, status: 400, body: { error: "invalid_tier", detail: `tier ${tier} not available for category ${mintRow?.category}` } };
+  }
   const collateralMintStr = collateralMintPk.toBase58();
   const borrowerWalletStr = borrowerPk.toBase58();
 
