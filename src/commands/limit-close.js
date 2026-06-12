@@ -229,8 +229,11 @@ function parseSlippage(s) {
     return { ok: false, error: `Invalid slippage: \`${s}\`` };
   }
   const bps = /bps$/i.test(s) ? Math.round(n) : Math.round(n * 100);
-  if (bps < 10 || bps > 1000) {
-    return { ok: false, error: "Slippage must be between 0.1% and 10%." };
+  // Upper bound matches arm-core's MAX_INITIAL_SLIPPAGE_BPS (25%). Thin-
+  // liquidity memecoin pumps regularly want a wider initial slippage so the
+  // first attempt fires; arm-core then derives an even wider cap on top.
+  if (bps < 10 || bps > 2500) {
+    return { ok: false, error: "Slippage must be between 0.1% and 25%." };
   }
   return { ok: true, bps };
 }
@@ -413,6 +416,12 @@ export async function handleLimitClose(ctx) {
   }
   const preflightAdvisory = !!preflight.advisory;
 
+  // Fill-guarantee defaults — match arm-core's derivation so TG orders
+  // get the same escalation headroom as site / agent paths. Operator
+  // mandate: "the order MUST execute." Cap = max(2500, slip * 8) capped
+  // at 5000 bps. Engine walks UNDER the cap on revert; never above.
+  const derivedCapBps = Math.min(5000, Math.max(2500, slippage_bps * 8));
+
   // 5. Insert. The UNIQUE partial index on (loan_id WHERE status='armed')
   //    makes "two orders on the same loan" physically impossible at the
   //    storage layer.
@@ -422,15 +431,15 @@ export async function handleLimitClose(ctx) {
       `INSERT INTO limit_close_orders
          (user_id, loan_id, trigger_kind, trigger_value_micro,
           slippage_bps, sell_destination, expires_at, source, status, armed_at,
-          initial_slippage_bps,
+          initial_slippage_bps, auto_escalate_slippage, max_slippage_bps_cap,
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'tg', 'armed', NOW(),
-               $8,
-               $9, $10, $11)
+               $8, TRUE, $9,
+               $10, $11, $12)
        RETURNING id`,
       [user.id, loan.id, trigger_kind, trigger_value_micro.toString(),
        slippage_bps, dest, expire_iso,
-       slippage_bps,
+       slippage_bps, derivedCapBps,
        preflightAdvisory ? null : slippage_bps,
        preflightAdvisory ? null : (preflight.proceedsLamports || null),
        preflightAdvisory ? null : (preflight.quotedAtIso || new Date().toISOString())],

@@ -81,6 +81,19 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier) {
  *
  * Returns { ok: true, orderId, loan, mint } or { ok: false, error, ... }.
  */
+// Fill-guarantee defaults. Operator-stated rule: "the order MUST execute or
+// it makes it look like we are advertising false promises." The prior
+// defaults (capBps = slippageBps, autoEscalate = false) were silently
+// preventing fills on thin-liquidity memecoin pumps — a 200 bps cap on a
+// 6% impact swap never clears. To honor the mandate every order ships with
+// escalation headroom by default. The borrower's stated initial slippage
+// is preserved as the FIRST attempt; the engine only walks UNDER the cap
+// when the first attempt would revert.
+const DEFAULT_HARD_CAP_BPS = 5000;        // 50% — absolute ceiling on any auto-widened cap
+const DEFAULT_CAP_FLOOR_BPS = 2500;       // 25% — every order gets at least this much room
+const DEFAULT_CAP_MULTIPLIER = 8;         // cap = max(floor, slip × 8) capped at hard cap
+const MAX_INITIAL_SLIPPAGE_BPS = 2500;    // 25% — allow aggressive initial for moon-pump UX
+
 export async function armOrder({
   userId,
   source,                  // 'tg' | 'site' | 'agent_x402'
@@ -91,9 +104,9 @@ export async function armOrder({
   slippageBps,
   sellDestination = "sol",
   expiresAt = null,
-  autoEscalate = false,
-  // For agent path the cap comes from delegation. For other paths
-  // capBps defaults to slippageBps (no escalation headroom).
+  autoEscalate = true,     // fill-guarantee default — overridable per call
+  // For agent path the cap comes from delegation. For other paths we
+  // derive the cap from slippage so every order has escalation room.
   capBps = null,
   preflightProtocolFeeBps = 100,
   armNote = null,
@@ -108,7 +121,7 @@ export async function armOrder({
   if (triggerBI < MIN_TRIGGER_VALUE_MICRO || triggerBI > MAX_TRIGGER_VALUE_MICRO) {
     return { ok: false, error: "trigger_value_out_of_range" };
   }
-  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > 1000) {
+  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > MAX_INITIAL_SLIPPAGE_BPS) {
     return { ok: false, error: "invalid_slippage_bps" };
   }
   if (!VALID_DESTINATIONS.has(sellDestination)) {
@@ -124,8 +137,16 @@ export async function armOrder({
     return { ok: false, error: "invalid_source" };
   }
 
-  const effectiveCap = Number.isInteger(capBps) ? capBps : slippageBps;
-  if (effectiveCap < slippageBps || effectiveCap > 1000) {
+  // Derive the cap: explicit caller-supplied value wins; otherwise default to
+  // max(floor, slip × multiplier) clamped to the hard ceiling. Even a 50 bps
+  // initial slippage gets at least 2500 bps of headroom under this rule, so
+  // the engine's escalation ladder always has somewhere to walk.
+  const derivedCap = Math.min(
+    DEFAULT_HARD_CAP_BPS,
+    Math.max(DEFAULT_CAP_FLOOR_BPS, slippageBps * DEFAULT_CAP_MULTIPLIER),
+  );
+  const effectiveCap = Number.isInteger(capBps) ? capBps : derivedCap;
+  if (effectiveCap < slippageBps || effectiveCap > DEFAULT_HARD_CAP_BPS) {
     return { ok: false, error: "invalid_cap_bps" };
   }
 
