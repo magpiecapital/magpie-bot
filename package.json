@@ -13,7 +13,8 @@
     "eval-ai": "node scripts/eval-ai-support.js",
     "check-site": "node scripts/check-site.js",
     "test-signed": "node scripts/test-signed-endpoints.js",
-    "preflight": "npm run check-site && npm run test-signed"
+    "preflight": "npm run check-site && npm run test-signed",
+    "verify:tier2": "node scripts/verify-tier2/run.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
