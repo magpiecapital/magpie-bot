@@ -65,24 +65,33 @@ export async function handleGovernanceTally(req, url) {
     return { status: 200, body: cached.body };
   }
 
-  const snapshotPath = findSnapshotFile(proposal.snapshot_id ?? proposalId);
-  if (!snapshotPath) {
-    return {
-      status: 503,
-      body: { error: "Snapshot not available — tally cannot be computed", proposal_id: proposalId },
-    };
-  }
+  // Tally reads from the DB-backed snapshot mirror first (the only path
+  // that works on Railway — the operator's filesystem snapshot isn't on
+  // disk here). Falls back to the filesystem path for operator CLI use.
+  const snapshotId = proposal.snapshot_id ?? proposalId;
+  const snapshotPath = findSnapshotFile(snapshotId);
 
   let tally;
   try {
     tally = await tallyProposal({
       proposalId,
       questionId: "Vote",
-      snapshotPath,
-      expectedSnapshotId: proposal.snapshot_id ?? proposalId,
+      // Prefer DB when filesystem isn't available. tallyProposal picks
+      // the right loader based on which arg is set.
+      snapshotId: snapshotPath ? null : snapshotId,
+      snapshotPath: snapshotPath ?? null,
+      expectedSnapshotId: snapshotId,
       capFraction: 0.02,
     });
   } catch (err) {
+    // Detect "snapshot truly missing" specifically — distinct from a
+    // generic tally compute error.
+    if (err.message?.includes("not in DB")) {
+      return {
+        status: 503,
+        body: { error: "Snapshot not available — tally cannot be computed", proposal_id: proposalId },
+      };
+    }
     // Internal error details are NEVER bubbled to the public response.
     // Node's fs.readFileSync error messages include the absolute path
     // (e.g. "ENOENT: no such file or directory, open
