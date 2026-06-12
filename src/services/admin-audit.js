@@ -128,3 +128,212 @@ export async function countDeniedAttempts({ hours = 24 } = {}) {
   );
   return r?.n || 0;
 }
+
+/* ════════════════════════════════════════════════════════════════
+ *  MULTI-STEP APPROVAL (audit F-4, migration 042)
+ * ════════════════════════════════════════════════════════════════
+ *
+ * Sensitive admin commands route through requireApproval(). When two
+ * admins are configured, the first admin's invocation creates a
+ * pending row + DMs the others; a different admin executes the action
+ * via /approve <id>. Solo-admin deployments bypass the gate (no second
+ * admin exists) and the bypass is logged for visibility.
+ *
+ * Default commands gated:
+ *   enablemint, disablemint, broadcast
+ *
+ * Tunable via ADMIN_COMMAND_APPROVAL_REQUIRED env var
+ * (comma-separated). Empty value disables the gate entirely.
+ */
+
+const APPROVAL_TTL_MS = Number(process.env.ADMIN_APPROVAL_TTL_MS || 5 * 60_000);
+
+// Parse the gated-command list once at import. Empty string OR "none"
+// disables the gate entirely (useful for staging).
+function gatedCommandSet() {
+  const env = process.env.ADMIN_COMMAND_APPROVAL_REQUIRED;
+  if (env === undefined || env === null) {
+    return new Set(["enablemint", "disablemint", "broadcast"]);
+  }
+  if (env === "" || env.toLowerCase() === "none") return new Set();
+  return new Set(env.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+export function isApprovalGated(command) {
+  return gatedCommandSet().has(String(command));
+}
+
+/**
+ * Snapshot the configured admin IDs at call time. Mirrors how
+ * src/services/admin.js builds its in-memory Set, but re-reads env so a
+ * mid-session ADMIN_TELEGRAM_IDS change is honored without a restart.
+ */
+function adminTgIds() {
+  return new Set(
+    (process.env.ADMIN_TELEGRAM_IDS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map(Number),
+  );
+}
+
+/**
+ * Create a pending approval row + return its id. Caller is responsible
+ * for DM'ing the other admins (we don't import grammy here to keep
+ * this module bot-framework-free).
+ *
+ * args object is stored verbatim as JSONB. It MUST contain everything
+ * the executor needs to replay the command — the original ctx is gone
+ * by the time the second admin approves.
+ */
+export async function requestApproval({ command, args, requesterCtx }) {
+  const expiresAt = new Date(Date.now() + APPROVAL_TTL_MS);
+  const { rows: [row] } = await query(
+    `INSERT INTO admin_command_approvals
+       (command, args_json, requester_tg_id, requester_username, requester_chat_id, expires_at)
+     VALUES ($1, $2::jsonb, $3, $4, $5, $6)
+     RETURNING id, expires_at`,
+    [
+      String(command).slice(0, 64),
+      JSON.stringify(args || {}),
+      Number(requesterCtx?.from?.id) || 0,
+      requesterCtx?.from?.username || null,
+      requesterCtx?.chat?.id ? Number(requesterCtx.chat.id) : null,
+      expiresAt,
+    ],
+  );
+  return { approvalId: Number(row.id), expiresAt: row.expires_at };
+}
+
+/**
+ * Look up a pending approval by id, with full row fields. Returns null
+ * if not found OR if the row's status is no longer pending.
+ */
+export async function getPendingApproval(approvalId) {
+  const { rows: [row] } = await query(
+    `SELECT id, command, args_json, requester_tg_id, requester_username,
+            requested_at, expires_at, status
+       FROM admin_command_approvals
+      WHERE id = $1 AND status = 'pending'`,
+    [Number(approvalId)],
+  );
+  return row || null;
+}
+
+/**
+ * Mark a pending approval as approved by approverTgId. Rejects:
+ *   - id not found / not pending
+ *   - approver is the same admin who requested it (self-approval block)
+ *   - expired (status → 'expired' as a side-effect)
+ *
+ * Returns { ok: true, row } on success or { ok: false, reason } on reject.
+ * The row return is the post-update state so the caller can dispatch
+ * to the executor with the original args_json.
+ */
+export async function approveAndClaim({ approvalId, approverCtx }) {
+  const approverTgId = Number(approverCtx?.from?.id) || 0;
+  const approverUsername = approverCtx?.from?.username || null;
+
+  // Read first to validate same-admin + expiry. A bad actor could try to
+  // race the UPDATE so we follow with a CAS-like conditional UPDATE that
+  // only succeeds if the row is still pending AND not expired AND not
+  // requested by the approver.
+  const pending = await getPendingApproval(approvalId);
+  if (!pending) return { ok: false, reason: "not_found_or_not_pending" };
+  if (Number(pending.requester_tg_id) === approverTgId) {
+    return { ok: false, reason: "self_approval_blocked" };
+  }
+  if (new Date(pending.expires_at) < new Date()) {
+    // Lazy expiry: mark expired so /pending doesn't show it again.
+    await query(
+      `UPDATE admin_command_approvals SET status='expired' WHERE id=$1 AND status='pending'`,
+      [Number(approvalId)],
+    );
+    return { ok: false, reason: "expired" };
+  }
+  const { rows: [updated] } = await query(
+    `UPDATE admin_command_approvals
+        SET status='approved', approver_tg_id=$2, approver_username=$3, approved_at=NOW()
+      WHERE id = $1
+        AND status = 'pending'
+        AND expires_at > NOW()
+        AND requester_tg_id <> $2
+      RETURNING id, command, args_json, requester_tg_id`,
+    [Number(approvalId), approverTgId, approverUsername],
+  );
+  if (!updated) return { ok: false, reason: "race_lost_or_invalid" };
+  return { ok: true, row: updated };
+}
+
+/**
+ * Mark a pending approval as denied. Same validation as approve except
+ * we allow self-deny (an admin can cancel their own pending request —
+ * useful if they realize they typo'd before another admin sees it).
+ */
+export async function denyApproval({ approvalId, denierCtx }) {
+  const { rows: [updated] } = await query(
+    `UPDATE admin_command_approvals
+        SET status='denied', denied_at=NOW(),
+            approver_tg_id=$2, approver_username=$3
+      WHERE id = $1 AND status = 'pending'
+      RETURNING id, command, requester_tg_id`,
+    [
+      Number(approvalId),
+      Number(denierCtx?.from?.id) || 0,
+      denierCtx?.from?.username || null,
+    ],
+  );
+  if (!updated) return { ok: false, reason: "not_found_or_not_pending" };
+  return { ok: true, row: updated };
+}
+
+/**
+ * Mark an approved request as executed. Caller invokes after the real
+ * command finishes; passes any error message for forensic logging.
+ */
+export async function markExecuted(approvalId, errorMessage = null) {
+  await query(
+    `UPDATE admin_command_approvals
+        SET status='executed', executed_at=NOW(), execute_error=$2
+      WHERE id = $1 AND status = 'approved'`,
+    [Number(approvalId), errorMessage ? String(errorMessage).slice(0, 200) : null],
+  );
+}
+
+/**
+ * List pending approvals. Cap 50.
+ */
+export async function listPendingApprovals({ limit = 25 } = {}) {
+  const cappedLimit = Math.max(1, Math.min(50, Number(limit) || 25));
+  const { rows } = await query(
+    `SELECT id, command, args_json, requester_tg_id, requester_username,
+            requested_at, expires_at
+       FROM admin_command_approvals
+      WHERE status = 'pending' AND expires_at > NOW()
+      ORDER BY requested_at DESC
+      LIMIT $1`,
+    [cappedLimit],
+  );
+  return rows;
+}
+
+/**
+ * Operator-facing helper used by the approval gate. Returns the list of
+ * admin TG ids EXCLUDING the requester — that's who should be DM'd.
+ */
+export function otherAdminTgIds(requesterTgId) {
+  const all = adminTgIds();
+  all.delete(Number(requesterTgId));
+  return [...all];
+}
+
+/**
+ * Solo-admin? Returns true when there's exactly ONE configured admin
+ * AND that admin is the requester. In that case, the approval gate
+ * cannot meaningfully require a second approver, so we short-circuit.
+ */
+export function isSoloAdmin(requesterTgId) {
+  const all = adminTgIds();
+  return all.size <= 1 && all.has(Number(requesterTgId));
+}

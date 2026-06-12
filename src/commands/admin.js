@@ -9,7 +9,20 @@ import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
-import { logAdminCommand, recentAdminCommands, countDeniedAttempts } from "../services/admin-audit.js";
+import {
+  logAdminCommand,
+  recentAdminCommands,
+  countDeniedAttempts,
+  isApprovalGated,
+  isSoloAdmin,
+  otherAdminTgIds,
+  requestApproval,
+  approveAndClaim,
+  denyApproval,
+  getPendingApproval,
+  listPendingApprovals,
+  markExecuted,
+} from "../services/admin-audit.js";
 
 // requireAdmin takes the command name so we can log every denied attempt
 // to admin_command_log. Unauthorized attempts are the highest-signal
@@ -79,6 +92,34 @@ export async function handleAdminStatus(ctx) {
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 }
 
+/**
+ * Pure executor for enablemint — given validated args, performs the
+ * INSERT/UPDATE and replies on the supplied ctx (which may be the
+ * SECOND admin who /approve'd, not the original requester). Used
+ * both for the solo-admin direct path AND for /approve dispatch.
+ */
+async function executeEnableMint(ctx, args) {
+  const { mint, symbol, decimals, name } = args;
+  try {
+    await query(
+      `INSERT INTO supported_mints (mint, symbol, name, decimals, enabled)
+       VALUES ($1, $2, $3, $4, TRUE)
+       ON CONFLICT (mint) DO UPDATE
+         SET symbol = EXCLUDED.symbol,
+             name = COALESCE(EXCLUDED.name, supported_mints.name),
+             decimals = EXCLUDED.decimals,
+             enabled = TRUE`,
+      [mint, symbol.toUpperCase(), name, decimals],
+    );
+    await logAdminCommand(ctx, "enablemint", { outcome: "success", args: `${symbol.toUpperCase()} ${mint}` });
+    await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
+    return { ok: true };
+  } catch (err) {
+    await logAdminCommand(ctx, "enablemint", { outcome: "error", args: `${symbol} ${mint}`, error: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
 export async function handleEnableMint(ctx) {
   if (!(await requireAdmin(ctx, "enablemint"))) return;
   const parts = ctx.message.text.split(/\s+/);
@@ -116,34 +157,17 @@ export async function handleEnableMint(ctx) {
     );
   }
   const name = nameParts.join(" ") || null;
-  try {
-    await query(
-      `INSERT INTO supported_mints (mint, symbol, name, decimals, enabled)
-       VALUES ($1, $2, $3, $4, TRUE)
-       ON CONFLICT (mint) DO UPDATE
-         SET symbol = EXCLUDED.symbol,
-             name = COALESCE(EXCLUDED.name, supported_mints.name),
-             decimals = EXCLUDED.decimals,
-             enabled = TRUE`,
-      [mint, symbol.toUpperCase(), name, decimals],
-    );
-    await logAdminCommand(ctx, "enablemint", { outcome: "success", args: `${symbol.toUpperCase()} ${mint}` });
-    await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
-  } catch (err) {
-    await logAdminCommand(ctx, "enablemint", { outcome: "error", args: `${symbol} ${mint}`, error: err.message });
-    throw err;
-  }
+  const args = { mint, symbol: symbol.toUpperCase(), decimals, name };
+
+  // ── Approval gate (audit F-4) ──────────────────────────────────
+  // /enablemint is approval-gated by default. If solo-admin OR the
+  // gate is disabled via env, execute immediately and log the bypass.
+  // Otherwise create a pending row + DM the other admins.
+  await requireApprovalOrExecute(ctx, "enablemint", args, executeEnableMint);
 }
 
-export async function handleBroadcast(ctx) {
-  if (!(await requireAdmin(ctx, "broadcast"))) return;
-  const text = ctx.message.text.replace(/^\/broadcast(\s+|$)/, "").trim();
-  if (!text) {
-    return ctx.reply("Usage: `/broadcast <message>`", { parse_mode: "Markdown" });
-  }
-  // Log the broadcast BEFORE sending — even partial sends are recorded
-  // so the operator can see what the broadcast contained without scanning
-  // every user's DMs.
+async function executeBroadcast(ctx, args) {
+  const text = String(args?.text || "");
   await logAdminCommand(ctx, "broadcast", { outcome: "success", args: text });
   const { rows } = await query(`SELECT telegram_id FROM users`);
   let ok = 0;
@@ -157,27 +181,215 @@ export async function handleBroadcast(ctx) {
     } catch {
       fail++;
     }
-    // Telegram rate-limits ~30 msgs/s; pacing keeps us safe.
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((rr) => setTimeout(rr, 50));
   }
   await ctx.reply(`✅ Sent to ${ok}, failed ${fail}.`);
+  return { ok: true };
+}
+
+export async function handleBroadcast(ctx) {
+  if (!(await requireAdmin(ctx, "broadcast"))) return;
+  const text = ctx.message.text.replace(/^\/broadcast(\s+|$)/, "").trim();
+  if (!text) {
+    return ctx.reply("Usage: `/broadcast <message>`", { parse_mode: "Markdown" });
+  }
+  await requireApprovalOrExecute(ctx, "broadcast", { text }, executeBroadcast);
+}
+
+async function executeDisableMint(ctx, args) {
+  const target = String(args?.target || "");
+  const { rowCount } = await query(
+    `UPDATE supported_mints SET enabled = FALSE
+     WHERE UPPER(symbol) = UPPER($1) OR mint = $1`,
+    [target],
+  );
+  await logAdminCommand(ctx, "disablemint", {
+    outcome: rowCount > 0 ? "success" : "error",
+    args: target,
+    error: rowCount > 0 ? null : "mint not found",
+  });
+  await ctx.reply(rowCount > 0 ? `✅ ${target} disabled.` : `❌ ${target} not found.`);
+  return { ok: rowCount > 0 };
 }
 
 export async function handleDisableMint(ctx) {
   if (!(await requireAdmin(ctx, "disablemint"))) return;
   const arg = ctx.message.text.split(/\s+/)[1];
   if (!arg) return ctx.reply("Usage: `/disablemint <symbol or mint>`", { parse_mode: "Markdown" });
-  const { rowCount } = await query(
-    `UPDATE supported_mints SET enabled = FALSE
-     WHERE UPPER(symbol) = UPPER($1) OR mint = $1`,
-    [arg],
-  );
-  await logAdminCommand(ctx, "disablemint", {
-    outcome: rowCount > 0 ? "success" : "error",
-    args: arg,
-    error: rowCount > 0 ? null : "mint not found",
+  await requireApprovalOrExecute(ctx, "disablemint", { target: arg }, executeDisableMint);
+}
+
+/* ════════════════════════════════════════════════════════════════
+ *  APPROVAL GATE (audit F-4, migration 042)
+ * ════════════════════════════════════════════════════════════════ */
+
+// Map of approval-gated command → executor. /approve dispatches into this
+// at execution time. Pure functions; they handle their own ctx replies
+// and audit logging.
+const APPROVAL_EXECUTORS = {
+  enablemint:  executeEnableMint,
+  disablemint: executeDisableMint,
+  broadcast:   executeBroadcast,
+};
+
+/**
+ * Shared gate. If the command isn't gated (env or solo-admin), executes
+ * immediately. Otherwise creates a pending row, DMs the other admins
+ * with `/approve <id>` instructions, and tells the requester the
+ * request is pending.
+ */
+async function requireApprovalOrExecute(ctx, command, args, executeFn) {
+  const requesterTgId = Number(ctx?.from?.id) || 0;
+
+  // Bypass if (a) operator disabled the gate via env, (b) command isn't
+  // in the gated set, or (c) solo admin (no second approver exists).
+  if (!isApprovalGated(command)) {
+    return executeFn(ctx, args);
+  }
+  if (isSoloAdmin(requesterTgId)) {
+    await logAdminCommand(ctx, command, {
+      outcome: "solo_admin_bypass",
+      args: JSON.stringify(args).slice(0, 200),
+    });
+    return executeFn(ctx, args);
+  }
+
+  // Create the pending approval row.
+  const { approvalId, expiresAt } = await requestApproval({
+    command,
+    args,
+    requesterCtx: ctx,
   });
-  await ctx.reply(rowCount > 0 ? `✅ ${arg} disabled.` : `❌ ${arg} not found.`);
+
+  // DM the other admins. Best-effort; failures don't block the request.
+  const others = otherAdminTgIds(requesterTgId);
+  const ttlMin = Math.max(1, Math.round((new Date(expiresAt).getTime() - Date.now()) / 60_000));
+  const summary = `\`${command}\` ${JSON.stringify(args).slice(0, 120)}`;
+  const requesterTag = ctx?.from?.username ? `@${ctx.from.username}` : `tg:${requesterTgId}`;
+  const dmText = [
+    `🔐 *Admin command pending your approval*`,
+    ``,
+    `Request #${approvalId}`,
+    `Command: ${summary}`,
+    `Requested by: ${requesterTag}`,
+    `Expires in: ${ttlMin} min`,
+    ``,
+    `Reply with \`/approve ${approvalId}\` to execute, or \`/deny ${approvalId}\` to reject.`,
+    ``,
+    `_Audit F-4 second-admin approval — same admin cannot self-approve._`,
+  ].join("\n");
+  for (const otherTgId of others) {
+    try {
+      await ctx.api.sendMessage(otherTgId, dmText, { parse_mode: "Markdown" });
+    } catch (err) {
+      console.warn(`[admin-approval] DM to admin ${otherTgId} failed: ${err.message?.slice(0, 100)}`);
+    }
+  }
+
+  await logAdminCommand(ctx, command, {
+    outcome: "pending_approval",
+    args: `approval_id=${approvalId}`,
+  });
+  await ctx.reply(
+    [
+      `🔐 *Approval requested — request #${approvalId}*`,
+      ``,
+      `Sent to ${others.length} other admin${others.length === 1 ? "" : "s"} for sign-off.`,
+      `Expires in ${ttlMin} min.`,
+      ``,
+      others.length === 0
+        ? `_No other admins configured. Add one to ADMIN_TELEGRAM_IDS to receive notifications._`
+        : `Approver runs \`/approve ${approvalId}\` to execute.`,
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
+}
+
+/**
+ * /approve <id> — second-admin sign-off on a pending sensitive command.
+ * Same-admin self-approval is blocked. Dispatches to the stored command's
+ * executor with the requester's args, replying on the approver's ctx
+ * so the approver sees the success/error message.
+ */
+export async function handleApprove(ctx) {
+  if (!(await requireAdmin(ctx, "approve"))) return;
+  const idStr = (ctx.message?.text || "").trim().split(/\s+/)[1];
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id <= 0) {
+    return ctx.reply("Usage: `/approve <id>`", { parse_mode: "Markdown" });
+  }
+  const claim = await approveAndClaim({ approvalId: id, approverCtx: ctx });
+  if (!claim.ok) {
+    const reasons = {
+      not_found_or_not_pending: "Request not found or no longer pending.",
+      self_approval_blocked: "You can't approve a request you submitted yourself.",
+      expired: "Request expired — ask the requester to re-submit.",
+      race_lost_or_invalid: "Another admin already actioned this request.",
+    };
+    await logAdminCommand(ctx, "approve", { outcome: "denied", args: `id=${id}`, error: claim.reason });
+    return ctx.reply(`❌ ${reasons[claim.reason] || claim.reason}`);
+  }
+  const exec = APPROVAL_EXECUTORS[claim.row.command];
+  if (!exec) {
+    await markExecuted(id, `no_executor_for_${claim.row.command}`);
+    return ctx.reply(`❌ Internal error: no executor registered for \`${claim.row.command}\`.`, { parse_mode: "Markdown" });
+  }
+  try {
+    const result = await exec(ctx, claim.row.args_json);
+    await markExecuted(id, result?.ok === false ? result.error : null);
+    await logAdminCommand(ctx, "approve", { outcome: "success", args: `id=${id} cmd=${claim.row.command}` });
+  } catch (err) {
+    await markExecuted(id, err.message);
+    await logAdminCommand(ctx, "approve", { outcome: "error", args: `id=${id}`, error: err.message });
+    await ctx.reply(`❌ Execute failed: ${err.message?.slice(0, 150)}`);
+  }
+}
+
+/**
+ * /deny <id> — reject a pending sensitive command. Either admin can deny.
+ */
+export async function handleDeny(ctx) {
+  if (!(await requireAdmin(ctx, "deny"))) return;
+  const idStr = (ctx.message?.text || "").trim().split(/\s+/)[1];
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id <= 0) {
+    return ctx.reply("Usage: `/deny <id>`", { parse_mode: "Markdown" });
+  }
+  const res = await denyApproval({ approvalId: id, denierCtx: ctx });
+  if (!res.ok) {
+    await logAdminCommand(ctx, "deny", { outcome: "denied", args: `id=${id}`, error: res.reason });
+    return ctx.reply(`❌ Request not found or no longer pending.`);
+  }
+  await logAdminCommand(ctx, "deny", { outcome: "success", args: `id=${id} cmd=${res.row.command}` });
+
+  // Notify the requester.
+  try {
+    await ctx.api.sendMessage(
+      Number(res.row.requester_tg_id),
+      `🔐 Your request #${id} (\`${res.row.command}\`) was denied by @${ctx.from?.username || `tg:${ctx.from?.id}`}.`,
+      { parse_mode: "Markdown" },
+    );
+  } catch { /* requester may have blocked the bot */ }
+  await ctx.reply(`🚫 Request #${id} denied.`);
+}
+
+/**
+ * /pending — list currently-pending approval requests.
+ */
+export async function handlePendingApprovals(ctx) {
+  if (!(await requireAdmin(ctx, "pending"))) return;
+  const rows = await listPendingApprovals({ limit: 25 });
+  if (rows.length === 0) {
+    return ctx.reply("No pending approval requests.");
+  }
+  const lines = rows.map((r) => {
+    const ageMin = Math.round((Date.now() - new Date(r.requested_at).getTime()) / 60_000);
+    const ttlMin = Math.max(0, Math.round((new Date(r.expires_at).getTime() - Date.now()) / 60_000));
+    const requester = r.requester_username ? `@${r.requester_username}` : `tg:${r.requester_tg_id}`;
+    return `#${r.id} /${r.command} — ${requester}, ${ageMin}m ago, ${ttlMin}m left`;
+  });
+  await logAdminCommand(ctx, "pending", { outcome: "success" });
+  await ctx.reply(`*Pending approvals* (${rows.length})\n\`\`\`\n${lines.join("\n")}\n\`\`\``, { parse_mode: "Markdown" });
 }
 
 /**
