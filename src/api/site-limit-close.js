@@ -444,7 +444,17 @@ export async function handleSiteLimitCloseArm(req) {
       collateral_symbol: armed.mint?.symbol || null,
       trigger_kind: triggerKind,
       trigger_value_micro: triggerValueMicro.toString(),
-      slippage_bps: slippageBps,
+      // The applied initial slippage AFTER any liquidity-aware bump.
+      slippage_bps: armed.initialSlippageBpsApplied ?? slippageBps,
+      // Surface the bump so the site can render "we armed at 5% instead
+      // of 2% because $TOKEN is thin." Only present when a bump landed.
+      ...(armed.initialSlippageBpsApplied !== armed.initialSlippageBpsRequested
+        ? {
+            slippage_bps_requested: armed.initialSlippageBpsRequested,
+            liquidity_floor_bps: armed.liquidityTierFloorBps,
+            liquidity_usd: armed.liquidityUsd,
+          }
+        : {}),
       sell_destination: dest,
       expires_at: expiresAt,
       multiplier: multiplierUsed,
