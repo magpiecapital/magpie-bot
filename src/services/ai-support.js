@@ -1830,6 +1830,8 @@ Mandatory tool triggers — pattern → tool:
 - User says "topup", "add collateral", "lower my LTV", "protect from liquidation", "boost health" → \`propose_topup\` (ask for amount if not given).
 - User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
+- User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
+- User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
 - ALL loan actions execute in this chat via cards. NEVER tell the user to run any of these commands in Telegram.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
@@ -2064,6 +2066,32 @@ const TOOLS = [
     },
   },
   {
+    name: "propose_take_profit",
+    description:
+      "Prepare a TAKE-PROFIT (limit-close-and-sell) proposal the user can arm with one tap on the site. Use when the user wants to set an autonomous sell-on-target on an active loan — 'sell my $PEPE when it 2x's', 'auto take profit at $0.005', 'lock in if BONK goes 4x', 'set a limit order'. " +
+      "The site renders an inline confirmation card with the resolved target USD price + slippage cap + an Arm take-profit button. Pip does NOT execute the arm — the borrower wallet signs the magpie: limit-close-arm/v1 envelope which the bot validates + INSERTs. " +
+      "EXACTLY ONE of multiplier OR target_usd OR mc_usd must be set: multiplier=2 means '2× current price'; target_usd=0.005 means 'sell at $0.005/token'; mc_usd=150000000 means 'sell when MC hits $150M'. " +
+      "If the user only says 'set a take-profit' without a target, ask them what target (default suggestion: 2x).",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to arm a take-profit on. Required." },
+        multiplier: { type: "number", description: "Multiplier of current price (e.g. 2 for 2x). Server resolves to a concrete USD price at arm time." },
+        target_usd: { type: "number", description: "Explicit USD price per token (e.g. 0.005)." },
+        mc_usd: { type: "number", description: "Explicit market cap in USD (e.g. 150000000 for $150M)." },
+        slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
+        sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
+        expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
+      },
+      required: ["loan_id"],
+    },
+  },
+  {
+    name: "list_my_take_profits",
+    description: "Get the current user's armed take-profit (limit-close) orders across their active loans. Use when user asks 'show my take-profits', 'do I have a take-profit set', 'what limit orders are active', or after they've just armed one and want to see it.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
     name: "propose_partial_repay",
     description: "Prepare a PAY-DOWN-PARTIAL action that pays down some of the loan without closing it (collateral stays locked). Use when the user wants to /partialrepay, 'pay down a chunk', 'reduce what I owe', 'partial repay'. Card shows new owed after the payment. Borrower-only signature.",
     input_schema: {
@@ -2243,6 +2271,27 @@ const TOOLS = [
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(6);
+}
+
+/**
+ * Format a take-profit trigger as a human-readable string for Pip's
+ * list output. Mirrors the formatter in commands/limit-close.js so
+ * the same value reads the same way regardless of surface.
+ */
+function formatTriggerHuman(kind, valueMicroStr) {
+  const n = Number(valueMicroStr);
+  if (kind === "mc_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1e9) return `$${(usd / 1e9).toFixed(2)}B MC`;
+    if (usd >= 1e6) return `$${(usd / 1e6).toFixed(2)}M MC`;
+    if (usd >= 1e3) return `$${(usd / 1e3).toFixed(2)}K MC`;
+    return `$${usd.toFixed(2)} MC`;
+  }
+  if (kind === "price_usd") {
+    const usd = n / 1e6;
+    return `$${usd < 0.01 ? usd.toFixed(8) : usd < 1 ? usd.toFixed(6) : usd.toFixed(4)}/token`;
+  }
+  return `${(n / 1e9).toFixed(9)} SOL/token`;
 }
 
 async function getUserWallet(userId) {
@@ -2636,6 +2685,134 @@ const TOOL_HANDLERS = {
         expires_at: Date.now() + 5 * 60 * 1000,
       },
       _agent_instruction: "Respond with ONE short line introducing the partial-repay card. Refer to the loan as `#" + String(loan.loan_id).slice(-6) + "` (matches the card title). Do NOT echo the SOL amount being paid down or the owed-after — the card shows everything. The card also carries the collateral-locked warning, so don't repeat that in prose.",
+    };
+  },
+
+  propose_take_profit: async ({ loan_id, multiplier, target_usd, mc_usd, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+    // Validate target: exactly ONE of multiplier / target_usd / mc_usd
+    const targetCount = [multiplier, target_usd, mc_usd].filter((x) => x != null).length;
+    if (targetCount !== 1) {
+      return toolError(
+        "missing_or_ambiguous_target",
+        null,
+        "Ask the user for a specific target: a multiplier ('at 2x'), an explicit price ('at $0.005'), OR a market cap ('at $150M'). Don't guess — confirm.",
+      );
+    }
+    if (multiplier != null && (!Number.isFinite(multiplier) || multiplier <= 1)) {
+      return toolError("bad_multiplier", null, "Multiplier must be > 1 (e.g. 2 for 2×).");
+    }
+
+    const slipPct = slippage_pct != null ? Number(slippage_pct) : 2;
+    if (!Number.isFinite(slipPct) || slipPct < 0.1 || slipPct > 10) {
+      return toolError("bad_slippage", null, "Slippage must be between 0.5% and 10%.");
+    }
+    const slippageBps = Math.round(slipPct * 100);
+    const dest = sell_to === "usdc" ? "usdc" : "sol";
+
+    // Validate the loan belongs to the user + is active
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals, sm.category, sm.enabled
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    if (loan.status !== "active") {
+      return toolError("loan_not_active", null, `This loan is ${loan.status}, not active. Take-profit only works on active loans.`);
+    }
+    if (["stock", "etf", "metal"].includes(loan.category)) {
+      return toolError("rwa_not_supported", null, "Take-profit isn't available on xStock / RWA collateral in v1 — memecoin loans only. Tell the user to wait for v1.1.");
+    }
+    if (!loan.enabled) {
+      return toolError("collateral_not_enabled", null, "This collateral isn't currently enabled in the protocol.");
+    }
+    // Check signer wallet matches if provided (consistency with other propose_* tools)
+    if (signerPubkey && loan.borrower_wallet && signerPubkey !== loan.borrower_wallet) {
+      return toolError(
+        "wrong_signer_wallet",
+        `loan.borrower=${loan.borrower_wallet} signer=${signerPubkey}`,
+        `That loan was opened by ${loan.borrower_wallet.slice(0,4)}…${loan.borrower_wallet.slice(-4)}. Tell the user to switch their wallet in Phantom to that one before arming a take-profit.`,
+      );
+    }
+
+    // Resolve multiplier → concrete USD price (locks in meaning at this moment)
+    let resolvedMultiplier = null;
+    let currentUsd = null;
+    let targetUsdResolved = null;
+    if (multiplier != null) {
+      const { resolveMultiplierToPrice } = await import("./limit-close-arm-core.js");
+      const r = await resolveMultiplierToPrice(loan.collateral_mint, multiplier);
+      if (!r.ok) return toolError("multiplier_resolve_failed", r.error,
+        `Couldn't resolve the multiplier target right now — tell the user to try an explicit price instead.`);
+      resolvedMultiplier = multiplier;
+      currentUsd = r.currentUsd;
+      targetUsdResolved = r.targetUsd;
+    } else if (target_usd != null) {
+      targetUsdResolved = Number(target_usd);
+    }
+
+    return {
+      action_proposed: {
+        type: "take_profit",
+        loan_id: loan.loan_id,
+        collateral_symbol: loan.symbol,
+        multiplier: resolvedMultiplier,
+        current_usd: currentUsd,
+        target_usd: targetUsdResolved,
+        // mc_usd flows through as an explicit price target via mc_usd
+        // microformat in the signed envelope's MC field; the site SDK
+        // re-encodes from target_usd when present. For now, mc_usd
+        // surfaces in the card as the target_usd-equivalent via the
+        // current MC math at sign time.
+        slippage_bps: slippageBps,
+        sell_destination: dest,
+        order_expire: expire || null,
+        expires_at: Date.now() + 5 * 60 * 1000,  // proposal freshness
+      },
+      _agent_instruction:
+        "Respond with ONE short line introducing the take-profit card. Refer to the loan as `#" +
+        String(loan.loan_id).slice(-6) +
+        "`. Mention the target in human terms (e.g. 'at 2× current' or 'at $0.005') and the slippage cap. " +
+        "DO NOT lecture them about how take-profit works — the card explains it. If the user picked a multiplier, mention the resolved USD price so they have a concrete number.",
+    };
+  },
+
+  list_my_take_profits: async (_args, { userId }) => {
+    const { rows } = await query(
+      `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
+              lco.slippage_bps, lco.sell_destination, lco.status, lco.armed_at, lco.expires_at,
+              lco.source, lco.source_agent_pubkey,
+              l.loan_id::text AS chain_loan_id,
+              sm.symbol AS collateral_symbol
+         FROM limit_close_orders lco
+         JOIN loans l ON l.id = lco.loan_id
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE lco.user_id = $1
+          AND lco.status IN ('armed','firing','twap_in_progress','awaiting_user')
+        ORDER BY lco.armed_at DESC
+        LIMIT 50`,
+      [userId],
+    );
+    return {
+      count: rows.length,
+      orders: rows.map((r) => ({
+        order_id: r.id,
+        loan_id: r.chain_loan_id,
+        collateral_symbol: r.collateral_symbol,
+        trigger_kind: r.trigger_kind,
+        trigger_value_micro: r.trigger_value_micro,
+        trigger_human: formatTriggerHuman(r.trigger_kind, r.trigger_value_micro),
+        slippage_pct: (r.slippage_bps / 100).toFixed(2),
+        sell_destination: r.sell_destination,
+        status: r.status,
+        armed_at: r.armed_at,
+        expires_at: r.expires_at,
+        source: r.source,
+        source_agent_pubkey: r.source_agent_pubkey,
+      })),
     };
   },
 
