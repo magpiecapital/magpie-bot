@@ -119,6 +119,46 @@ export async function loadEligibleVoters(proposalId, snapshotPath, expectedSnaps
 }
 
 /**
+ * DB-backed eligible voters loader. Reads the same data as the file-backed
+ * loadEligibleVoters() but from governance_snapshot_weights — necessary
+ * for the live tally endpoint running on Railway, where the operator's
+ * snapshot file isn't on disk.
+ *
+ * Sums held_raw + collateralized_raw per wallet (same algebra as the
+ * file loader, same algebra as voting-power.js). Both columns are
+ * authoritative — collateralized_raw is the wallets whose $MAGPIE is
+ * locked in active loans at snapshot time, which the operator explicitly
+ * wants counted as voting power per the "include $MAGPIE collateral in
+ * voting rights" mandate.
+ *
+ * Returns Map<voter_pubkey, weight_raw_lamports (bigint)>.
+ */
+export async function loadEligibleVotersFromDb(snapshotId) {
+  const { rows: header } = await query(
+    `SELECT total_eligible_weight FROM governance_snapshots WHERE snapshot_id = $1`,
+    [snapshotId],
+  );
+  if (header.length === 0) {
+    // No snapshot in DB → tally caller decides what to do. Distinct
+    // signal from "snapshot present but voter not eligible" so the API
+    // can return a 503 vs a 0-weight tally.
+    return null;
+  }
+  const { rows } = await query(
+    `SELECT wallet, held_raw::text AS held, collateralized_raw::text AS collat
+       FROM governance_snapshot_weights
+      WHERE snapshot_id = $1`,
+    [snapshotId],
+  );
+  const weights = new Map();
+  for (const r of rows) {
+    const total = BigInt(r.held) + BigInt(r.collat);
+    if (total > 0n) weights.set(r.wallet, total);
+  }
+  return weights;
+}
+
+/**
  * Pull the latest-per-voter votes from governance_votes.
  * Voter changing their vote means later signature supersedes earlier.
  * Returns Map<voter_pubkey, 'yes'|'no'|'abstain'>.
@@ -140,8 +180,29 @@ export async function loadVotes(proposalId, questionId) {
  * Compute a full tally for a proposal. Returns an object with all
  * the numbers the rest of the pipeline needs.
  */
-export async function tallyProposal({ proposalId, questionId, snapshotPath, expectedSnapshotId = null, capFraction = 0.02 }) {
-  const eligible = await loadEligibleVoters(proposalId, snapshotPath, expectedSnapshotId);
+export async function tallyProposal({
+  proposalId,
+  questionId,
+  snapshotPath = null,
+  snapshotId = null,
+  expectedSnapshotId = null,
+  capFraction = 0.02,
+}) {
+  // Prefer the DB-backed loader when a snapshotId is provided — required
+  // for the API path (Railway has no operator filesystem). Fall back to
+  // the file loader for operator-CLI close-time tallies that still read
+  // the on-disk authoritative file.
+  let eligible;
+  if (snapshotId && !snapshotPath) {
+    eligible = await loadEligibleVotersFromDb(snapshotId);
+    if (!eligible) {
+      throw new Error(`snapshot ${snapshotId} not in DB`);
+    }
+  } else if (snapshotPath) {
+    eligible = await loadEligibleVoters(proposalId, snapshotPath, expectedSnapshotId);
+  } else {
+    throw new Error("tallyProposal requires snapshotId or snapshotPath");
+  }
   const votes = await loadVotes(proposalId, questionId);
 
   // Build raw weights of voters who actually voted, restricted to eligible set

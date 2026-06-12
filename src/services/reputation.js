@@ -47,20 +47,19 @@ export function nextTierHint({ repaid_count, liquidated_count }) {
   return { next, repaysNeeded: need };
 }
 
-export async function incrementBorrowed(userId, lamports, loanDbId = null) {
-  await query(
-    `UPDATE users
-       SET total_borrowed_lamports = total_borrowed_lamports + $2::numeric,
-           updated_at = NOW()
-     WHERE id = $1`,
-    [userId, String(lamports)],
-  );
-  // Emit credit event
-  try {
-    await recordCreditEvent(userId, "borrow", loanDbId, { lamports: String(lamports) });
-  } catch (err) {
-    console.error("[reputation] credit event error:", err.message);
-  }
+/**
+ * @deprecated The total_borrowed_lamports bump + the borrow credit event
+ * are now emitted from loans.recordLoan() so that BOTH the TG path and
+ * the site path get a single, consistent set of side effects. This
+ * function is now a NO-OP — left as an exported symbol so existing TG
+ * callers don't crash mid-deploy. Remove next major.
+ *
+ * Removing the body avoids double-counting (recordLoan now does the work)
+ * AND removes the silent divergence where site-native users were missing
+ * borrow credit events entirely. See loans.recordLoan().
+ */
+export async function incrementBorrowed(_userId, _lamports, _loanDbId = null) {
+  // Intentional no-op. See JSDoc above.
 }
 
 export async function incrementRepaid(userId) {
