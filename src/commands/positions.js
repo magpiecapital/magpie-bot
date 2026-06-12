@@ -91,22 +91,37 @@ export async function handlePositions(ctx) {
     rows.map((loan, i) => enrichWithHealth(loan, liveAmounts[i])),
   );
 
-  // Fetch any armed take-profit / limit-close orders for this user's
-  // loans in ONE query so we can annotate the cards. This is what
-  // makes the feature discoverable — users see "→ Take-profit armed
-  // at $X" right under each loan without needing a separate command.
+  // Fetch any take-profit / limit-close orders for this user's loans
+  // in ONE query so we can annotate the cards. Multiple statuses are
+  // surfaced so the user can see WHERE in the lifecycle each order is
+  // (armed / in-flight TWAP / awaiting their decision):
+  //   - 'armed'                — waiting for trigger
+  //   - 'twap_in_progress'     — engine actively selling chunks
+  //   - 'awaiting_user'        — Layer 3 intervention DM in flight
+  // Other terminal states (fired / failed / cancelled / expired) are
+  // intentionally excluded — those are post-mortem, not active state.
   const loanDbIds = rows.map((r) => r.id);
-  const armedOrdersByLoan = new Map();
+  const orderByLoan = new Map();
+  let awaitingUserCount = 0;
   if (loanDbIds.length > 0) {
     try {
       const { rows: orderRows } = await query(
-        `SELECT id, loan_id, trigger_kind, trigger_value_micro::text AS trigger_value_micro,
-                slippage_bps, sell_destination
+        `SELECT id, loan_id, status, trigger_kind,
+                trigger_value_micro::text AS trigger_value_micro,
+                slippage_bps, sell_destination, intervention_state,
+                intervention_suggested_slippage_bps, intervention_requested_at,
+                twap_chunks_total, twap_chunks_completed
            FROM limit_close_orders
-          WHERE loan_id = ANY($1::bigint[]) AND status = 'armed'`,
+          WHERE loan_id = ANY($1::bigint[])
+            AND status IN ('armed','twap_in_progress','awaiting_user')`,
         [loanDbIds],
       );
-      for (const o of orderRows) armedOrdersByLoan.set(o.loan_id, o);
+      for (const o of orderRows) {
+        orderByLoan.set(o.loan_id, o);
+        if (o.status === "awaiting_user" && o.intervention_state === "requested") {
+          awaitingUserCount++;
+        }
+      }
     } catch (err) {
       console.warn("[positions] take-profit lookup failed (continuing):", err.message);
     }
@@ -120,6 +135,9 @@ export async function handlePositions(ctx) {
     `${totalSol} SOL owed`,
   ];
   if (dueSoonCount > 0) summary.push(`${dueSoonCount} due within 24h`);
+  if (awaitingUserCount > 0) {
+    summary.push(`*${awaitingUserCount} take-profit awaiting your decision*`);
+  }
 
   const lines = [
     "*Your Active Loans*",
@@ -137,17 +155,26 @@ export async function handlePositions(ctx) {
     });
     lines.push(card);
 
-    // Take-profit annotation — show existing armed order OR prompt to
-    // set one. Surfacing this here is the single biggest discoverability
-    // unlock for the limit-close feature: users see it next to every
-    // loan, not buried in a separate command.
-    const existing = armedOrdersByLoan.get(loan.id);
-    if (existing) {
+    // Take-profit annotation — render per-status so the user can see
+    // EXACTLY where each order is in its lifecycle. The awaiting_user
+    // branch is the most important one to surface here: those orders
+    // sent the user a DM but the user may have dismissed/missed it;
+    // /loans reminds them they have a decision pending.
+    const existing = orderByLoan.get(loan.id);
+    if (!existing) {
+      lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+    } else if (existing.status === "armed") {
       const trig = formatTriggerInline(existing.trigger_kind, existing.trigger_value_micro);
       const slip = (existing.slippage_bps / 100).toFixed(2);
       lines.push(`   take-profit armed: ${trig} (slip ${slip}%) · /canceltp ${existing.id}`);
-    } else {
-      lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+    } else if (existing.status === "twap_in_progress") {
+      const done = existing.twap_chunks_completed ?? 0;
+      const total = existing.twap_chunks_total ?? 0;
+      lines.push(`   take-profit *filling now*: chunk ${done}/${total} via TWAP · /canceltp ${existing.id}`);
+    } else if (existing.status === "awaiting_user") {
+      const suggested = existing.intervention_suggested_slippage_bps;
+      const pct = suggested ? (suggested / 100).toFixed(1) : "?";
+      lines.push(`   take-profit *awaiting your call*: tap the DM (\`Allow ${pct}%\` / Wait / Cancel)`);
     }
     lines.push("");
   }
