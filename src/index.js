@@ -326,9 +326,19 @@ bot.command("crosspost", handleCommunityCrosspost);
 // fires an order.
 {
   const lc = await import("./commands/limit-close.js");
+  // Primary names + memorable aliases. "/takeprofit" + "/tp" are
+  // dramatically more discoverable than "/limitclose" — users know
+  // what "take profit" means; "limit close" is jargon.
   bot.command("limitclose", lc.handleLimitClose);
+  bot.command("takeprofit", lc.handleLimitClose);
+  bot.command("tp", lc.handleLimitClose);
+  bot.command("lo", lc.handleLimitClose);
   bot.command("limitorders", lc.handleLimitOrders);
+  bot.command("takeprofitorders", lc.handleLimitOrders);
+  bot.command("tps", lc.handleLimitOrders);
+  bot.command("los", lc.handleLimitOrders);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
+  bot.command("canceltp", lc.handleCancelLimitOrder);
 
   // Layer 3 — intervention callback handler (inline keyboard taps).
   // Registers a bot.callbackQuery(/^lcint:/) handler that processes
