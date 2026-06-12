@@ -43,6 +43,7 @@
  */
 import { query } from "../db/pool.js";
 import { runArmPreflight } from "./limit-close-preflight.js";
+import { MAX_PROTOCOL_SLIPPAGE_BPS } from "../lib/slippage-constants.js";
 
 export const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL
 export const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -105,7 +106,9 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier, { all
 const DEFAULT_HARD_CAP_BPS = 5000;        // 50% — absolute ceiling on any auto-widened cap
 const DEFAULT_CAP_FLOOR_BPS = 2500;       // 25% — every order gets at least this much room
 const DEFAULT_CAP_MULTIPLIER = 8;         // cap = max(floor, slip × 8) capped at hard cap
-const MAX_INITIAL_SLIPPAGE_BPS = 2500;    // 25% — allow aggressive initial for moon-pump UX
+// Sourced from src/lib/slippage-constants.js — protocol-absolute ceiling
+// shared with internal-agent-limitclose.js and the DB CHECK constraint.
+const MAX_INITIAL_SLIPPAGE_BPS = MAX_PROTOCOL_SLIPPAGE_BPS; // 25% — allow aggressive initial for moon-pump UX
 
 export async function armOrder({
   userId,

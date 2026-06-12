@@ -45,11 +45,22 @@ const POLL_MS = Number(process.env.KEEPER_POLL_MS) || 30_000;
  *                                where you don't want a keypair file
  *                                living in the image.
  *   2. KEEPER_KEYPAIR_PATH     — JSON keypair file path.
- *   3. LENDER_KEYPAIR_PATH     — legacy fallback. The keeper sharing
- *                                the lender's keypair is a least-privilege
- *                                violation flagged in the 2026-06-11 audit.
- *                                Setting KEEPER_PRIVATE_KEY or
- *                                KEEPER_KEYPAIR_PATH avoids it.
+ *
+ * NOTE 2026-06-12 (security audit F-6): the legacy LENDER_KEYPAIR_PATH
+ * fallback that used to live here was REMOVED. The keeper sharing the
+ * lender's keypair is a least-privilege violation — the keeper only
+ * needs to sign liquidations, but the lender keypair also gates
+ * admin_withdraw, set_paused, set_keeper_reward, and price attestation.
+ *
+ * If neither KEEPER_PRIVATE_KEY nor KEEPER_KEYPAIR_PATH is set the
+ * keeper now THROWS at startup. This is intentional — fail loud, not
+ * silently falling back to a more powerful key. Operators running the
+ * keeper must provision a dedicated keeper key (see runbook docs).
+ *
+ * The fallback escape hatch is gone on purpose; if you genuinely need to
+ * temporarily run the keeper with the lender key, set KEEPER_PRIVATE_KEY
+ * to the lender's base58 secret explicitly so the configuration is
+ * VISIBLE in env, not implicit through a path-fallback.
  */
 function loadKeeperKeypair() {
   const b58 = process.env.KEEPER_PRIVATE_KEY;
@@ -57,8 +68,12 @@ function loadKeeperKeypair() {
     const decode = bs58.decode || (bs58.default && bs58.default.decode);
     return Keypair.fromSecretKey(decode(b58));
   }
-  const kpPath = process.env.KEEPER_KEYPAIR_PATH || process.env.LENDER_KEYPAIR_PATH;
-  if (!kpPath) throw new Error("KEEPER_PRIVATE_KEY or KEEPER_KEYPAIR_PATH must be set");
+  const kpPath = process.env.KEEPER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error(
+      "[keeper] KEEPER_PRIVATE_KEY or KEEPER_KEYPAIR_PATH must be set — refusing to fall back to LENDER_KEYPAIR_PATH (least-privilege rule, audit F-6 2026-06-12). Set KEEPER_PRIVATE_KEY (preferred) or KEEPER_KEYPAIR_PATH explicitly.",
+    );
+  }
   return Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(readFileSync(kpPath, "utf8"))),
   );
