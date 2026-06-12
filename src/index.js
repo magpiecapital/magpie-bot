@@ -671,6 +671,12 @@ bot.start({
     // first take-profit fills by surfacing the opportunity the moment it
     // exists, instead of waiting for the user to think to check.
     import("./services/upside-watcher.js").then((m) => m.startUpsideWatcher());
+    // Credit-events auto-healer — every 6h, scans for loans missing
+    // canonical credit_events and backfills them. Belt-and-suspenders
+    // for the live recordLoan / markLoanRepaid writers; any future bug
+    // that drops an event has its impact bounded to one healer cycle.
+    // Self-monitor's stale_credit probe DMs the operator faster.
+    import("./services/credit-events-healer.js").then((m) => m.startCreditEventsHealer());
     // Downside Watcher — symmetric to upside. Pip DMs at -20% / -35% /
     // -50% depreciation with concrete derisk options BEFORE the
     // health-watcher's liquidation tiers escalate.
