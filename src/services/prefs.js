@@ -19,12 +19,18 @@ const DEFAULTS = {
   // "zero liquidations" trust claim — users get protection without
   // having to know it exists. They can opt out via /autoprotect.
   auto_protect: true,
+  // Upside-take-profit nudges from Pip — fires when collateral has
+  // appreciated +40% / +100% / +200% since loan-open. Default ON;
+  // capped at 3 DMs per loan lifetime so worst case is genuinely
+  // valuable (your bag actually moonshot).
+  notify_upside_alerts: true,
 };
 
 export async function getPrefs(userId) {
   const { rows } = await query(
     `SELECT notify_deposits, notify_loan_warnings, notify_liquidations,
-            notify_health, notify_pump, auto_repay, auto_protect
+            notify_health, notify_pump, auto_repay, auto_protect,
+            notify_upside_alerts
      FROM user_prefs WHERE user_id = $1`,
     [userId],
   );

@@ -135,12 +135,21 @@ function renderLimitCloseCancelled(p) {
   ].filter((s) => s !== null).join("\n");
 }
 
+// Pip-proactive payload renderer. The upside watcher pre-renders the
+// full text into payload.text, so we just pass it through. Keeping the
+// rendering server-side (in the watcher) lets the watcher own the
+// economic numbers + threshold copy without leaking renderer details.
+function renderPipUpsideAlert(p) {
+  return p?.text || "";
+}
+
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
   limit_close_fired:        renderLimitCloseFired,
   limit_close_failed:       renderLimitCloseFailed,
   limit_close_cancelled:    renderLimitCloseCancelled,
   limit_close_intervention: renderLimitCloseIntervention,
+  pip_upside_alert:         renderPipUpsideAlert,
 };
 
 function renderPayload(kind, payload) {
