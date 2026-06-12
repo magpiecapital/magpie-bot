@@ -274,8 +274,23 @@ async function probeEngineTopupWallet(bot) {
     const sol = (Number(balance) / 1e9).toFixed(3);
     const floor = (Number(ENGINE_TOPUP_LOW_LAMPORTS) / 1e9).toFixed(3);
     const sev = balance < ENGINE_TOPUP_LOW_LAMPORTS / 5n ? "crit" : "warn";
+    // Pull recent lending velocity so the operator can size the refill.
+    // Operator-stated wallet is reused for BOTH lending disbursements
+    // AND the engine topup pool — alert context needs to reflect both.
+    let burnContext = "";
+    try {
+      const { rows: [r] } = await query(`
+        SELECT
+          COALESCE(SUM(loan_amount_lamports) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours'), 0)::numeric AS lent_24h,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS new_loans_24h,
+          COUNT(*) FILTER (WHERE status = 'active')::int AS active_open
+          FROM loans
+      `);
+      const lent24h = (Number(r.lent_24h) / 1e9).toFixed(1);
+      burnContext = ` Lending velocity: ${lent24h} SOL out in last 24h across ${r.new_loans_24h} loans; ${r.active_open} loans currently outstanding.`;
+    } catch { /* non-critical */ }
     await alertIfNew(bot, KIND,
-      `Engine topup wallet at ${sol} SOL (floor ${floor}). Take-profit fills will start failing once this drains. Top it up: ${pubkeyStr}`,
+      `Engine topup wallet at ${sol} SOL (floor ${floor}). Take-profit fills AND new loan disbursements will fail when this drains.${burnContext} Top it up: ${pubkeyStr}`,
       sev,
     );
   } else {
@@ -284,9 +299,28 @@ async function probeEngineTopupWallet(bot) {
 }
 
 /**
- * Stale support tickets — any open/awaiting_user ticket sitting >24h.
- * The support vigil + auto-ticket-resolver should prevent this; if not,
- * we DM the operator directly so they can step in via /tickets.
+ * Stale support tickets — operator only hears about ones the support
+ * vigil is NOT actively handling. The vigil's tier schedule is:
+ *   0h-24h   after admin_replied:  ticket in "user has time to respond" window
+ *   24h-96h  after admin_replied:  Pip DM #1 has been sent (followup_count=1)
+ *   96h-168h after admin_replied:  Pip DM #2 has been sent (followup_count=2)
+ *   168h+:                          should be auto-closed
+ *
+ * Anything matching the expected schedule is NOT alerted — the vigil
+ * has it. We alert ONLY when:
+ *   - status='open' AND age >24h (admin hasn't replied + vigil only
+ *     handles awaiting_user, so an old open is a real backlog)
+ *   - awaiting_user AND age >24h AND followup_count=0 (vigil should
+ *     have DM'd but didn't)
+ *   - awaiting_user AND age >96h AND followup_count<=1 (vigil's 2nd
+ *     nudge should have fired)
+ *   - awaiting_user AND age >168h AND status not closed (auto-close
+ *     should have fired)
+ *
+ * This keeps the operator's signal-to-noise clean — every alert here
+ * means the vigil itself is failing in some way, not that a ticket is
+ * within an expected window.
+ *
  * Operator-stated rule: "No cases should go unanswered or unsolved."
  */
 async function probeStaleSupport(bot) {
@@ -298,8 +332,25 @@ async function probeStaleSupport(bot) {
       SELECT count(*)::int AS n,
              COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(admin_replied_at, created_at)))) / 3600, 0)::int AS oldest_hours
         FROM support_tickets
-       WHERE status IN ('open', 'awaiting_user')
-         AND COALESCE(admin_replied_at, created_at) < NOW() - INTERVAL '24 hours'
+       WHERE (
+         -- Truly stale OPEN tickets — admin never replied
+         (status = 'open'
+            AND created_at < NOW() - INTERVAL '24 hours')
+         OR
+         -- awaiting_user where vigil should have sent first nudge but didn't
+         (status = 'awaiting_user'
+            AND admin_replied_at < NOW() - INTERVAL '24 hours'
+            AND COALESCE(pip_followup_count, 0) = 0)
+         OR
+         -- awaiting_user where vigil should have sent second nudge but didn't
+         (status = 'awaiting_user'
+            AND admin_replied_at < NOW() - INTERVAL '96 hours'
+            AND COALESCE(pip_followup_count, 0) <= 1)
+         OR
+         -- awaiting_user that should have auto-closed but hasn't
+         (status = 'awaiting_user'
+            AND admin_replied_at < NOW() - INTERVAL '168 hours')
+       )
     `);
     count = r.n;
     oldestHours = r.oldest_hours;
@@ -308,11 +359,48 @@ async function probeStaleSupport(bot) {
   recordOutcome(KIND, isBad);
   if (isBad) {
     await alertIfNew(bot, KIND,
-      `${count} support ticket(s) sitting >24h (oldest ${oldestHours}h). Vigil should be clearing these — check /tickets for what's stuck.`,
-      count >= 5 || oldestHours >= 72 ? "crit" : "warn",
+      `${count} support ticket(s) the vigil is NOT handling (oldest ${oldestHours}h). Tickets in active vigil care are excluded. Check /tickets for what's truly stuck.`,
+      count >= 5 || oldestHours >= 168 ? "crit" : "warn",
     );
   } else {
-    await alertRecovery(bot, KIND, `No stale support tickets.`);
+    await alertRecovery(bot, KIND, `No support tickets outside vigil care.`);
+  }
+}
+
+/**
+ * Credit-events coverage probe — alerts the operator if ANY loan in
+ * the protocol is missing its canonical credit_events. The healer
+ * runs every 6h and auto-backfills; this probe runs every 60s so
+ * the operator finds out within a minute rather than waiting. The
+ * gap should always be 0 in steady state — anything > 0 means a
+ * live writer dropped an event and the healer hasn't swept yet.
+ *
+ * Operator-stated mandate: "make sure we have parameters in place
+ * for this to NEVER happen again." Probe is the early-warning leg.
+ */
+async function probeCreditCoverage(bot) {
+  const KIND = "credit_coverage_gap";
+  let audit;
+  try {
+    const m = await import("./credit-events-healer.js");
+    audit = await m.auditCreditCoverage();
+  } catch (err) {
+    console.warn("[self-monitor] credit_coverage probe threw:", err.message);
+    return;
+  }
+  const isBad = audit.total > 0;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    const parts = [];
+    if (audit.missing_borrow > 0) parts.push(`${audit.missing_borrow} borrow`);
+    if (audit.missing_repay > 0) parts.push(`${audit.missing_repay} repay`);
+    if (audit.missing_liquidated > 0) parts.push(`${audit.missing_liquidated} liquidated`);
+    await alertIfNew(bot, KIND,
+      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 6h; investigate the WRITE path if this persists.`,
+      audit.total >= 10 ? "crit" : "warn",
+    );
+  } else {
+    await alertRecovery(bot, KIND, `Credit-event coverage clean (0 gaps).`);
   }
 }
 
@@ -330,6 +418,7 @@ async function tick(bot) {
       probeTwapWatchdogMisses(bot).catch((e) => console.warn("[self-monitor] twap_watchdog probe threw:", e.message)),
       probeEngineTopupWallet(bot).catch((e) => console.warn("[self-monitor] engine_topup probe threw:", e.message)),
       probeStaleSupport(bot).catch((e) => console.warn("[self-monitor] stale_support probe threw:", e.message)),
+      probeCreditCoverage(bot).catch((e) => console.warn("[self-monitor] credit_coverage probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
