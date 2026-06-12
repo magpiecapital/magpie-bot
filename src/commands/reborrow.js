@@ -14,12 +14,7 @@ import { incrementBorrowed } from "../services/reputation.js";
 import { query } from "../db/pool.js";
 import { filterLoansForWallet } from "../services/wallet-scoped-loans.js";
 import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
-
-const LTV_TIERS = [
-  { option: 0, ltv: 30, days: 2, feeBps: 300, label: "Express" },
-  { option: 1, ltv: 25, days: 3, feeBps: 200, label: "Quick" },
-  { option: 2, ltv: 20, days: 7, feeBps: 150, label: "Standard" },
-];
+import { getEligibleTiers } from "../services/loan-tier-resolver.js";
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
@@ -70,8 +65,24 @@ export async function handleReborrow(ctx) {
     );
   }
 
-  // Use same tier as last loan
-  const tier = LTV_TIERS.find((t) => t.ltv === lastLoan.ltv_percentage) || LTV_TIERS[2];
+  // Resolve the tier set for THIS specific mint's category. RWA mints
+  // pull from rwa_loan_tiers; memecoin (and uncategorized) get
+  // MEMECOIN_TIERS. We need the category from supported_mints — the
+  // loans table doesn't carry it, and the user could have re-borrowed
+  // across categories.
+  const { rows: [mintRow] } = await query(
+    `SELECT category FROM supported_mints WHERE mint = $1`,
+    [match.mint],
+  );
+  const tiers = await getEligibleTiers({ category: mintRow?.category });
+  // Match by LTV percentage to keep the "same tier as last loan" UX, but
+  // pull from the category-correct set. If no exact LTV match (e.g. user
+  // last borrowed at 30% memecoin, then transferred RWA — RWA Express is
+  // 50%), fall back to the most conservative tier (longest term, lowest LTV)
+  // — preserves the "safe default" intent of the original `|| LTV_TIERS[2]`.
+  const tier =
+    tiers.find((t) => t.ltv === lastLoan.ltv_percentage) ||
+    tiers[tiers.length - 1];
 
   // Use same amount or full balance (whichever is smaller)
   const lastRaw = BigInt(lastLoan.collateral_amount);
