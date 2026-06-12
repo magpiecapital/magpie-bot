@@ -171,12 +171,56 @@ export async function armOrder({
 
   // ── Collateral allowlist ────────────────────────────────────
   const { rows: [mintRow] } = await query(
-    `SELECT enabled, category, symbol FROM supported_mints WHERE mint = $1`,
+    `SELECT enabled, category, symbol, liquidity_usd FROM supported_mints WHERE mint = $1`,
     [loan.collateral_mint],
   );
   if (!mintRow || !mintRow.enabled) return { ok: false, error: "collateral_not_enabled" };
   if (["stock", "etf", "metal"].includes(mintRow.category)) {
     return { ok: false, error: "rwa_collateral_not_supported_in_v1" };
+  }
+
+  // ── Liquidity-aware initial slippage adjustment ─────────────
+  // Operator mandate: "the order MUST execute." The arm-time INITIAL
+  // slippage is what the engine tries FIRST. For thin tokens, a default
+  // 200 bps initial means the first attempt almost certainly reverts and
+  // we waste a tick before auto-escalation kicks in. Bumping the initial
+  // up to a token-liquidity-appropriate floor saves that round-trip.
+  //
+  // Exploit surface analysis:
+  //   - liquidity_usd is screener-vetted and operator-controlled (slow
+  //     cadence). Not manipulable per-arm — an attacker cannot create a
+  //     fake low-liquidity reading right before an arm to force a wider
+  //     initial. The CAP is the actual ceiling (5000 bps absolute via
+  //     DEFAULT_HARD_CAP_BPS), and this code never touches the cap.
+  //   - Hard floor on the bump: never bump initial ABOVE the user's
+  //     stated cap. If the bump would exceed the cap, clamp to cap.
+  //   - User's stated cap (effectiveCap) is unchanged.
+  //
+  // Tiers (bps floors):
+  //   deep      (>= $100k liquidity_usd) : no bump
+  //   mid       ($25k-$100k)             : 300 bps floor (3%)
+  //   thin      ($5k-$25k)               : 500 bps floor (5%)
+  //   very_thin (< $5k)                  : 1000 bps floor (10%)
+  const liqUsd = Number(mintRow.liquidity_usd ?? 0);
+  let liquidityFloorBps = 0;
+  // Treat liquidity_usd <= 0 as UNKNOWN (screener data missing or stale)
+  // rather than as "very thin". Bumping to 10% on a token that may have
+  // real $1M liquidity (just unscanned) would be a surprise to the user.
+  // The engine's auto-escalation still walks UP from the initial when the
+  // first attempt fails, so the user is still protected against thin
+  // liquidity at fire time — we just don't preemptively widen on data we
+  // don't have.
+  if (liqUsd <= 0) liquidityFloorBps = 0;
+  else if (liqUsd >= 100_000) liquidityFloorBps = 0;
+  else if (liqUsd >= 25_000) liquidityFloorBps = 300;
+  else if (liqUsd >= 5_000) liquidityFloorBps = 500;
+  else liquidityFloorBps = 1000;
+  const originalInitialBps = slippageBps;
+  let appliedInitialBps = slippageBps;
+  if (liquidityFloorBps > 0 && slippageBps < liquidityFloorBps) {
+    // Clamp to user's stated cap so the bump never widens past what
+    // they already accepted as the worst case for this order.
+    appliedInitialBps = Math.min(liquidityFloorBps, effectiveCap);
   }
 
   // ── Per-user concurrency cap ────────────────────────────────
@@ -227,13 +271,16 @@ export async function armOrder({
                $16)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
-       slippageBps, sellDestination, expiresAt,
+       appliedInitialBps, sellDestination, expiresAt,
        source, sourceAgentPubkey,
-       autoEscalate, effectiveCap, slippageBps,
+       autoEscalate, effectiveCap, appliedInitialBps,
        advisory ? null : effectiveCap,
        advisory ? null : (preflight.proceedsLamports || null),
        advisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
-       armNote || `armed via ${source}`],
+       armNote
+         || (appliedInitialBps !== originalInitialBps
+           ? `armed via ${source}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+           : `armed via ${source}`)],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
@@ -250,6 +297,13 @@ export async function armOrder({
     loan,
     mint: mintRow,
     preflightAdvisory: advisory,
+    // Surfacing the bump lets callers (TG cmd, site UI, agent response)
+    // tell the user "you asked for 2%, we armed at 5% because $TOKEN
+    // is thin." Cap is unchanged either way.
+    initialSlippageBpsRequested: originalInitialBps,
+    initialSlippageBpsApplied: appliedInitialBps,
+    liquidityTierFloorBps: liquidityFloorBps,
+    liquidityUsd: liqUsd,
   };
 }
 
