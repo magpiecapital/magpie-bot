@@ -1,5 +1,6 @@
 import axios from "axios";
 import "dotenv/config";
+import { hasPythCoverage, pythPriceInSol, pythPriceInUsd } from "./pyth-price.js";
 
 // Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
 // prices are derived as token_usd / sol_usd.
@@ -129,6 +130,59 @@ export async function getPricesInSolBatch(mints) {
  */
 const MAX_DIVERGENCE = Number(process.env.PRICE_MAX_DIVERGENCE) || 0.05;
 
+/**
+ * Three-source agreement helper (audit F-2 follow-up — Pyth as 3rd source).
+ *
+ * Returns a price the caller can trust, or null if the inputs don't agree.
+ * The caller decides whether to throw / fall back / escape-hatch.
+ *
+ *   sources: array of { name, price } objects. price may be null if the
+ *     source didn't return. Filter to truthy prices internally.
+ *   maxDivergence: pairwise fractional threshold (default 5%)
+ *
+ * Semantics:
+ *   - 0 sources       → null
+ *   - 1 source        → null (caller handles single-source escape hatch)
+ *   - 2 sources agree → return their average
+ *   - 2 sources disagree → null
+ *   - 3 sources, at least 2 agree (the "median majority") → return average
+ *     of the agreeing pair. The disagreeing one is the suspect outlier.
+ *   - 3 sources, all 3 disagree → null
+ *
+ * Logs a one-line summary so the operator can see "outlier rejected"
+ * patterns in the daily ops digest.
+ */
+function agreeOnPrice({ mint, sources, maxDivergence }) {
+  const valid = sources.filter((s) => s.price != null && s.price > 0);
+  if (valid.length <= 1) return null;
+  if (valid.length === 2) {
+    const [a, b] = valid;
+    const div = Math.abs(a.price - b.price) / Math.min(a.price, b.price);
+    if (div <= maxDivergence) return { price: (a.price + b.price) / 2, agreed: [a.name, b.name], outlier: null };
+    return null;
+  }
+  // 3 sources — find the pair with smallest divergence.
+  const pairs = [
+    [valid[0], valid[1]],
+    [valid[0], valid[2]],
+    [valid[1], valid[2]],
+  ].map(([a, b]) => ({
+    a, b,
+    div: Math.abs(a.price - b.price) / Math.min(a.price, b.price),
+  }));
+  pairs.sort((x, y) => x.div - y.div);
+  const best = pairs[0];
+  if (best.div > maxDivergence) return null;
+  const outlier = valid.find((s) => s.name !== best.a.name && s.name !== best.b.name);
+  if (outlier) {
+    const outlierDiv = Math.abs(outlier.price - best.a.price) / Math.min(outlier.price, best.a.price);
+    if (outlierDiv > maxDivergence) {
+      console.warn(`[price] 3-source outlier rejected for ${String(mint).slice(0, 8)}: ${outlier.name} (${outlier.price}) disagrees with ${best.a.name}+${best.b.name} agreed avg by ${(outlierDiv * 100).toFixed(1)}%`);
+    }
+  }
+  return { price: (best.a.price + best.b.price) / 2, agreed: [best.a.name, best.b.name], outlier: outlier?.name ?? null };
+}
+
 async function dexscreenerPriceInSol(mint) {
   const resp = await axios.get(
     `https://api.dexscreener.com/tokens/v1/solana/${mint},${SOL_MINT}`,
@@ -180,41 +234,58 @@ async function dexscreenerPriceInSol(mint) {
 // attestor goes through getPriceInSol() (singular, lenient retry+fallback)
 // — that's intentional and unchanged.
 export async function getPriceInSolCrossSourced(mint) {
-  const [jupRes, dexRes] = await Promise.allSettled([
-    getPriceInSol(mint),
-    dexscreenerPriceInSol(mint),
-  ]);
+  // Pyth coverage check — most memecoins won't have a feed and that's
+  // fine. The function gracefully degrades to 2-source mode (Jup+Dex)
+  // for any mint without Pyth coverage.
+  const usePyth = hasPythCoverage(mint);
+  const promises = [getPriceInSol(mint), dexscreenerPriceInSol(mint)];
+  if (usePyth) promises.push(pythPriceInSol(mint));
 
-  const jup = jupRes.status === "fulfilled" ? jupRes.value : null;
-  const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
-  const jupErr = jupRes.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
-  const dexErr = dexRes.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
+  const settled = await Promise.allSettled(promises);
+  const [jupRes, dexRes, pythRes] = settled;
+  const jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
+  const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
+  const dexErr = dexRes?.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
+  const pythErr = pythRes?.status === "rejected" ? pythRes.reason?.message?.slice(0, 80) : null;
 
-  if (!jup && !dex) {
-    throw new Error(`No price data for ${mint} from any source (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+  const sources = [
+    { name: "Jupiter", price: jup },
+    { name: "DexScreener", price: dex },
+  ];
+  if (usePyth) sources.push({ name: "Pyth", price: pyth });
+  const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;
+
+  if (respondingCount === 0) {
+    throw new Error(`No price data for ${mint} from any source (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"}${usePyth ? `; pyth=${pythErr ?? "n/a"}` : ""})`);
   }
 
   // Single-source case — fail closed unless the env-var escape hatch is on.
-  if (!jup || !dex) {
-    const survivor = jup ? "Jupiter" : "DexScreener";
-    const downSrc = jup ? "DexScreener" : "Jupiter";
-    const downErr = jup ? dexErr : jupErr;
+  if (respondingCount === 1) {
+    const survivor = sources.find((s) => s.price != null && s.price > 0);
+    const down = sources.filter((s) => s.price == null).map((s) => s.name).join(",");
     if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
-      console.warn(`[price] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor} (${downSrc} down: ${downErr}). Escape hatch is ON — security posture is degraded.`);
-      return jup ?? dex;
+      console.warn(`[price] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor.name} (${down} down). Escape hatch is ON — security posture is degraded.`);
+      return survivor.price;
     }
-    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} down: ${downErr}). Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
-    throw new Error(`Price data temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} is down). Try again in a moment.`);
+    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down). Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
+    throw new Error(`Price data temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor.name} responded. Try again in a moment.`);
   }
 
-  // Both returned — verify agreement.
-  const divergence = Math.abs(jup - dex) / Math.min(jup, dex);
-  if (divergence > MAX_DIVERGENCE) {
+  // 2 or 3 sources responded — delegate to the agreement helper.
+  const agreed = agreeOnPrice({ mint, sources, maxDivergence: MAX_DIVERGENCE });
+  if (!agreed) {
+    const detail = sources.filter((s) => s.price != null && s.price > 0)
+      .map((s) => `${s.name}=${s.price.toFixed(9)}`).join(", ");
     throw new Error(
-      `Price sources disagree for ${mint.slice(0, 8)}: Jupiter=${jup.toFixed(9)} SOL vs DexScreener=${dex.toFixed(9)} SOL (${(divergence * 100).toFixed(1)}% gap). Likely manipulation — refusing to value.`,
+      `Price sources disagree for ${mint.slice(0, 8)}: ${detail}. Above ${(MAX_DIVERGENCE * 100).toFixed(0)}% threshold — likely manipulation. Refusing to value.`,
     );
   }
-  return jup;
+  if (agreed.outlier) {
+    console.warn(`[price] outlier rejected for ${mint.slice(0, 8)}: ${agreed.agreed.join("+")} agreed; ${agreed.outlier} flagged`);
+  }
+  return agreed.price;
 }
 
 /**
@@ -257,38 +328,54 @@ async function dexscreenerPriceInUsd(mint) {
 // (ALLOW_SINGLE_SOURCE_PRICING=true) covers both functions — flipping it
 // degrades the entire valuation surface, not just one path.
 export async function getPriceInUsdCrossSourced(mint) {
-  const [jupRes, dexRes] = await Promise.allSettled([
-    jupiterPriceInUsd(mint),
-    dexscreenerPriceInUsd(mint),
-  ]);
-  const jup = jupRes.status === "fulfilled" ? jupRes.value : null;
-  const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
-  const jupErr = jupRes.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
-  const dexErr = dexRes.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
+  const usePyth = hasPythCoverage(mint);
+  const promises = [jupiterPriceInUsd(mint), dexscreenerPriceInUsd(mint)];
+  if (usePyth) promises.push(pythPriceInUsd(mint));
 
-  if (!jup && !dex) throw new Error(`No USD price data for ${mint} (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+  const settled = await Promise.allSettled(promises);
+  const [jupRes, dexRes, pythRes] = settled;
+  const jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
+  const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
+  const dexErr = dexRes?.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
+  const pythErr = pythRes?.status === "rejected" ? pythRes.reason?.message?.slice(0, 80) : null;
 
-  if (!jup || !dex) {
-    const survivor = jup ? "Jupiter" : "DexScreener";
-    const downSrc = jup ? "DexScreener" : "Jupiter";
-    const downErr = jup ? dexErr : jupErr;
+  const sources = [
+    { name: "Jupiter", price: jup },
+    { name: "DexScreener", price: dex },
+  ];
+  if (usePyth) sources.push({ name: "Pyth", price: pyth });
+  const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;
+
+  if (respondingCount === 0) {
+    throw new Error(`No USD price data for ${mint} (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"}${usePyth ? `; pyth=${pythErr ?? "n/a"}` : ""})`);
+  }
+
+  if (respondingCount === 1) {
+    const survivor = sources.find((s) => s.price != null && s.price > 0);
+    const down = sources.filter((s) => s.price == null).map((s) => s.name).join(",");
     if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
-      console.warn(`[price-usd] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor} (${downSrc} down: ${downErr}). Escape hatch is ON.`);
-      return jup ?? dex;
+      console.warn(`[price-usd] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor.name} (${down} down). Escape hatch is ON.`);
+      return survivor.price;
     }
-    console.warn(`[price-usd] REFUSED ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} down: ${downErr}).`);
-    throw new Error(`USD price temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor} responded. Try again in a moment.`);
+    console.warn(`[price-usd] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down).`);
+    throw new Error(`USD price temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor.name} responded. Try again in a moment.`);
   }
 
-  const divergence = Math.abs(jup - dex) / Math.min(jup, dex);
-  if (divergence > MAX_DIVERGENCE) {
-    throw new Error(
-      `USD price sources disagree for ${mint.slice(0, 8)}: Jupiter=$${jup.toFixed(6)} vs DexScreener=$${dex.toFixed(6)}`,
-    );
+  const agreed = agreeOnPrice({ mint, sources, maxDivergence: MAX_DIVERGENCE });
+  if (!agreed) {
+    const detail = sources.filter((s) => s.price != null && s.price > 0)
+      .map((s) => `${s.name}=$${s.price.toFixed(6)}`).join(", ");
+    throw new Error(`USD price sources disagree for ${mint.slice(0, 8)}: ${detail}`);
   }
-  // Take the more conservative (lower) value — caller may use this
-  // for trigger evaluation, where "go conservative" is the right bias.
-  return Math.min(jup, dex);
+  if (agreed.outlier) {
+    console.warn(`[price-usd] outlier rejected for ${mint.slice(0, 8)}: ${agreed.agreed.join("+")} agreed; ${agreed.outlier} flagged`);
+  }
+  // Caller may use this for trigger evaluation; previously took min(jup, dex)
+  // as a conservative bias. The 3-source agreement helper returns the
+  // average of the agreeing pair, which is a stronger consensus value.
+  return agreed.price;
 }
 
 /**
