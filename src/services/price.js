@@ -152,6 +152,33 @@ async function dexscreenerPriceInSol(mint) {
   return bestToken.priceUsd / bestSol.priceUsd;
 }
 
+// Fail-closed policy (security audit F-2, 2026-06-12):
+//
+// This function is the canonical valuation gate for borrow LTV and limit-
+// close arming — high-stakes paths where a manipulated price translates
+// directly into a borrowable inflation against the pool. The 2026-06-07
+// $FATHER incident showed that single-source acceptance during a sibling
+// source's outage is enough to extract value at a thin pool that's been
+// pumped on the surviving source.
+//
+// The function REQUIRES BOTH sources by default. If exactly one source
+// fails (rate limit, 5xx, timeout, missing-mint), the function throws.
+// The borrow flow's error surface translates this into a friendly
+// "couldn't value collateral right now — try again in a moment" message.
+// Better to fail one borrow attempt than to mis-value a loan.
+//
+// Single-source escape hatch:
+//   ALLOW_SINGLE_SOURCE_PRICING=true
+//
+// Only flip this during a confirmed long-running outage of either Jupiter
+// or DexScreener, AND only when the surviving source has been independently
+// verified as un-manipulated. Default to false; the bot logs a WARN every
+// time this fires so an attacker can't quietly degrade the protocol's
+// posture from inside the system.
+//
+// The low-stakes "give-me-a-price" path used by the on-chain price-feed
+// attestor goes through getPriceInSol() (singular, lenient retry+fallback)
+// — that's intentional and unchanged.
 export async function getPriceInSolCrossSourced(mint) {
   const [jupRes, dexRes] = await Promise.allSettled([
     getPriceInSol(mint),
@@ -160,19 +187,24 @@ export async function getPriceInSolCrossSourced(mint) {
 
   const jup = jupRes.status === "fulfilled" ? jupRes.value : null;
   const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
+  const jupErr = jupRes.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
+  const dexErr = dexRes.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
 
-  // If only one source returns, accept it but flag — better than refusing
-  // to value a real loan because of a third-party outage.
-  if (jup && !dex) {
-    console.warn(`[price] ${mint.slice(0, 8)} single-source (Jupiter only): ${jup}`);
-    return jup;
-  }
-  if (!jup && dex) {
-    console.warn(`[price] ${mint.slice(0, 8)} single-source (DexScreener only): ${dex}`);
-    return dex;
-  }
   if (!jup && !dex) {
-    throw new Error(`No price data for ${mint} from any source`);
+    throw new Error(`No price data for ${mint} from any source (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+  }
+
+  // Single-source case — fail closed unless the env-var escape hatch is on.
+  if (!jup || !dex) {
+    const survivor = jup ? "Jupiter" : "DexScreener";
+    const downSrc = jup ? "DexScreener" : "Jupiter";
+    const downErr = jup ? dexErr : jupErr;
+    if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
+      console.warn(`[price] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor} (${downSrc} down: ${downErr}). Escape hatch is ON — security posture is degraded.`);
+      return jup ?? dex;
+    }
+    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} down: ${downErr}). Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
+    throw new Error(`Price data temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} is down). Try again in a moment.`);
   }
 
   // Both returned — verify agreement.
@@ -219,6 +251,11 @@ async function dexscreenerPriceInUsd(mint) {
   return best.priceUsd;
 }
 
+// Same fail-closed policy as getPriceInSolCrossSourced (security audit F-2).
+// Used by limit-close arm validation, dashboard price displays, and Pip
+// answers about token prices. The single-source escape hatch
+// (ALLOW_SINGLE_SOURCE_PRICING=true) covers both functions — flipping it
+// degrades the entire valuation surface, not just one path.
 export async function getPriceInUsdCrossSourced(mint) {
   const [jupRes, dexRes] = await Promise.allSettled([
     jupiterPriceInUsd(mint),
@@ -226,10 +263,22 @@ export async function getPriceInUsdCrossSourced(mint) {
   ]);
   const jup = jupRes.status === "fulfilled" ? jupRes.value : null;
   const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
+  const jupErr = jupRes.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
+  const dexErr = dexRes.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
 
-  if (jup && !dex) return jup;
-  if (!jup && dex) return dex;
-  if (!jup && !dex) throw new Error(`No USD price data for ${mint}`);
+  if (!jup && !dex) throw new Error(`No USD price data for ${mint} (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+
+  if (!jup || !dex) {
+    const survivor = jup ? "Jupiter" : "DexScreener";
+    const downSrc = jup ? "DexScreener" : "Jupiter";
+    const downErr = jup ? dexErr : jupErr;
+    if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
+      console.warn(`[price-usd] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor} (${downSrc} down: ${downErr}). Escape hatch is ON.`);
+      return jup ?? dex;
+    }
+    console.warn(`[price-usd] REFUSED ${mint.slice(0, 8)} — only ${survivor} responded (${downSrc} down: ${downErr}).`);
+    throw new Error(`USD price temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor} responded. Try again in a moment.`);
+  }
 
   const divergence = Math.abs(jup - dex) / Math.min(jup, dex);
   if (divergence > MAX_DIVERGENCE) {
