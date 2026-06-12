@@ -9,6 +9,16 @@ import { connection } from "./connection.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const idlPath = path.join(__dirname, "idl", "magpie_lending.json");
 const idl = JSON.parse(readFileSync(idlPath, "utf8"));
+// V2 IDL — different account layout (no fee_wallet field on LendingPool;
+// the V2 program enforces fee routing via the authority-signed borrow tx
+// rather than a stored fee_wallet pubkey). Loading it lazily here so
+// existing V1 callers don't pay the parse cost.
+const idlPathV2 = path.join(__dirname, "idl", "magpie_lending_v2.json");
+let _idlV2 = null;
+function getV2Idl() {
+  if (!_idlV2) _idlV2 = JSON.parse(readFileSync(idlPathV2, "utf8"));
+  return _idlV2;
+}
 
 export const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || idl.address,
@@ -128,7 +138,13 @@ export function getReadOnlyProgram(programId = PROGRAM_ID) {
   const provider = new AnchorProvider(connection, new Wallet(dummyKp), {
     commitment: "confirmed",
   });
-  return new Program({ ...idl, address: programId.toBase58() }, provider);
+  // Pick the matching IDL: V1 uses the legacy layout (LendingPool has
+  // fee_wallet); V2 uses the newer layout (authority-routed fees, no
+  // fee_wallet field). Using the wrong IDL silently mis-deserializes
+  // every field past the layout divergence — caught the missing V2
+  // fee_wallet during the 2026-06-12 V2-pool audit.
+  const useIdl = PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2) ? getV2Idl() : idl;
+  return new Program({ ...useIdl, address: programId.toBase58() }, provider);
 }
 
 /**
