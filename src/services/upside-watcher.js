@@ -56,28 +56,29 @@ let _timer = null;
  * historical price marker are skipped (we don't guess).
  */
 async function computeAppreciation(loan) {
+  // getPriceInUsdCrossSourced THROWS when no price is available (thin
+  // pump.fun tokens, Jupiter outages, DexScreener gaps). For the
+  // watcher's purposes "no price" == "skip this loan, try next tick" —
+  // we never want a missing price to log-spam or crash the tick. Both
+  // price lookups are wrapped + swallowed silently.
   const decimals = loan.decimals ?? 9;
-  const currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
+  let currentUsdPerToken;
+  try {
+    currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
+  } catch { return null; }
   if (!currentUsdPerToken || currentUsdPerToken <= 0) return null;
   const collateralWhole = Number(loan.collateral_amount) / 10 ** decimals;
   const currentValueUsd = collateralWhole * currentUsdPerToken;
-  // Loan-open value: original_loan_amount_lamports was the SOL disbursed
-  // at LTV ratio against the collateral at THAT moment. We back out the
-  // collateral USD value from the loan amount + LTV. This is more reliable
-  // than relying on a historical price oracle (which we'd have to store).
-  // If ltv_percentage is missing/zero, we cannot reason about appreciation.
   const ltv = Number(loan.ltv_percentage);
   if (!ltv || ltv <= 0) return null;
-  // SOL borrowed (lamports) → SOL borrowed (whole)
   const solBorrowed = Number(loan.original_loan_amount_lamports) / 1e9;
-  // SOL/USD reference: use the current SOL price as a stable denominator.
-  // The watcher's accuracy is tier-based ("did we cross 40%?"), so
-  // using current SOL/USD for both sides is consistent — drift in SOL
-  // price affects both legs equally.
-  const solUsd = await getPriceInUsdCrossSourced("So11111111111111111111111111111111111111112");
+  let solUsd;
+  try {
+    solUsd = await getPriceInUsdCrossSourced("So11111111111111111111111111111111111111112");
+  } catch { return null; }
   if (!solUsd || solUsd <= 0) return null;
   const borrowedUsd = solBorrowed * solUsd;
-  const borrowValueUsd = borrowedUsd / (ltv / 100);  // back out collateral USD at open
+  const borrowValueUsd = borrowedUsd / (ltv / 100);
   if (borrowValueUsd <= 0) return null;
   const pct = ((currentValueUsd - borrowValueUsd) / borrowValueUsd) * 100;
   return { pct, currentValueUsd, borrowValueUsd, currentUsdPerToken };
