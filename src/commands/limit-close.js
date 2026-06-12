@@ -422,6 +422,24 @@ export async function handleLimitClose(ctx) {
   // at 5000 bps. Engine walks UNDER the cap on revert; never above.
   const derivedCapBps = Math.min(5000, Math.max(2500, slippage_bps * 8));
 
+  // Liquidity-aware initial slippage — mirrors arm-core. Bumps the
+  // INITIAL up to a token-liquidity-appropriate floor for thin tokens
+  // so the engine's first attempt is more likely to fill (saves a 30s
+  // retry cycle on auto-escalation). Treats liquidity_usd <= 0 as
+  // UNKNOWN (no bump) — bumping on missing screener data would surprise
+  // the user. Cap is unchanged.
+  const liqUsd = Number(mintRow.liquidity_usd ?? 0);
+  let liquidityFloorBps = 0;
+  if (liqUsd <= 0) liquidityFloorBps = 0;
+  else if (liqUsd >= 100_000) liquidityFloorBps = 0;
+  else if (liqUsd >= 25_000) liquidityFloorBps = 300;
+  else if (liqUsd >= 5_000) liquidityFloorBps = 500;
+  else liquidityFloorBps = 1000;
+  const originalInitialBps = slippage_bps;
+  const appliedInitialBps = liquidityFloorBps > 0 && slippage_bps < liquidityFloorBps
+    ? Math.min(liquidityFloorBps, derivedCapBps)
+    : slippage_bps;
+
   // 5. Insert. The UNIQUE partial index on (loan_id WHERE status='armed')
   //    makes "two orders on the same loan" physically impossible at the
   //    storage layer.
@@ -432,17 +450,21 @@ export async function handleLimitClose(ctx) {
          (user_id, loan_id, trigger_kind, trigger_value_micro,
           slippage_bps, sell_destination, expires_at, source, status, armed_at,
           initial_slippage_bps, auto_escalate_slippage, max_slippage_bps_cap,
-          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at)
+          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
+          notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'tg', 'armed', NOW(),
                $8, TRUE, $9,
-               $10, $11, $12)
+               $10, $11, $12, $13)
        RETURNING id`,
       [user.id, loan.id, trigger_kind, trigger_value_micro.toString(),
-       slippage_bps, dest, expire_iso,
-       slippage_bps, derivedCapBps,
-       preflightAdvisory ? null : slippage_bps,
+       appliedInitialBps, dest, expire_iso,
+       appliedInitialBps, derivedCapBps,
+       preflightAdvisory ? null : appliedInitialBps,
        preflightAdvisory ? null : (preflight.proceedsLamports || null),
-       preflightAdvisory ? null : (preflight.quotedAtIso || new Date().toISOString())],
+       preflightAdvisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
+       appliedInitialBps !== originalInitialBps
+         ? `armed via tg; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+         : "armed via tg"],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message)) {
@@ -465,7 +487,11 @@ export async function handleLimitClose(ctx) {
       `Loan: #${loan.loan_id} (${symbol})`,
       `Trigger: ${triggerLabel}`,
       multiplierContextLine ? `_${multiplierContextLine}_` : null,
-      `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
+      `Slippage: ${(appliedInitialBps / 100).toFixed(2)}%${
+        appliedInitialBps !== originalInitialBps
+          ? ` _(bumped from ${(originalInitialBps / 100).toFixed(2)}% — ${symbol} has thin liquidity)_`
+          : ""
+      }`,
       `Destination: ${dest.toUpperCase()}`,
       ``,
       `When ${symbol} hits your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`,
