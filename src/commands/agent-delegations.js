@@ -23,6 +23,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
+import { MIN_AGENT_DELEGATION_BPS, MAX_AGENT_DELEGATION_BPS } from "../lib/slippage-constants.js";
 import { ensureWallet } from "../services/wallet.js";
 
 const VALID_ACTIONS = new Set(["limit_close"]);
@@ -102,8 +103,12 @@ export async function handleAgentAuthorize(ctx) {
       maxActiveOrders = n;
     } else if (k === "max_slippage_bps") {
       const n = Number(v);
-      if (!Number.isInteger(n) || n < 10 || n > 1000) {
-        return ctx.reply("max_slippage_bps must be between 10 and 1000 (0.1% to 10%).");
+      // User-consent ceiling — see src/lib/slippage-constants.js for why
+      // this is lower than MAX_PROTOCOL_SLIPPAGE_BPS.
+      if (!Number.isInteger(n) || n < MIN_AGENT_DELEGATION_BPS || n > MAX_AGENT_DELEGATION_BPS) {
+        const minPct = (MIN_AGENT_DELEGATION_BPS / 100).toFixed(1);
+        const maxPct = (MAX_AGENT_DELEGATION_BPS / 100).toFixed(1);
+        return ctx.reply(`max_slippage_bps must be between ${MIN_AGENT_DELEGATION_BPS} and ${MAX_AGENT_DELEGATION_BPS} (${minPct}% to ${maxPct}%).`);
       }
       maxSlippageBps = n;
     } else if (k === "expires") {
