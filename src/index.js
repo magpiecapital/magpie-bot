@@ -709,10 +709,10 @@ bot.start({
     // applies uniformly to BOTH fee types once ratified.
     import("./services/limit-close-fee-accrual-watcher.js").then((m) => m.startLimitCloseFeeAccrualWatcher());
     // Protocol fee sweeper — hourly, consolidates TP fees from
-    // PROTOCOL_FEE_DESTINATION (5hsZBr…) into the lender wallet
-    // (4JSSSaG3…) so the existing distributor includes them in the
-    // 70-10-10-10 split. NO-OPs silently if PROTOCOL_FEE_KEYPAIR isn't
-    // set — operator can sweep manually + use /protocolfees for state.
+    // PROTOCOL_FEE_DESTINATION into the lender wallet so the existing
+    // distributor includes them in the 70-10-10-10 split. NO-OPs silently
+    // if PROTOCOL_FEE_KEYPAIR isn't set — operator can sweep manually
+    // + use /protocolfees for state.
     import("./services/protocol-fee-sweeper.js").then((m) => m.startProtocolFeeSweeper());
     // Downside Watcher — symmetric to upside. Pip DMs at -20% / -35% /
     // -50% depreciation with concrete derisk options BEFORE the
