@@ -66,9 +66,15 @@ export const VALID_TRIGGER_DIRECTIONS = new Set(["above", "below"]);
  * Returns { ok: true, triggerValueMicro: BigInt, currentUsd, targetUsd }
  * or { ok: false, error: string }.
  */
-export async function resolveMultiplierToPrice(collateralMint, multiplier) {
-  if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 1) {
+export async function resolveMultiplierToPrice(collateralMint, multiplier, { allowBelowOne = false } = {}) {
+  if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 0) {
+    return { ok: false, error: "Multiplier must be a positive number." };
+  }
+  if (!allowBelowOne && multiplier <= 1) {
     return { ok: false, error: "Multiplier must be > 1 (e.g. 2 for 2×)." };
+  }
+  if (allowBelowOne && multiplier >= 1) {
+    return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
   const { getPriceInUsdCrossSourced } = await import("./price.js");
   const currentUsd = await getPriceInUsdCrossSourced(collateralMint);

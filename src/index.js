@@ -336,12 +336,22 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("takeprofit", lc.handleLimitClose);
   bot.command("tp", lc.handleLimitClose);
   bot.command("lo", lc.handleLimitClose);
+  // Stop-loss — same arm-core path, direction='below' flips the engine's
+  // trigger comparator from >= to <=. 1% protocol fee applies in BOTH
+  // directions (operator rule 2026-06-12). Cutting losses before the
+  // liquidation edge is the user's choice; the engine still charges
+  // the fee on proceeds either way.
+  bot.command("stoploss", lc.handleStopLoss);
+  bot.command("sl", lc.handleStopLoss);
   bot.command("limitorders", lc.handleLimitOrders);
   bot.command("takeprofitorders", lc.handleLimitOrders);
   bot.command("tps", lc.handleLimitOrders);
   bot.command("los", lc.handleLimitOrders);
+  bot.command("stoplosses", lc.handleLimitOrders);
+  bot.command("sls", lc.handleLimitOrders);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
   bot.command("canceltp", lc.handleCancelLimitOrder);
+  bot.command("cancelsl", lc.handleCancelLimitOrder);
 
   // Layer 3 — intervention callback handler (inline keyboard taps).
   // Registers a bot.callbackQuery(/^lcint:/) handler that processes
