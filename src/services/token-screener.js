@@ -40,18 +40,62 @@ const BLOCKED_SYMBOLS = new Set([
 // DIFFERENT mint address gets rejected. Add canonical mints as we
 // onboard them so the screener catches "Fake BONK", "USDC2", "Real WIF",
 // unicode lookalikes, etc.
+// Expanded 2026-06-12 (audit F-3): catches symbol/name impersonation
+// of top-50 Solana tokens by mcap. An attacker minting a fake "JLP" or
+// "Real WIF" on a different mint address can't slip past name/symbol
+// matchers and end up enabled as collateral. Add entries as new
+// well-known mints emerge — operator quarterly review per F-3 follow-up.
+//
+// IMPORTANT: never store an entry for a token whose canonical mint
+// could legitimately have a duplicate (e.g. mint authority still
+// active and re-issuing). The map enforces 1:1; ambiguous tokens stay
+// out so checkImpersonation doesn't false-reject.
 const CANONICAL_MINTS = new Map([
+  // Memecoins (highest impersonation risk — symbols are short + meme-y)
   ["BONK", "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"],
   ["WIF", "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"],
   ["PENGU", "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv"],
   ["POPCAT", "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"],
   ["FARTCOIN", "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"],
   ["CUM", "oqU4DdYCbdSf9j74vnEgvCn1YzNfYQEPWaC6pu6pump"],
+  ["MEW", "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"],
+  ["MOTHER", "3S8qX1MsMqRbiwKg2cQyx7nis1oHMgaCuc9c4VfvVdPN"],
+  ["GIGA", "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9"],
+  ["MANEKI", "25hAyBQfoDhfWx9ay6rarbgvWGwDdNqcHsXS3jQ3mTDJ"],
+  ["MOODENG", "ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY"],
+  ["GOAT", "CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump"],
+  ["RETARDIO", "6ogzHhzdrQr9Pgv6hZ2MNze7UrzBMAFyBBWUYp1Fhitx"],
+  ["MICHI", "5mbK36SZ7J19An8jFochhQS4of8g6BwUjbeCSxBSoWdp"],
+  ["BILLY", "3B5wuUrMEi5yATD7on46hKfej3pfmd7t1RKgrsN3pump"],
+
+  // Stables
   ["USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],
   ["USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"],
+  ["PYUSD", "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"],
+  ["USDS", "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA"],
+
+  // DeFi (Solana DEXs + lending)
   ["JUP", "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"],
+  ["JLP", "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"],
+  ["RAY", "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"],
+  ["ORCA", "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"],
+  ["DRIFT", "DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7"],
+  ["KMNO", "KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS"],
+
+  // Oracles + Infrastructure
   ["PYTH", "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"],
   ["JTO", "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"],
+  ["W", "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ"],
+  ["TNSR", "TNSRxcUxoT9xBG3de7PiJyTDYu7kskLqcpddxnEJAS6"],
+
+  // Liquid Staking Tokens (often impersonated — yield-bearing)
+  ["MSOL", "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"],
+  ["JITOSOL", "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"],
+  ["BSOL", "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"],
+  ["INF", "5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm"],
+
+  // SOL itself — guard against "wrapped SOL impersonator"
+  ["SOL", "So11111111111111111111111111111111111111112"],
 ]);
 
 // Normalize a string for comparison: lowercase, strip whitespace, remove
@@ -73,19 +117,28 @@ function normalizeName(s) {
 /**
  * Reject tokens trying to impersonate a well-known mint. Triggers if the
  * submission's symbol or name matches a canonical one but the mint differs.
+ *
+ * Hits get logged to stderr with a SECURITY tag so an operator can see
+ * the pattern (an attacker probing the screener generates a trail). The
+ * screener's existing per-tick alerting wrapper will batch these for the
+ * daily ops digest.
  */
 export function checkImpersonation(mint, symbol, name) {
   const symUp = (symbol || "").toUpperCase().trim();
   if (CANONICAL_MINTS.has(symUp)) {
     const canonical = CANONICAL_MINTS.get(symUp);
     if (canonical !== mint) {
-      return { ok: false, reason: `symbol "${symUp}" impersonates canonical mint ${canonical.slice(0, 8)}…` };
+      const reason = `symbol "${symUp}" impersonates canonical mint ${canonical.slice(0, 8)}…`;
+      console.warn(`[SECURITY][impersonation] reject ${String(mint).slice(0,8)}…: ${reason} (symbol="${symbol}", name="${name}")`);
+      return { ok: false, reason };
     }
   }
   const nameNorm = normalizeName(name);
   for (const [canonSym, canonMint] of CANONICAL_MINTS) {
     if (nameNorm === canonSym.toLowerCase() && mint !== canonMint) {
-      return { ok: false, reason: `name "${name}" matches canonical "${canonSym}" but mint differs` };
+      const reason = `name "${name}" matches canonical "${canonSym}" but mint differs`;
+      console.warn(`[SECURITY][impersonation] reject ${String(mint).slice(0,8)}…: ${reason} (canonical=${canonMint.slice(0,8)}…)`);
+      return { ok: false, reason };
     }
   }
   return { ok: true };
