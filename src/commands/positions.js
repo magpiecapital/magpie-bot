@@ -31,6 +31,27 @@ async function enrichWithHealth(loan, owedLamports) {
   }
 }
 
+/**
+ * Inline formatter for a take-profit trigger label. Compact — used
+ * in the /loans card under each loan. Matches the formatting used by
+ * /takeprofit's success message.
+ */
+function formatTriggerInline(kind, valueMicroStr) {
+  const n = Number(valueMicroStr);
+  if (kind === "mc_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1e9) return `MC $${(usd / 1e9).toFixed(2)}B`;
+    if (usd >= 1e6) return `MC $${(usd / 1e6).toFixed(2)}M`;
+    if (usd >= 1e3) return `MC $${(usd / 1e3).toFixed(2)}K`;
+    return `MC $${usd.toFixed(2)}`;
+  }
+  if (kind === "price_usd") {
+    const usd = n / 1e6;
+    return `$${usd < 0.01 ? usd.toFixed(8) : usd < 1 ? usd.toFixed(6) : usd.toFixed(4)}/token`;
+  }
+  return `${(n / 1e9).toFixed(9)} SOL/token`;
+}
+
 export async function handlePositions(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
@@ -70,6 +91,27 @@ export async function handlePositions(ctx) {
     rows.map((loan, i) => enrichWithHealth(loan, liveAmounts[i])),
   );
 
+  // Fetch any armed take-profit / limit-close orders for this user's
+  // loans in ONE query so we can annotate the cards. This is what
+  // makes the feature discoverable — users see "→ Take-profit armed
+  // at $X" right under each loan without needing a separate command.
+  const loanDbIds = rows.map((r) => r.id);
+  const armedOrdersByLoan = new Map();
+  if (loanDbIds.length > 0) {
+    try {
+      const { rows: orderRows } = await query(
+        `SELECT id, loan_id, trigger_kind, trigger_value_micro::text AS trigger_value_micro,
+                slippage_bps, sell_destination
+           FROM limit_close_orders
+          WHERE loan_id = ANY($1::bigint[]) AND status = 'armed'`,
+        [loanDbIds],
+      );
+      for (const o of orderRows) armedOrdersByLoan.set(o.loan_id, o);
+    } catch (err) {
+      console.warn("[positions] take-profit lookup failed (continuing):", err.message);
+    }
+  }
+
   const totalSol = totalOwedSol(liveAmounts);
   const dueSoonCount = countDueWithin(rows, 24);
 
@@ -93,13 +135,27 @@ export async function handlePositions(ctx) {
       collateralValueLamports: healthResults[i]?.currentLamports,
       position: i + 1,
     });
-    lines.push(card, "");
+    lines.push(card);
+
+    // Take-profit annotation — show existing armed order OR prompt to
+    // set one. Surfacing this here is the single biggest discoverability
+    // unlock for the limit-close feature: users see it next to every
+    // loan, not buried in a separate command.
+    const existing = armedOrdersByLoan.get(loan.id);
+    if (existing) {
+      const trig = formatTriggerInline(existing.trigger_kind, existing.trigger_value_micro);
+      const slip = (existing.slippage_bps / 100).toFixed(2);
+      lines.push(`   take-profit armed: ${trig} (slip ${slip}%) · /canceltp ${existing.id}`);
+    } else {
+      lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+    }
+    lines.push("");
   }
 
   lines.push(
     "_Health < 1.1× risks liquidation._",
     "",
-    "Actions: /repay · /partialrepay · /topup · /extend · /health",
+    "Actions: /repay · /partialrepay · /topup · /extend · /takeprofit · /health",
   );
   if (otherWalletCount > 0) {
     lines.push(

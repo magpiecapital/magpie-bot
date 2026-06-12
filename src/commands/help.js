@@ -28,6 +28,8 @@ export async function handleHelp(ctx) {
     "/partialrepay — pay down part of a loan",
     "/topup — add collateral (improves health, no fee)",
     "/extend — extend a loan (tier fee: 3%/2%/1.5%)",
+    "/takeprofit <loan_id> at 2x — auto-close + sell when collateral hits target",
+    "/takeprofitorders — show your armed take-profits",
     "/history — last 10 loans",
     "/price <symbol|mint> — oracle price + max loan per tier",
     "",

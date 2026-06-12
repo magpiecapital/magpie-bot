@@ -523,6 +523,13 @@ export function registerBorrowCallbacks(bot) {
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
           "",
+          // Surface the take-profit feature inline with a concrete
+          // ready-to-run example. This is THE prime moment to mention
+          // it — the user just locked up collateral, they care about
+          // the upside scenario right now.
+          "💡 *Lock in upside?* Set a take-profit:",
+          `\`/takeprofit ${result.loanId} at 2x\``,
+          "",
           "/positions to check status · /share to flex on the timeline",
         ].join("\n"),
         { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: shareKb },

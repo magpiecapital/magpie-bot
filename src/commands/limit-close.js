@@ -34,18 +34,46 @@ const MIN_TRIGGER_VALUE_MICRO = 1n;
 const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n; // 1e15 — sanity ceiling
 
 /**
- * Parse `/limitclose <loan_id> mc=130M slip=2% dest=sol [expire=30d]` style args.
- * Returns { ok: true, parsed } or { ok: false, error }.
+ * Parse limit-close args. Supports TWO syntaxes:
+ *
+ *   1. NATURAL (recommended):
+ *        /takeprofit 1234 at 2x
+ *        /takeprofit 1234 at 3x slip=3%
+ *        /takeprofit 1234 at $150m       (market cap target)
+ *        /takeprofit 1234 at $0.005      (USD price target)
+ *
+ *      "at <N>x" means "when the collateral's USD price hits N times
+ *      its current price." Engine computes the trigger at arm time so
+ *      we lock in the multiplier semantically, not the raw price.
+ *
+ *   2. POWER (back-compat for /limitclose):
+ *        /limitclose 1234 mc=130M slip=2% dest=sol
+ *        /limitclose 1234 price=0.0025 slip=2%
+ *
+ * Returns { ok: true, parsed } or { ok: false, error }. Parsed includes
+ * an optional `multiplier` field — if set, the caller must convert it
+ * to a USD price using the live collateral price BEFORE inserting.
  */
 function parseLimitCloseArgs(text) {
-  // /limitclose <loan_id> key1=val1 key2=val2 ...
-  const tokens = text.trim().split(/\s+/).slice(1); // drop /limitclose
-  if (tokens.length < 2) {
-    return { ok: false, error: "Usage: `/limitclose <loan_id> mc=130M slip=2% dest=sol`" };
+  // strip command word, normalize "/cmd 1234 at 2x" or "/cmd 1234 sell at 2x"
+  const raw = text.trim();
+  const tokens = raw.split(/\s+/).slice(1); // drop the /command word
+
+  // Allow "sell" as an optional ignorable word: "/tp 1234 sell at 2x"
+  // — makes the english read more naturally.
+  const filtered = tokens.filter((t) => t.toLowerCase() !== "sell");
+  if (filtered.length < 2) {
+    return {
+      ok: false,
+      error:
+        "*Usage:*\n" +
+        "`/takeprofit <loan_id> at 2x`  (sell when price doubles)\n" +
+        "`/takeprofit <loan_id> at $150m`  (market cap target)\n" +
+        "`/takeprofit <loan_id> at $0.005 slip=3%`  (USD price target)\n\n" +
+        "Find your loan_id with /loans.",
+    };
   }
-  const loanIdRaw = tokens[0];
-  // loan_id is the user-facing on-chain loan id stored in loans.loan_id
-  // (NOT the DB primary key — users see the readable id).
+  const loanIdRaw = filtered[0];
   if (!/^\d+$/.test(loanIdRaw)) {
     return { ok: false, error: "loan_id must be a number. Find it with /loans." };
   }
@@ -54,13 +82,59 @@ function parseLimitCloseArgs(text) {
   // Parse the key=value pairs
   let trigger_kind = null;
   let trigger_value_micro = null;
+  let multiplier = null;            // set when user used "at Nx" — caller resolves to USD price
   let slippage_bps = 200;
   let dest = "sol";
   let expire_iso = null;
 
-  for (const t of tokens.slice(1)) {
+  // Natural-language path: "at <value>" where <value> is either:
+  //   - "<N>x"     → multiplier semantic
+  //   - "$<num>m"  → market cap USD
+  //   - "$<num>"   → USD price target
+  for (let i = 1; i < filtered.length; i++) {
+    const t = filtered[i];
+
+    // Handle "at <value>" — consume i+1 too.
+    if (t.toLowerCase() === "at" && i + 1 < filtered.length) {
+      const v = filtered[i + 1];
+      // multiplier: "2x", "1.5x"
+      const mMul = v.match(/^([0-9]+(?:\.[0-9]+)?)x$/i);
+      if (mMul) {
+        const n = Number(mMul[1]);
+        if (!Number.isFinite(n) || n <= 1) {
+          return { ok: false, error: "Multiplier must be > 1x (e.g. `at 2x`, `at 1.5x`)." };
+        }
+        multiplier = n;
+        trigger_kind = "price_usd"; // we'll resolve to actual USD value before INSERT
+        i++; // consume value
+        continue;
+      }
+      // market cap: "$130m", "150M"
+      const mMc = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)([KMBkmb])$/);
+      if (mMc) {
+        trigger_kind = "mc_usd";
+        const parsed = parseMcOrPrice(mMc[1] + mMc[2], "mc");
+        if (!parsed.ok) return parsed;
+        trigger_value_micro = parsed.micro;
+        i++;
+        continue;
+      }
+      // USD price: "$0.005" or "0.005"
+      const mPrice = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)$/);
+      if (mPrice) {
+        trigger_kind = "price_usd";
+        const parsed = parseMcOrPrice(mPrice[1], "price_usd");
+        if (!parsed.ok) return parsed;
+        trigger_value_micro = parsed.micro;
+        i++;
+        continue;
+      }
+      return { ok: false, error: `Couldn't parse target after "at": \`${v}\`. Try \`at 2x\` or \`at $150m\` or \`at $0.005\`.` };
+    }
+
+    // Power-user path: key=value
     const m = t.match(/^([a-z_]+)=(.+)$/i);
-    if (!m) return { ok: false, error: `Unrecognized token: \`${t}\`` };
+    if (!m) return { ok: false, error: `Unrecognized token: \`${t}\`. Use natural syntax (e.g. \`at 2x\`) or key=value pairs.` };
     const k = m[1].toLowerCase();
     const v = m[2];
     if (k === "mc") {
@@ -100,12 +174,12 @@ function parseLimitCloseArgs(text) {
     }
   }
 
-  if (!trigger_kind) {
-    return { ok: false, error: "Specify a trigger: `mc=130M` or `price=0.0025` (USD) or `price=0.0025sol`." };
+  if (!trigger_kind && multiplier == null) {
+    return { ok: false, error: "Specify a target: `at 2x`, `at $150m`, or `at $0.005`." };
   }
   return {
     ok: true,
-    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso },
+    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso, multiplier },
   };
 }
 
@@ -200,7 +274,8 @@ export async function handleLimitClose(ctx) {
   if (!parseResult.ok) {
     return ctx.reply(parseResult.error, { parse_mode: "Markdown" });
   }
-  const { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso } = parseResult.parsed;
+  let { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso } = parseResult.parsed;
+  const { multiplier } = parseResult.parsed;
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
@@ -252,6 +327,44 @@ export async function handleLimitClose(ctx) {
   );
   if (activeCount.n >= MAX_ACTIVE_ORDERS_PER_USER) {
     return ctx.reply(`You have ${activeCount.n} active limit orders (max ${MAX_ACTIVE_ORDERS_PER_USER}). Cancel one with /cancellimitorder first.`);
+  }
+
+  // 3b. Resolve the natural-language "at <N>x" multiplier to a concrete
+  //     USD price target. The user said "sell at 2x" — we lock in
+  //     2× the CURRENT live USD price as the trigger so the meaning is
+  //     stable regardless of when the engine actually evaluates.
+  //
+  //     Skipped when trigger_value_micro is already set from explicit
+  //     mc=/price= syntax.
+  // Same module the health watcher + risk engine use — cross-sourced
+  // for accuracy + drift detection.
+  let multiplierContextLine = null;
+  if (multiplier != null && trigger_value_micro == null) {
+    try {
+      const { getPriceInUsdCrossSourced } = await import("../services/price.js");
+      const currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
+      if (!currentUsdPerToken || currentUsdPerToken <= 0) {
+        return ctx.reply(
+          `Couldn't fetch current USD price for ${mintRow.symbol || "collateral"} to resolve "at ${multiplier}×". Try again, or use \`at $<usd_price>\` instead.`,
+          { parse_mode: "Markdown" },
+        );
+      }
+      const targetUsdPerToken = currentUsdPerToken * multiplier;
+      // price_usd micros = USD × 1e6
+      trigger_value_micro = BigInt(Math.round(targetUsdPerToken * 1e6));
+      if (trigger_value_micro < MIN_TRIGGER_VALUE_MICRO || trigger_value_micro > MAX_TRIGGER_VALUE_MICRO) {
+        return ctx.reply(`Resolved target is out of range. Try a smaller multiplier or an explicit \`at $<usd_price>\`.`);
+      }
+      const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+      multiplierContextLine =
+        `Current: $${fmt(currentUsdPerToken)} → target: $${fmt(targetUsdPerToken)} (${multiplier}×)`;
+    } catch (err) {
+      console.warn("[limit-close] multiplier resolve failed:", err.message);
+      return ctx.reply(
+        `Couldn't resolve "at ${multiplier}×" right now. Try \`at $<usd_price>\` instead, or try again in a moment.`,
+        { parse_mode: "Markdown" },
+      );
+    }
   }
 
   // 4. Pre-flight liquidity check (Layer 1).
@@ -335,20 +448,22 @@ export async function handleLimitClose(ctx) {
   const owedSol = (Number(loan.owed) / 1e9).toFixed(4);
   const expiryLabel = expire_iso ? ` (expires ${expire_iso.slice(0, 10)})` : "";
 
+  const symbol = mintRow.symbol || "your collateral";
   await ctx.reply(
     [
-      `*Limit-close order #${orderId} armed* ${expiryLabel}`,
+      `*Take-profit armed* — order #${orderId}${expiryLabel}`,
       ``,
-      `Loan: #${loan.loan_id}`,
+      `Loan: #${loan.loan_id} (${symbol})`,
       `Trigger: ${triggerLabel}`,
+      multiplierContextLine ? `_${multiplierContextLine}_` : null,
       `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
       `Destination: ${dest.toUpperCase()}`,
       ``,
-      `When the trigger hits, I'll repay the ${owedSol} SOL loan and sell the rest into ${dest.toUpperCase()}.`,
+      `When ${symbol} hits your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`,
       `The 1% execution fee covers protocol operating costs.`,
       ``,
-      `/limitorders to view all · /cancellimitorder ${orderId} to cancel`,
-    ].join("\n"),
+      `/takeprofitorders to view all · /cancellimitorder ${orderId} to cancel`,
+    ].filter(Boolean).join("\n"),
     { parse_mode: "Markdown" },
   );
 }
