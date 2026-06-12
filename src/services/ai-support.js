@@ -1833,6 +1833,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
 - User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
+- User says "what would I net at 2x", "how much SOL if I set a 3x take-profit", "if I locked in at 1.5x what do I get", "is it worth arming a TP at X" → \`simulate_take_profit\` with their loan_id + multiplier. After the call, report net_to_user_sol as the headline ("you'd net ~X SOL after fees and slippage"). Always include the caveat from result.note about prices changing. Surface result.arm_hint as a one-tap command if the projection looks good. If error is present, narrate the error.note verbatim.
 - ALL loan actions execute in this chat via cards. NEVER tell the user to run any of these commands in Telegram.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
@@ -2100,6 +2101,18 @@ const TOOLS = [
       properties: {
         order_id: { type: "string", description: "The numeric limit_close_orders.id from /loans or list_my_take_profits. Optional — omit to get the user's most recent order." },
       },
+    },
+  },
+  {
+    name: "simulate_take_profit",
+    description: "PROJECT what the user would NET if they armed a take-profit at a given multiplier on an active loan and it fired today. Reads the loan's current collateral USD value and computes (proceeds_at_target - loan_owed - 1% protocol fee - slippage_buffer) in SOL. Use when user asks 'what would I make if I set a 2x', 'how much SOL would I get at 3x', 'should I lock in at 1.5x', or after Pip's upside alert nudges them. Loan MUST belong to the current user.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The chain loan_id (long number from /loans). The loan must be active and owned by the current user." },
+        multiplier: { type: "number", description: "The target multiplier vs the current collateral USD price. 2 = sell at 2x current, 1.5 = sell at 1.5x current, etc. Must be > 1." },
+      },
+      required: ["loan_id", "multiplier"],
     },
   },
   {
@@ -2923,6 +2936,81 @@ const TOOL_HANDLERS = {
           ? `last failure: ${reasonHuman}`
           : null,
       ].filter(Boolean),
+    };
+  },
+  // What-if calculator: given a loan + multiplier, project the net SOL
+  // the user would receive if they armed today and the target fired.
+  // Read-only; never arms anything. Loan ownership is enforced both via
+  // the WHERE clause AND via the tool's required `loan_id` param being
+  // matched to the calling userId.
+  simulate_take_profit: async ({ loan_id, multiplier }, { userId }) => {
+    const mult = Number(multiplier);
+    if (!Number.isFinite(mult) || mult <= 1) {
+      return { error: "invalid_multiplier", note: "Multiplier must be > 1 (e.g. 2 for 2x, 1.5 for 1.5x)." };
+    }
+    if (mult > 100) {
+      return { error: "multiplier_too_high", note: "Multiplier capped at 100x for projections. Pick a realistic target." };
+    }
+    const loanIdStr = String(loan_id).trim();
+    if (!/^\d+$/.test(loanIdStr)) {
+      return { error: "invalid_loan_id" };
+    }
+    const { rows: [loan] } = await query(
+      `SELECT l.id, l.user_id, l.loan_id::text AS loan_id_chain, l.collateral_mint,
+              l.collateral_amount::text AS collateral_amount_raw,
+              l.original_loan_amount_lamports::text AS owed_lamports,
+              l.status, sm.symbol AS collateral_symbol, sm.decimals
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.user_id = $1 AND l.loan_id = $2`,
+      [userId, loanIdStr],
+    );
+    if (!loan) return { error: "loan_not_found", note: "No loan with that id belongs to this user." };
+    if (loan.status !== "active") return { error: "loan_not_active", status: loan.status };
+
+    // Pull current USD price for the collateral.
+    const { getPriceInUsdCrossSourced } = await import("./price.js");
+    const currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
+    if (!currentUsdPerToken || currentUsdPerToken <= 0) {
+      return { error: "price_unavailable", note: "Can't fetch current USD price right now — try again in a moment." };
+    }
+    const solUsd = await getPriceInUsdCrossSourced("So11111111111111111111111111111111111111112");
+    if (!solUsd || solUsd <= 0) {
+      return { error: "sol_price_unavailable" };
+    }
+    const decimals = loan.decimals ?? 9;
+    const collateralWhole = Number(loan.collateral_amount_raw) / 10 ** decimals;
+    const targetUsdPerToken = currentUsdPerToken * mult;
+    const grossUsdAtTarget = collateralWhole * targetUsdPerToken;
+    // Convert to SOL gross.
+    const grossSolAtTarget = grossUsdAtTarget / solUsd;
+    // Subtract owed (in SOL).
+    const owedSol = Number(loan.owed_lamports) / 1e9;
+    // Subtract protocol fee (1% of gross proceeds).
+    const protocolFeeSol = grossSolAtTarget * 0.01;
+    // Slippage buffer — assume the engine fills at 200 bps (2%) below
+    // the target as a reasonable conservative estimate. The actual fill
+    // depends on liquidity at fire time; this is a projection only.
+    const slippageBufferSol = grossSolAtTarget * 0.02;
+    const netToUserSol = grossSolAtTarget - owedSol - protocolFeeSol - slippageBufferSol;
+
+    return {
+      loan_id_chain: loan.loan_id_chain,
+      collateral_symbol: loan.collateral_symbol || null,
+      multiplier: mult,
+      current_usd_per_token: currentUsdPerToken,
+      target_usd_per_token: targetUsdPerToken,
+      collateral_amount: collateralWhole,
+      gross_proceeds_sol_at_target: Number(grossSolAtTarget.toFixed(4)),
+      loan_owed_sol: Number(owedSol.toFixed(4)),
+      protocol_fee_sol: Number(protocolFeeSol.toFixed(4)),
+      slippage_buffer_sol_2pct: Number(slippageBufferSol.toFixed(4)),
+      // The headline number — what lands in the user's wallet AFTER repay,
+      // fee, and a conservative 2% slippage drag.
+      net_to_user_sol: Number(netToUserSol.toFixed(4)),
+      // Caveat — pricing changes. We surface this so Pip narrates it.
+      note: "Projection based on current USD prices. Actual fill depends on liquidity at trigger time.",
+      arm_hint: `/takeprofit ${loan.loan_id_chain} at ${mult}x`,
     };
   },
   list_my_take_profits: async (_args, { userId }) => {
