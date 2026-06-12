@@ -249,6 +249,12 @@ export function registerSupportVigilCallbacks(bot) {
 
 let _timer = null;
 
+// Timer-only startup. Callback registration MUST happen separately via
+// registerSupportVigilCallbacks(bot) at top-level index.js init — Grammy
+// throws if listeners are registered from inside another listener
+// execution (e.g. from inside a dynamic-import .then() handler called
+// during bot startup). Splitting timer + callbacks lets the runtime
+// init flow do the right thing in the right order.
 export function startSupportVigil(bot) {
   if (_timer) return;
   console.log(`[support-vigil] armed — probing every ${TICK_MS / 60_000}m`);
@@ -256,7 +262,6 @@ export function startSupportVigil(bot) {
     tick(bot).catch(() => {});
     _timer = setInterval(() => tick(bot).catch(() => {}), TICK_MS);
   }, 120_000);
-  registerSupportVigilCallbacks(bot);
 }
 
 export function stopSupportVigil() {
