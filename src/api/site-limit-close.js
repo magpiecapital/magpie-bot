@@ -189,6 +189,31 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
   }
   if (!sigOk) return { ok: false, status: 401, error: "signature_does_not_match" };
 
+  // ── Nonce uniqueness enforcement ─────────────────────────────
+  // Audit fix 2026-06-12: every other signed-envelope endpoint
+  // (me-export, wallets-api, ai-chat, support-ask) records consumed
+  // nonces in used_nonces and rejects duplicates inside the freshness
+  // window. site-limit-close had only the freshness + per-signer rate
+  // limit before — sufficient against most attackers but weaker than
+  // the rest of the system. Bringing into line.
+  //
+  // Purpose tag separates limit-close nonces from other endpoints' so
+  // a nonce reused for a different action doesn't collide. Action-binding
+  // header (magpie:) already prevents the cross-action replay; this
+  // closes the SAME-action replay leg.
+  try {
+    await query(
+      `INSERT INTO used_nonces(nonce, purpose, signer_pubkey) VALUES($1, $2, $3)`,
+      [String(fields.Nonce), `limit_close:${expectedMagpieHeader}`, signerPubkey],
+    );
+  } catch (err) {
+    if (err.code === "23505") {
+      return { ok: false, status: 409, error: "nonce_already_used" };
+    }
+    console.error("[site-limit-close] nonce insert threw:", err.message);
+    return { ok: false, status: 500, error: "nonce_check_failed" };
+  }
+
   // Wallet ownership + custodial check
   const { rows: [walletRow] } = await query(
     `SELECT user_id, encrypted_secret, source
