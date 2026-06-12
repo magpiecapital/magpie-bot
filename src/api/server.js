@@ -1472,6 +1472,7 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/internal/agent/limit-close",
   "/api/v1/internal/agent/limit-close/list",
   "/api/v1/internal/agent/limit-close/delegations",
+  "/api/v1/internal/agent/limit-close/eligible-loans",
   // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
   // so the on-chain feed is fresh by the time the wallet simulates the
   // tx — closes the window where Phantom rejects with StalePriceAttestation
@@ -1738,6 +1739,11 @@ async function router(req, res) {
       case "/api/v1/internal/agent/limit-close/delegations": {
         const { handleAgentLimitCloseListDelegations } = await import("./internal-agent-limitclose.js");
         result = await handleAgentLimitCloseListDelegations(req, Object.fromEntries(url.searchParams));
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/eligible-loans": {
+        const { handleAgentLimitCloseEligibleLoans } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitCloseEligibleLoans(req, Object.fromEntries(url.searchParams));
         break;
       }
       case "/api/v1/internal/agent/limit-close": {
