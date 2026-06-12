@@ -55,7 +55,7 @@ const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n; // 1e15 — sanity ceili
  * an optional `multiplier` field — if set, the caller must convert it
  * to a USD price using the live collateral price BEFORE inserting.
  */
-function parseLimitCloseArgs(text) {
+function parseLimitCloseArgs(text, direction = "above") {
   // strip command word, normalize "/cmd 1234 at 2x" or "/cmd 1234 sell at 2x"
   const raw = text.trim();
   const tokens = raw.split(/\s+/).slice(1); // drop the /command word
@@ -66,12 +66,17 @@ function parseLimitCloseArgs(text) {
   if (filtered.length < 2) {
     return {
       ok: false,
-      error:
-        "*Usage:*\n" +
-        "`/takeprofit <loan_id> at 2x`  (sell when price doubles)\n" +
-        "`/takeprofit <loan_id> at $150m`  (market cap target)\n" +
-        "`/takeprofit <loan_id> at $0.005 slip=3%`  (USD price target)\n\n" +
-        "Find your loan_id with /loans.",
+      error: direction === "below"
+        ? "*Usage:*\n" +
+          "`/stoploss <loan_id> at -30%`  (sell if price drops 30%)\n" +
+          "`/stoploss <loan_id> at 0.7x`  (sell at 70% of current price)\n" +
+          "`/stoploss <loan_id> at $0.002 slip=3%`  (USD price floor)\n\n" +
+          "Find your loan_id with /loans."
+        : "*Usage:*\n" +
+          "`/takeprofit <loan_id> at 2x`  (sell when price doubles)\n" +
+          "`/takeprofit <loan_id> at $150m`  (market cap target)\n" +
+          "`/takeprofit <loan_id> at $0.005 slip=3%`  (USD price target)\n\n" +
+          "Find your loan_id with /loans.",
     };
   }
   const loanIdRaw = filtered[0];
@@ -98,15 +103,38 @@ function parseLimitCloseArgs(text) {
     // Handle "at <value>" — consume i+1 too.
     if (t.toLowerCase() === "at" && i + 1 < filtered.length) {
       const v = filtered[i + 1];
-      // multiplier: "2x", "1.5x"
+      // Stop-loss percent: "-30%" / "-5%"
+      const mPct = v.match(/^-([0-9]+(?:\.[0-9]+)?)%$/);
+      if (mPct) {
+        if (direction !== "below") {
+          return { ok: false, error: "Percent-drop targets (e.g. `at -30%`) are only valid for /stoploss." };
+        }
+        const p = Number(mPct[1]);
+        if (!Number.isFinite(p) || p <= 0 || p >= 100) {
+          return { ok: false, error: "Stop-loss percent must be between 0% and 100% (e.g. `at -30%`)." };
+        }
+        multiplier = 1 - (p / 100); // 30% drop → 0.7x of current
+        trigger_kind = "price_usd";
+        i++; continue;
+      }
+      // multiplier: "2x", "1.5x" (TP) or "0.7x", "0.5x" (SL)
       const mMul = v.match(/^([0-9]+(?:\.[0-9]+)?)x$/i);
       if (mMul) {
         const n = Number(mMul[1]);
-        if (!Number.isFinite(n) || n <= 1) {
-          return { ok: false, error: "Multiplier must be > 1x (e.g. `at 2x`, `at 1.5x`)." };
+        if (!Number.isFinite(n) || n <= 0) {
+          return { ok: false, error: "Multiplier must be a positive number (e.g. `at 2x`, `at 0.7x`)." };
+        }
+        if (direction === "below") {
+          if (n >= 1) {
+            return { ok: false, error: "Stop-loss multiplier must be < 1x (e.g. `at 0.7x` = sell at 70% of current). Use /takeprofit for upside targets." };
+          }
+        } else {
+          if (n <= 1) {
+            return { ok: false, error: "Take-profit multiplier must be > 1x (e.g. `at 2x`). Use /stoploss for downside targets." };
+          }
         }
         multiplier = n;
-        trigger_kind = "price_usd"; // we'll resolve to actual USD value before INSERT
+        trigger_kind = "price_usd"; // resolved to actual USD value before INSERT
         i++; // consume value
         continue;
       }
@@ -269,12 +297,12 @@ function fmtTrigger(kind, value_micro) {
 
 /* ─── /limitclose ──────────────────────────────────────────────── */
 
-export async function handleLimitClose(ctx) {
+export async function handleLimitClose(ctx, direction = "above") {
   const tgUser = ctx.from;
   if (!tgUser) return;
   const text = ctx.message?.text ?? "";
 
-  const parseResult = parseLimitCloseArgs(text);
+  const parseResult = parseLimitCloseArgs(text, direction);
   if (!parseResult.ok) {
     return ctx.reply(parseResult.error, { parse_mode: "Markdown" });
   }
@@ -283,44 +311,42 @@ export async function handleLimitClose(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
-  // Multiplier path: resolve "at 2x" to a concrete USD micros price BEFORE
-  // calling armOrder. armOrder takes a concrete trigger_value_micro — the
-  // multiplier-to-price resolution is a TG-specific UX concern.
+  // Multiplier path: resolve "at 2x" / "at 0.7x" / "at -30%" to a concrete
+  // USD micros price BEFORE calling armOrder. armOrder takes a concrete
+  // trigger_value_micro — the multiplier-to-price resolution is a TG-specific
+  // UX concern.
   let multiplierContextLine = null;
   if (multiplier != null && trigger_value_micro == null) {
-    // We need the collateral mint to resolve. armOrder will re-fetch this
-    // anyway, but at this stage we only need a cheap loans-table lookup.
     const { rows: [loanForMint] } = await query(
       `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id = $2`,
       [user.id, loan_id],
     );
     if (!loanForMint) {
-      // armOrder will surface this same error anyway, but a friendly
-      // pre-emptive message reads better than the resolveMultiplier
-      // error.
       return ctx.reply(`Loan #${loan_id} not found in your account.`);
     }
-    const r = await resolveMultiplierToPrice(loanForMint.collateral_mint, multiplier);
+    const r = await resolveMultiplierToPrice(loanForMint.collateral_mint, multiplier, {
+      allowBelowOne: direction === "below",
+    });
     if (!r.ok) {
       return ctx.reply(r.error, { parse_mode: "Markdown" });
     }
     trigger_value_micro = r.triggerValueMicro;
     trigger_kind = "price_usd";
     const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
-    multiplierContextLine = `Current: $${fmt(r.currentUsd)} → target: $${fmt(r.targetUsd)} (${multiplier}×)`;
+    const arrow = direction === "below" ? "↓" : "↑";
+    multiplierContextLine = `Current: $${fmt(r.currentUsd)} ${arrow} target: $${fmt(r.targetUsd)} (${multiplier}×)`;
   }
 
-  // Hand off to arm-core. This consolidates loan ownership, mint
-  // allowlist + RWA exclusion, concurrency cap, fill-guarantee defaults
-  // (autoEscalate=true, derived cap), liquidity-aware initial bump,
-  // direction sanity check, INSERT, and the unique-index race guard.
-  // Any future hardening in arm-core lands here automatically.
+  // Hand off to arm-core. Direction-aware: arm-core's immediate-fire guard
+  // rejects an 'above' arm whose trigger is <= current, or a 'below' arm
+  // whose trigger is >= current.
   const armed = await armOrder({
     userId: user.id,
     source: "tg",
     loanIdChain: String(loan_id),
     triggerKind: trigger_kind,
     triggerValueMicro: trigger_value_micro.toString(),
+    triggerDirection: direction,
     slippageBps: slippage_bps,
     sellDestination: dest,
     expiresAt: expire_iso,
@@ -366,6 +392,12 @@ export async function handleLimitClose(ctx) {
         case "trigger_below_current":
         case "trigger_above_current":
           return `${armed.detail || "Trigger is on the wrong side of the current price."}`;
+        case "trigger_would_fire_immediately":
+          return direction === "below"
+            ? `Stop-loss target is already at or above the current price — the order would fire immediately. Set a lower target.`
+            : `Take-profit target is already at or below the current price — the order would fire immediately. Set a higher target.`;
+        case "invalid_trigger_direction":
+          return `Internal error — invalid trigger direction. Try again.`;
         default:
           console.error(`[limit-close] arm-core returned unrecognized error: ${armed.error}`, armed);
           return `Couldn't arm the order: ${armed.error}. Please try again.`;
@@ -389,9 +421,19 @@ export async function handleLimitClose(ctx) {
   const originalInitial = armed.initialSlippageBpsRequested ?? slippage_bps;
   const bumped = appliedInitial !== originalInitial;
 
+  const isStopLoss = direction === "below";
+  const headline = isStopLoss
+    ? `*Stop-loss armed* — order #${orderId}${expiryLabel}`
+    : `*Take-profit armed* — order #${orderId}${expiryLabel}`;
+  const triggerVerb = isStopLoss ? "drops to" : "hits";
+  const purpose = isStopLoss
+    ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
+    : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`;
+  const listCmd = isStopLoss ? "/stoplosses" : "/takeprofitorders";
+
   await ctx.reply(
     [
-      `*Take-profit armed* — order #${orderId}${expiryLabel}`,
+      headline,
       ``,
       `Loan: #${loan.loan_id} (${symbol})`,
       `Trigger: ${triggerLabel}`,
@@ -403,13 +445,21 @@ export async function handleLimitClose(ctx) {
       }`,
       `Destination: ${dest.toUpperCase()}`,
       ``,
-      `When ${symbol} hits your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`,
-      `The 1% execution fee covers protocol operating costs.`,
+      purpose,
+      `The 1% execution fee applies in both directions and covers protocol operating costs.`,
       ``,
-      `/takeprofitorders to view all · /cancellimitorder ${orderId} to cancel`,
+      `${listCmd} to view all · /cancellimitorder ${orderId} to cancel`,
     ].filter(Boolean).join("\n"),
     { parse_mode: "Markdown" },
   );
+}
+
+/* ─── /stoploss ────────────────────────────────────────────────── */
+// Thin wrapper that delegates to handleLimitClose with direction='below'.
+// Shares every gate, fill-guarantee, and 1% fee — only the trigger
+// comparator flips at fire time (see magpie-limitclose isTriggerHit).
+export async function handleStopLoss(ctx) {
+  return handleLimitClose(ctx, "below");
 }
 
 /* ─── /limitorders ─────────────────────────────────────────────── */

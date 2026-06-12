@@ -50,6 +50,13 @@ export const MIN_TRIGGER_VALUE_MICRO = 1n;
 export const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n;
 export const VALID_TRIGGER_KINDS = new Set(["mc_usd", "price_usd", "price_sol"]);
 export const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
+// Direction the trigger fires from:
+//   'above' (default) — take-profit: fires when current >= trigger
+//   'below'           — stop-loss:   fires when current <= trigger
+// arm-core validates that the trigger sits on the correct side of
+// current price at arm time so an immediate-fire arm is rejected.
+// 1% protocol fee applies in BOTH directions — operator rule 2026-06-12.
+export const VALID_TRIGGER_DIRECTIONS = new Set(["above", "below"]);
 
 /**
  * Resolve a multiplier ("at 2x" semantic) to a price_usd micros value
@@ -59,9 +66,15 @@ export const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
  * Returns { ok: true, triggerValueMicro: BigInt, currentUsd, targetUsd }
  * or { ok: false, error: string }.
  */
-export async function resolveMultiplierToPrice(collateralMint, multiplier) {
-  if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 1) {
+export async function resolveMultiplierToPrice(collateralMint, multiplier, { allowBelowOne = false } = {}) {
+  if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 0) {
+    return { ok: false, error: "Multiplier must be a positive number." };
+  }
+  if (!allowBelowOne && multiplier <= 1) {
     return { ok: false, error: "Multiplier must be > 1 (e.g. 2 for 2×)." };
+  }
+  if (allowBelowOne && multiplier >= 1) {
+    return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
   const { getPriceInUsdCrossSourced } = await import("./price.js");
   const currentUsd = await getPriceInUsdCrossSourced(collateralMint);
@@ -101,6 +114,7 @@ export async function armOrder({
   loanIdChain,             // string
   triggerKind,
   triggerValueMicro,       // BigInt or string
+  triggerDirection = "above", // 'above' = take-profit, 'below' = stop-loss
   slippageBps,
   sellDestination = "sol",
   expiresAt = null,
@@ -114,6 +128,9 @@ export async function armOrder({
   // ── Shape validation ─────────────────────────────────────────
   if (!VALID_TRIGGER_KINDS.has(triggerKind)) {
     return { ok: false, error: "invalid_trigger_kind" };
+  }
+  if (!VALID_TRIGGER_DIRECTIONS.has(triggerDirection)) {
+    return { ok: false, error: "invalid_trigger_direction" };
   }
   let triggerBI;
   try { triggerBI = BigInt(triggerValueMicro); }
@@ -223,6 +240,43 @@ export async function armOrder({
     appliedInitialBps = Math.min(liquidityFloorBps, effectiveCap);
   }
 
+  // ── Immediate-fire guard (best-effort) ──────────────────────
+  // Reject arms that would fire immediately:
+  //   - 'above' (TP)  with trigger <= current
+  //   - 'below' (SL)  with trigger >= current
+  // The engine re-checks at fire time so this is purely a UX guard;
+  // fail-open on any oracle hiccup so a transient price miss doesn't
+  // block a legitimate arm. Implemented for USD-denominated triggers
+  // (mc_usd, price_usd); price_sol skipped because the SOL denominator
+  // moves fast enough that a stale read can false-reject.
+  try {
+    if (triggerKind === "mc_usd" || triggerKind === "price_usd") {
+      const { getPriceInUsdCrossSourced } = await import("./price.js");
+      const currentUsdPerDisplayed = await getPriceInUsdCrossSourced(loan.collateral_mint);
+      if (currentUsdPerDisplayed && currentUsdPerDisplayed > 0) {
+        // For price_usd, trigger_value_micro is per displayed unit in USD micros.
+        // For mc_usd, multiply current price by circulating supply (best-effort —
+        // mintRow may not carry supply; skip if missing).
+        let currentMicros = null;
+        if (triggerKind === "price_usd") {
+          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6));
+        } else if (triggerKind === "mc_usd" && mintRow.supply) {
+          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6)) * BigInt(mintRow.supply);
+        }
+        if (currentMicros != null) {
+          if (triggerDirection === "above" && triggerBI <= currentMicros) {
+            return { ok: false, error: "trigger_would_fire_immediately",
+              detail: { direction: "above", currentMicros: currentMicros.toString(), triggerMicros: triggerBI.toString() } };
+          }
+          if (triggerDirection === "below" && triggerBI >= currentMicros) {
+            return { ok: false, error: "trigger_would_fire_immediately",
+              detail: { direction: "below", currentMicros: currentMicros.toString(), triggerMicros: triggerBI.toString() } };
+          }
+        }
+      }
+    }
+  } catch { /* fail-open: engine is the source of truth */ }
+
   // ── Per-user concurrency cap ────────────────────────────────
   const { rows: [activeCount] } = await query(
     `SELECT COUNT(*)::int AS n FROM limit_close_orders
@@ -259,18 +313,22 @@ export async function armOrder({
     inserted = await query(
       `INSERT INTO limit_close_orders
          (user_id, loan_id, trigger_kind, trigger_value_micro,
+          trigger_direction,
           slippage_bps, sell_destination, expires_at,
           source, source_agent_pubkey, status, armed_at,
           auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
           notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7,
-               $8, $9, 'armed', NOW(),
-               $10, $11, $12,
-               $13, $14, $15,
-               $16)
+       VALUES ($1, $2, $3, $4,
+               $5,
+               $6, $7, $8,
+               $9, $10, 'armed', NOW(),
+               $11, $12, $13,
+               $14, $15, $16,
+               $17)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
+       triggerDirection,
        appliedInitialBps, sellDestination, expiresAt,
        source, sourceAgentPubkey,
        autoEscalate, effectiveCap, appliedInitialBps,
@@ -279,8 +337,8 @@ export async function armOrder({
        advisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
        armNote
          || (appliedInitialBps !== originalInitialBps
-           ? `armed via ${source}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
-           : `armed via ${source}`)],
+           ? `armed via ${source}; ${triggerDirection === "below" ? "STOP-LOSS" : "TP"}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+           : `armed via ${source}; ${triggerDirection === "below" ? "STOP-LOSS" : "TP"}`)],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
@@ -304,6 +362,7 @@ export async function armOrder({
     initialSlippageBpsApplied: appliedInitialBps,
     liquidityTierFloorBps: liquidityFloorBps,
     liquidityUsd: liqUsd,
+    triggerDirection,
   };
 }
 
