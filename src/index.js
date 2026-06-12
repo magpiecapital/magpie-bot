@@ -116,6 +116,9 @@ import {
   handleInfraHealth,
   handleHolderPool,
   handleAdminCmds,
+  handleApprove,
+  handleDeny,
+  handlePendingApprovals,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -244,6 +247,13 @@ bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
 bot.command(["admincmds", "adminlog"], handleAdminCmds);
+// F-4 multi-step approval — second-admin sign-off for sensitive commands.
+// Default gated commands: enablemint, disablemint, broadcast (tunable via
+// ADMIN_COMMAND_APPROVAL_REQUIRED env var). Solo-admin operators bypass
+// transparently — the bypass is logged via admin_command_log.
+bot.command("approve", handleApprove);
+bot.command("deny", handleDeny);
+bot.command(["pending", "pending_approvals"], handlePendingApprovals);
 bot.command("siteops", handleSiteOps);
 bot.command(["protocolfees", "protocol-fees"], handleProtocolFees);
 bot.command("ban_user", handleBanUser);
