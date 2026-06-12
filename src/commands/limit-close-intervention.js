@@ -93,9 +93,9 @@ export function registerLimitCloseInterventionCallbacks(bot) {
         return;
       }
       // Hard ceiling guard, mirroring the engine's INTERVENTION_HARD_CEILING_BPS.
-      // The CHECK constraint on slippage_bps also enforces (10, 1000), so
-      // this is belt-and-suspenders.
-      if (requested < 10 || requested > 1000) {
+      // The CHECK constraint on slippage_bps is (10, 5000) post-mig 031, so
+      // this is belt-and-suspenders aligned with the post-PR-77 ceilings.
+      if (requested < 10 || requested > 5000) {
         await ctx.answerCallbackQuery({ text: "Out-of-range slippage." });
         return;
       }
