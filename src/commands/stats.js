@@ -1,8 +1,33 @@
 import { PublicKey } from "@solana/web3.js";
-import { getReadOnlyProgram, PROGRAM_ID } from "../solana/program.js";
+import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2 } from "../solana/program.js";
 import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+
+// Helper: fetch a single pool's on-chain snapshot for the /stats roll-up.
+// Pool layouts are identical between V1 and V2 across the fields we read
+// here (totalDeposits, totalBorrowed, totalFeesEarned, totalLoansIssued,
+// totalLiquidations); V2 just drops fee_wallet — we don't touch it. The
+// IDL-aware getReadOnlyProgram now hands back the matching layout per
+// programId so the deserialize is correct for both.
+async function fetchPoolSnapshot(programId) {
+  const program = getReadOnlyProgram(programId);
+  const lenderPubkey = new PublicKey(process.env.LENDER_PUBKEY);
+  const [poolPda] = lendingPoolPda(lenderPubkey, programId);
+  const pool = await program.account.lendingPool.fetch(poolPda);
+  const [vaultPda] = loanTokenVaultPda(poolPda, programId);
+  const vault = await connection.getTokenAccountBalance(vaultPda).catch(() => null);
+  return {
+    poolPda,
+    vaultPda,
+    totalDeposits: BigInt(pool.totalDeposits.toString()),
+    totalBorrowed: BigInt(pool.totalBorrowed.toString()),
+    totalFeesEarned: BigInt(pool.totalFeesEarned.toString()),
+    totalLoansIssued: BigInt(pool.totalLoansIssued.toString()),
+    totalLiquidations: BigInt(pool.totalLiquidations.toString()),
+    vaultUiSol: vault ? Number(vault.value.uiAmount) : null,
+  };
+}
 
 /**
  * /stats — unified protocol-stats readout (works in DM and groups).
@@ -38,12 +63,31 @@ export async function handleStats(ctx) {
   if (!lenderPubkey) return ctx.reply("Stats not configured (LENDER_PUBKEY missing).");
 
   try {
-    const program = getReadOnlyProgram();
-    const [poolPda] = lendingPoolPda(new PublicKey(lenderPubkey));
-    const pool = await program.account.lendingPool.fetch(poolPda);
+    // Read BOTH pool snapshots in parallel. V2 is the RWA-capable pool
+    // (tokenized stocks etc.); fees flow to the same LENDER_PUBKEY wSOL
+    // ATA via the authority-signed borrow path, so the protocol view of
+    // fees-earned is V1 + V2. If V2 is not configured (env missing), we
+    // gracefully skip — keeps /stats working in dev / staging where only
+    // V1 is set up.
+    const [v1] = await Promise.all([
+      fetchPoolSnapshot(PROGRAM_ID),
+    ]);
+    let v2 = null;
+    if (PROGRAM_ID_V2) {
+      try { v2 = await fetchPoolSnapshot(PROGRAM_ID_V2); }
+      catch (err) {
+        // Don't fail the whole /stats if V2 is uninitialized or RPC blips
+        // on it — just report what we have. Logged so we notice persistent
+        // V2 read failures.
+        console.warn("[stats] V2 pool read failed (continuing with V1 only):", err.message);
+      }
+    }
 
-    const [vaultPda] = loanTokenVaultPda(poolPda);
-    const vault = await connection.getTokenAccountBalance(vaultPda).catch(() => null);
+    const totalDeposits = v1.totalDeposits + (v2?.totalDeposits ?? 0n);
+    const totalFeesEarned = v1.totalFeesEarned + (v2?.totalFeesEarned ?? 0n);
+    const totalLoansIssued = v1.totalLoansIssued + (v2?.totalLoansIssued ?? 0n);
+    const totalLiquidations = v1.totalLiquidations + (v2?.totalLiquidations ?? 0n);
+    const totalVaultUi = (v1.vaultUiSol ?? 0) + (v2?.vaultUiSol ?? 0);
 
     const { rows: counts } = await query(
       `SELECT
@@ -56,32 +100,29 @@ export async function handleStats(ctx) {
     );
     const r = counts[0];
 
-    // HEADLINE: lifetime cumulative SOL ever borrowed.
-    //
-    // IMPORTANT: this is the DB SUM across all loan rows, NOT
-    // `pool.totalBorrowed` from on-chain. The on-chain field is
-    // documented as "Total wSOL currently lent out" — it decrements
-    // on repayment, so it's the OUTSTANDING balance, not lifetime.
-    // The DB sum is the only authoritative source for "total ever lent."
+    // HEADLINE: lifetime cumulative SOL ever borrowed — DB SUM across
+    // all loan rows (pool-agnostic; both V1 and V2 borrows land in
+    // `loans` via the same recordLoan path). On-chain `totalBorrowed`
+    // is OUTSTANDING balance not lifetime, so DB SUM is authoritative.
     const lifetimeBorrowedSol = fmtSol(r.lifetime_lamports);
-    const totalDepositsSol = fmtSol(pool.totalDeposits.toNumber());
-    const totalFeesSol = fmtSol(pool.totalFeesEarned.toNumber());
+    const totalDepositsSol = fmtSol(totalDeposits);
+    const totalFeesSol = fmtSol(totalFeesEarned);
     const activeOutSol = fmtSol(r.active_lamports);
-    const currentlyLentSolOnchain = fmtSol(pool.totalBorrowed.toNumber());
 
-    // Vault wSOL: keep 2-decimal precision so the line fits in 26 chars
-    const vaultSol = vault ? Number(vault.value.uiAmount).toFixed(2) : null;
+    const vaultSol = (v1.vaultUiSol != null || v2?.vaultUiSol != null)
+      ? totalVaultUi.toFixed(2)
+      : null;
 
     const codeLines = [
       RULE,
       `LOAN BOOK`,
       row("Currently out", `${activeOutSol} SOL`),
       row("Active loans", String(r.active)),
-      row("Issued lifetime", pool.totalLoansIssued.toString()),
+      row("Issued lifetime", totalLoansIssued.toString()),
       row("Repaid", String(r.repaid)),
-      row("Liquidated", pool.totalLiquidations.toString()),
+      row("Liquidated", totalLiquidations.toString()),
       ``,
-      `POOL`,
+      `POOL${v2 ? " (V1+V2)" : ""}`,
       row("LP deposited", `${totalDepositsSol} SOL`),
       row("Fees earned", `${totalFeesSol} SOL`),
       vaultSol ? row("Vault", `${vaultSol} wSOL`) : row("Vault", "—"),
