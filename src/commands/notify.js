@@ -14,6 +14,7 @@ const PREFS = [
   { key: "notify_health",        label: "Progressive health alerts" },
   { key: "notify_liquidations",  label: "Liquidation receipts" },
   { key: "notify_pump",          label: "🚀 Pump alerts (3x / 5x / 10x bag)" },
+  { key: "notify_upside_alerts", label: "Take-profit nudges when collateral 1.5x / 2x / 3x's" },
   { key: "auto_repay",           label: "Auto-repay on SOL deposit" },
   { key: "auto_protect",         label: "🛡 Auto-Protect (anti-liquidation)" },
 ];

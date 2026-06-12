@@ -660,6 +660,11 @@ bot.start({
     // external watchdogs can't see (queue backlog, DB pool exhaustion,
     // stuck orders, lingering TWAPs, migration ledger drift).
     import("./services/self-monitor.js").then((m) => m.startSelfMonitor(bot));
+    // Upside Watcher — every 15 min, scans active loans whose collateral
+    // has appreciated and DMs the borrower a Pip nudge to arm a TP. Seeds
+    // first take-profit fills by surfacing the opportunity the moment it
+    // exists, instead of waiting for the user to think to check.
+    import("./services/upside-watcher.js").then((m) => m.startUpsideWatcher());
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1
     // (SECURITY-AUDIT-ANCHOR-2026-06-09.md). Polls confirmed program
