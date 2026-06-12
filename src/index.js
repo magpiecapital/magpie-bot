@@ -677,6 +677,12 @@ bot.start({
     // that drops an event has its impact bounded to one healer cycle.
     // Self-monitor's stale_credit probe DMs the operator faster.
     import("./services/credit-events-healer.js").then((m) => m.startCreditEventsHealer());
+    // Take-profit fee accrual — every 2 min, finds fired TP orders that
+    // haven't been accrued yet and routes the 1% protocol_fee_lamports
+    // through accrueFromLoan + accrueToHolderPool + accrueToLpLoyaltyPool.
+    // Same pipeline as borrow fees, so MGP-001's 70/10/10/10 rebalance
+    // applies uniformly to BOTH fee types once ratified.
+    import("./services/limit-close-fee-accrual-watcher.js").then((m) => m.startLimitCloseFeeAccrualWatcher());
     // Downside Watcher — symmetric to upside. Pip DMs at -20% / -35% /
     // -50% depreciation with concrete derisk options BEFORE the
     // health-watcher's liquidation tiers escalate.
