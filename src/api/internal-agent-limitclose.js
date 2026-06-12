@@ -47,13 +47,12 @@ const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n;
 const VALID_TRIGGER_KINDS = new Set(["mc_usd", "price_usd", "price_sol"]);
 const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
 
-// Mirrors the protocol-wide MAX_INITIAL_SLIPPAGE_BPS from arm-core. Raised
-// 1000 -> 2500 on 2026-06-12 (PR #77 fill-guarantee defaults). The agent
-// endpoint had drifted to the old ceiling — fixed during the audit pass
-// 2026-06-12 (gap #1: slippage validation range mismatch). Delegation
-// max_slippage_bps still gates further, so an aggressive request from the
-// agent is still clamped by the borrower's authorized cap.
-const MAX_INITIAL_SLIPPAGE_BPS_PROTOCOL = 2500;
+// Sourced from src/lib/slippage-constants.js — protocol-absolute ceiling.
+// The delegation's max_slippage_bps still gates further (it's the user-
+// consent ceiling and is lower by design — see slippage-constants.js for
+// the layered model). This constant is the OUTER bound only; the agent
+// can never exceed min(delegation.max_slippage_bps, this).
+import { MAX_PROTOCOL_SLIPPAGE_BPS as MAX_INITIAL_SLIPPAGE_BPS_PROTOCOL } from "../lib/slippage-constants.js";
 
 function isValidPubkey(s) {
   return typeof s === "string" && s.length >= 32 && s.length <= 44 &&
