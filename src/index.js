@@ -148,6 +148,7 @@ import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js"
 import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
+import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
@@ -407,6 +408,11 @@ bot.command("nomination_review", handleNominationReview);
 registerImportCallbacks(bot);
 registerSupportCallbacks(bot);
 registerMyTicketsCallbacks(bot);
+// Support vigil callbacks must register BEFORE bot.start — Grammy
+// throws if listeners are added during another listener's execution.
+// The vigil's timer starts later via startSupportVigil() from inside
+// the runtime startup section.
+registerSupportVigilCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
