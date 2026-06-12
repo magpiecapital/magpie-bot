@@ -9,9 +9,25 @@ import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
+import { logAdminCommand, recentAdminCommands, countDeniedAttempts } from "../services/admin-audit.js";
 
-async function requireAdmin(ctx) {
+// requireAdmin takes the command name so we can log every denied attempt
+// to admin_command_log. Unauthorized attempts are the highest-signal
+// security event — a sustained pattern of denied calls means someone is
+// probing admin commands without the right TG ID (recon, social-engineered
+// admin account, or a previously-removed admin still trying old credentials).
+// cmdName falls back to parsing the first slash-token if not passed,
+// so older callsites that didn't pass it still log meaningfully rather
+// than as "unknown".
+async function requireAdmin(ctx, cmdName) {
   if (!isAdmin(ctx.from?.id)) {
+    let name = cmdName;
+    if (!name) {
+      const txt = ctx?.message?.text || "";
+      const m = txt.match(/^\/([a-z0-9_]+)/i);
+      name = m ? m[1] : "unknown";
+    }
+    await logAdminCommand(ctx, name, { outcome: "denied" });
     await ctx.reply("❌ Not authorized.");
     return false;
   }
@@ -19,19 +35,21 @@ async function requireAdmin(ctx) {
 }
 
 export async function handlePause(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "pause"))) return;
   pauseBorrowing();
+  await logAdminCommand(ctx, "pause", { outcome: "success" });
   await ctx.reply("⏸ Borrowing paused. Existing loans unaffected.");
 }
 
 export async function handleResume(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "resume"))) return;
   resumeBorrowing();
+  await logAdminCommand(ctx, "resume", { outcome: "success" });
   await ctx.reply("▶️ Borrowing resumed.");
 }
 
 export async function handleAdminStatus(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "admin"))) return;
   const { getGlobalSiteState } = await import("../services/site-global.js");
   const [{ rows }, siteState, lockedRow] = await Promise.all([
     query(
@@ -62,7 +80,7 @@ export async function handleAdminStatus(ctx) {
 }
 
 export async function handleEnableMint(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "enablemint"))) return;
   const parts = ctx.message.text.split(/\s+/);
   // /enablemint <mint> <symbol> <decimals> [name]
   if (parts.length < 4) {
@@ -98,25 +116,35 @@ export async function handleEnableMint(ctx) {
     );
   }
   const name = nameParts.join(" ") || null;
-  await query(
-    `INSERT INTO supported_mints (mint, symbol, name, decimals, enabled)
-     VALUES ($1, $2, $3, $4, TRUE)
-     ON CONFLICT (mint) DO UPDATE
-       SET symbol = EXCLUDED.symbol,
-           name = COALESCE(EXCLUDED.name, supported_mints.name),
-           decimals = EXCLUDED.decimals,
-           enabled = TRUE`,
-    [mint, symbol.toUpperCase(), name, decimals],
-  );
-  await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
+  try {
+    await query(
+      `INSERT INTO supported_mints (mint, symbol, name, decimals, enabled)
+       VALUES ($1, $2, $3, $4, TRUE)
+       ON CONFLICT (mint) DO UPDATE
+         SET symbol = EXCLUDED.symbol,
+             name = COALESCE(EXCLUDED.name, supported_mints.name),
+             decimals = EXCLUDED.decimals,
+             enabled = TRUE`,
+      [mint, symbol.toUpperCase(), name, decimals],
+    );
+    await logAdminCommand(ctx, "enablemint", { outcome: "success", args: `${symbol.toUpperCase()} ${mint}` });
+    await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
+  } catch (err) {
+    await logAdminCommand(ctx, "enablemint", { outcome: "error", args: `${symbol} ${mint}`, error: err.message });
+    throw err;
+  }
 }
 
 export async function handleBroadcast(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "broadcast"))) return;
   const text = ctx.message.text.replace(/^\/broadcast(\s+|$)/, "").trim();
   if (!text) {
     return ctx.reply("Usage: `/broadcast <message>`", { parse_mode: "Markdown" });
   }
+  // Log the broadcast BEFORE sending — even partial sends are recorded
+  // so the operator can see what the broadcast contained without scanning
+  // every user's DMs.
+  await logAdminCommand(ctx, "broadcast", { outcome: "success", args: text });
   const { rows } = await query(`SELECT telegram_id FROM users`);
   let ok = 0;
   let fail = 0;
@@ -136,7 +164,7 @@ export async function handleBroadcast(ctx) {
 }
 
 export async function handleDisableMint(ctx) {
-  if (!(await requireAdmin(ctx))) return;
+  if (!(await requireAdmin(ctx, "disablemint"))) return;
   const arg = ctx.message.text.split(/\s+/)[1];
   if (!arg) return ctx.reply("Usage: `/disablemint <symbol or mint>`", { parse_mode: "Markdown" });
   const { rowCount } = await query(
@@ -144,7 +172,62 @@ export async function handleDisableMint(ctx) {
      WHERE UPPER(symbol) = UPPER($1) OR mint = $1`,
     [arg],
   );
+  await logAdminCommand(ctx, "disablemint", {
+    outcome: rowCount > 0 ? "success" : "error",
+    args: arg,
+    error: rowCount > 0 ? null : "mint not found",
+  });
   await ctx.reply(rowCount > 0 ? `✅ ${arg} disabled.` : `❌ ${arg} not found.`);
+}
+
+/**
+ * /admincmds [N] — read the most recent N admin command attempts from
+ * the audit log. Default 25, max 200. Admin-only (logging this read is
+ * itself logged as 'admincmds' so an attacker can't quietly inspect
+ * recent commands without leaving a trace).
+ *
+ * Usage:
+ *   /admincmds              — last 25
+ *   /admincmds 50           — last 50
+ *   /admincmds enablemint   — filter by command
+ *   /admincmds denied       — recent unauthorized attempts only
+ */
+export async function handleAdminCmds(ctx) {
+  if (!(await requireAdmin(ctx, "admincmds"))) return;
+  const parts = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  let limit = 25;
+  let command = null;
+  let deniedOnly = false;
+  for (const p of parts) {
+    if (/^\d+$/.test(p)) limit = Number(p);
+    else if (p.toLowerCase() === "denied") deniedOnly = true;
+    else command = p;
+  }
+  let rows;
+  if (deniedOnly) {
+    rows = await recentAdminCommands({ limit });
+    rows = rows.filter((r) => r.outcome === "denied");
+  } else {
+    rows = await recentAdminCommands({ limit, command });
+  }
+  const deniedCount = await countDeniedAttempts({ hours: 24 });
+  await logAdminCommand(ctx, "admincmds", { outcome: "success", args: parts.join(" ") || null });
+  if (rows.length === 0) {
+    return ctx.reply(`No matching admin commands.\n\n*Denied attempts last 24h:* ${deniedCount}`, {
+      parse_mode: "Markdown",
+    });
+  }
+  const lines = rows.map((r) => {
+    const when = r.created_at.toISOString().replace("T", " ").slice(0, 19);
+    const marker = r.outcome === "denied" ? "🚫" : r.outcome === "error" ? "⚠️" : "✓";
+    const who = r.admin_username ? `@${r.admin_username}` : `tg:${r.admin_tg_id}`;
+    const args = r.args_redacted ? ` ${r.args_redacted}` : "";
+    return `${marker} ${when}  ${who}  /${r.command}${args}`;
+  });
+  const body = lines.join("\n");
+  const header = `*Admin command log* (last ${rows.length}${command ? ` for /${command}` : ""}${deniedOnly ? ", denied only" : ""})`;
+  const footer = `\n\n*Denied attempts last 24h:* ${deniedCount}`;
+  await ctx.reply(`${header}\n\`\`\`\n${body}\n\`\`\`${footer}`, { parse_mode: "Markdown" });
 }
 
 /**
