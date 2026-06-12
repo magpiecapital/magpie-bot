@@ -1478,6 +1478,13 @@ const PUBLIC_ROUTES = new Set([
   // tx — closes the window where Phantom rejects with StalePriceAttestation
   // before the user can even sign.
   "/api/v1/price/refresh",
+  // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
+  // POST + DELETE require an Ed25519-signed envelope. Security is
+  // enforced internally by the handler (signature verification + linked
+  // wallet check), so the API-key gate is bypassed.
+  "/api/v1/site/limit-close",
+  "/api/v1/site/limit-close/arm",
+  "/api/v1/site/limit-close/cancel",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1758,6 +1765,21 @@ async function router(req, res) {
       case "/api/v1/price/refresh": {
         const { handlePriceRefresh } = await import("./price-refresh.js");
         result = await handlePriceRefresh(req);
+        break;
+      }
+      case "/api/v1/site/limit-close": {
+        const { handleSiteLimitCloseList } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseList(req, url);
+        break;
+      }
+      case "/api/v1/site/limit-close/arm": {
+        const { handleSiteLimitCloseArm } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseArm(req);
+        break;
+      }
+      case "/api/v1/site/limit-close/cancel": {
+        const { handleSiteLimitCloseCancel } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseCancel(req);
         break;
       }
       case "/api/v1/tokens":
