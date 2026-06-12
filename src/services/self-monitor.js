@@ -283,6 +283,39 @@ async function probeEngineTopupWallet(bot) {
   }
 }
 
+/**
+ * Stale support tickets — any open/awaiting_user ticket sitting >24h.
+ * The support vigil + auto-ticket-resolver should prevent this; if not,
+ * we DM the operator directly so they can step in via /tickets.
+ * Operator-stated rule: "No cases should go unanswered or unsolved."
+ */
+async function probeStaleSupport(bot) {
+  const KIND = "stale_support";
+  let count = 0;
+  let oldestHours = 0;
+  try {
+    const { rows: [r] } = await query(`
+      SELECT count(*)::int AS n,
+             COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(admin_replied_at, created_at)))) / 3600, 0)::int AS oldest_hours
+        FROM support_tickets
+       WHERE status IN ('open', 'awaiting_user')
+         AND COALESCE(admin_replied_at, created_at) < NOW() - INTERVAL '24 hours'
+    `);
+    count = r.n;
+    oldestHours = r.oldest_hours;
+  } catch { return; }
+  const isBad = count > 0;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    await alertIfNew(bot, KIND,
+      `${count} support ticket(s) sitting >24h (oldest ${oldestHours}h). Vigil should be clearing these — check /tickets for what's stuck.`,
+      count >= 5 || oldestHours >= 72 ? "crit" : "warn",
+    );
+  } else {
+    await alertRecovery(bot, KIND, `No stale support tickets.`);
+  }
+}
+
 /* ─── Tick loop ──────────────────────────────────────────────── */
 
 let _timer = null;
@@ -296,6 +329,7 @@ async function tick(bot) {
       probeMigrationsFailed(bot).catch((e) => console.warn("[self-monitor] migrations probe threw:", e.message)),
       probeTwapWatchdogMisses(bot).catch((e) => console.warn("[self-monitor] twap_watchdog probe threw:", e.message)),
       probeEngineTopupWallet(bot).catch((e) => console.warn("[self-monitor] engine_topup probe threw:", e.message)),
+      probeStaleSupport(bot).catch((e) => console.warn("[self-monitor] stale_support probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
