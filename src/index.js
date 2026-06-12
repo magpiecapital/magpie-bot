@@ -247,6 +247,11 @@ bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
 bot.command(["admincmds", "adminlog"], handleAdminCmds);
+// Limit-close engine observability (operator-facing). Read-only.
+{
+  const lcStatus = await import("./commands/lc-status.js");
+  bot.command(["lc-status", "lcstatus", "lc_status"], lcStatus.handleLcStatus);
+}
 // F-4 multi-step approval — second-admin sign-off for sensitive commands.
 // Default gated commands: enablemint, disablemint, broadcast (tunable via
 // ADMIN_COMMAND_APPROVAL_REQUIRED env var). Solo-admin operators bypass
