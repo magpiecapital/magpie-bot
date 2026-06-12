@@ -1832,6 +1832,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
 - User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
+- User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
 - ALL loan actions execute in this chat via cards. NEVER tell the user to run any of these commands in Telegram.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
@@ -2090,6 +2091,16 @@ const TOOLS = [
     name: "list_my_take_profits",
     description: "Get the current user's armed take-profit (limit-close) orders across their active loans. Use when user asks 'show my take-profits', 'do I have a take-profit set', 'what limit orders are active', or after they've just armed one and want to see it.",
     input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "explain_my_take_profit",
+    description: "Look up the lifecycle of one of the user's take-profit orders and return a structured explanation: what they asked for, what happened at fire time, whether the engine escalated slippage or fell back to TWAP, and the final fill numbers. Use when user asks 'why did my TP fire at X%', 'why was my limit order so much slippage', 'what happened with order #N', 'explain my last take-profit'. Order MUST belong to the current user; defaults to the most recent order if no order_id is provided.",
+    input_schema: {
+      type: "object",
+      properties: {
+        order_id: { type: "string", description: "The numeric limit_close_orders.id from /loans or list_my_take_profits. Optional — omit to get the user's most recent order." },
+      },
+    },
   },
   {
     name: "propose_partial_repay",
@@ -2780,6 +2791,140 @@ const TOOL_HANDLERS = {
     };
   },
 
+  // Read-only explainer for one of the user's take-profit orders. Reads
+  // ONLY rows owned by the calling userId (defense in depth — even if Pip's
+  // upstream input claimed a different order_id, the WHERE clause blocks
+  // cross-user reads). All internal engine string IDs are translated to
+  // user-friendly language; no infrastructure details leak.
+  explain_my_take_profit: async ({ order_id }, { userId }) => {
+    const wantId = order_id ? String(order_id).trim() : null;
+    const q = wantId
+      ? `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
+                lco.slippage_bps, lco.initial_slippage_bps, lco.max_slippage_bps_cap,
+                lco.slippage_escalations, lco.auto_escalate_slippage,
+                lco.status, lco.armed_at, lco.fired_at, lco.expires_at,
+                lco.failure_count, lco.failure_reason,
+                lco.intervention_state, lco.intervention_response,
+                lco.intervention_suggested_slippage_bps,
+                lco.twap_chunks_total, lco.twap_chunks_completed,
+                lco.proceeds_lamports::text AS proceeds_lamports,
+                lco.protocol_fee_lamports::text AS protocol_fee_lamports,
+                lco.net_to_user_lamports::text AS net_to_user_lamports,
+                lco.engine_topup_lamports::text AS engine_topup_lamports,
+                lco.sell_destination, lco.source,
+                l.loan_id::text AS chain_loan_id, sm.symbol AS collateral_symbol
+           FROM limit_close_orders lco
+           JOIN loans l ON l.id = lco.loan_id
+           LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+          WHERE lco.id = $1 AND lco.user_id = $2`
+      : `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
+                lco.slippage_bps, lco.initial_slippage_bps, lco.max_slippage_bps_cap,
+                lco.slippage_escalations, lco.auto_escalate_slippage,
+                lco.status, lco.armed_at, lco.fired_at, lco.expires_at,
+                lco.failure_count, lco.failure_reason,
+                lco.intervention_state, lco.intervention_response,
+                lco.intervention_suggested_slippage_bps,
+                lco.twap_chunks_total, lco.twap_chunks_completed,
+                lco.proceeds_lamports::text AS proceeds_lamports,
+                lco.protocol_fee_lamports::text AS protocol_fee_lamports,
+                lco.net_to_user_lamports::text AS net_to_user_lamports,
+                lco.engine_topup_lamports::text AS engine_topup_lamports,
+                lco.sell_destination, lco.source,
+                l.loan_id::text AS chain_loan_id, sm.symbol AS collateral_symbol
+           FROM limit_close_orders lco
+           JOIN loans l ON l.id = lco.loan_id
+           LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+          WHERE lco.user_id = $1
+          ORDER BY lco.armed_at DESC NULLS LAST
+          LIMIT 1`;
+    const params = wantId ? [wantId, userId] : [userId];
+    const { rows } = await query(q, params);
+    if (rows.length === 0) {
+      return wantId
+        ? { not_found: true, requested_order_id: wantId, note: "No take-profit with that ID belongs to this user." }
+        : { not_found: true, note: "User has no take-profit orders yet." };
+    }
+    const o = rows[0];
+    const slipPct = (b) => b == null ? null : (b / 100).toFixed(2);
+
+    // Translate engine failure_reason to user-friendly language. Strict
+    // allowlist — anything unrecognized is reported as a generic phrase
+    // so internal infrastructure strings never leak to chat.
+    const reasonHuman = (() => {
+      const r = (o.failure_reason || "").toLowerCase();
+      if (!r) return null;
+      if (r.includes("proceeds_below_safety_floor")) return "the swap would have netted you less than the safety floor at the time of the attempt";
+      if (r.includes("twap_feasibility_failed")) return "single-block AND chunked TWAP both couldn't clear at your stated cap (liquidity was too thin in that window)";
+      if (r.includes("intervention_requested")) return "the engine asked you for permission to widen — see the DM in this chat";
+      if (r.includes("stuck_firing_recovered")) return "the engine restart-recovered the order; one tick re-tried it";
+      if (r.includes("borrower_wallet_changed")) return "the wallet on the loan changed between borrow and fire — engine refused as a safety measure";
+      if (r.includes("repay_failed")) return "the repay transaction didn't land — engine retried";
+      if (r.includes("swap_failed")) return "the on-chain swap didn't confirm — engine retried";
+      // Generic fallback so unrecognized internal strings stay opaque.
+      return "a transient engine condition";
+    })();
+
+    const interventionHuman = (() => {
+      if (!o.intervention_state || o.intervention_state === "none") return null;
+      if (o.intervention_state === "requested") return "the engine sent you a DM with Allow / Wait / Cancel — your response is pending";
+      if (o.intervention_state === "approved") return `you tapped Allow at ${slipPct(o.intervention_suggested_slippage_bps)}% — engine retried at the wider slippage`;
+      if (o.intervention_state === "declined") return "you tapped Wait — engine kept trying at your original cap with a 15 min DM cooldown";
+      if (o.intervention_state === "cancelled") return "you cancelled the order via the intervention DM";
+      if (o.intervention_state === "timed_out") return "the 1-hour decision window expired without a response";
+      return null;
+    })();
+
+    const lamportsToSol = (l) => l ? (Number(l) / 1e9).toFixed(6) : null;
+
+    return {
+      order_id: o.id,
+      loan_id_chain: o.chain_loan_id,
+      collateral_symbol: o.collateral_symbol || null,
+      sell_destination: o.sell_destination,
+      armed: {
+        initial_slippage_pct: slipPct(o.initial_slippage_bps ?? o.slippage_bps),
+        cap_slippage_pct: slipPct(o.max_slippage_bps_cap),
+        auto_escalate: !!o.auto_escalate_slippage,
+        source: o.source,
+        armed_at: o.armed_at,
+      },
+      current: {
+        status: o.status,
+        current_slippage_pct: slipPct(o.slippage_bps),
+        escalations: o.slippage_escalations || 0,
+        failure_count: o.failure_count || 0,
+        twap_progress: o.twap_chunks_total
+          ? `${o.twap_chunks_completed ?? 0}/${o.twap_chunks_total} chunks`
+          : null,
+      },
+      outcome: o.status === "fired" || o.status === "partial_fired"
+        ? {
+            fired_at: o.fired_at,
+            fill_slippage_pct: slipPct(o.slippage_bps),
+            proceeds_sol: lamportsToSol(o.proceeds_lamports),
+            protocol_fee_sol: lamportsToSol(o.protocol_fee_lamports),
+            engine_topup_sol: lamportsToSol(o.engine_topup_lamports),
+            net_to_user_sol: lamportsToSol(o.net_to_user_lamports),
+            twap_used: !!o.twap_chunks_total,
+          }
+        : null,
+      timeline_notes: [
+        o.slippage_escalations
+          ? `auto-escalation walked slippage from ${slipPct(o.initial_slippage_bps)}% toward your ${slipPct(o.max_slippage_bps_cap)}% cap (${o.slippage_escalations} steps)`
+          : null,
+        o.twap_chunks_total
+          ? `TWAP fallback engaged — order filled across ${o.twap_chunks_total} smaller slices to control price impact`
+          : null,
+        Number(o.engine_topup_lamports || 0) > 0
+          ? `engine front-funded ~${lamportsToSol(o.engine_topup_lamports)} SOL to your wallet for tx fees; reclaimed from proceeds at settlement`
+          : null,
+        interventionHuman,
+        reasonHuman && !["fired", "cancelled", "expired"].includes(o.status)
+          ? `last failure: ${reasonHuman}`
+          : null,
+      ].filter(Boolean),
+    };
+  },
   list_my_take_profits: async (_args, { userId }) => {
     const { rows } = await query(
       `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
