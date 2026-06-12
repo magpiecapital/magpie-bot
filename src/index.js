@@ -665,6 +665,11 @@ bot.start({
     // first take-profit fills by surfacing the opportunity the moment it
     // exists, instead of waiting for the user to think to check.
     import("./services/upside-watcher.js").then((m) => m.startUpsideWatcher());
+    // Support vigil — closes the awaiting_user gap so no support case
+    // goes silently unresolved. Pip DMs the user at 24h + 96h asking
+    // "did this resolve?" with inline confirm/reopen buttons, and
+    // auto-closes after 7d total of silence.
+    import("./services/support-vigil.js").then((m) => m.startSupportVigil(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
     // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1
     // (SECURITY-AUDIT-ANCHOR-2026-06-09.md). Polls confirmed program
