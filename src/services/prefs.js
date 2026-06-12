@@ -24,13 +24,18 @@ const DEFAULTS = {
   // capped at 3 DMs per loan lifetime so worst case is genuinely
   // valuable (your bag actually moonshot).
   notify_upside_alerts: true,
+  // Downside derisk nudges — symmetric to upside, fires at -20% /
+  // -35% / -50% depreciation with concrete partial-repay / topup /
+  // repay options. Earlier than the health-watcher's liquidation
+  // tiers so users have time to act.
+  notify_downside_alerts: true,
 };
 
 export async function getPrefs(userId) {
   const { rows } = await query(
     `SELECT notify_deposits, notify_loan_warnings, notify_liquidations,
             notify_health, notify_pump, auto_repay, auto_protect,
-            notify_upside_alerts
+            notify_upside_alerts, notify_downside_alerts
      FROM user_prefs WHERE user_id = $1`,
     [userId],
   );

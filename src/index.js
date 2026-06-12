@@ -671,6 +671,10 @@ bot.start({
     // first take-profit fills by surfacing the opportunity the moment it
     // exists, instead of waiting for the user to think to check.
     import("./services/upside-watcher.js").then((m) => m.startUpsideWatcher());
+    // Downside Watcher — symmetric to upside. Pip DMs at -20% / -35% /
+    // -50% depreciation with concrete derisk options BEFORE the
+    // health-watcher's liquidation tiers escalate.
+    import("./services/downside-watcher.js").then((m) => m.startDownsideWatcher());
     // Support vigil — closes the awaiting_user gap so no support case
     // goes silently unresolved. Pip DMs the user at 24h + 96h asking
     // "did this resolve?" with inline confirm/reopen buttons, and
