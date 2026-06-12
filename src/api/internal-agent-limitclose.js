@@ -47,6 +47,14 @@ const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n;
 const VALID_TRIGGER_KINDS = new Set(["mc_usd", "price_usd", "price_sol"]);
 const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
 
+// Mirrors the protocol-wide MAX_INITIAL_SLIPPAGE_BPS from arm-core. Raised
+// 1000 -> 2500 on 2026-06-12 (PR #77 fill-guarantee defaults). The agent
+// endpoint had drifted to the old ceiling — fixed during the audit pass
+// 2026-06-12 (gap #1: slippage validation range mismatch). Delegation
+// max_slippage_bps still gates further, so an aggressive request from the
+// agent is still clamped by the borrower's authorized cap.
+const MAX_INITIAL_SLIPPAGE_BPS_PROTOCOL = 2500;
+
 function isValidPubkey(s) {
   return typeof s === "string" && s.length >= 32 && s.length <= 44 &&
     /^[1-9A-HJ-NP-Za-km-z]+$/.test(s);
@@ -122,7 +130,7 @@ export async function handleAgentLimitCloseArm(req) {
   if (triggerValueMicro < MIN_TRIGGER_VALUE_MICRO || triggerValueMicro > MAX_TRIGGER_VALUE_MICRO) {
     return bad("trigger_value_out_of_range");
   }
-  if (!Number.isInteger(slippageBpsRaw) || slippageBpsRaw < 10 || slippageBpsRaw > 1000) {
+  if (!Number.isInteger(slippageBpsRaw) || slippageBpsRaw < 10 || slippageBpsRaw > MAX_INITIAL_SLIPPAGE_BPS_PROTOCOL) {
     return bad("invalid_slippage_bps");
   }
   const slippageBps = slippageBpsRaw;
@@ -188,7 +196,7 @@ export async function handleAgentLimitCloseArm(req) {
 
   // ── Collateral allowlist (mirrors TG path) ──────────────────
   const { rows: [mintRow] } = await query(
-    `SELECT enabled, category FROM supported_mints WHERE mint = $1`,
+    `SELECT enabled, category, symbol, liquidity_usd FROM supported_mints WHERE mint = $1`,
     [loan.collateral_mint],
   );
   if (!mintRow || !mintRow.enabled) {
@@ -286,6 +294,27 @@ export async function handleAgentLimitCloseArm(req) {
   const preflightProceedsLamports  = preflight.advisory ? null : (preflight.proceedsLamports || null);
   const preflightQuotedAtIso       = preflight.advisory ? null : (preflight.quotedAtIso || new Date().toISOString());
 
+  // ── Liquidity-aware initial slippage bump ───────────────────
+  // Mirrors arm-core's logic from PR #86. Agents requesting the default
+  // 200 bps initial against a thin token will see their first attempt
+  // revert and waste a tick before auto-escalation. Bumping the initial
+  // to a token-liquidity-appropriate floor saves that round-trip.
+  // Hard constraint specific to the agent path: NEVER bump above the
+  // borrower's stated delegation.max_slippage_bps. The delegation is the
+  // borrower's stated worst-case-acceptable; we never widen past it.
+  const liqUsd = Number(mintRow.liquidity_usd ?? 0);
+  let liquidityFloorBps = 0;
+  if (liqUsd <= 0) liquidityFloorBps = 0;                       // unknown → no bump
+  else if (liqUsd >= 100_000) liquidityFloorBps = 0;             // deep
+  else if (liqUsd >= 25_000) liquidityFloorBps = 300;            // mid
+  else if (liqUsd >= 5_000) liquidityFloorBps = 500;             // thin
+  else liquidityFloorBps = 1000;                                  // very thin
+  const originalRequestedBps = slippageBps;
+  const appliedInitialBps =
+    liquidityFloorBps > 0 && slippageBps < liquidityFloorBps
+      ? Math.min(liquidityFloorBps, delegation.max_slippage_bps)
+      : slippageBps;
+
   // ── INSERT — UNIQUE partial index catches dup-arm races ──────
   //
   // For auto-escalation we snapshot the borrower's delegation cap into
@@ -318,12 +347,15 @@ export async function handleAgentLimitCloseArm(req) {
                $15)
        RETURNING id, armed_at`,
       [delegation.user_id, loan.id, triggerKind, triggerValueMicro.toString(),
-       slippageBps, sellDestination, expiresAt,
+       appliedInitialBps, sellDestination, expiresAt,
        agentPubkey,
-       autoEscalate, capBps, slippageBps,
+       autoEscalate, capBps, appliedInitialBps,
        preflightSlippageQuotedBps, preflightProceedsLamports, preflightQuotedAtIso,
        `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; ` +
        `auto_escalate=${autoEscalate} cap=${capBps}bps; ` +
+       (appliedInitialBps !== originalRequestedBps
+         ? `initial slippage bumped ${originalRequestedBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)}); `
+         : "") +
        `preflight=${preflight.advisory ? "advisory" : "passed"}`],
     );
   } catch (err) {
@@ -366,7 +398,7 @@ export async function handleAgentLimitCloseArm(req) {
       loan_id: loan.loan_id,
       trigger_kind: triggerKind,
       trigger_value_micro: triggerValueMicro.toString(),
-      slippage_bps: slippageBps,
+      slippage_bps: appliedInitialBps,
       sell_destination: sellDestination,
       armed_at: inserted.rows[0].armed_at,
       expires_at: expiresAt,
@@ -374,7 +406,16 @@ export async function handleAgentLimitCloseArm(req) {
       source_agent_pubkey: agentPubkey,
       auto_escalate_slippage: autoEscalate,
       max_slippage_bps_cap: capBps,
-      initial_slippage_bps: slippageBps,
+      initial_slippage_bps: appliedInitialBps,
+      // Surface the bump so the agent can log / present it to the user.
+      // Only present when an actual bump landed.
+      ...(appliedInitialBps !== originalRequestedBps
+        ? {
+            slippage_bps_requested: originalRequestedBps,
+            liquidity_floor_bps: liquidityFloorBps,
+            liquidity_usd: liqUsd,
+          }
+        : {}),
     },
   };
 }
