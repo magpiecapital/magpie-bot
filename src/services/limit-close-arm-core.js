@@ -1,0 +1,299 @@
+/**
+ * Core arming + cancel logic for limit-close orders.
+ *
+ * Three call sites share this:
+ *   - TG: src/commands/limit-close.js  (handleLimitClose for custodial TG users)
+ *   - Internal: src/api/internal-agent-limitclose.js  (x402 agent path)
+ *   - Site: src/api/site-limit-close.js  (signed Ed25519 from the dashboard)
+ *
+ * Keeping all three behind ONE armOrder() implementation prevents
+ * drift — the eligibility math, schema columns, preflight check,
+ * and DM-on-arm behavior must be identical regardless of where the
+ * arm came from. If we let each surface evolve independently they
+ * would silently get out of sync.
+ *
+ * The function takes:
+ *   - userId       (resolved from telegram_id / signer pubkey / delegation)
+ *   - source       ('tg' | 'site' | 'agent_x402')
+ *   - sourceAgent  (only for 'agent_x402', the agent's pubkey)
+ *   - loanId       (on-chain loan_id as a string)
+ *   - triggerKind  ('mc_usd' | 'price_usd' | 'price_sol')
+ *   - triggerValueMicro (BigInt string or BigInt)
+ *   - slippageBps  (integer 10..1000)
+ *   - sellDestination ('sol' | 'usdc')
+ *   - expiresAt    (ISO string or null)
+ *   - autoEscalate (bool)
+ *   - capBps       (max slippage cap; defaults to slippageBps if no
+ *                   escalation; defaults to delegation.max_slippage_bps
+ *                   for agent path; for TG + site there's no widening
+ *                   today so cap === initial slippage)
+ *
+ * Returns { ok: true, orderId, loanRow, mintRow } or { ok: false, error,
+ *   detail?, suggestedSlippageBps? }.
+ *
+ * Defense in depth applied here so every surface gets it:
+ *   - Loan must belong to userId
+ *   - Loan must be 'active' + meet min size (1 SOL)
+ *   - Collateral must be enabled + not RWA category
+ *   - User concurrency cap (10 orders)
+ *   - Pre-flight Jupiter quote at the EFFECTIVE max slippage (the
+ *     cap if auto-escalate is on, else the literal slippage)
+ *   - INSERT uses ON CONFLICT on the UNIQUE(loan_id WHERE status='armed')
+ *     partial index → double-arm physically impossible
+ */
+import { query } from "../db/pool.js";
+import { runArmPreflight } from "./limit-close-preflight.js";
+
+export const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL
+export const MAX_ACTIVE_ORDERS_PER_USER = 10;
+export const MIN_TRIGGER_VALUE_MICRO = 1n;
+export const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n;
+export const VALID_TRIGGER_KINDS = new Set(["mc_usd", "price_usd", "price_sol"]);
+export const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
+
+/**
+ * Resolve a multiplier ("at 2x" semantic) to a price_usd micros value
+ * using the cross-sourced oracle. Shared so TG, site, and Pip all
+ * lock in the same target meaning.
+ *
+ * Returns { ok: true, triggerValueMicro: BigInt, currentUsd, targetUsd }
+ * or { ok: false, error: string }.
+ */
+export async function resolveMultiplierToPrice(collateralMint, multiplier) {
+  if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 1) {
+    return { ok: false, error: "Multiplier must be > 1 (e.g. 2 for 2×)." };
+  }
+  const { getPriceInUsdCrossSourced } = await import("./price.js");
+  const currentUsd = await getPriceInUsdCrossSourced(collateralMint);
+  if (!currentUsd || currentUsd <= 0) {
+    return { ok: false, error: "Couldn't fetch current USD price right now — try again or use an explicit price target." };
+  }
+  const targetUsd = currentUsd * multiplier;
+  const triggerValueMicro = BigInt(Math.round(targetUsd * 1e6));
+  if (triggerValueMicro < MIN_TRIGGER_VALUE_MICRO || triggerValueMicro > MAX_TRIGGER_VALUE_MICRO) {
+    return { ok: false, error: "Resolved target is out of range." };
+  }
+  return { ok: true, triggerValueMicro, currentUsd, targetUsd };
+}
+
+/**
+ * The shared arm implementation. Same gates regardless of source.
+ *
+ * Returns { ok: true, orderId, loan, mint } or { ok: false, error, ... }.
+ */
+export async function armOrder({
+  userId,
+  source,                  // 'tg' | 'site' | 'agent_x402'
+  sourceAgentPubkey = null,
+  loanIdChain,             // string
+  triggerKind,
+  triggerValueMicro,       // BigInt or string
+  slippageBps,
+  sellDestination = "sol",
+  expiresAt = null,
+  autoEscalate = false,
+  // For agent path the cap comes from delegation. For other paths
+  // capBps defaults to slippageBps (no escalation headroom).
+  capBps = null,
+  preflightProtocolFeeBps = 100,
+  armNote = null,
+}) {
+  // ── Shape validation ─────────────────────────────────────────
+  if (!VALID_TRIGGER_KINDS.has(triggerKind)) {
+    return { ok: false, error: "invalid_trigger_kind" };
+  }
+  let triggerBI;
+  try { triggerBI = BigInt(triggerValueMicro); }
+  catch { return { ok: false, error: "invalid_trigger_value" }; }
+  if (triggerBI < MIN_TRIGGER_VALUE_MICRO || triggerBI > MAX_TRIGGER_VALUE_MICRO) {
+    return { ok: false, error: "trigger_value_out_of_range" };
+  }
+  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > 1000) {
+    return { ok: false, error: "invalid_slippage_bps" };
+  }
+  if (!VALID_DESTINATIONS.has(sellDestination)) {
+    return { ok: false, error: "invalid_sell_destination" };
+  }
+  if (!/^\d+$/.test(String(loanIdChain))) {
+    return { ok: false, error: "invalid_loan_id" };
+  }
+  if (expiresAt && Number.isNaN(Date.parse(expiresAt))) {
+    return { ok: false, error: "invalid_expires_at" };
+  }
+  if (!["tg", "site", "agent_x402"].includes(source)) {
+    return { ok: false, error: "invalid_source" };
+  }
+
+  const effectiveCap = Number.isInteger(capBps) ? capBps : slippageBps;
+  if (effectiveCap < slippageBps || effectiveCap > 1000) {
+    return { ok: false, error: "invalid_cap_bps" };
+  }
+
+  // ── Loan ownership + state ──────────────────────────────────
+  const { rows: [loan] } = await query(
+    `SELECT id, loan_id::text AS loan_id, status,
+            original_loan_amount_lamports::text AS owed,
+            collateral_mint, collateral_amount::text AS coll_amount,
+            collateral_amount::text AS collateral_amount_raw,
+            borrower_wallet, user_id
+       FROM loans
+      WHERE user_id = $1 AND loan_id = $2`,
+    [userId, loanIdChain],
+  );
+  if (!loan) return { ok: false, error: "loan_not_found_for_user" };
+  if (loan.status !== "active") {
+    return { ok: false, error: "loan_not_active", detail: loan.status };
+  }
+  if (BigInt(loan.owed) < MIN_LOAN_LAMPORTS) {
+    return { ok: false, error: "loan_below_minimum_size" };
+  }
+
+  // ── Collateral allowlist ────────────────────────────────────
+  const { rows: [mintRow] } = await query(
+    `SELECT enabled, category, symbol FROM supported_mints WHERE mint = $1`,
+    [loan.collateral_mint],
+  );
+  if (!mintRow || !mintRow.enabled) return { ok: false, error: "collateral_not_enabled" };
+  if (["stock", "etf", "metal"].includes(mintRow.category)) {
+    return { ok: false, error: "rwa_collateral_not_supported_in_v1" };
+  }
+
+  // ── Per-user concurrency cap ────────────────────────────────
+  const { rows: [activeCount] } = await query(
+    `SELECT COUNT(*)::int AS n FROM limit_close_orders
+       WHERE user_id = $1 AND status = 'armed'`,
+    [userId],
+  );
+  if (activeCount.n >= MAX_ACTIVE_ORDERS_PER_USER) {
+    return { ok: false, error: "user_concurrency_cap_reached", detail: { active: activeCount.n, cap: MAX_ACTIVE_ORDERS_PER_USER } };
+  }
+
+  // ── Pre-flight Jupiter quote ────────────────────────────────
+  const preflight = await runArmPreflight({
+    collateralMint: loan.collateral_mint,
+    collateralAmountRaw: loan.collateral_amount_raw,
+    sellDestination,
+    slippageBps: effectiveCap,
+    loanOwedLamports: loan.owed,
+    protocolFeeBps: preflightProtocolFeeBps,
+  });
+  if (!preflight.ok) {
+    return {
+      ok: false,
+      error: preflight.reason,
+      detail: preflight.detail,
+      suggestedSlippageBps: preflight.suggestedSlippageBps,
+      yourSlippageBps: preflight.yourSlippageBps,
+    };
+  }
+  const advisory = !!preflight.advisory;
+
+  // ── INSERT ──
+  let inserted;
+  try {
+    inserted = await query(
+      `INSERT INTO limit_close_orders
+         (user_id, loan_id, trigger_kind, trigger_value_micro,
+          slippage_bps, sell_destination, expires_at,
+          source, source_agent_pubkey, status, armed_at,
+          auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
+          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
+          notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7,
+               $8, $9, 'armed', NOW(),
+               $10, $11, $12,
+               $13, $14, $15,
+               $16)
+       RETURNING id, armed_at`,
+      [userId, loan.id, triggerKind, triggerBI.toString(),
+       slippageBps, sellDestination, expiresAt,
+       source, sourceAgentPubkey,
+       autoEscalate, effectiveCap, slippageBps,
+       advisory ? null : effectiveCap,
+       advisory ? null : (preflight.proceedsLamports || null),
+       advisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
+       armNote || `armed via ${source}`],
+    );
+  } catch (err) {
+    if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
+      return { ok: false, error: "loan_already_has_active_order" };
+    }
+    console.error(`[arm-core] insert failed (source=${source}):`, err.message);
+    return { ok: false, error: "insert_failed", detail: err.message?.slice(0, 200) };
+  }
+
+  return {
+    ok: true,
+    orderId: inserted.rows[0].id,
+    armedAt: inserted.rows[0].armed_at,
+    loan,
+    mint: mintRow,
+    preflightAdvisory: advisory,
+  };
+}
+
+/**
+ * Cancel an armed order by ID. Scoped to a specific user OR a specific
+ * agent pubkey. The UPDATE's WHERE status='armed' makes a too-late
+ * cancel a 409 no-op rather than corrupting an in-flight 'firing' row.
+ */
+export async function cancelOrder({ orderId, userId = null, sourceAgentPubkey = null, reason }) {
+  const conditions = ["status = 'armed'"];
+  const params = [orderId];
+  let p = 2;
+  if (userId != null) {
+    conditions.push(`user_id = $${p++}`);
+    params.push(userId);
+  }
+  if (sourceAgentPubkey != null) {
+    conditions.push(`source = 'agent_x402' AND source_agent_pubkey = $${p++}`);
+    params.push(sourceAgentPubkey);
+  }
+  const r = await query(
+    `UPDATE limit_close_orders
+        SET status = 'cancelled',
+            cancellation_reason = $${p++},
+            updated_at = NOW()
+      WHERE id = $1
+        AND ${conditions.join(" AND ")}
+      RETURNING id`,
+    [...params, reason || "user_cancel"],
+  );
+  if (r.rows.length === 0) return { ok: false, error: "not_cancellable_or_not_found" };
+  return { ok: true, orderId: r.rows[0].id };
+}
+
+/**
+ * Enqueue a DM telling the borrower a take-profit was armed on their
+ * loan. Used by TG + site + agent paths so the user always knows.
+ * Best-effort: enqueue failure does NOT roll back the arm.
+ */
+export async function enqueueArmedDm({
+  userId,
+  orderId,
+  loanIdChain,
+  triggerKind,
+  triggerValueMicro,
+  slippageBps,
+  sellDestination,
+  source,
+  sourceAgentPubkey,
+}) {
+  try {
+    await query(
+      `INSERT INTO pending_notifications (user_id, channel, kind, payload, status)
+         VALUES ($1, 'tg', 'limit_close_armed', $2::jsonb, 'pending')`,
+      [userId, JSON.stringify({
+        order_id: orderId,
+        loan_id_chain: loanIdChain,
+        trigger_label: `${triggerKind}=${triggerValueMicro}`,
+        slippage_bps: slippageBps,
+        sell_destination: sellDestination,
+        source,
+        source_agent_pubkey: sourceAgentPubkey || null,
+      })],
+    );
+  } catch (err) {
+    console.warn("[arm-core] arm-DM enqueue failed:", err.message?.slice(0, 200));
+  }
+}
