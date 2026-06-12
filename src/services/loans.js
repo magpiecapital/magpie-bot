@@ -471,6 +471,7 @@ export async function recordLoan({
        start_timestamp, due_timestamp, status, tx_signature, program_id,
        borrower_wallet
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13,$14)
+     ON CONFLICT (loan_id) DO NOTHING
      RETURNING id`,
     [
       userId,
@@ -489,6 +490,40 @@ export async function recordLoan({
       borrowerWallet ?? null,
     ],
   );
+
+  // ON CONFLICT path → the loan already existed (a previous recordLoan
+  // succeeded but the caller is retrying). Nothing new to do — every
+  // downstream side-effect below was already done on the first call.
+  // Returning early avoids double-credit on retries.
+  if (rows.length === 0) return;
+
+  const loanDbId = rows[0].id;
+
+  // Canonical credit-event emission. This is the SINGLE source of truth
+  // for the "user borrowed" event so BOTH the TG path and the site path
+  // get +N points for a borrow. Previously this ran inside
+  // incrementBorrowed (TG-only), so site-native users silently received
+  // ZERO points for borrows — only repay events landed for them.
+  try {
+    await recordCreditEvent(userId, "borrow", loanDbId, {
+      lamports: String(originalLoanAmountLamports),
+    });
+  } catch (err) {
+    console.error("[loans.recordLoan] credit event failed (non-fatal):", err.message);
+  }
+
+  // Bump the user's lifetime-borrowed counter. Also previously TG-only.
+  try {
+    await query(
+      `UPDATE users
+         SET total_borrowed_lamports = total_borrowed_lamports + $2::numeric,
+             updated_at = NOW()
+       WHERE id = $1`,
+      [userId, String(originalLoanAmountLamports)],
+    );
+  } catch (err) {
+    console.error("[loans.recordLoan] total_borrowed bump failed (non-fatal):", err.message);
+  }
 
   // Compute the on-chain fee once and feed it to all the off-chain accrual hooks
   // (referrals + $MAGPIE holder pool). fee = debt − received.
