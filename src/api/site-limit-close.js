@@ -39,7 +39,11 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
-import { sign as naclSign } from "tweetnacl";
+// tweetnacl is a CommonJS module — the named-import form (`import { sign }`)
+// breaks under Node ESM in some environments. Use the default-import +
+// destructure pattern (same as src/api/credit-attest.js).
+import nacl from "tweetnacl";
+const { sign: naclSign } = nacl;
 import { query } from "../db/pool.js";
 import {
   armOrder, cancelOrder, enqueueArmedDm,
