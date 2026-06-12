@@ -115,6 +115,7 @@ import {
   handleAiStats,
   handleInfraHealth,
   handleHolderPool,
+  handleAdminCmds,
 } from "./commands/admin.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { startDepositWatcher } from "./services/deposit-watcher.js";
@@ -237,10 +238,12 @@ bot.command("distributions", handleDistributions);
 bot.command("distribution", handleDistributions); // alias
 bot.command("mydistributions", handleDistributions); // alias
 
-// Admin commands (authorization enforced in handlers)
+// Admin commands (authorization enforced in handlers — every gate now
+// logs success + denied attempts to admin_command_log per audit F-4).
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
+bot.command(["admincmds", "adminlog"], handleAdminCmds);
 bot.command("siteops", handleSiteOps);
 bot.command(["protocolfees", "protocol-fees"], handleProtocolFees);
 bot.command("ban_user", handleBanUser);
