@@ -150,6 +150,9 @@ const RENDERERS = {
   limit_close_cancelled:    renderLimitCloseCancelled,
   limit_close_intervention: renderLimitCloseIntervention,
   pip_upside_alert:         renderPipUpsideAlert,
+  // Downside alert reuses the same renderer — the watcher pre-renders
+  // the entire DM body into payload.text, identical contract.
+  pip_downside_alert:       renderPipUpsideAlert,
 };
 
 function renderPayload(kind, payload) {
