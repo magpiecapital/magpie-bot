@@ -588,4 +588,241 @@ export async function handleAgentLimitCloseListDelegations(req, params) {
   };
 }
 
+/**
+ * GET /api/v1/internal/agent/limit-close/eligible-loans?agent=<pubkey>
+ *
+ * The agent's complete actionable surface — every (wallet, loan) tuple
+ * they could arm a limit-close against, with explicit eligibility for
+ * each so the agent doesn't have to encode protocol invariants on
+ * their side.
+ *
+ * Returns ONE shaped object containing:
+ *   - by_wallet: array, one entry per active delegation
+ *       - user_wallet
+ *       - delegation: bounds + current usage (active orders, headroom)
+ *       - loans: every loan owned by that wallet, with:
+ *           - loan metadata (loan_id, collateral_mint+symbol, amount, status, due)
+ *           - is_eligible: true/false
+ *           - ineligibility_reasons: an explicit array; empty if eligible
+ *
+ * The endpoint surfaces INELIGIBLE loans too (not just eligible) — agents
+ * can use the reasons to display "this loan is too small to limit-close"
+ * or "the collateral type isn't supported" to the user in their UI.
+ *
+ * Free. X-Internal-Token gated (only the x402 service calls this); the
+ * x402 service has already proven the agent's pubkey via the X-Agent-
+ * Pubkey header binding before forwarding.
+ *
+ * Defense in depth:
+ *   - Strictly scoped to wallets where (user_wallet, agent_pubkey,
+ *     action='limit_close') has an ACTIVE non-expired delegation. An
+ *     agent CANNOT discover loans on wallets that haven't authorized them.
+ *   - Eligibility checks mirror the arm endpoint exactly (single source
+ *     of truth via the same set of constants + queries) so the agent
+ *     can never see a loan as "eligible" that the arm endpoint would
+ *     subsequently reject. Drift between these two paths would be
+ *     a serious UX bug.
+ *   - Loan size, collateral category, existing-armed-order checks are
+ *     all applied. Agent's per-wallet active-order count is applied to
+ *     the delegation's max_active_orders cap.
+ *   - Hard cap of 500 loans across all wallets in one response. An
+ *     agent with delegations on many wallets gets the most-recent
+ *     loans for each.
+ */
+export async function handleAgentLimitCloseEligibleLoans(req, params) {
+  if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
+    return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  const agentPubkey = String(params.agent ?? "");
+  if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
+
+  // ── Active delegations for this agent ──────────────────────────
+  const { rows: delegations } = await query(
+    `SELECT id,
+            user_wallet,
+            user_id,
+            max_per_order_lamports::text AS max_per_order_lamports,
+            max_active_orders,
+            max_slippage_bps,
+            granted_at,
+            expires_at
+       FROM agent_delegations
+      WHERE agent_pubkey = $1
+        AND action = 'limit_close'
+        AND status = 'active'
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY granted_at DESC
+      LIMIT 100`,
+    [agentPubkey],
+  );
+  if (delegations.length === 0) {
+    return {
+      status: 200,
+      body: {
+        agent_pubkey: agentPubkey,
+        delegations_count: 0,
+        eligible_loans_count: 0,
+        by_wallet: [],
+      },
+    };
+  }
+
+  // ── For each delegation, fetch the wallet's loans + agent's
+  //    existing active orders against THIS user (for cap math) ──
+  // We do the fetch in two batched queries to keep round-trips at O(1)
+  // regardless of delegation count — important if an agent has many
+  // delegations.
+  const userIds = delegations.map((d) => d.user_id);
+  const wallets = delegations.map((d) => d.user_wallet);
+
+  const [{ rows: allLoans }, { rows: activeOrderCounts }, { rows: activeLimitOrders }] =
+    await Promise.all([
+      query(
+        `SELECT l.id, l.loan_id::text AS loan_id, l.loan_pda,
+                l.collateral_mint, l.collateral_amount::text AS collateral_amount,
+                l.original_loan_amount_lamports::text AS owed_lamports,
+                l.status, l.due_timestamp, l.start_timestamp,
+                l.borrower_wallet, l.user_id,
+                sm.symbol AS collateral_symbol, sm.category AS collateral_category,
+                sm.enabled AS collateral_enabled, sm.decimals
+           FROM loans l
+           LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+          WHERE l.user_id = ANY($1::bigint[])
+            AND l.borrower_wallet = ANY($2::text[])
+            AND l.status = 'active'
+          ORDER BY l.start_timestamp DESC
+          LIMIT 500`,
+        [userIds, wallets],
+      ),
+      // Per-(user, agent) active-orders counter — used to compute headroom
+      // against delegation.max_active_orders. Counts ONLY orders this
+      // agent armed for this user (other agents' counts don't deplete
+      // this agent's headroom).
+      query(
+        `SELECT user_id, COUNT(*)::int AS active_orders
+           FROM limit_close_orders
+          WHERE status = 'armed'
+            AND source = 'agent_x402'
+            AND source_agent_pubkey = $1
+            AND user_id = ANY($2::bigint[])
+          GROUP BY user_id`,
+        [agentPubkey, userIds],
+      ),
+      // Set of loan_ids that ALREADY have an active limit-close order
+      // (from ANY source — TG, agent, etc). Loans in this set are
+      // ineligible regardless of who would try to arm them, because
+      // the UNIQUE partial index physically prevents two armed orders
+      // on the same loan.
+      query(
+        `SELECT DISTINCT loan_id
+           FROM limit_close_orders
+          WHERE status = 'armed'
+            AND loan_id = ANY(
+              SELECT id FROM loans
+               WHERE user_id = ANY($1::bigint[])
+            )`,
+        [userIds],
+      ),
+    ]);
+
+  const activeByUser = new Map(
+    activeOrderCounts.map((r) => [Number(r.user_id), r.active_orders]),
+  );
+  const loanIdsWithActiveOrder = new Set(
+    activeLimitOrders.map((r) => Number(r.loan_id)),
+  );
+
+  // Group loans by user_wallet for the response shape.
+  const loansByWallet = new Map();
+  for (const l of allLoans) {
+    const key = l.borrower_wallet;
+    if (!loansByWallet.has(key)) loansByWallet.set(key, []);
+    loansByWallet.get(key).push(l);
+  }
+
+  // ── Build per-wallet response, applying eligibility per loan ───
+  let totalEligible = 0;
+  const byWallet = delegations.map((d) => {
+    const wLoans = loansByWallet.get(d.user_wallet) || [];
+    const userId = Number(d.user_id);
+    const activeOrders = activeByUser.get(userId) ?? 0;
+    const headroom = d.max_active_orders - activeOrders;
+    const maxPerOrder = BigInt(d.max_per_order_lamports);
+
+    const loans = wLoans.map((l) => {
+      const reasons = [];
+      const owedBI = BigInt(l.owed_lamports);
+
+      // Mirror the arm endpoint's checks EXACTLY. Keep this list aligned
+      // with handleAgentLimitCloseArm.
+      if (l.status !== "active") reasons.push("loan_not_active");
+      if (owedBI < MIN_LOAN_LAMPORTS) reasons.push("loan_below_minimum_size");
+      if (!l.collateral_enabled) reasons.push("collateral_not_enabled");
+      if (["stock", "etf", "metal"].includes(l.collateral_category)) {
+        reasons.push("rwa_collateral_not_supported_in_v1");
+      }
+      if (loanIdsWithActiveOrder.has(Number(l.id))) {
+        reasons.push("loan_already_has_active_order");
+      }
+      if (owedBI > maxPerOrder) {
+        reasons.push("loan_exceeds_delegation_per_order_cap");
+      }
+      if (headroom <= 0) {
+        reasons.push("agent_concurrency_cap_reached");
+      }
+
+      const isEligible = reasons.length === 0;
+      if (isEligible) totalEligible++;
+
+      return {
+        loan_id: l.loan_id,
+        loan_pda: l.loan_pda,
+        collateral_mint: l.collateral_mint,
+        collateral_symbol: l.collateral_symbol,
+        collateral_category: l.collateral_category,
+        collateral_amount_raw: l.collateral_amount,
+        collateral_decimals: l.decimals,
+        owed_lamports: l.owed_lamports,
+        owed_sol: Number(l.owed_lamports) / 1e9,
+        status: l.status,
+        start_at: l.start_timestamp,
+        due_at: l.due_timestamp,
+        is_eligible: isEligible,
+        ineligibility_reasons: reasons,
+      };
+    });
+
+    return {
+      user_wallet: d.user_wallet,
+      delegation: {
+        max_per_order_lamports: d.max_per_order_lamports,
+        max_per_order_sol: Number(d.max_per_order_lamports) / 1e9,
+        max_active_orders: d.max_active_orders,
+        max_slippage_bps: d.max_slippage_bps,
+        active_orders_used: activeOrders,
+        headroom,
+        granted_at: d.granted_at,
+        expires_at: d.expires_at,
+      },
+      loans_total: loans.length,
+      loans_eligible: loans.filter((x) => x.is_eligible).length,
+      loans,
+    };
+  });
+
+  return {
+    status: 200,
+    body: {
+      agent_pubkey: agentPubkey,
+      delegations_count: delegations.length,
+      eligible_loans_count: totalEligible,
+      // generated_at gives the agent a freshness signal — they can
+      // cache this for a short window without worrying about staleness
+      // making them try-and-fail on an arm.
+      generated_at: new Date().toISOString(),
+      by_wallet: byWallet,
+    },
+  };
+}
+
 function bad(err) { return { status: 400, body: { error: err } }; }
