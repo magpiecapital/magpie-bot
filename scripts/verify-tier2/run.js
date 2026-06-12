@@ -358,8 +358,16 @@ async function main() {
       if (armedOrderId) await query(`DELETE FROM limit_close_orders WHERE id = $1`, [armedOrderId]);
       if (createdDelegationId) await query(`DELETE FROM agent_delegations WHERE id = $1`, [createdDelegationId]);
       if (createdLoanId) await query(`DELETE FROM loans WHERE id = $1`, [createdLoanId]);
-      // Wallets first (FK on user_id), then user
-      await query(`DELETE FROM wallets WHERE user_id = $1`, [createdUserId]);
+      // The arm endpoint enqueues a limit_close_armed DM for the borrower
+      // (correct behavior — they should know an agent armed an order on
+      // their loan). Clear ALL pending_notifications for the synthetic
+      // user before deleting the user row, otherwise the
+      // pending_notifications.user_id FK blocks the user DELETE.
+      if (createdUserId) {
+        await query(`DELETE FROM pending_notifications WHERE user_id = $1`, [createdUserId]);
+      }
+      // Wallets next (FK on user_id), then user
+      if (createdUserId) await query(`DELETE FROM wallets WHERE user_id = $1`, [createdUserId]);
       if (createdUserId) await query(`DELETE FROM users WHERE id = $1 AND telegram_username = $2`, [createdUserId, SYNTHETIC.username]);
       console.log("   cleanup OK");
     } catch (err) {
