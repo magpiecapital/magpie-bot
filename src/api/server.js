@@ -1487,6 +1487,7 @@ const PUBLIC_ROUTES = new Set([
   // wallet check), so the API-key gate is bypassed.
   "/api/v1/site/limit-close",
   "/api/v1/site/limit-close/arm",
+  "/api/v1/site/limit-close/modify",
   "/api/v1/site/limit-close/cancel",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
@@ -1793,6 +1794,11 @@ async function router(req, res) {
       case "/api/v1/site/limit-close/cancel": {
         const { handleSiteLimitCloseCancel } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseCancel(req);
+        break;
+      }
+      case "/api/v1/site/limit-close/modify": {
+        const { handleSiteLimitCloseModify } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseModify(req);
         break;
       }
       case "/api/v1/tokens":
