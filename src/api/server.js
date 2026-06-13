@@ -1470,6 +1470,7 @@ const PUBLIC_ROUTES = new Set([
   // the inbound agent_pubkey on this path BECAUSE the token gate
   // proves it came from the x402 service.
   "/api/v1/internal/agent/limit-close/arm",
+  "/api/v1/internal/agent/limit-close/preflight",
   "/api/v1/internal/agent/limit-close",
   "/api/v1/internal/agent/limit-close/list",
   "/api/v1/internal/agent/limit-close/delegations",
@@ -1737,6 +1738,11 @@ async function router(req, res) {
       case "/api/v1/internal/agent/limit-close/arm": {
         const { handleAgentLimitCloseArm } = await import("./internal-agent-limitclose.js");
         result = await handleAgentLimitCloseArm(req);
+        break;
+      }
+      case "/api/v1/internal/agent/limit-close/preflight": {
+        const { handleAgentLimitClosePreflight } = await import("./internal-agent-limitclose.js");
+        result = await handleAgentLimitClosePreflight(req);
         break;
       }
       case "/api/v1/internal/agent/limit-close/list": {
