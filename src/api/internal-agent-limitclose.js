@@ -46,6 +46,11 @@ const MIN_TRIGGER_VALUE_MICRO = 1n;
 const MAX_TRIGGER_VALUE_MICRO = 1_000_000_000_000_000n;
 const VALID_TRIGGER_KINDS = new Set(["mc_usd", "price_usd", "price_sol"]);
 const VALID_DESTINATIONS = new Set(["sol", "usdc"]);
+// Mirror VALID_TRIGGER_DIRECTIONS from arm-core. Adding 'below' support
+// 2026-06-13 — operator escalation "limit sale build for both regular
+// protocol and x402 must be PERFECTED." The TG/site path already supports
+// stop-loss via /stoploss; the x402 agent path was missing it.
+const VALID_TRIGGER_DIRECTIONS = new Set(["above", "below"]);
 
 // Sourced from src/lib/slippage-constants.js — protocol-absolute ceiling.
 // The delegation's max_slippage_bps still gates further (it's the user-
@@ -107,6 +112,9 @@ export async function handleAgentLimitCloseArm(req) {
   const agentPubkey      = String(body?.agent_pubkey ?? "");
   const loanIdRaw        = String(body?.loan_id ?? "");
   const triggerKind      = String(body?.trigger_kind ?? "");
+  // Default 'above' (take-profit) for back-compat with existing agents.
+  // Agents wanting stop-loss pass {"trigger_direction": "below"}.
+  const triggerDirection = String(body?.trigger_direction ?? "above");
   const triggerValueMicroRaw = String(body?.trigger_value_micro ?? "");
   const slippageBpsRaw   = body?.slippage_bps;
   const sellDestination  = String(body?.sell_destination ?? "sol").toLowerCase();
@@ -123,6 +131,7 @@ export async function handleAgentLimitCloseArm(req) {
   if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
   if (!/^\d+$/.test(loanIdRaw))    return bad("invalid_loan_id");
   if (!VALID_TRIGGER_KINDS.has(triggerKind)) return bad("invalid_trigger_kind");
+  if (!VALID_TRIGGER_DIRECTIONS.has(triggerDirection)) return bad("invalid_trigger_direction");
   if (!/^\d+$/.test(triggerValueMicroRaw))   return bad("invalid_trigger_value");
   let triggerValueMicro;
   try { triggerValueMicro = BigInt(triggerValueMicroRaw); } catch { return bad("invalid_trigger_value"); }
@@ -293,6 +302,55 @@ export async function handleAgentLimitCloseArm(req) {
   const preflightProceedsLamports  = preflight.advisory ? null : (preflight.proceedsLamports || null);
   const preflightQuotedAtIso       = preflight.advisory ? null : (preflight.quotedAtIso || new Date().toISOString());
 
+  // ── Immediate-fire + SL solvency guards (mirrors arm-core PRs #114) ─
+  // Same gates the TG/site path runs. Implemented inline here because
+  // the agent endpoint duplicates the INSERT logic rather than calling
+  // armOrder() — a fuller refactor is queued as a follow-up. For now,
+  // narrow port keeps the two paths aligned on safety.
+  let currentMicrosForLater = null;
+  try {
+    if (triggerKind === "mc_usd" || triggerKind === "price_usd") {
+      const { getPriceInUsdCrossSourced } = await import("../services/price.js");
+      const currentUsdPerDisplayed = await getPriceInUsdCrossSourced(loan.collateral_mint);
+      if (currentUsdPerDisplayed && currentUsdPerDisplayed > 0) {
+        let currentMicros = null;
+        if (triggerKind === "price_usd") {
+          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6));
+        } else if (triggerKind === "mc_usd" && mintRow.supply) {
+          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6)) * BigInt(mintRow.supply);
+        }
+        if (currentMicros != null) {
+          currentMicrosForLater = currentMicros;
+          if (triggerDirection === "above" && triggerValueMicro <= currentMicros) {
+            return { status: 409, body: { error: "trigger_would_fire_immediately", direction: "above" } };
+          }
+          if (triggerDirection === "below" && triggerValueMicro >= currentMicros) {
+            return { status: 409, body: { error: "trigger_would_fire_immediately", direction: "below" } };
+          }
+        }
+      }
+    }
+  } catch { /* fail-open: engine re-checks at fire time */ }
+
+  // SL solvency floor — same math as PR #114 in arm-core.
+  if (triggerDirection === "below" && preflight.proceedsLamports != null && currentMicrosForLater != null && currentMicrosForLater > 0n) {
+    const triggerProceedsEstimate = (BigInt(preflight.proceedsLamports) * triggerValueMicro) / currentMicrosForLater;
+    const ownedBI = BigInt(loan.owed);
+    const owedWithBuffer = (ownedBI * 105n) / 100n;
+    if (triggerProceedsEstimate < owedWithBuffer) {
+      return {
+        status: 409,
+        body: {
+          error: "sl_below_solvency",
+          owed_lamports: ownedBI.toString(),
+          required_proceeds_lamports: owedWithBuffer.toString(),
+          estimated_proceeds_at_trigger_lamports: triggerProceedsEstimate.toString(),
+          shortfall_lamports: (owedWithBuffer - triggerProceedsEstimate).toString(),
+        },
+      };
+    }
+  }
+
   // ── Liquidity-aware initial slippage bump ───────────────────
   // Mirrors arm-core's logic from PR #86. Agents requesting the default
   // 200 bps initial against a thin token will see their first attempt
@@ -334,23 +392,28 @@ export async function handleAgentLimitCloseArm(req) {
     inserted = await query(
       `INSERT INTO limit_close_orders
          (user_id, loan_id, trigger_kind, trigger_value_micro,
+          trigger_direction,
           slippage_bps, sell_destination, expires_at,
           source, source_agent_pubkey, status, armed_at,
           auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
           notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7,
-               'agent_x402', $8, 'armed', NOW(),
-               $9, $10, $11,
-               $12, $13, $14,
-               $15)
+       VALUES ($1, $2, $3, $4,
+               $5,
+               $6, $7, $8,
+               'agent_x402', $9, 'armed', NOW(),
+               $10, $11, $12,
+               $13, $14, $15,
+               $16)
        RETURNING id, armed_at`,
       [delegation.user_id, loan.id, triggerKind, triggerValueMicro.toString(),
+       triggerDirection,
        appliedInitialBps, sellDestination, expiresAt,
        agentPubkey,
        autoEscalate, capBps, appliedInitialBps,
        preflightSlippageQuotedBps, preflightProceedsLamports, preflightQuotedAtIso,
        `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; ` +
+       `direction=${triggerDirection}; ` +
        `auto_escalate=${autoEscalate} cap=${capBps}bps; ` +
        (appliedInitialBps !== originalRequestedBps
          ? `initial slippage bumped ${originalRequestedBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)}); `
