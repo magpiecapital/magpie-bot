@@ -46,6 +46,7 @@ import { collateralValueLamports as fetchValueLamports } from "../services/price
 import { query } from "../db/pool.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
+import { getTierByOption } from "../services/loan-tier-resolver.js";
 
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
@@ -409,16 +410,15 @@ export async function handleCosignBorrow(req) {
       if (data.length >= 8 + 8 + 1 + 8 + 8) {
         const collateralAmountRaw = data.readBigUInt64LE(8);
         const tierOption = data.readUInt8(8 + 8);
-        const TIER_LTV = { 0: 30, 1: 25, 2: 20 };
-        const ltv = TIER_LTV[tierOption];
         const collateralMintKey = magpieIx.keys[4]?.pubkey;
         const borrowerPubkeyStr = borrowerSig.publicKey.toBase58();
-        if (ltv && collateralMintKey) {
+        if (collateralMintKey) {
           const collateralMintStr = collateralMintKey.toBase58();
-          // Look up mint metadata for decimals (anti-exploit doesn't need
-          // it, but cross-sourced valuation does).
+          // Look up mint metadata: decimals (for valuation) AND category
+          // (for LTV ladder selection — see below). Single SELECT so we
+          // can resolve both without a second round-trip.
           const { rows: [mintRow] } = await query(
-            `SELECT decimals FROM supported_mints WHERE mint = $1`,
+            `SELECT decimals, category, symbol FROM supported_mints WHERE mint = $1`,
             [collateralMintStr],
           );
           if (!mintRow) {
@@ -427,6 +427,34 @@ export async function handleCosignBorrow(req) {
               body: { error: "Unsupported collateral mint", detail: `mint ${collateralMintStr} not in supported_mints` },
             };
           }
+          // ── LTV ladder resolution (category-aware) ─────────────────
+          // 2026-06-13 root cause: this endpoint previously hardcoded the
+          // memecoin ladder `{0:30, 1:25, 2:20}` for every borrow, regardless
+          // of collateral category. RWA users picking "RWA Standard" (option
+          // 2 = 70% LTV per rwa_loan_tiers) were silently downgraded to
+          // memecoin Standard (20%) — they got ~29% of the advertised loan
+          // amount. Affected SPCX loans #680, #687, #668, #655.
+          //
+          // The fix routes through loan-tier-resolver.getTierByOption, which
+          // is the same path the TG bot, x402 agent, and dashboard quote use.
+          // RWA categories (stock/etf/metal) get rwa_loan_tiers ladder
+          // (50%/60%/70% LTV); memecoin (and default) get MEMECOIN_TIERS
+          // (30%/25%/20%). When the operator tunes either ladder in the DB,
+          // all four surfaces stay in sync.
+          const tier = await getTierByOption({
+            category: mintRow.category,
+            option: tierOption,
+          });
+          if (!tier) {
+            return {
+              status: 400,
+              body: {
+                error: "Invalid tier option",
+                detail: `tier option ${tierOption} not in the ${mintRow.category || "memecoin"} ladder`,
+              },
+            };
+          }
+          const ltv = tier.ltv;
           // Re-value collateral with our own cross-sourced oracle.
           // Three-layer fallback so a momentary rate-limit blip doesn't
           // block a legit borrow:
