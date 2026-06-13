@@ -452,32 +452,53 @@ export async function recordLoan({
   // 2026-06-13: previous behavior fell through to v1's PROGRAM_ID
   // when the caller omitted programId. That silently mis-tagged V2
   // RWA loans as V1, which broke wallet-scoped filtering on the
-  // dashboard (the PDA re-derivation would never match because it
-  // used the wrong program). The user saw a "missing SPCX loan"
-  // even though the loan row existed.
+  // dashboard. PR #145 added on-chain lookup as a fallback for the
+  // missing case.
   //
-  // New posture: if the caller doesn't pass programId, attempt to
-  // determine it from the on-chain owner of loan_pda — the actual
-  // program that owns the account is authoritative. If both the
-  // arg AND the on-chain lookup fail, throw rather than silently
-  // mis-tag. This is the same fail-closed posture used in the
-  // governance + price layers per [[feedback_exploit_prevention_load_bearing]].
-  let recordedProgramId = programId;
-  if (!recordedProgramId && loanPda) {
+  // Later that same day a second incident hit: an upstream caller
+  // was passing the WRONG program_id explicitly (V1's literal
+  // instead of V2's) for V2 borrows. PR #145 didn't catch that
+  // because it only triggered when the arg was absent — an explicit
+  // wrong value bypassed the lookup.
+  //
+  // Hardened posture (this commit, 2026-06-13): on-chain owner of
+  // loan_pda is the SOLE source of truth. We ignore the caller's
+  // programId arg entirely (use it only as a hint / debug log) and
+  // always derive recordedProgramId from getAccountInfo(loan_pda).
+  // If on-chain lookup fails AND the caller supplied a programId,
+  // fall back to caller's value (best-effort during RPC outage).
+  // If both fail, throw — silent corruption is the worst outcome.
+  //
+  // This makes the field self-healing at write-time: no future code
+  // path can mis-tag a loan because the value is read straight from
+  // the chain account that owns the PDA. Drift-probe + healer below
+  // catch any pre-existing rows in the rare case the write-time
+  // lookup also failed.
+  let recordedProgramId = null;
+  if (loanPda) {
     try {
       const { Connection, PublicKey } = await import("@solana/web3.js");
       const conn = new Connection(process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
       const info = await conn.getAccountInfo(new PublicKey(loanPda));
       if (info?.owner) {
         recordedProgramId = info.owner.toBase58();
-        console.warn(
-          `[loans.recordLoan] programId arg missing — recovered from on-chain owner of ${loanPda.slice(0, 8)}…: ${recordedProgramId.slice(0, 8)}…`,
-        );
+        if (programId && programId !== recordedProgramId) {
+          // Loud warning when caller's arg disagrees with on-chain.
+          // Goes to logs so the operator can find which caller is
+          // passing the wrong value. On-chain wins regardless.
+          console.warn(
+            `[loans.recordLoan] PROGRAM_ID DRIFT — caller passed ${programId.slice(0, 8)}… but on-chain owner of ${loanPda.slice(0, 8)}… is ${recordedProgramId.slice(0, 8)}…. Using on-chain value. Investigate caller.`,
+          );
+        }
       }
     } catch (err) {
-      console.warn(`[loans.recordLoan] on-chain programId recovery failed: ${err.message?.slice(0, 80)}`);
+      console.warn(`[loans.recordLoan] on-chain programId lookup failed: ${err.message?.slice(0, 80)}`);
     }
   }
+  // Fall back to caller's arg only if on-chain lookup couldn't run
+  // (RPC outage). Better to record SOMETHING than throw on every
+  // borrow during a transient RPC blip.
+  if (!recordedProgramId) recordedProgramId = programId;
   if (!recordedProgramId) {
     throw new Error(
       `recordLoan refuses to store loan_id=${loanId} loan_pda=${loanPda} without programId — ` +
