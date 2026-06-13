@@ -384,6 +384,10 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
   bot.command("canceltp", lc.handleCancelLimitOrder);
   bot.command("cancelsl", lc.handleCancelLimitOrder);
+  // In-place order modification — change trigger / slippage / dest /
+  // expires without canceling. Order stays armed throughout so users
+  // can fine-tune without a market-move gap.
+  bot.command(["modifyorder", "modifylimitorder", "lcmodify", "lc_modify"], lc.handleModifyLimitOrder);
 
   // Layer 3 — intervention callback handler (inline keyboard taps).
   // Registers a bot.callbackQuery(/^lcint:/) handler that processes

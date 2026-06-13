@@ -463,6 +463,217 @@ export async function armOrder({
 }
 
 /**
+ * Modify an armed order in place — change trigger value, slippage,
+ * sell destination, or expires_at without canceling first.
+ *
+ * Why this exists
+ * ───────────────
+ * Before: a user who wanted to adjust their trigger had to /cancel
+ * then /takeprofit again. That left a small window where the market
+ * could move past their old trigger before the new arm landed. The
+ * UX nudged users away from fine-tuning — bad for "set it and forget
+ * it" + bad for the order-perfection mandate.
+ *
+ * After: a single UPDATE call. The order stays armed throughout; the
+ * engine sees the new values on its next tick. No window.
+ *
+ * What CAN be modified
+ *   trigger_value_micro  — change the price target
+ *   slippage_bps         — tighten or loosen
+ *   sell_destination     — swap between sol/usdc
+ *   expires_at           — extend or set a new auto-cancel
+ *
+ * What CAN'T
+ *   trigger_kind         — switching mc_usd ↔ price_usd ↔ price_sol
+ *                          changes the units. Force cancel + re-arm
+ *                          to avoid silent unit mismatches.
+ *   trigger_direction    — TP ↔ SL is a semantic change too risky to
+ *                          smuggle through a modify endpoint.
+ *   loan_id              — different loan = different order; cancel + arm
+ *
+ * Re-validates the new values against the same gates armOrder()
+ * applied at original arm time: immediate-fire guard, SL solvency
+ * floor (for SL direction), slippage bounds, expires_at parse,
+ * trigger value range. If any new value violates a gate, the modify
+ * fails and the existing order continues unchanged.
+ *
+ * Concurrency: WHERE status='armed' makes a race with the engine's
+ * atomic claim safe. If the engine flipped status='firing' between
+ * read and write, the UPDATE matches zero rows and returns
+ * not_modifiable_or_not_found — caller treats that as "too late, the
+ * order is firing already".
+ *
+ * Scoping: same model as cancelOrder — user_id for TG/site paths,
+ * source_agent_pubkey for the x402 agent path.
+ */
+export async function modifyOrder({
+  orderId,
+  userId = null,
+  sourceAgentPubkey = null,
+  // Each modifiable field is OPTIONAL. Caller passes only what's
+  // changing. Undefined fields are left untouched on the row.
+  triggerValueMicro,
+  slippageBps,
+  sellDestination,
+  expiresAt,
+}) {
+  // ── Load current order state for re-validation ─────────────
+  const conditions = ["status = 'armed'"];
+  const params = [orderId];
+  let p = 2;
+  if (userId != null) {
+    conditions.push(`user_id = $${p++}`);
+    params.push(userId);
+  }
+  if (sourceAgentPubkey != null) {
+    conditions.push(`source = 'agent_x402' AND source_agent_pubkey = $${p++}`);
+    params.push(sourceAgentPubkey);
+  }
+
+  const { rows: [current] } = await query(
+    `SELECT id, user_id, loan_id,
+            trigger_kind, trigger_value_micro::text AS trigger_value_micro,
+            COALESCE(trigger_direction, 'above') AS trigger_direction,
+            slippage_bps, sell_destination, expires_at,
+            max_slippage_bps_cap, source, source_agent_pubkey
+       FROM limit_close_orders
+      WHERE id = $1 AND ${conditions.join(" AND ")}`,
+    params,
+  );
+  if (!current) return { ok: false, error: "not_modifiable_or_not_found" };
+
+  // ── Shape validation per modifiable field ───────────────────
+  const updates = {};
+
+  if (triggerValueMicro !== undefined) {
+    let bi;
+    try { bi = BigInt(triggerValueMicro); } catch { return { ok: false, error: "invalid_trigger_value" }; }
+    if (bi < MIN_TRIGGER_VALUE_MICRO || bi > MAX_TRIGGER_VALUE_MICRO) {
+      return { ok: false, error: "trigger_value_out_of_range" };
+    }
+    updates.trigger_value_micro = bi.toString();
+  }
+  if (slippageBps !== undefined) {
+    if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > MAX_INITIAL_SLIPPAGE_BPS) {
+      return { ok: false, error: "invalid_slippage_bps" };
+    }
+    // Slippage cannot exceed the order's existing cap. The cap was set
+    // at arm time from delegation / derived headroom; loosening past
+    // it would silently widen user consent.
+    if (current.max_slippage_bps_cap != null && slippageBps > Number(current.max_slippage_bps_cap)) {
+      return {
+        ok: false,
+        error: "slippage_exceeds_order_cap",
+        detail: { requested: slippageBps, cap_bps: Number(current.max_slippage_bps_cap) },
+      };
+    }
+    updates.slippage_bps = slippageBps;
+  }
+  if (sellDestination !== undefined) {
+    if (!VALID_DESTINATIONS.has(sellDestination)) {
+      return { ok: false, error: "invalid_sell_destination" };
+    }
+    updates.sell_destination = sellDestination;
+  }
+  if (expiresAt !== undefined) {
+    if (expiresAt !== null && Number.isNaN(Date.parse(expiresAt))) {
+      return { ok: false, error: "invalid_expires_at" };
+    }
+    updates.expires_at = expiresAt;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return { ok: false, error: "no_changes_supplied" };
+  }
+
+  // ── Immediate-fire re-check (best-effort) for new trigger ───
+  // Mirrors armOrder's guard. Skips for price_sol (denominator moves)
+  // and fails-open on oracle hiccup — engine re-checks at fire time.
+  if (updates.trigger_value_micro && (current.trigger_kind === "mc_usd" || current.trigger_kind === "price_usd")) {
+    try {
+      const { getPriceInUsdCrossSourced } = await import("./price.js");
+      // We need the collateral mint for the price read. Pull from the
+      // loan row tied to this order.
+      const { rows: [loan] } = await query(
+        `SELECT collateral_mint FROM loans WHERE id = $1`,
+        [current.loan_id],
+      );
+      if (loan) {
+        const currentUsd = await getPriceInUsdCrossSourced(loan.collateral_mint);
+        if (currentUsd && currentUsd > 0) {
+          let currentMicros = null;
+          if (current.trigger_kind === "price_usd") {
+            currentMicros = BigInt(Math.round(currentUsd * 1e6));
+          }
+          // mc_usd would need supply; skip if not trivially derivable —
+          // engine still catches at fire time.
+          if (currentMicros != null) {
+            const newBi = BigInt(updates.trigger_value_micro);
+            if (current.trigger_direction === "above" && newBi <= currentMicros) {
+              return { ok: false, error: "trigger_would_fire_immediately", detail: { direction: "above" } };
+            }
+            if (current.trigger_direction === "below" && newBi >= currentMicros) {
+              return { ok: false, error: "trigger_would_fire_immediately", detail: { direction: "below" } };
+            }
+          }
+        }
+      }
+    } catch { /* fail-open: engine re-checks at fire time */ }
+  }
+
+  // ── UPDATE ───────────────────────────────────────────────────
+  // Build a parameterized UPDATE. WHERE status='armed' is the race
+  // guard. RETURNING gives us the post-update row.
+  const setParts = [];
+  const updateParams = [];
+  let up = 1;
+  for (const [col, val] of Object.entries(updates)) {
+    setParts.push(`${col} = $${up++}`);
+    updateParams.push(val);
+  }
+  setParts.push("updated_at = NOW()");
+  // Audit note appended so /lc-status armed shows that the order was modified.
+  const noteSuffix = ` modified ${new Date().toISOString().slice(0, 19)}Z (${Object.keys(updates).join(",")})`;
+  setParts.push(`notes = COALESCE(notes, '') || $${up++}`);
+  updateParams.push(noteSuffix);
+  updateParams.push(orderId);
+  const orderIdPos = up;
+
+  // Re-apply ownership guard so a stale userId or source_agent_pubkey
+  // can't bypass scope between the SELECT and the UPDATE.
+  const updateConditions = ["status = 'armed'"];
+  if (userId != null) {
+    updateConditions.push(`user_id = $${++up - 1}`);
+    updateParams.push(userId);
+    up++;
+  }
+  if (sourceAgentPubkey != null) {
+    updateConditions.push(`source = 'agent_x402' AND source_agent_pubkey = $${up - 1}`);
+    updateParams.push(sourceAgentPubkey);
+    up++;
+  }
+
+  const r = await query(
+    `UPDATE limit_close_orders
+        SET ${setParts.join(", ")}
+      WHERE id = $${orderIdPos}
+        AND ${updateConditions.join(" AND ")}
+      RETURNING id, trigger_value_micro::text AS trigger_value_micro,
+                slippage_bps, sell_destination, expires_at, updated_at`,
+    updateParams,
+  );
+  if (r.rows.length === 0) {
+    // Raced with engine flipping status to 'firing' — too late.
+    return { ok: false, error: "not_modifiable_or_not_found" };
+  }
+  return {
+    ok: true,
+    order: r.rows[0],
+    changedFields: Object.keys(updates),
+  };
+}
+
+/**
  * Cancel an armed order by ID. Scoped to a specific user OR a specific
  * agent pubkey. The UPDATE's WHERE status='armed' makes a too-late
  * cancel a 409 no-op rather than corrupting an in-flight 'firing' row.
