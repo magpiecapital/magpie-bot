@@ -1446,6 +1446,7 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/tokens",
   "/api/v1/loans",
   "/api/v1/wallet/balance",
+  "/api/v1/loan-tiers",
   "/api/v1/credit/score",
   // Public leaderboard — no PII, just usernames (TG handles) + scores.
   "/api/v1/credit/leaderboard",
@@ -1785,6 +1786,11 @@ async function router(req, res) {
       case "/api/v1/tokens":
         result = await handleTokens();
         break;
+      case "/api/v1/loan-tiers": {
+        const { handleLoanTiers } = await import("./loan-tiers-api.js");
+        result = await handleLoanTiers(req, url);
+        break;
+      }
       case "/api/v1/loans":
         result = await handleLoans(req, url);
         break;
