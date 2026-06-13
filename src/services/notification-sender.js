@@ -173,6 +173,24 @@ function renderPipUpsideAlert(p) {
   return p?.text || "";
 }
 
+function renderEnginePreflightFailed(p) {
+  const failures = Array.isArray(p?.failures) ? p.failures : [];
+  const lines = [
+    "*Limit-close engine refused to start*",
+    "",
+    "The engine ran its preflight self-test on boot and failed at least one check, so the watcher is not armed. Until this is resolved, no limit-close orders will fire.",
+    "",
+    "*Failures:*",
+    ...failures.map((f) => `• \`${f.name}\` — ${f.detail || "no detail"}`),
+    "",
+    p?.hostname ? `_Host:_ \`${p.hostname}\`` : null,
+    p?.checked_at ? `_At:_ \`${p.checked_at}\`` : null,
+    "",
+    "Fix the underlying issue (env, DB, RPC, keypair) and redeploy. Railway will restart the engine and rerun the preflight automatically.",
+  ].filter((l) => l !== null);
+  return lines.join("\n");
+}
+
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
   limit_close_fired:           renderLimitCloseFired,
@@ -180,6 +198,7 @@ const RENDERERS = {
   limit_close_cancelled:       renderLimitCloseCancelled,
   limit_close_action_required: renderLimitCloseActionRequired,
   limit_close_intervention: renderLimitCloseIntervention,
+  engine_preflight_failed:  renderEnginePreflightFailed,
   pip_upside_alert:         renderPipUpsideAlert,
   // Downside alert reuses the same renderer — the watcher pre-renders
   // the entire DM body into payload.text, identical contract.
