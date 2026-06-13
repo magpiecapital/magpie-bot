@@ -18,6 +18,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { query } from "../db/pool.js";
 import { getProposal, listProposalIds } from "./registry.js";
 import { tallyProposal } from "./tally.js";
+import { takeCloseTimeSnapshot } from "./close-time-snapshot.js";
 import { runAnomalyChecks } from "./anomaly.js";
 import { executeImplementationPlan } from "./implementation.js";
 import { auditImplementation } from "./audit.js";
@@ -112,16 +113,43 @@ export async function processProposal(proposal) {
     [proposalId],
   );
 
+  // ── STEP 0: CLOSE-TIME SNAPSHOT (snapshot_mode='at_close' only) ──
+  // For proposals using close-time eligibility, take the fresh
+  // snapshot now (at close, not at activation). The new snapshot_id
+  // is "<proposal_id>_close" and lands in governance_snapshot_weights
+  // exactly like an activation snapshot would, so step 1's tally is
+  // unchanged downstream.
+  let closeSnapshotId = null;
+  if (proposal.snapshot_mode === "at_close") {
+    const t0 = Date.now();
+    try {
+      const r = await takeCloseTimeSnapshot({ proposalId });
+      closeSnapshotId = r.snapshotId;
+      await log("close_snapshot", "ok", r, null, Date.now() - t0);
+    } catch (err) {
+      await log("close_snapshot", "failed", null, err.message, Date.now() - t0);
+      await markPipelineError(proposalId, "close_snapshot_failed");
+      return "pipeline_error";
+    }
+  }
+
   // ── STEP 1: TALLY ───────────────────────────────────────────────
   let tally;
-  let snapshotPath;
+  let snapshotPath = null;
+  let snapshotIdForTally = null;
   {
     const t0 = Date.now();
-    snapshotPath = findSnapshotFile(proposal.snapshot_id ?? proposalId);
-    if (!snapshotPath) {
-      await log("tally", "failed", { snapshot_dir: SNAPSHOT_DIR }, "no_snapshot_file_found", Date.now() - t0);
-      await markPipelineError(proposalId, "no_snapshot_file_found");
-      return "pipeline_error";
+    if (closeSnapshotId) {
+      // Close-time mode — DB-backed snapshot. No file to find/verify.
+      snapshotIdForTally = closeSnapshotId;
+    } else {
+      // Activation-mode (legacy): load the operator-private snapshot file.
+      snapshotPath = findSnapshotFile(proposal.snapshot_id ?? proposalId);
+      if (!snapshotPath) {
+        await log("tally", "failed", { snapshot_dir: SNAPSHOT_DIR }, "no_snapshot_file_found", Date.now() - t0);
+        await markPipelineError(proposalId, "no_snapshot_file_found");
+        return "pipeline_error";
+      }
     }
     // questionId MUST match what the vote-submission API stored. Votes
     // are stored with question_id = the key in
@@ -143,6 +171,7 @@ export async function processProposal(proposal) {
         proposalId,
         questionId,
         snapshotPath,
+        snapshotId: snapshotIdForTally,
         expectedSnapshotId,
         capFraction: 0.02,
       });
@@ -163,6 +192,7 @@ export async function processProposal(proposal) {
         proposalId,
         questionId: "Vote",
         snapshotPath,
+        snapshotId: closeSnapshotId,
         expectedSnapshotId: proposal.snapshot_id ?? proposalId,
         capFraction: 0.02,
       });
@@ -193,34 +223,51 @@ export async function processProposal(proposal) {
     // between activation and tally is detected here. If a proposal lacks a
     // canonical hash, fail closed rather than computing-and-comparing the
     // file to itself (which is a tautology).
-    if (!proposal.snapshot_sha256) {
-      await log(
-        "anomaly",
-        "halted",
-        { proposal_id: proposalId },
-        "snapshot_sha256_missing_in_registry",
-        Date.now() - t0,
-      );
-      await markPipelineError(proposalId, "snapshot_sha256_missing_in_registry");
-      await operatorDm(
-        `AUTOPILOT HALT: ${proposalId} has no canonical snapshot_sha256 in the registry. Add it before the pipeline can verify snapshot integrity.`,
-      );
-      return "pipeline_error";
-    }
-    const actualHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
-    if (actualHash !== proposal.snapshot_sha256) {
-      await log(
-        "anomaly",
-        "halted",
-        { expected: proposal.snapshot_sha256, actual: actualHash, snapshot_path: snapshotPath },
-        "snapshot_hash_mismatch",
-        Date.now() - t0,
-      );
-      await markPipelineError(proposalId, "snapshot_hash_mismatch");
-      await operatorDm(
-        `AUTOPILOT HALT: ${proposalId} snapshot hash MISMATCH.\nExpected: ${proposal.snapshot_sha256}\nActual:   ${actualHash}\nThe on-disk snapshot has been altered since activation — manual review required.`,
-      );
-      return "pipeline_error";
+    // File-hash verification only applies to activation-mode snapshots
+    // (those have a canonical SHA-256 captured at activation that the
+    // file should still match at close). Close-time snapshots are
+    // generated fresh from on-chain reads at close — there's no pre-
+    // computed hash to compare against, and the takeCloseTimeSnapshot
+    // function already returns a deterministic hash over the inputs
+    // which is persisted to governance_snapshots.hash_sha256 for
+    // audit. Non-hash anomaly checks (vote spikes, vote-shape sanity)
+    // still run for close-time mode below.
+    if (!closeSnapshotId) {
+      // Canonical hash comes from the registry (set at activation time, never
+      // edited). The pipeline rejects the run if the on-disk snapshot's hash
+      // doesn't match — an attacker who tampered with the snapshot file
+      // between activation and tally is detected here. If a proposal lacks a
+      // canonical hash, fail closed rather than computing-and-comparing the
+      // file to itself (which is a tautology).
+      if (!proposal.snapshot_sha256) {
+        await log(
+          "anomaly",
+          "halted",
+          { proposal_id: proposalId },
+          "snapshot_sha256_missing_in_registry",
+          Date.now() - t0,
+        );
+        await markPipelineError(proposalId, "snapshot_sha256_missing_in_registry");
+        await operatorDm(
+          `AUTOPILOT HALT: ${proposalId} has no canonical snapshot_sha256 in the registry. Add it before the pipeline can verify snapshot integrity.`,
+        );
+        return "pipeline_error";
+      }
+      const actualHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+      if (actualHash !== proposal.snapshot_sha256) {
+        await log(
+          "anomaly",
+          "halted",
+          { expected: proposal.snapshot_sha256, actual: actualHash, snapshot_path: snapshotPath },
+          "snapshot_hash_mismatch",
+          Date.now() - t0,
+        );
+        await markPipelineError(proposalId, "snapshot_hash_mismatch");
+        await operatorDm(
+          `AUTOPILOT HALT: ${proposalId} snapshot hash MISMATCH.\nExpected: ${proposal.snapshot_sha256}\nActual:   ${actualHash}\nThe on-disk snapshot has been altered since activation — manual review required.`,
+        );
+        return "pipeline_error";
+      }
     }
     anomaly = await runAnomalyChecks({
       proposalId,
@@ -228,6 +275,7 @@ export async function processProposal(proposal) {
       snapshotPath,
       expectedSnapshotHash: proposal.snapshot_sha256,
       windowEndsAtIso: proposal.voting_ends_at_iso,
+      closeSnapshotId,
     });
     if (!anomaly.ok) {
       await log("anomaly", "halted", { flags: anomaly.flags }, "anomaly_detected", Date.now() - t0);
@@ -305,7 +353,18 @@ export async function processProposal(proposal) {
   // ── STEP 7: ANNOUNCE — only after audit passes ──────────────────
   if (proposal.announcement_template && COMMUNITY_CHAT_ID && BOT_TOKEN) {
     const t0 = Date.now();
-    const snapshotHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+    let snapshotHash;
+    if (closeSnapshotId) {
+      // Close-time mode: pull the deterministic hash takeCloseTimeSnapshot
+      // wrote into governance_snapshots — same audit trail, no file read.
+      const { rows } = await query(
+        `SELECT hash_sha256 FROM governance_snapshots WHERE snapshot_id = $1`,
+        [closeSnapshotId],
+      );
+      snapshotHash = rows[0]?.hash_sha256 ?? "unknown";
+    } else {
+      snapshotHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+    }
     const variables = buildVariables({ proposal, tally, outcome, snapshotHash });
     const renderedText = renderTemplate(proposal.announcement_template, variables);
     const sendResult = await sendAnnouncement({
