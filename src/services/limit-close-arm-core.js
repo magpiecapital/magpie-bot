@@ -205,9 +205,23 @@ export async function armOrder({
     [loan.collateral_mint],
   );
   if (!mintRow || !mintRow.enabled) return { ok: false, error: "collateral_not_enabled" };
-  if (["stock", "etf", "metal"].includes(mintRow.category)) {
-    return { ok: false, error: "rwa_collateral_not_supported_in_v1" };
-  }
+  // ── RWA collateral support (2026-06-13, PR C) ───────────────
+  // Pre-2026-06-13 we hard-refused RWA limit-close arms because the
+  // engine couldn't fire V2 program orders. PR B (engine repo) added
+  // the V2 fill path; this gate is now the limiting factor we remove.
+  //
+  // For RWA tokens (stock/etf/metal) the V2 lending program handles
+  // the actual repay — engine_program_id discriminator on the order
+  // row (PR A) routes the fire to V2.
+  //
+  // The remaining concern: stock-token Jupiter routes thin out hard
+  // during weekend hours when underlying equities are closed. Backed
+  // arb desks step away, AMM depth collapses 5-10x. The existing
+  // liquidity-floor tiers below already widen initial slippage based
+  // on a screener-vetted liquidity_usd reading — but that reading is
+  // a weekday-average, not a live snapshot. So for RWA we layer a
+  // weekend-aware bump ON TOP of the tier floor.
+  const isRwa = ["stock", "etf", "metal"].includes(mintRow.category);
 
   // ── Liquidity-aware initial slippage adjustment ─────────────
   // Operator mandate: "the order MUST execute." The arm-time INITIAL
@@ -231,6 +245,18 @@ export async function armOrder({
   //   mid       ($25k-$100k)             : 300 bps floor (3%)
   //   thin      ($5k-$25k)               : 500 bps floor (5%)
   //   very_thin (< $5k)                  : 1000 bps floor (10%)
+  //
+  // RWA weekend adjustment (PR C): when arming during weekend cutoff
+  // window, layer an additional bump because Jupiter route quality for
+  // stock tokens collapses outside US RTH. Same window the premium
+  // tier uses to refuse new borrows — we don't refuse here (limit
+  // arms are reversible and the engine can wait for Monday to fire),
+  // but we widen the initial so when the order DOES fire it clears.
+  //   weekend deep      : +200 bps  (300 if base was 0)
+  //   weekend mid       : +400 bps
+  //   weekend thin      : +800 bps
+  //   weekend very_thin : +1500 bps
+  // Clamped to effectiveCap regardless — never wider than user accepted.
   const liqUsd = Number(mintRow.liquidity_usd ?? 0);
   let liquidityFloorBps = 0;
   // Treat liquidity_usd <= 0 as UNKNOWN (screener data missing or stale)
@@ -245,6 +271,31 @@ export async function armOrder({
   else if (liqUsd >= 25_000) liquidityFloorBps = 300;
   else if (liqUsd >= 5_000) liquidityFloorBps = 500;
   else liquidityFloorBps = 1000;
+
+  // RWA weekend bump — only applied when collateral is RWA AND the
+  // weekend cutoff window is active. Lazy-imported to avoid module
+  // cycles between arm-core and the premium tier (which itself depends
+  // on supported_mints which is far from limit-close concerns).
+  if (isRwa) {
+    try {
+      const { isInWeekendCutoff } = await import("./premium-tier-screener.js");
+      if (isInWeekendCutoff()) {
+        let weekendBump;
+        if (liqUsd <= 0) weekendBump = 300;            // unknown liquidity → safe default
+        else if (liqUsd >= 100_000) weekendBump = 200;
+        else if (liqUsd >= 25_000) weekendBump = 400;
+        else if (liqUsd >= 5_000) weekendBump = 800;
+        else weekendBump = 1500;
+        liquidityFloorBps = liquidityFloorBps + weekendBump;
+      }
+    } catch (err) {
+      // Non-fatal — if the weekend check throws (e.g. premium-tier
+      // module rename), fall through with just the standard liquidity
+      // floor. The engine's runtime escalation is the actual fill
+      // guarantee; this is a soft optimization.
+      console.warn(`[limit-close-arm-core] weekend-bump check failed: ${err.message?.slice(0, 80)}`);
+    }
+  }
   const originalInitialBps = slippageBps;
   let appliedInitialBps = slippageBps;
   if (liquidityFloorBps > 0 && slippageBps < liquidityFloorBps) {
