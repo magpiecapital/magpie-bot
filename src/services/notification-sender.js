@@ -124,6 +124,36 @@ function renderLimitCloseFailed(p) {
   ].filter((s) => s !== null).join("\n");
 }
 
+// Engine borrower-balance pre-check (2026-06-13 P0). Soft-fail: the
+// order is still ARMED — user just needs to fund the wallet and the
+// next tick will re-evaluate. Tell them the exact amount + destination.
+function renderLimitCloseActionRequired(p) {
+  if (p?.reason === "borrower_balance_below_owed") {
+    return [
+      `⚠️ *Limit-close order #${p.order_id} — action needed*`,
+      ``,
+      `Your trigger hit, but your wallet doesn't have enough SOL for the loan repay right now.`,
+      ``,
+      `*Needed:* ${p.required_sol} SOL · *In wallet:* ${p.current_sol} SOL`,
+      `*Send:* ${p.shortfall_sol} SOL`,
+      ``,
+      `Send to:`,
+      `\`${p.wallet}\``,
+      ``,
+      `Once funded, the engine retries automatically on the next tick (~30s) — no need to re-arm.`,
+      ``,
+      `_Why this happens: the on-chain repay step requires you to hold the original loan amount in native SOL at execution time. Most users withdraw their borrow shortly after taking it out. Topping back up unblocks the order._`,
+    ].join("\n");
+  }
+  // Generic fallback for future action_required reasons.
+  return [
+    `⚠️ *Limit-close order #${p.order_id} — action needed*`,
+    ``,
+    `Reason: ${p?.reason || "unknown"}`,
+    p?.action ? `Action: ${p.action}` : null,
+  ].filter(Boolean).join("\n");
+}
+
 function renderLimitCloseCancelled(p) {
   const agentLine = agentAttribution(p);
   return [
@@ -145,9 +175,10 @@ function renderPipUpsideAlert(p) {
 
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
-  limit_close_fired:        renderLimitCloseFired,
-  limit_close_failed:       renderLimitCloseFailed,
-  limit_close_cancelled:    renderLimitCloseCancelled,
+  limit_close_fired:           renderLimitCloseFired,
+  limit_close_failed:          renderLimitCloseFailed,
+  limit_close_cancelled:       renderLimitCloseCancelled,
+  limit_close_action_required: renderLimitCloseActionRequired,
   limit_close_intervention: renderLimitCloseIntervention,
   pip_upside_alert:         renderPipUpsideAlert,
   // Downside alert reuses the same renderer — the watcher pre-renders
