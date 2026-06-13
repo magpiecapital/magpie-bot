@@ -160,6 +160,7 @@ import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
+import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -801,6 +802,14 @@ bot.start({
     // orders are old AND trigger far from current price. One-time
     // nudge per order. See feedback_tg_changes_careful.
     setTimeout(() => startLimitCloseStalenessWatcher(), 90_000);
+    // Impersonator watchdog — every 30 min retroactively scans the
+    // last 24h of community joins against the CURRENT
+    // IMPERSONATION_PATTERNS list. Catches impersonators who slipped
+    // through during a bot-down window OR who joined before a
+    // relevant pattern was added (e.g. \bpip\b added 2026-06-13
+    // after the live incident). Defense-in-depth on top of the
+    // real-time on-join filter.
+    setTimeout(() => startImpersonatorWatchdog(bot), 95_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
