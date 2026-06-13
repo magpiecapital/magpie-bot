@@ -476,6 +476,47 @@ export async function handleStopLoss(ctx) {
 
 /* ─── /limitorders ─────────────────────────────────────────────── */
 
+// Age tag: "3d ago" / "5h ago" / "12m ago"
+function ageLabel(ts) {
+  const ms = Date.now() - new Date(ts).getTime();
+  if (ms < 60_000) return "just now";
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+  return `${Math.round(ms / 86_400_000)}d ago`;
+}
+
+// Signed distance from current → trigger, expressed as a percentage in
+// the order's fire direction. Positive = the price needs to move N% in
+// the trigger's favor before this fires. Returns null if we can't
+// compute (price_sol triggers, missing supply for mc_usd, oracle hiccup).
+async function distancePctToTrigger(row) {
+  try {
+    if (row.trigger_kind !== "price_usd" && row.trigger_kind !== "mc_usd") return null;
+    const { getPriceInUsdCrossSourced } = await import("../services/price.js");
+    const usd = await getPriceInUsdCrossSourced(row.collateral_mint);
+    if (!usd || usd <= 0) return null;
+    let currentMicros = null;
+    if (row.trigger_kind === "price_usd") {
+      currentMicros = BigInt(Math.round(usd * 1e6));
+    } else if (row.trigger_kind === "mc_usd") {
+      const { rows: [m] } = await query(
+        `SELECT supply FROM supported_mints WHERE mint = $1`,
+        [row.collateral_mint],
+      );
+      if (!m?.supply) return null;
+      currentMicros = BigInt(Math.round(usd * 1e6)) * BigInt(m.supply);
+    }
+    if (currentMicros == null || currentMicros === 0n) return null;
+    const triggerMicros = BigInt(row.trigger_value_micro);
+    const diff = triggerMicros - currentMicros;
+    const pct = Number(diff) / Number(currentMicros) * 100;
+    const direction = row.trigger_direction || "above";
+    return direction === "above" ? pct : -pct;
+  } catch {
+    return null;
+  }
+}
+
 export async function handleLimitOrders(ctx) {
   const tgUser = ctx.from;
   if (!tgUser) return;
@@ -483,28 +524,77 @@ export async function handleLimitOrders(ctx) {
 
   const { rows } = await query(
     `SELECT lc.id, lc.trigger_kind, lc.trigger_value_micro::text AS trigger_value_micro,
+            COALESCE(lc.trigger_direction, 'above') AS trigger_direction,
             lc.slippage_bps, lc.sell_destination, lc.status,
             lc.armed_at, lc.expires_at,
             l.loan_id AS chain_loan_id,
-            l.collateral_mint
+            l.collateral_mint,
+            m.symbol AS collateral_symbol
        FROM limit_close_orders lc
        JOIN loans l ON l.id = lc.loan_id
+       LEFT JOIN supported_mints m ON m.mint = l.collateral_mint
       WHERE lc.user_id = $1 AND lc.status = 'armed'
       ORDER BY lc.armed_at DESC`,
     [user.id],
   );
   if (rows.length === 0) {
-    return ctx.reply(`No active limit-close orders. Set one with /limitclose <loan_id> mc=130M.`);
+    return ctx.reply(
+      [
+        "*No active limit-close orders.*",
+        "",
+        "Set one with `/limitclose <loan_id> mc=130M` (take-profit) or `/stoploss <loan_id> 0.7x` (stop-loss).",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
   }
-  const lines = [`*Your active limit-close orders* (${rows.length})`, ``];
-  for (const r of rows) {
+
+  // Fetch distance for each order in parallel — they're independent
+  // and the cross-sourced oracle has its own caching.
+  const distances = await Promise.all(rows.map(distancePctToTrigger));
+
+  const { InlineKeyboard } = await import("grammy");
+  const lines = [`*Your active limit-close orders* (${rows.length})`, ""];
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
     const trig = fmtTrigger(r.trigger_kind, BigInt(r.trigger_value_micro));
-    const slip = (r.slippage_bps / 100).toFixed(2);
+    const slip = (r.slippage_bps / 100).toFixed(r.slippage_bps < 200 ? 2 : 1);
+    const directionPill = r.trigger_direction === "below" ? "*SL*" : "*TP*";
+    const sym = r.collateral_symbol ? ` (${r.collateral_symbol})` : "";
     const expiry = r.expires_at ? ` · expires ${new Date(r.expires_at).toISOString().slice(0, 10)}` : "";
-    lines.push(`#${r.id}  loan ${r.chain_loan_id}  →  ${trig}  slip=${slip}%  dest=${r.sell_destination.toUpperCase()}${expiry}`);
+    const distPct = distances[i];
+    let distLine = "";
+    if (distPct != null) {
+      const abs = Math.abs(distPct);
+      // If distance is negative, the order should be firing on the next
+      // engine tick. Make that visible to the user.
+      if (distPct <= 0) distLine = `\n   ~ trigger reached — firing on next tick`;
+      else if (abs < 1) distLine = `\n   ~ ${abs.toFixed(2)}% from trigger`;
+      else if (abs < 10) distLine = `\n   ~ ${abs.toFixed(1)}% from trigger`;
+      else distLine = `\n   ~ ${Math.round(abs)}% from trigger`;
+    }
+    lines.push(
+      `${directionPill}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${distLine}`,
+      "",
+    );
   }
-  lines.push(``, `Cancel one: /cancellimitorder <order_id>`);
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+
+  // One inline cancel button per order — keeps the keyboard compact
+  // even when the user has many orders. Reuses the staleness-nudge
+  // callback so the cancel path is consistent across surfaces.
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < rows.length; i++) {
+    kb.text(`Cancel #${rows[i].id}`, `lcstale:cancel:${rows[i].id}`);
+    if (i % 2 === 1) kb.row();
+  }
+  if (rows.length % 2 === 1) kb.row();
+
+  await ctx.reply(lines.join("\n"), {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: kb,
+  });
 }
 
 /* ─── /cancellimitorder ────────────────────────────────────────── */
