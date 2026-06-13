@@ -222,6 +222,43 @@ async function showEngine(ctx) {
     }
   } catch { /* table may not exist yet on a brand-new deploy */ }
 
+  // Latest canary result — high-confidence "would a fire succeed
+  // right now" signal. Engine writes one row hourly; we surface the
+  // most recent one's overall_ok + which checks failed (if any).
+  let canaryLines = [];
+  try {
+    const { rows: [c] } = await query(
+      `SELECT run_at, overall_ok, duration_ms, checks, jupiter_ok,
+              dexscreener_ok, cross_source_ok, program_ok
+         FROM engine_canary_runs
+        WHERE service = 'limit_close_watcher'
+        ORDER BY run_at DESC
+        LIMIT 1`,
+    );
+    if (c) {
+      const tag = c.overall_ok ? "passed" : "*FAILED*";
+      const ageStrCanary = ageStr(c.run_at);
+      const compactStatus = [
+        `jup=${c.jupiter_ok ? "ok" : "X"}`,
+        `dex=${c.dexscreener_ok ? "ok" : "X"}`,
+        `cross=${c.cross_source_ok ? "ok" : "X"}`,
+        `prog=${c.program_ok ? "ok" : "X"}`,
+      ].join(" ");
+      canaryLines = [
+        "",
+        "*Latest canary (synthetic fire-path validation):*",
+        `${tag} · ${ageStrCanary} ago · ${c.duration_ms}ms · ${compactStatus}`,
+      ];
+      if (!c.overall_ok && c.checks) {
+        const failing = Object.entries(c.checks)
+          .filter(([, v]) => v && !v.ok)
+          .map(([k, v]) => `  • ${k}: ${(v.detail || "").slice(0, 60)}`)
+          .join("\n");
+        if (failing) canaryLines.push(failing);
+      }
+    }
+  } catch { /* table may not exist on a fresh deploy */ }
+
   // engine_metrics_hourly recent rollups — last hour + last 24h
   let metricsLines = [];
   try {
