@@ -186,7 +186,7 @@ export async function armOrder({
             original_loan_amount_lamports::text AS owed,
             collateral_mint, collateral_amount::text AS coll_amount,
             collateral_amount::text AS collateral_amount_raw,
-            borrower_wallet, user_id
+            borrower_wallet, user_id, program_id
        FROM loans
       WHERE user_id = $1 AND loan_id = $2`,
     [userId, loanIdChain],
@@ -414,6 +414,7 @@ export async function armOrder({
           source, source_agent_pubkey, status, armed_at,
           auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
+          engine_program_id,
           notes)
        VALUES ($1, $2, $3, $4,
                $5,
@@ -421,7 +422,8 @@ export async function armOrder({
                $9, $10, 'armed', NOW(),
                $11, $12, $13,
                $14, $15, $16,
-               $17)
+               $17,
+               $18)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
        triggerDirection,
@@ -431,6 +433,13 @@ export async function armOrder({
        advisory ? null : effectiveCap,
        advisory ? null : (preflight.proceedsLamports || null),
        advisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
+       // engine_program_id: source-of-truth for which Solana program the
+       // fill engine targets when this order fires. Pulled from the
+       // loan row (loans.program_id) which is itself derived from the
+       // on-chain owner of the loan PDA at recordLoan time. Engine
+       // treats NULL as legacy-V1 for back-compat with pre-2026-06-13
+       // rows; new arms always populate this.
+       loan.program_id || null,
        armNote
          || (appliedInitialBps !== originalInitialBps
            ? `armed via ${source}; ${triggerDirection === "below" ? "STOP-LOSS" : "TP"}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
