@@ -63,7 +63,10 @@ jobs:
 
           # Files that legitimately encode these literals (the resolver,
           # seed migrations, the historical-frozen remediation script).
-          ALLOWLIST_REGEX='^(src/services/loan-tier-resolver\.js|migrations/.*\.sql|scripts/remediate-rwa-ltv-misroute\.js)$'
+          # scripts/verify-tier-resolution.js intentionally references the
+          # historical bug pattern in its comments (it's the test that asserts
+          # the pattern has been removed from real code), so it's allowlisted.
+          ALLOWLIST_REGEX='^(src/services/loan-tier-resolver\.js|migrations/.*\.sql|scripts/remediate-rwa-ltv-misroute\.js|scripts/verify-tier-resolution\.js)$'
 
           HITS=0
           for pattern in "$MEMECOIN_PATTERN" "$RWA_PATTERN"; do
