@@ -367,7 +367,11 @@ export async function handleLimitClose(ctx, direction = "above") {
         case "collateral_not_enabled":
           return `Collateral token is not currently enabled in the protocol.`;
         case "rwa_collateral_not_supported_in_v1":
-          return `Limit-close is not available on RWA collateral (xStocks/metals) in v1. Memecoin collateral only for now. Coming in v1.1.`;
+          // Unreachable since 2026-06-13 (PR C flipped the arm-core
+          // gate; RWA collateral is now arm-eligible end-to-end via the
+          // V2 fill path). Kept for back-compat with cached agent SDKs
+          // that pattern-match on this error string.
+          return `Limit-close on RWA collateral is now live — please try again.`;
         case "user_concurrency_cap_reached":
           return `You have ${armed.detail?.active} active limit orders (max ${armed.detail?.cap}). Cancel one with /cancellimitorder first.`;
         case "loan_already_has_active_order":
