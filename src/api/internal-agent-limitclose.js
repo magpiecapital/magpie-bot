@@ -27,7 +27,7 @@
  */
 import { query } from "../db/pool.js";
 import { constantTimeEqual } from "./auth-utils.js";
-import { armOrder } from "../services/limit-close-arm-core.js";
+import { armOrder, modifyOrder } from "../services/limit-close-arm-core.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
@@ -686,6 +686,89 @@ export async function handleAgentLimitCloseList(req, params) {
  * uses — the engine flips status to 'firing' before doing any
  * on-chain work, so once 'firing' the cancel is too late.
  */
+/**
+ * PATCH /api/v1/internal/agent/limit-close/modify
+ *
+ * Body: { id: <order_id>, trigger_value_micro?, slippage_bps?,
+ *         sell_destination?, expires_at? }
+ *
+ * Agent identity: X-Agent-Pubkey header (same scoping as /list /get).
+ * Internal-token gated. Calls into the shared modifyOrder() so the
+ * agent path applies the same gates as the TG/site /modifyorder.
+ *
+ * Why agents need modify: an agent that arms a TP at $0.0030 and the
+ * market moves wants to push to $0.0040 without re-paying the x402
+ * arm fee. Modify is free (no x402) — the agent already paid for
+ * the slot at arm time.
+ */
+export async function handleAgentLimitCloseModify(req) {
+  if (!INTERNAL_API_TOKEN) {
+    return { status: 503, body: { error: "service_not_configured" } };
+  }
+  if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
+    return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return { status: 400, body: { error: "Invalid JSON body" } }; }
+
+  const agentPubkey = String(req.headers["x-agent-pubkey"] || body?.agent_pubkey || "");
+  const orderIdRaw  = String(body?.id ?? "");
+  if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
+  if (!/^\d+$/.test(orderIdRaw))   return bad("invalid_order_id");
+
+  // Optional fields — passed through to modifyOrder when present.
+  const updates = {};
+  if (body?.trigger_value_micro !== undefined) {
+    const v = String(body.trigger_value_micro);
+    if (!/^\d+$/.test(v)) return bad("invalid_trigger_value");
+    updates.triggerValueMicro = v;
+  }
+  if (body?.slippage_bps !== undefined) {
+    if (!Number.isInteger(body.slippage_bps)) return bad("invalid_slippage_bps");
+    updates.slippageBps = body.slippage_bps;
+  }
+  if (body?.sell_destination !== undefined) {
+    updates.sellDestination = String(body.sell_destination).toLowerCase();
+  }
+  if (body?.expires_at !== undefined) {
+    if (body.expires_at !== null) updates.expiresAt = String(body.expires_at);
+    else updates.expiresAt = null;
+  }
+  if (Object.keys(updates).length === 0) {
+    return bad("no_changes_supplied");
+  }
+
+  const result = await modifyOrder({
+    orderId: Number(orderIdRaw),
+    sourceAgentPubkey: agentPubkey,
+    ...updates,
+  });
+  if (!result.ok) {
+    const status = ARM_ERROR_STATUS[result.error] || 409;
+    return {
+      status,
+      body: {
+        error: result.error,
+        ...(result.detail ? { detail: result.detail } : {}),
+      },
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      order_id: result.order.id,
+      changed_fields: result.changedFields,
+      trigger_value_micro: result.order.trigger_value_micro,
+      slippage_bps: result.order.slippage_bps,
+      sell_destination: result.order.sell_destination,
+      expires_at: result.order.expires_at,
+      updated_at: result.order.updated_at,
+    },
+  };
+}
+
 export async function handleAgentLimitCloseDelete(req, params) {
   if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
     return { status: 401, body: { error: "Invalid or missing API key" } };
