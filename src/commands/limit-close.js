@@ -371,7 +371,28 @@ export async function handleLimitClose(ctx, direction = "above") {
         case "user_concurrency_cap_reached":
           return `You have ${armed.detail?.active} active limit orders (max ${armed.detail?.cap}). Cancel one with /cancellimitorder first.`;
         case "loan_already_has_active_order":
-          return `This loan already has an active limit order. Cancel it first with /cancellimitorder.`;
+          // Legacy code from before per-direction UNIQUE shipped — kept
+          // so any cached agent code that key-matches on it still gets
+          // a friendly message.
+          return `This loan already has an active limit order. Cancel it first with /cancellimitorder, or use /modifyorder to adjust it in place.`;
+        case "loan_already_has_active_order_in_direction": {
+          // Post-multi-leg (migration 047). Tells the user precisely
+          // which side is occupied so they can choose: modify the
+          // existing one, cancel it, OR arm the OPPOSITE side
+          // (TP+SL on same loan is now supported).
+          const existingDirection = armed.detail?.direction;
+          const existingLabel = existingDirection === "below" ? "stop-loss" : "take-profit";
+          const otherCmd = existingDirection === "below" ? "/takeprofit" : "/stoploss";
+          const otherLabel = existingDirection === "below" ? "take-profit" : "stop-loss";
+          return [
+            `*You already have an active ${existingLabel} on this loan.*`,
+            ``,
+            `Options:`,
+            `• \`/modifyorder <id> ...\` — adjust the existing one in place (no cancel/re-arm gap)`,
+            `• \`/cancellimitorder <id>\` — cancel + re-arm`,
+            `• \`${otherCmd} <loan_id> ...\` — arm a ${otherLabel} alongside it (TP+SL on same loan is now supported)`,
+          ].join("\n");
+        }
         case "slippage_too_low":
           return [
             `*Order would not fill right now.*`,
