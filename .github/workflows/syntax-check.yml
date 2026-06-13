@@ -1,0 +1,59 @@
+name: Syntax check
+
+# Pre-merge guard against the class of bug that took prod down at
+# 2026-06-13 04:22Z: a duplicate top-level function declaration in
+# src/services/self-monitor.js shipped through review, Railway built
+# fine, then Node refused to load the file with:
+#   SyntaxError: Identifier 'probeCreditCoverage' has already been declared
+#
+# Bot was unreachable for ~10 min. The fix was a one-line edit.
+# This workflow runs `node --check` on every .js/.mjs file under src/
+# and scripts/, which catches every parser-rejected file — duplicates,
+# unterminated strings, missing brackets, etc. — without running
+# anything. Cheap and fast (whole repo finishes in a few seconds).
+#
+# Required check on main (added via branch protection alongside leak-check).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: none
+      actions: none
+      checks: none
+      deployments: none
+      packages: none
+      pull-requests: none
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Shallow clone is plenty — we're parsing files, not history.
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: node --check across src/ and scripts/
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          FAILED=0
+          # Glob over both directories; nullglob ensures missing dirs
+          # don't blow up the loop with a literal pattern.
+          for f in src/**/*.js src/**/*.mjs scripts/**/*.js scripts/**/*.mjs scripts/**/*.cjs; do
+            if ! node --check "$f" 2>&1; then
+              echo "::error file=$f::node --check failed on $f"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Syntax errors above. Fix and re-push." >&2
+            exit 1
+          fi
+          echo "All source files parse cleanly."
