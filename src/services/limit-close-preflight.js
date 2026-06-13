@@ -29,6 +29,7 @@
  *     arm goes through this gate. (Operator kill switch is separate.)
  */
 import axios from "axios";
+import { MAX_PROTOCOL_SLIPPAGE_BPS } from "../lib/slippage-constants.js";
 
 const JUP_QUOTE_API = process.env.JUPITER_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -122,7 +123,14 @@ export async function runArmPreflight({
   const amountBI = BigInt(collateralAmountRaw);
   if (amountBI <= 0n) return { ok: false, reason: "zero_collateral_amount" };
   const dst = sellDestination === "usdc" ? USDC_MINT : SOL_MINT;
-  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > 1000) {
+  // 2026-06-13: preflight previously refused slippage > 1000 bps but
+  // arm-core's effectiveCap defaults to DEFAULT_CAP_FLOOR_BPS = 2500
+  // (the MAX_PROTOCOL_SLIPPAGE_BPS) so EVERY default-cap arm hit this
+  // refusal — caught by the RWA dry-run on 2026-06-13. Aligning the
+  // ceiling with the protocol-wide constant so the two layers agree.
+  // The actual fill-quality protection is the no_route / slippage_too_low
+  // checks below — those still flag a route that won't clear.
+  if (!Number.isInteger(slippageBps) || slippageBps < 10 || slippageBps > MAX_PROTOCOL_SLIPPAGE_BPS) {
     return { ok: false, reason: "invalid_slippage" };
   }
   let owedBI;
