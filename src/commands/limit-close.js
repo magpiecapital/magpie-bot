@@ -597,6 +597,134 @@ export async function handleLimitOrders(ctx) {
   });
 }
 
+/* ─── /modifyorder ─────────────────────────────────────────────── */
+
+/**
+ * /modifyorder <order_id> price=0.0030 slip=3% dest=usdc expires=2026-06-30
+ *
+ * All but order_id are optional — pass only what's changing. The
+ * order stays armed throughout (no cancel/re-arm gap where the
+ * market can move past the trigger).
+ *
+ * Accepted shortcuts (mirror /takeprofit):
+ *   price=<usd_per_token>     — sets trigger_value_micro for price_usd
+ *   mc=<$130M | 130_000_000>  — sets trigger_value_micro for mc_usd
+ *   slip=<2%|200bps|200>       — sets slippage_bps
+ *   dest=<sol|usdc>            — sets sell_destination
+ *   expires=<YYYY-MM-DD|ISO>   — sets expires_at, or "none" to clear
+ *
+ * To change trigger_kind, trigger_direction, or loan_id: use /cancel + /takeprofit.
+ */
+export async function handleModifyLimitOrder(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const text = ctx.message?.text ?? "";
+  const parts = text.trim().split(/\s+/).slice(1);
+  if (parts.length < 1 || !/^\d+$/.test(parts[0])) {
+    return ctx.reply(
+      [
+        "Usage: `/modifyorder <order_id> <changes…>`",
+        "",
+        "Examples:",
+        "• `/modifyorder 412 price=0.0030`",
+        "• `/modifyorder 412 slip=3% dest=usdc`",
+        "• `/modifyorder 412 expires=2026-06-30`",
+        "• `/modifyorder 412 expires=none` (clear expiration)",
+        "",
+        "_Order stays armed — no cancel/re-arm gap._",
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  const orderId = Number(parts[0]);
+  const args = parts.slice(1);
+  const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // Parse kv args
+  const updates = {};
+  for (const a of args) {
+    const m = a.match(/^([a-z_]+)=(.+)$/i);
+    if (!m) return ctx.reply(`Couldn't parse \`${a}\` — use \`key=value\` form.`, { parse_mode: "Markdown" });
+    const key = m[1].toLowerCase();
+    const val = m[2];
+    if (key === "price") {
+      const usd = parseFloat(val);
+      if (!Number.isFinite(usd) || usd <= 0) return ctx.reply(`\`price=${val}\` is invalid.`, { parse_mode: "Markdown" });
+      updates.triggerValueMicro = BigInt(Math.round(usd * 1e6)).toString();
+    } else if (key === "mc") {
+      // Accept "130M", "130_000_000", "$130000000"
+      const raw = val.replace(/[$_,]/g, "").toLowerCase();
+      let usd;
+      if (raw.endsWith("b")) usd = parseFloat(raw) * 1e9;
+      else if (raw.endsWith("m")) usd = parseFloat(raw) * 1e6;
+      else if (raw.endsWith("k")) usd = parseFloat(raw) * 1e3;
+      else usd = parseFloat(raw);
+      if (!Number.isFinite(usd) || usd <= 0) return ctx.reply(`\`mc=${val}\` is invalid.`, { parse_mode: "Markdown" });
+      updates.triggerValueMicro = BigInt(Math.round(usd * 1e6)).toString();
+    } else if (key === "slip") {
+      let bps;
+      if (val.endsWith("%")) bps = Math.round(parseFloat(val) * 100);
+      else if (val.endsWith("bps")) bps = Math.round(parseFloat(val));
+      else bps = Math.round(parseFloat(val));
+      if (!Number.isFinite(bps) || bps < 10) return ctx.reply(`\`slip=${val}\` is invalid.`, { parse_mode: "Markdown" });
+      updates.slippageBps = bps;
+    } else if (key === "dest") {
+      const v = val.toLowerCase();
+      if (v !== "sol" && v !== "usdc") return ctx.reply(`\`dest=${val}\` must be sol or usdc.`, { parse_mode: "Markdown" });
+      updates.sellDestination = v;
+    } else if (key === "expires") {
+      if (val.toLowerCase() === "none") updates.expiresAt = null;
+      else if (Number.isNaN(Date.parse(val))) return ctx.reply(`\`expires=${val}\` couldn't be parsed.`, { parse_mode: "Markdown" });
+      else updates.expiresAt = new Date(val).toISOString();
+    } else {
+      return ctx.reply(`Unknown field \`${key}\`. Supported: price, mc, slip, dest, expires.`, { parse_mode: "Markdown" });
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return ctx.reply("No changes supplied. See /modifyorder for usage.", { parse_mode: "Markdown" });
+  }
+
+  const { modifyOrder } = await import("../services/limit-close-arm-core.js");
+  const result = await modifyOrder({
+    orderId,
+    userId: user.id,
+    ...updates,
+  });
+  if (!result.ok) {
+    const friendly = {
+      not_modifiable_or_not_found: "That order isn't yours, or it's already firing / closed.",
+      invalid_trigger_value: "Trigger value is out of range.",
+      invalid_slippage_bps: "Slippage must be 10–2500 bps (0.1%–25%).",
+      slippage_exceeds_order_cap: result.detail
+        ? `Slippage above this order's cap (${(result.detail.cap_bps / 100).toFixed(2)}%). Cancel + re-arm if you need more headroom.`
+        : "Slippage above this order's cap. Cancel + re-arm if you need more.",
+      invalid_sell_destination: "Destination must be sol or usdc.",
+      invalid_expires_at: "Expires couldn't be parsed.",
+      trigger_would_fire_immediately: "That new trigger would fire RIGHT NOW. Pick a target on the unfired side.",
+      no_changes_supplied: "No changes supplied.",
+    };
+    return ctx.reply(friendly[result.error] || `Modify failed: \`${result.error}\``, { parse_mode: "Markdown" });
+  }
+
+  const o = result.order;
+  return ctx.reply(
+    [
+      `*Order #${o.id} updated.*`,
+      "",
+      `Changed: ${result.changedFields.join(", ")}`,
+      o.trigger_value_micro ? `New trigger: \`${o.trigger_value_micro}\` micros` : null,
+      `Slippage: ${(o.slippage_bps / 100).toFixed(2)}%`,
+      `Destination: ${(o.sell_destination || "").toUpperCase()}`,
+      o.expires_at ? `Expires: ${new Date(o.expires_at).toISOString().slice(0, 10)}` : "Expires: never",
+      "",
+      "_Order stays armed — engine picks up new values on its next tick._",
+    ].filter(Boolean).join("\n"),
+    { parse_mode: "Markdown" },
+  );
+}
+
 /* ─── /cancellimitorder ────────────────────────────────────────── */
 
 export async function handleCancelLimitOrder(ctx) {
