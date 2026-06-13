@@ -206,6 +206,32 @@ async function showPerf(ctx, windowKey) {
     console.warn("[lc-perf] engine_metrics_hourly read failed:", err.message?.slice(0, 80));
   }
 
+  // ── Canary success rate (engine_canary_runs) ──
+  // Engine writes one canary row per hour exercising the full fire-
+  // path read surface. Surfacing pass-rate here gives the operator
+  // confidence that fires WOULD succeed even when no real fires
+  // happened in the window.
+  let canarySummary = null;
+  try {
+    const canaryWindow = win.interval
+      ? ` AND run_at > NOW() - INTERVAL '${win.interval}'`
+      : "";
+    const { rows: [cn] } = await query(
+      `SELECT COALESCE(COUNT(*), 0)::int                                       AS total,
+              COALESCE(SUM(CASE WHEN overall_ok THEN 1 ELSE 0 END), 0)::int    AS ok,
+              MAX(run_at)                                                       AS latest_at,
+              MAX(CASE WHEN NOT overall_ok THEN run_at END)                     AS latest_fail_at
+         FROM engine_canary_runs
+        WHERE service = 'limit_close_watcher' ${canaryWindow}`,
+    );
+    if (cn && cn.total > 0) {
+      const passRate = ((cn.ok / cn.total) * 100).toFixed(1);
+      canarySummary = { total: cn.total, ok: cn.ok, passRate, latest_at: cn.latest_at, latest_fail_at: cn.latest_fail_at };
+    }
+  } catch (err) {
+    console.warn("[lc-perf] canary read failed:", err.message?.slice(0, 80));
+  }
+
   const lines = [
     `*Limit-close performance — ${win.label}*`,
     "",
@@ -254,6 +280,17 @@ async function showPerf(ctx, windowKey) {
     lines.push(`• Fires attempted:    ${Number(eng.fires_attempted)} → ${Number(eng.fires_succeeded)} ok · ${Number(eng.fires_failed)} fail · ${Number(eng.fires_reverted)} revert`);
     if (Number(eng.errors) > 0) {
       lines.push(`• Tick errors:        ${Number(eng.errors)}`);
+    }
+  }
+
+  if (canarySummary) {
+    lines.push("");
+    lines.push(`*Synthetic fire-path canary:*`);
+    lines.push(`• Pass rate: *${canarySummary.passRate}%* (${canarySummary.ok}/${canarySummary.total} runs)`);
+    if (canarySummary.latest_fail_at) {
+      const ageMs = Date.now() - new Date(canarySummary.latest_fail_at).getTime();
+      const ageH = Math.max(0, Math.round(ageMs / 3_600_000));
+      lines.push(`• Last failure: ${ageH < 1 ? "<1h" : `${ageH}h`} ago`);
     }
   }
 
