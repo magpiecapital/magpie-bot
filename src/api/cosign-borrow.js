@@ -427,19 +427,92 @@ export async function handleCosignBorrow(req) {
               body: { error: "Unsupported collateral mint", detail: `mint ${collateralMintStr} not in supported_mints` },
             };
           }
-          // Re-value collateral with our own cross-sourced oracle —
-          // ignore the client's collateral_value_lamports claim.
+          // Re-value collateral with our own cross-sourced oracle.
+          // Three-layer fallback so a momentary rate-limit blip doesn't
+          // block a legit borrow:
+          //   1. Try fresh quote — up to 3 attempts with exponential backoff.
+          //   2. On total failure, fall back to a recent trailing snapshot
+          //      (within STALE_SNAPSHOT_MAX_AGE_MS) — the snapshotter
+          //      stores every supported mint's price every ~2 min, so
+          //      this is a sub-2-minute-stale read. Conservative pricing
+          //      because the gate against fresh-pump exploits remains
+          //      enforced elsewhere.
+          //   3. Only on no-snapshot-and-no-fresh — return the 502.
+          //
+          // This closes the "Price oracle unavailable" UX failure where
+          // both Jupiter + DexScreener happen to rate-limit at the same
+          // moment. Operator-stated mandate 2026-06-13: protocol must
+          // operate at the highest level; momentary oracle blips can't
+          // block borrows.
+          const PRICE_RETRY_DELAYS_MS = [0, 800, 2200];
+          const STALE_SNAPSHOT_MAX_AGE_MS = 3 * 60_000; // 3 min — snapshotter runs every ~2 min
           let valueLamports;
-          try {
-            valueLamports = await fetchValueLamports(
-              collateralMintStr,
-              collateralAmountRaw,
-              Number(mintRow.decimals),
-            );
-          } catch (err) {
+          let lastErr;
+          for (const delayMs of PRICE_RETRY_DELAYS_MS) {
+            if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+            try {
+              valueLamports = await fetchValueLamports(
+                collateralMintStr,
+                collateralAmountRaw,
+                Number(mintRow.decimals),
+              );
+              if (valueLamports && valueLamports > 0) break;
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+          // Snapshot fallback when all three live attempts failed.
+          // mint_price_snapshots has (mint, snapshot_at, price_usd,
+          // liquidity_usd) — we convert price_usd → lamports value
+          // by dividing by a fresh SOL/USD quote. If THAT also fails
+          // we surrender. This is the same "we know the recent price"
+          // posture the limit-close engine takes per [[feedback_exploit_prevention_load_bearing]]
+          // — a 2-min-stale snapshot is safer than blocking a legit
+          // borrow on a transient oracle blip.
+          if (!valueLamports || valueLamports <= 0) {
+            try {
+              const { rows: [snap] } = await query(
+                `SELECT price_usd, snapshot_at
+                   FROM mint_price_snapshots
+                  WHERE mint = $1
+                    AND snapshot_at > NOW() - ($2 || ' milliseconds')::INTERVAL
+                  ORDER BY snapshot_at DESC LIMIT 1`,
+                [collateralMintStr, String(STALE_SNAPSHOT_MAX_AGE_MS)],
+              );
+              if (snap?.price_usd) {
+                // SOL/USD also from snapshotter — snapshotter records SOL
+                // every cycle, so a recent snapshot is the source of
+                // truth during oracle blip.
+                let solUsd = null;
+                const { rows: [solSnap] } = await query(
+                  `SELECT price_usd FROM mint_price_snapshots
+                    WHERE mint = 'So11111111111111111111111111111111111111112'
+                      AND snapshot_at > NOW() - INTERVAL '10 minutes'
+                    ORDER BY snapshot_at DESC LIMIT 1`,
+                );
+                if (solSnap?.price_usd) solUsd = Number(solSnap.price_usd);
+                if (solUsd && solUsd > 0) {
+                  // value_in_sol = (collateral_units * price_usd) / sol_usd
+                  // collateral_units = collateralAmountRaw / 10^decimals
+                  const decimals = Number(mintRow.decimals);
+                  const units = Number(collateralAmountRaw) / Math.pow(10, decimals);
+                  const valueSol = (units * Number(snap.price_usd)) / solUsd;
+                  valueLamports = Math.floor(valueSol * 1e9);
+                  const ageSec = Math.round((Date.now() - new Date(snap.snapshot_at).getTime()) / 1000);
+                  console.warn(`[cosign-borrow] live oracle failed for ${collateralMintStr.slice(0, 8)}…, fell back to ${ageSec}s-old snapshot (price_usd=${snap.price_usd}, sol_usd=${solUsd.toFixed(2)}). valueLamports=${valueLamports}`);
+                }
+              }
+            } catch (snapErr) {
+              console.warn(`[cosign-borrow] snapshot fallback failed: ${snapErr.message?.slice(0, 80)}`);
+            }
+          }
+          if (!valueLamports || valueLamports <= 0) {
             return {
               status: 502,
-              body: { error: "Price oracle unavailable — please retry", detail: err.message?.slice(0, 200) },
+              body: {
+                error: "Price oracle briefly unavailable — please retry in a moment",
+                detail: lastErr?.message?.slice(0, 200) || "no fresh quote AND no recent snapshot",
+              },
             };
           }
           if (!valueLamports || valueLamports <= 0) {
