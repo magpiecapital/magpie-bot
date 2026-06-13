@@ -274,11 +274,18 @@ export function registerBorrowCallbacks(bot) {
     pending.set(ctx.chat.id, state);
 
     // Fetch value in lamports for each LTV tier and timestamp the quote.
-    const valueLamports = await collateralValueLamports(
-      state.selected.mint,
-      rawBig,
-      state.selected.decimals,
-    );
+    let valueLamports;
+    try {
+      valueLamports = await collateralValueLamports(
+        state.selected.mint,
+        rawBig,
+        state.selected.decimals,
+      );
+    } catch (err) {
+      console.error("[borrow] price fetch error (pct):", err.message);
+      pending.delete(ctx.chat.id);
+      return ctx.reply("⚠️ Couldn't fetch price right now. Run /borrow to try again.");
+    }
     state.collateralValueLamports = valueLamports;
     state.quotedAt = Date.now();
     pending.set(ctx.chat.id, state);
