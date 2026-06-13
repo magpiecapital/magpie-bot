@@ -404,43 +404,6 @@ async function probeCreditCoverage(bot) {
   }
 }
 
-/**
- * Credit-events coverage probe — alerts the operator if ANY loan in
- * the protocol is missing its canonical credit_events. The healer
- * runs every 6h and auto-backfills; this probe runs every 60s so
- * the operator finds out within a minute rather than waiting. The
- * gap should always be 0 in steady state — anything > 0 means a
- * live writer dropped an event and the healer hasn't swept yet.
- *
- * Operator-stated mandate: "make sure we have parameters in place
- * for this to NEVER happen again." Probe is the early-warning leg.
- */
-async function probeCreditCoverage(bot) {
-  const KIND = "credit_coverage_gap";
-  let audit;
-  try {
-    const m = await import("./credit-events-healer.js");
-    audit = await m.auditCreditCoverage();
-  } catch (err) {
-    console.warn("[self-monitor] credit_coverage probe threw:", err.message);
-    return;
-  }
-  const isBad = audit.total > 0;
-  recordOutcome(KIND, isBad);
-  if (isBad) {
-    const parts = [];
-    if (audit.missing_borrow > 0) parts.push(`${audit.missing_borrow} borrow`);
-    if (audit.missing_repay > 0) parts.push(`${audit.missing_repay} repay`);
-    if (audit.missing_liquidated > 0) parts.push(`${audit.missing_liquidated} liquidated`);
-    await alertIfNew(bot, KIND,
-      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 6h; investigate the WRITE path if this persists.`,
-      audit.total >= 10 ? "crit" : "warn",
-    );
-  } else {
-    await alertRecovery(bot, KIND, `Credit-event coverage clean (0 gaps).`);
-  }
-}
-
 /* ─── Tick loop ──────────────────────────────────────────────── */
 
 let _timer = null;
