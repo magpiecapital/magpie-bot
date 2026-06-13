@@ -2747,9 +2747,9 @@ const TOOL_HANDLERS = {
     if (loan.status !== "active") {
       return toolError("loan_not_active", null, `This loan is ${loan.status}, not active. Take-profit only works on active loans.`);
     }
-    if (["stock", "etf", "metal"].includes(loan.category)) {
-      return toolError("rwa_not_supported", null, "Take-profit isn't available on xStock / RWA collateral in v1 — memecoin loans only. Tell the user to wait for v1.1.");
-    }
+    // 2026-06-13: take-profit/stop-loss on RWA collateral (xStocks/metals)
+    // is now live. Fall through to standard handling — the engine routes
+    // to the V2 fill path automatically via engine_program_id.
     if (!loan.enabled) {
       return toolError("collateral_not_enabled", null, "This collateral isn't currently enabled in the protocol.");
     }
