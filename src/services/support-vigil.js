@@ -125,15 +125,24 @@ async function autoClose(ticket) {
 async function tick(bot) {
   if (!bot) return;
   try {
+    // Catch both 'awaiting_user' (the canonical post-auto-resolve state
+    // from site Pip) AND 'open' tickets where Pip auto-resolved without
+    // flipping status (escalated tickets, certain TG paths). Without
+    // the 'open' branch, escalated-but-auto-resolved tickets sit
+    // forever — that's the 37h-stuck-ticket pattern the operator
+    // flagged 2026-06-13. closed_at IS NULL on every match keeps
+    // closed tickets out.
     const { rows } = await query(
-      `SELECT st.id, st.user_id, st.message, st.admin_replied_at,
+      `SELECT st.id, st.user_id, st.message, st.admin_replied_at, st.status,
               st.last_pip_followup_at, st.pip_followup_count,
               u.telegram_id,
               EXTRACT(EPOCH FROM (NOW() - st.admin_replied_at))::int AS age_since_reply_secs
          FROM support_tickets st
          JOIN users u ON u.id = st.user_id
-        WHERE st.status = 'awaiting_user'
-          AND st.admin_replied_at IS NOT NULL`,
+        WHERE st.closed_at IS NULL
+          AND st.admin_replied_at IS NOT NULL
+          AND (st.status = 'awaiting_user'
+               OR (st.status = 'open' AND st.auto_resolved_at IS NOT NULL))`,
     );
 
     let sent = 0;
