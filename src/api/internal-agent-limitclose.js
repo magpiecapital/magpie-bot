@@ -1051,9 +1051,11 @@ export async function handleAgentLimitCloseEligibleLoans(req, params) {
       if (l.status !== "active") reasons.push("loan_not_active");
       if (owedBI < MIN_LOAN_LAMPORTS) reasons.push("loan_below_minimum_size");
       if (!l.collateral_enabled) reasons.push("collateral_not_enabled");
-      if (["stock", "etf", "metal"].includes(l.collateral_category)) {
-        reasons.push("rwa_collateral_not_supported_in_v1");
-      }
+      // 2026-06-13 (PR C): RWA collateral now arm-eligible end-to-end.
+      // engine_program_id discriminator + V2 fill path (PR B) + weekend
+      // slippage bump (arm-core) make this safe. Kept the error code in
+      // the status map below for back-compat with old agent SDKs that
+      // pattern-match on the string.
       if (loanIdsWithActiveOrder.has(Number(l.id))) {
         reasons.push("loan_already_has_active_order");
       }

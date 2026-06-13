@@ -311,9 +311,9 @@ export async function handleSiteLimitCloseList(req, url) {
     const reasons = [];
     if (BigInt(l.owed_lamports) < MIN_LOAN_LAMPORTS) reasons.push("loan_below_minimum_size");
     if (!l.collateral_enabled) reasons.push("collateral_not_enabled");
-    if (["stock", "etf", "metal"].includes(l.collateral_category)) {
-      reasons.push("rwa_collateral_not_supported_in_v1");
-    }
+    // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible
+    // for limit-close. The engine's V2 fill path landed in PR B; arm-core
+    // applies a weekend-aware initial-slippage bump for thin RWA routes.
     if (armedByLoan.has(Number(l.id))) reasons.push("loan_already_has_active_order");
     return {
       ...l,
