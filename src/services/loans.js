@@ -447,9 +447,43 @@ export async function recordLoan({
   const startTs = new Date();
   const dueTs = new Date(startTs.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
-  // Persist which program this loan was created against. Older callers that
-  // don't pass programId fall through to v1 — matches the column backfill.
-  const recordedProgramId = programId ?? PROGRAM_ID.toBase58();
+  // Persist which program this loan was created against.
+  //
+  // 2026-06-13: previous behavior fell through to v1's PROGRAM_ID
+  // when the caller omitted programId. That silently mis-tagged V2
+  // RWA loans as V1, which broke wallet-scoped filtering on the
+  // dashboard (the PDA re-derivation would never match because it
+  // used the wrong program). The user saw a "missing SPCX loan"
+  // even though the loan row existed.
+  //
+  // New posture: if the caller doesn't pass programId, attempt to
+  // determine it from the on-chain owner of loan_pda — the actual
+  // program that owns the account is authoritative. If both the
+  // arg AND the on-chain lookup fail, throw rather than silently
+  // mis-tag. This is the same fail-closed posture used in the
+  // governance + price layers per [[feedback_exploit_prevention_load_bearing]].
+  let recordedProgramId = programId;
+  if (!recordedProgramId && loanPda) {
+    try {
+      const { Connection, PublicKey } = await import("@solana/web3.js");
+      const conn = new Connection(process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
+      const info = await conn.getAccountInfo(new PublicKey(loanPda));
+      if (info?.owner) {
+        recordedProgramId = info.owner.toBase58();
+        console.warn(
+          `[loans.recordLoan] programId arg missing — recovered from on-chain owner of ${loanPda.slice(0, 8)}…: ${recordedProgramId.slice(0, 8)}…`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[loans.recordLoan] on-chain programId recovery failed: ${err.message?.slice(0, 80)}`);
+    }
+  }
+  if (!recordedProgramId) {
+    throw new Error(
+      `recordLoan refuses to store loan_id=${loanId} loan_pda=${loanPda} without programId — ` +
+      `pass it explicitly OR ensure the on-chain account exists so the owner can be looked up.`,
+    );
+  }
 
   // A missing borrowerWallet here means the loan row gets inserted as NULL,
   // which silently excludes the borrower from governance snapshots + holder
