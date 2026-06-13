@@ -14,10 +14,23 @@ import { getPrefs } from "./prefs.js";
 
 const POLL_INTERVAL_MS = Number(process.env.LOAN_WATCH_MS) || 60_000;
 
+// Format a deep-link to the user's dashboard view of a specific loan.
+// The dashboard route accepts ?loan=<chain_loan_id> and scrolls/focuses
+// the matching card so the user lands directly on the action surface.
+const DASHBOARD_LOAN_BASE = process.env.DASHBOARD_LOAN_BASE
+  || "https://magpie.capital/dashboard?loan=";
+
+function fmtWallet(addr) {
+  if (!addr || addr.length < 12) return addr || "—";
+  return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
+
 async function warn24h(bot) {
   const { rows } = await query(
     `SELECT l.id, l.loan_id, l.user_id, l.due_timestamp,
-            l.original_loan_amount_lamports, u.telegram_id
+            l.original_loan_amount_lamports,
+            l.borrower_wallet,
+            u.telegram_id
      FROM loans l JOIN users u ON u.id = l.user_id
      WHERE l.status = 'active'
        AND l.warned_24h_at IS NULL
@@ -37,20 +50,28 @@ async function warn24h(bot) {
       Math.round((new Date(row.due_timestamp).getTime() - Date.now()) / 3_600_000),
     );
     const solOwed = Number(row.original_loan_amount_lamports) / 1e9;
+    const loanLink = `${DASHBOARD_LOAN_BASE}${row.loan_id}`;
+    const walletShort = fmtWallet(row.borrower_wallet);
     const msg = [
       "⚠️ *Loan due soon*",
       "",
-      `Loan #${row.loan_id} is due in ~${hours}h.`,
+      `Loan [#${row.loan_id}](${loanLink}) is due in ~${hours}h.`,
+      `Wallet: \`${walletShort}\``,
       `Repay *${solOwed.toFixed(4)} SOL* to reclaim your collateral.`,
+      "",
+      `Tap the loan number above to open it in the dashboard, or use the buttons below.`,
     ].join("\n");
     const kb = new InlineKeyboard()
       .text("🔧 Repay now", `repay:loan:${row.id}`)
-      .text("⏱ Extend", `extend:loan:${row.id}`);
+      .text("⏱ Extend", `extend:loan:${row.id}`)
+      .row()
+      .url("📋 Open loan in dashboard", loanLink);
 
     try {
       await bot.api.sendMessage(row.telegram_id, msg, {
         parse_mode: "Markdown",
         reply_markup: kb,
+        disable_web_page_preview: true,
       });
       await query(`UPDATE loans SET warned_24h_at = NOW() WHERE id = $1`, [row.id]);
     } catch (err) {
@@ -62,7 +83,9 @@ async function warn24h(bot) {
 async function warn6h(bot) {
   const { rows } = await query(
     `SELECT l.id, l.loan_id, l.user_id, l.due_timestamp,
-            l.original_loan_amount_lamports, u.telegram_id
+            l.original_loan_amount_lamports,
+            l.borrower_wallet,
+            u.telegram_id
      FROM loans l JOIN users u ON u.id = l.user_id
      WHERE l.status = 'active'
        AND l.warned_6h_at IS NULL
@@ -83,21 +106,27 @@ async function warn6h(bot) {
     );
     const solOwed = Number(row.original_loan_amount_lamports) / 1e9;
     const timeStr = mins >= 60 ? `${Math.round(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+    const loanLink = `${DASHBOARD_LOAN_BASE}${row.loan_id}`;
+    const walletShort = fmtWallet(row.borrower_wallet);
     const msg = [
       "🚨 *URGENT — Loan expiring soon*",
       "",
-      `Loan #${row.loan_id} is due in *${timeStr}*.`,
+      `Loan [#${row.loan_id}](${loanLink}) is due in *${timeStr}*.`,
+      `Wallet: \`${walletShort}\``,
       `Repay *${solOwed.toFixed(4)} SOL* NOW to save your collateral.`,
       "",
-      "After the deadline your tokens will be liquidated.",
+      "After the deadline your tokens will be liquidated. Tap the loan number above or use a button below.",
     ].join("\n");
     const kb = new InlineKeyboard()
       .text("🔧 Repay now", `repay:loan:${row.id}`)
-      .text("⏱ Extend", `extend:loan:${row.id}`);
+      .text("⏱ Extend", `extend:loan:${row.id}`)
+      .row()
+      .url("📋 Open loan in dashboard", loanLink);
 
     try {
       await bot.api.sendMessage(row.telegram_id, msg, {
         parse_mode: "Markdown",
+        disable_web_page_preview: true,
         reply_markup: kb,
       });
       await query(`UPDATE loans SET warned_6h_at = NOW() WHERE id = $1`, [row.id]);
