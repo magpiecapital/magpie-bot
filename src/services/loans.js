@@ -657,7 +657,7 @@ export async function recordLoan({
     console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
   }
 
-  // LP Loyalty Bonus Pool accrual (2% of fee, sourced from protocol slice)
+  // LP Loyalty Bonus Pool accrual (bps live-read from governance_config)
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
     if (feeLamports > 0n) {
@@ -665,6 +665,20 @@ export async function recordLoan({
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on borrow failed (continuing):", err.message);
+  }
+
+  // Protocol Reserve accrual (MGP-001, 10% of fee, live-read from governance_config)
+  try {
+    const { accrueToProtocolReserve } = await import("./protocol-reserve.js");
+    if (feeLamports > 0n) {
+      await accrueToProtocolReserve({
+        loanDbId: rows[0].id,
+        feeLamports,
+        eventType: "borrow",
+      });
+    }
+  } catch (err) {
+    console.error("[loans] protocol reserve accrual on borrow failed (continuing):", err.message);
   }
 }
 
@@ -958,6 +972,20 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on extend failed (continuing):", err.message);
+  }
+
+  // Protocol Reserve accrual on the extend fee (MGP-001).
+  try {
+    const { accrueToProtocolReserve } = await import("./protocol-reserve.js");
+    if (feeLamports > 0n) {
+      await accrueToProtocolReserve({
+        loanDbId: loanDbRow.id,
+        feeLamports,
+        eventType: "extend",
+      });
+    }
+  } catch (err) {
+    console.error("[loans] protocol reserve accrual on extend failed (continuing):", err.message);
   }
 
   return { signature: sig, feeLamports: feeLamports.toString() };

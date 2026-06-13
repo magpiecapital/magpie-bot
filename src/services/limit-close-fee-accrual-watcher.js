@@ -62,10 +62,16 @@ async function tick() {
   }
   if (rows.length === 0) return;
 
-  const [{ accrueFromLoan }, { accrueToHolderPool }, { accrueToLpLoyaltyPool }] = await Promise.all([
+  const [
+    { accrueFromLoan },
+    { accrueToHolderPool },
+    { accrueToLpLoyaltyPool },
+    { accrueToProtocolReserve },
+  ] = await Promise.all([
     import("./referral-rewards.js"),
     import("./magpie-holder-rewards.js"),
     import("./lp-loyalty.js"),
+    import("./protocol-reserve.js"),
   ]);
 
   let accruedCount = 0;
@@ -87,16 +93,10 @@ async function tick() {
         continue;
       }
 
-      // Three accrual paths — all on the same fee number.
-      // accrueFromLoan: looks up the referrer of refereeUserId and
-      //                 credits referral_earnings.
-      // accrueToHolderPool: bumps the global holder pool by the BPS
-      //                    configured (default 1000 = 10%, will become
-      //                    7000 after MGP-001).
-      // accrueToLpLoyaltyPool: bumps the LP loyalty pool by its BPS.
-      // Each is independent; they read the current bps from
-      // governance_config (or hardcoded defaults) at call time. So
-      // MGP-001's split takes effect automatically without changes.
+      // Four accrual paths — all on the same fee number, all reading
+      // their share from governance_config at call time (MGP-001 split
+      // takes effect automatically: 70% holders / 10% LPs / 10% referrers
+      // / 10% protocol reserve).
       try {
         await accrueFromLoan({
           refereeUserId: row.user_id,
@@ -116,6 +116,15 @@ async function tick() {
         await accrueToLpLoyaltyPool(feeLamports);
       } catch (err) {
         console.warn(`[limit-close-accrual] LP accrual failed for order ${row.id}:`, err.message);
+      }
+      try {
+        await accrueToProtocolReserve({
+          loanDbId: row.loan_id,
+          feeLamports,
+          eventType: "limit_close",
+        });
+      } catch (err) {
+        console.warn(`[limit-close-accrual] protocol reserve accrual failed for order ${row.id}:`, err.message);
       }
 
       await c.query(
