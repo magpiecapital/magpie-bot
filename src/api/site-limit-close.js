@@ -504,6 +504,115 @@ export async function handleSiteLimitCloseArm(req) {
  *   Nonce: <random>
  *   IssuedAt: <ISO timestamp>
  * ───────────────────────────────────────────────────────────────── */
+/* ── POST /api/v1/site/limit-close/modify ──────────────────────────
+ *
+ * In-place modify an armed order without canceling first. Same auth
+ * pattern as /cancel — Ed25519 signed envelope; the wallet that
+ * signed must be the order's owner.
+ *
+ * Envelope (signed message body):
+ *   Action: limit-close-modify/v1
+ *   OrderId: <int>
+ *   Price?: <usd_per_token>     — change trigger_value_micro for price_usd
+ *   MC?: <mc_usd>               — change trigger_value_micro for mc_usd
+ *   Slippage?: <bps integer>    — change slippage_bps
+ *   Dest?: sol | usdc           — change sell_destination
+ *   Expires?: <ISO|none>        — change expires_at (or "none" to clear)
+ *   Wallet: <pubkey>
+ *   IssuedAt: <ISO>
+ *
+ * At least one of Price / MC / Slippage / Dest / Expires required.
+ *
+ * Pairs with magpie-bot#148 (modifyOrder core) + magpie-x402#29
+ * (x402 forwarder). Brings site users to parity with TG and agent
+ * surfaces — fine-tune your trigger without a cancel/re-arm market-
+ * move gap.
+ * ────────────────────────────────────────────────────────────────── */
+export async function handleSiteLimitCloseModify(req) {
+  const auth = await authSignedEnvelope(req, "limit-close-modify/v1", ["OrderId"]);
+  if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
+  const { userId, fields } = auth;
+
+  const orderId = Number(fields.OrderId);
+  if (!Number.isInteger(orderId)) return { status: 400, body: { error: "invalid_OrderId" } };
+
+  const updates = {};
+  if (fields.Price !== undefined) {
+    const usd = Number(String(fields.Price).replace(/^\$/, ""));
+    if (!Number.isFinite(usd) || usd <= 0) return { status: 400, body: { error: "invalid_price" } };
+    updates.triggerValueMicro = BigInt(Math.round(usd * 1e6)).toString();
+  } else if (fields.MC !== undefined) {
+    const raw = String(fields.MC).replace(/^\$/, "");
+    const m = raw.match(/^([0-9]+(?:\.[0-9]+)?)([KMBkmb])?$/);
+    if (!m) return { status: 400, body: { error: "invalid_mc" } };
+    const n = Number(m[1]);
+    const mul = (m[2] || "").toLowerCase() === "b" ? 1e9 : (m[2] || "").toLowerCase() === "m" ? 1e6 : (m[2] || "").toLowerCase() === "k" ? 1e3 : 1;
+    const usd = n * mul;
+    updates.triggerValueMicro = BigInt(Math.round(usd * 1e6)).toString();
+  }
+  if (fields.Slippage !== undefined) {
+    const bps = Number(fields.Slippage);
+    if (!Number.isInteger(bps) || bps < 10 || bps > 2500) {
+      return { status: 400, body: { error: "invalid_slippage" } };
+    }
+    updates.slippageBps = bps;
+  }
+  if (fields.Dest !== undefined) {
+    const d = String(fields.Dest).toLowerCase();
+    if (d !== "sol" && d !== "usdc") return { status: 400, body: { error: "invalid_dest" } };
+    updates.sellDestination = d;
+  }
+  if (fields.Expires !== undefined) {
+    if (String(fields.Expires).toLowerCase() === "none") {
+      updates.expiresAt = null;
+    } else if (Number.isNaN(Date.parse(fields.Expires))) {
+      return { status: 400, body: { error: "invalid_expires" } };
+    } else {
+      updates.expiresAt = new Date(fields.Expires).toISOString();
+    }
+  }
+  if (Object.keys(updates).length === 0) {
+    return { status: 400, body: { error: "no_changes_supplied" } };
+  }
+
+  const { modifyOrder } = await import("../services/limit-close-arm-core.js");
+  const r = await modifyOrder({
+    orderId,
+    userId,
+    ...updates,
+  });
+  if (!r.ok) {
+    const statusMap = {
+      not_modifiable_or_not_found: 409,
+      invalid_trigger_value: 400,
+      trigger_value_out_of_range: 400,
+      invalid_slippage_bps: 400,
+      slippage_exceeds_order_cap: 403,
+      invalid_sell_destination: 400,
+      invalid_expires_at: 400,
+      trigger_would_fire_immediately: 409,
+      no_changes_supplied: 400,
+    };
+    return {
+      status: statusMap[r.error] || 409,
+      body: { error: r.error, ...(r.detail ? { detail: r.detail } : {}) },
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      order_id: r.order.id,
+      changed_fields: r.changedFields,
+      trigger_value_micro: r.order.trigger_value_micro,
+      slippage_bps: r.order.slippage_bps,
+      sell_destination: r.order.sell_destination,
+      expires_at: r.order.expires_at,
+      updated_at: r.order.updated_at,
+    },
+  };
+}
+
 export async function handleSiteLimitCloseCancel(req) {
   const auth = await authSignedEnvelope(req, "limit-close-cancel/v1", ["OrderId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
