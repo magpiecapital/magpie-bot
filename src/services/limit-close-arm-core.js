@@ -243,15 +243,23 @@ export async function armOrder({
     appliedInitialBps = Math.min(liquidityFloorBps, effectiveCap);
   }
 
-  // ── Immediate-fire guard (best-effort) ──────────────────────
-  // Reject arms that would fire immediately:
-  //   - 'above' (TP)  with trigger <= current
-  //   - 'below' (SL)  with trigger >= current
-  // The engine re-checks at fire time so this is purely a UX guard;
+  // ── Immediate-fire + SL solvency guards (best-effort) ──────
+  // Two checks combined:
+  //   1. Immediate-fire: reject arms that would fire immediately:
+  //      - 'above' (TP)  with trigger <= current
+  //      - 'below' (SL)  with trigger >= current
+  //   2. SL solvency (2026-06-13): reject SL arms where expected
+  //      proceeds at trigger < owed + buffer. The engine's repay step
+  //      requires the borrower wallet to hold `owed` lamports in
+  //      native SOL — if the sale proceeds can't cover that, the user
+  //      goes negative and the engine eats the shortfall. Better to
+  //      refuse the arm than to fire into insolvency.
+  // The engine re-checks at fire time so these are purely UX guards;
   // fail-open on any oracle hiccup so a transient price miss doesn't
   // block a legitimate arm. Implemented for USD-denominated triggers
   // (mc_usd, price_usd); price_sol skipped because the SOL denominator
   // moves fast enough that a stale read can false-reject.
+  let currentMicrosForLater = null;
   try {
     if (triggerKind === "mc_usd" || triggerKind === "price_usd") {
       const { getPriceInUsdCrossSourced } = await import("./price.js");
@@ -267,6 +275,7 @@ export async function armOrder({
           currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6)) * BigInt(mintRow.supply);
         }
         if (currentMicros != null) {
+          currentMicrosForLater = currentMicros;
           if (triggerDirection === "above" && triggerBI <= currentMicros) {
             return { ok: false, error: "trigger_would_fire_immediately",
               detail: { direction: "above", currentMicros: currentMicros.toString(), triggerMicros: triggerBI.toString() } };
@@ -309,6 +318,51 @@ export async function armOrder({
     };
   }
   const advisory = !!preflight.advisory;
+
+  // ── SL solvency floor (2026-06-13) ──────────────────────────
+  // The engine's repay step requires the borrower wallet to hold the
+  // OWED amount in native SOL — the on-chain program's repay_loan ix
+  // wraps `owed` lamports into wSOL and burns them. For SL where
+  // collateral has dropped, expected sale proceeds may be below owed
+  // and the user would go negative.
+  //
+  // For TP this is never a concern (proceeds always > owed by the
+  // very nature of "I want to sell at a profit"). For SL it's the
+  // central risk.
+  //
+  // What we check: estimated proceeds AT TRIGGER >= owed * 1.05 (5%
+  // buffer). The buffer accounts for swap slippage eating proceeds +
+  // price moving past trigger before the engine catches the cross.
+  //
+  // What we DON'T check (yet): the borrower's actual wallet balance
+  // at fire time. That belongs in the engine's pre-flight gates and
+  // is covered by the engine's existing ensureSolReserve topup, which
+  // tops gas but not the owed amount. Sell-first-then-repay is the
+  // proper fix; awaits a program-level change.
+  //
+  // Fail-open if we couldn't compute the trigger:current ratio (e.g.
+  // price_sol triggers or oracle hiccup) — the engine's own runtime
+  // safety check at fire time backstops.
+  if (triggerDirection === "below" && preflight.proceedsLamports != null && currentMicrosForLater != null && currentMicrosForLater > 0n) {
+    // Scale current proceeds to trigger-time proceeds estimate.
+    // triggerProceeds ≈ currentProceeds * (trigger / current)
+    // BigInt math: (current_proceeds * trigger_micros) / current_micros
+    const triggerProceedsEstimate = (BigInt(preflight.proceedsLamports) * triggerBI) / currentMicrosForLater;
+    const ownedBI = BigInt(loan.owed);
+    const owedWithBuffer = (ownedBI * 105n) / 100n; // 5% buffer
+    if (triggerProceedsEstimate < owedWithBuffer) {
+      return {
+        ok: false,
+        error: "sl_below_solvency",
+        detail: {
+          owed_sol: (Number(ownedBI) / 1e9).toFixed(4),
+          required_proceeds_sol: (Number(owedWithBuffer) / 1e9).toFixed(4),
+          estimated_proceeds_at_trigger_sol: (Number(triggerProceedsEstimate) / 1e9).toFixed(4),
+          shortfall_sol: (Number(owedWithBuffer - triggerProceedsEstimate) / 1e9).toFixed(4),
+        },
+      };
+    }
+  }
 
   // ── INSERT ──
   let inserted;
