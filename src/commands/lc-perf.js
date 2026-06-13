@@ -137,6 +137,31 @@ async function showPerf(ctx, windowKey) {
       GROUP BY source ORDER BY n DESC`,
   );
 
+  // ── Pool breakdown (V1 memecoin vs V2 RWA) — PR B follow-up ──
+  // engine_program_id (added in migration 050, PR #157) discriminates
+  // V1 vs V2 fills. Pre-2026-06-13 orders have NULL — counted as
+  // "v1_legacy" since the engine treats NULL as V1 for back-compat.
+  // The split tells the operator how RWA adoption is tracking now
+  // that the gate flipped in PR #161.
+  const V1_PROGRAM_ID = process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh";
+  const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2 || null;
+  const { rows: poolRows } = await query(
+    `SELECT
+        CASE
+          WHEN engine_program_id IS NULL THEN 'v1_legacy'
+          WHEN engine_program_id = $1 THEN 'v1'
+          WHEN engine_program_id = $2 THEN 'v2'
+          ELSE 'unknown'
+        END AS pool,
+        COUNT(*)::int AS n,
+        COUNT(*) FILTER (WHERE status = 'fired')::int AS fired,
+        COUNT(*) FILTER (WHERE status = 'armed')::int AS armed
+       FROM limit_close_orders
+      WHERE 1=1 ${sqlClause}
+      GROUP BY 1 ORDER BY n DESC`,
+    [V1_PROGRAM_ID, V2_PROGRAM_ID],
+  );
+
   // ── Net-to-user totals (dollars users got back through the engine) ──
   const { rows: [econ] } = await query(
     `SELECT
@@ -250,6 +275,17 @@ async function showPerf(ctx, windowKey) {
     "",
     "*Source breakdown:*",
     ...sources.map((s) => `• ${s.source.padEnd(12)} ${s.n}`),
+    "",
+    "*Pool breakdown (V1 memecoin / V2 RWA):*",
+    ...(poolRows.length === 0
+      ? ["• (no orders in window)"]
+      : poolRows.map((p) => {
+          const label = p.pool === "v1" ? "v1 (memecoin)"
+                      : p.pool === "v2" ? "v2 (RWA)"
+                      : p.pool === "v1_legacy" ? "v1 (pre-PR#157)"
+                      : `unknown`;
+          return `• ${label.padEnd(20)} total ${p.n}  fired ${p.fired}  armed ${p.armed}`;
+        })),
     "",
     "*Economic totals (fired only):*",
     `• Total proceeds:   ${fmtSol(econ?.total_proceeds)} SOL`,
