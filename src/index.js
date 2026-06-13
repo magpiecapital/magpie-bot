@@ -254,6 +254,8 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
 {
   const lcStatus = await import("./commands/lc-status.js");
   bot.command(["lc-status", "lcstatus", "lc_status"], lcStatus.handleLcStatus);
+  const lcPerf = await import("./commands/lc-perf.js");
+  bot.command(["lc-perf", "lcperf", "lc_perf"], lcPerf.handleLcPerf);
 }
 // F-4 multi-step approval — second-admin sign-off for sensitive commands.
 // Default gated commands: enablemint, disablemint, broadcast (tunable via
