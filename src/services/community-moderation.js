@@ -70,6 +70,17 @@ export const IMPERSONATION_PATTERNS = [
   /\bmoderator\b/i,
   /\bmod\b/i,
   /\bhelp\s*desk\b/i,
+  // 2026-06-13: live impersonator joined with display name "Pip" (no
+  // "magpie" substring), slipped past the join-time filter. The bot's
+  // AI helper IS named Pip in the community chat, so anyone using
+  // that name is impersonating. The verified-account allowlist still
+  // exempts @magpie_capital_bot itself and the operator's account.
+  /\bpip\b/i,
+  // Also lock down "dev"/"founder"/"owner" which scammers love and
+  // which a legit member has no reason to put in their display name.
+  /\bdev\b/i,
+  /\bfounder\b/i,
+  /\bowner\b/i,
 ];
 
 // Verified accounts that are allowed to use those words (the bot
