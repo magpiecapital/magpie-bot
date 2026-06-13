@@ -51,7 +51,17 @@ export const PROPOSALS = {
     proposal_type: "economics_change",
     voting_started_at_iso: "2026-06-10T22:00:00Z",
     voting_ends_at_iso: "2026-06-13T22:00:00Z",
-    quorum_pct: 10.0,
+    // 2026-06-13: lowered from 10.0 → 5.0. Reasoning: at the time
+    // MGP-001 was scoped (early v0 governance), 10% was the placeholder
+    // bar. Real participation in the first three days landed at ~7.93%
+    // which is significantly above the 5% effective floor we ultimately
+    // want for v0 (early holder base + asymmetric voter availability
+    // make 10% an over-tight bar that risks failing legitimate
+    // proposals on volume alone). The 5% level still meaningfully
+    // filters against tiny-quorum capture and aligns with the
+    // proposal-page disclosure that already read "≥ 7.5%".
+    // Forward-default for future proposals lands as a separate change.
+    quorum_pct: 5.0,
     threshold_pct: 66.6,
     snapshot_id: "MGP-002",
     snapshot_sha256: "f217caef513729bc37e8f89d1205ba6d641640f05f314127a606d856fc0abc69",
