@@ -10,7 +10,7 @@ import { upsertUser } from "../services/users.js";
 import { getOrCreateCode } from "../services/referrals.js";
 import {
   getReferralSummary,
-  REFERRAL_REWARD_BPS,
+  getReferralRewardBps,
   MIN_CLAIM_LAMPORTS,
 } from "../services/referral-rewards.js";
 
@@ -26,10 +26,13 @@ export async function handleRefer(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
   const code = await getOrCreateCode(user.id);
-  const summary = await getReferralSummary(user.id);
+  const [summary, liveBps] = await Promise.all([
+    getReferralSummary(user.id),
+    getReferralRewardBps(),
+  ]);
 
   const shareLink = `https://t.me/${BOT_USERNAME}?start=${code}`;
-  const pct = (REFERRAL_REWARD_BPS / 100).toFixed(0);
+  const pct = (liveBps / 100).toFixed(0);
 
   const lines = [
     "🎁 *Magpie Referral Program*",

@@ -30,8 +30,24 @@ import { connection } from "../solana/connection.js";
 import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
+import { getRuntimeConfigBps } from "./runtime-config.js";
 
-export const LP_LOYALTY_REWARD_BPS = 200; // 2% of every loan fee
+// Fallback used when governance_config.lp_loyalty_reward_bps can't be
+// read (DB outage or unset key). MGP-001 ratified the live value to
+// 1000 (10%); the runtime reader takes precedence over this constant.
+// Kept exported (= fallback) so legacy importers still resolve.
+export const LP_LOYALTY_REWARD_BPS_FALLBACK = 1_000; // 10%
+export const LP_LOYALTY_REWARD_BPS = LP_LOYALTY_REWARD_BPS_FALLBACK;
+
+/**
+ * Read the LIVE lp-loyalty reward bps from governance_config. Mirrors
+ * getHolderRewardBps in magpie-holder-rewards.js. Any governance vote
+ * that changes lp_loyalty_reward_bps takes effect everywhere within
+ * runtime-config's TTL with no code change.
+ */
+export async function getLpLoyaltyRewardBps() {
+  return getRuntimeConfigBps("lp_loyalty_reward_bps", LP_LOYALTY_REWARD_BPS_FALLBACK);
+}
 export const MIN_LP_LOYALTY_CLAIM_LAMPORTS = 5_000_000n; // 0.005 SOL
 export const MIN_LP_DISTRIBUTION_LAMPORTS = 10_000_000n; // 0.01 SOL (don't run dust distributions)
 export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL ops floor
@@ -65,7 +81,8 @@ function loadLenderKeypair() {
 export async function accrueToLpLoyaltyPool(feeLamports) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
-  const reward = (fee * BigInt(LP_LOYALTY_REWARD_BPS)) / 10_000n;
+  const liveBps = await getLpLoyaltyRewardBps();
+  const reward = (fee * BigInt(liveBps)) / 10_000n;
   if (reward <= 0n) return null;
   try {
     await query(
