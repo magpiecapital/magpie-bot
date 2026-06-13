@@ -438,7 +438,18 @@ export async function armOrder({
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
-      return { ok: false, error: "loan_already_has_active_order" };
+      // Post migration 047, the UNIQUE is (loan_id, trigger_direction).
+      // The error means an armed TP already exists when caller asked
+      // for a TP, OR an armed SL already exists when caller asked for
+      // SL. The OTHER direction is still open for arming. Detail tells
+      // the caller which side they collided on so the UI can suggest
+      // "you already have a TP on this loan — modify or cancel it,
+      // OR arm a stop-loss instead".
+      return {
+        ok: false,
+        error: "loan_already_has_active_order_in_direction",
+        detail: { direction: triggerDirection },
+      };
     }
     console.error(`[arm-core] insert failed (source=${source}):`, err.message);
     return { ok: false, error: "insert_failed", detail: err.message?.slice(0, 200) };
