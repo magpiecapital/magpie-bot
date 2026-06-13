@@ -630,6 +630,7 @@ async function handleLoans(req, url) {
   const { rows: allUserRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
             l.loan_amount_lamports, l.original_loan_amount_lamports,
+            l.actual_received_lamports,
             l.ltv_percentage, l.duration_days,
             l.start_timestamp, l.due_timestamp,
             l.status, l.tx_signature, l.updated_at, l.program_id,
@@ -672,7 +673,16 @@ async function handleLoans(req, url) {
       amount: l.collateral_amount?.toString?.() ?? null,
     },
     loan: {
+      // Legacy field (kept for back-compat with existing site code):
+      // post-protocol-fee value. Does NOT subtract Solana account-
+      // creation rent.
       amount_lamports: l.loan_amount_lamports?.toString?.() ?? null,
+      // The borrower's TRUE on-chain SOL credit on the borrow tx.
+      // Subtracts protocol fee AND Solana account-creation rent
+      // (collateral vault ATA + borrower wSOL ATA). Render THIS in
+      // user-facing "you received" UI — it matches what the user
+      // sees in their wallet.
+      actual_received_lamports: l.actual_received_lamports?.toString?.() ?? null,
       original_amount_lamports: l.original_loan_amount_lamports?.toString?.() ?? null,
       ltv_percentage: l.ltv_percentage,
       duration_days: l.duration_days,

@@ -554,6 +554,54 @@ export async function recordLoan({
 
   const loanDbId = rows[0].id;
 
+  // Capture the borrower's ACTUAL on-chain SOL delta on the borrow tx.
+  // The DB's loan_amount_lamports = principal - protocol_fee but ignores
+  // Solana account-creation rent (collateral vault ATA + borrower wSOL
+  // ATA, ~0.004414 SOL total) that the program silently subtracts from
+  // loan proceeds. The borrower's wallet went up by less than
+  // loan_amount_lamports suggests, so the dashboard was overstating
+  // received-amount by ~$1 per borrow.
+  //
+  // We read the tx after the insert and store the real delta into
+  // actual_received_lamports (migration 048). Dashboard renders this;
+  // loan_amount_lamports stays as the legacy fee-net value for back-
+  // compat. If the read fails (RPC blip, tx still propagating), leave
+  // NULL — the on-chain-delta watchdog backfills.
+  if (txSignature && borrowerWallet) {
+    try {
+      const { Connection, PublicKey } = await import("@solana/web3.js");
+      const conn = new Connection(process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
+      const tx = await conn.getTransaction(txSignature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx && !tx.meta?.err) {
+        const keys = tx.transaction.message.staticAccountKeys
+          || tx.transaction.message.accountKeys
+          || [];
+        const borrowerPk = new PublicKey(borrowerWallet).toBase58();
+        const bi = keys.findIndex((k) => (k.toBase58 ? k.toBase58() : String(k)) === borrowerPk);
+        if (bi >= 0) {
+          const delta = BigInt(tx.meta.postBalances[bi]) - BigInt(tx.meta.preBalances[bi]);
+          // Add back the tx fee that the borrower paid as signer — that's
+          // a Solana-runtime cost separate from the protocol-side
+          // accounting. The borrower's true credit from the borrow is
+          // (delta + tx_fee).
+          const txFee = BigInt(tx.meta.fee || 0);
+          const credit = delta + txFee;
+          if (credit > 0n) {
+            await query(
+              `UPDATE loans SET actual_received_lamports = $1 WHERE id = $2`,
+              [credit.toString(), loanDbId],
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[loans.recordLoan] on-chain delta capture failed for ${txSignature?.slice(0, 16)}…: ${err.message?.slice(0, 80)}`);
+    }
+  }
+
   // Canonical credit-event emission. This is the SINGLE source of truth
   // for the "user borrowed" event so BOTH the TG path and the site path
   // get +N points for a borrow. Previously this ran inside
