@@ -398,6 +398,18 @@ export async function handleLimitClose(ctx, direction = "above") {
             : `Take-profit target is already at or below the current price — the order would fire immediately. Set a higher target.`;
         case "invalid_trigger_direction":
           return `Internal error — invalid trigger direction. Try again.`;
+        case "sl_below_solvency": {
+          // arm-core returned the math; surface it to the user clearly.
+          const d = armed.detail || {};
+          return [
+            `*Stop-loss target is too low — would leave you owing more than the sale covers.*`,
+            ``,
+            `At that trigger, the engine estimates your collateral sells for about *${d.estimated_proceeds_at_trigger_sol} SOL*, but the loan repay needs *${d.required_proceeds_sol} SOL* (owed ${d.owed_sol} SOL + 5% safety buffer).`,
+            `Shortfall: *${d.shortfall_sol} SOL*.`,
+            ``,
+            `Raise your stop-loss target so estimated proceeds cover the repay, OR repay part of the loan first to lower what you owe.`,
+          ].join("\n");
+        }
         default:
           console.error(`[limit-close] arm-core returned unrecognized error: ${armed.error}`, armed);
           return `Couldn't arm the order: ${armed.error}. Please try again.`;
