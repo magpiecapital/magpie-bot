@@ -160,6 +160,52 @@ async function showPerf(ctx, windowKey) {
       LIMIT 5`,
   );
 
+  // ── Engine activity (from engine_metrics_hourly) ──
+  // engine_metrics_hourly has the per-hour rollups the engine writes
+  // every tick. Without this, /lc-perf goes silent during quiet
+  // periods — even though the engine has been ticking faithfully.
+  // The "ticks" column is the proof-of-life number; jupiter probe
+  // success rate is the proof-of-health number.
+  let engineSummary = null;
+  try {
+    const engineWindow = win.interval
+      ? ` AND hour > NOW() - INTERVAL '${win.interval}'`
+      : "";
+    const { rows: [eng] } = await query(
+      `SELECT COALESCE(SUM(ticks), 0)::bigint::text                 AS ticks,
+              COALESCE(SUM(jupiter_probes_ok), 0)::bigint::text     AS jup_ok,
+              COALESCE(SUM(jupiter_probes_failed), 0)::bigint::text AS jup_fail,
+              COALESCE(SUM(armed_orders_evaluated), 0)::bigint::text AS evaluated,
+              COALESCE(SUM(fires_attempted), 0)::bigint::text       AS fires_attempted,
+              COALESCE(SUM(fires_succeeded), 0)::bigint::text       AS fires_succeeded,
+              COALESCE(SUM(fires_failed), 0)::bigint::text          AS fires_failed,
+              COALESCE(SUM(fires_reverted), 0)::bigint::text        AS fires_reverted,
+              COALESCE(SUM(errors), 0)::bigint::text                AS errors,
+              MIN(hour)                                              AS earliest_hour,
+              MAX(hour)                                              AS latest_hour
+         FROM engine_metrics_hourly
+        WHERE service = 'limit_close_watcher' ${engineWindow}`,
+    );
+    if (eng && Number(eng.ticks) > 0) {
+      const jupTotal = Number(eng.jup_ok) + Number(eng.jup_fail);
+      const jupRate  = jupTotal > 0
+        ? ((Number(eng.jup_ok) / jupTotal) * 100).toFixed(2)
+        : "—";
+      // Activity span — useful when the window straddles a deploy or restart.
+      let span = "n/a";
+      if (eng.earliest_hour && eng.latest_hour) {
+        const spanMs = new Date(eng.latest_hour).getTime() - new Date(eng.earliest_hour).getTime();
+        const spanH  = Math.max(1, Math.round(spanMs / 3_600_000));
+        span = spanH < 24 ? `${spanH}h` : `${Math.round(spanH / 24)}d`;
+      }
+      engineSummary = { eng, jupRate, span };
+    }
+  } catch (err) {
+    // engine_metrics_hourly may not exist yet on a fresh deploy — log
+    // and continue. /lc-perf still renders the order-driven sections.
+    console.warn("[lc-perf] engine_metrics_hourly read failed:", err.message?.slice(0, 80));
+  }
+
   const lines = [
     `*Limit-close performance — ${win.label}*`,
     "",
@@ -196,6 +242,19 @@ async function showPerf(ctx, windowKey) {
     lines.push("_/lc-perf failures for the full breakdown._");
   } else {
     lines.push("*No failures in this window.* ✓");
+  }
+
+  if (engineSummary) {
+    const { eng, jupRate, span } = engineSummary;
+    lines.push("");
+    lines.push(`*Engine activity (rollup span: ${span}):*`);
+    lines.push(`• Ticks:              ${Number(eng.ticks).toLocaleString()}`);
+    lines.push(`• Jupiter probe rate: *${jupRate}%* (${Number(eng.jup_ok)} ok / ${Number(eng.jup_fail)} failed)`);
+    lines.push(`• Orders evaluated:   ${Number(eng.evaluated).toLocaleString()}`);
+    lines.push(`• Fires attempted:    ${Number(eng.fires_attempted)} → ${Number(eng.fires_succeeded)} ok · ${Number(eng.fires_failed)} fail · ${Number(eng.fires_reverted)} revert`);
+    if (Number(eng.errors) > 0) {
+      lines.push(`• Tick errors:        ${Number(eng.errors)}`);
+    }
   }
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown", disable_web_page_preview: true });
