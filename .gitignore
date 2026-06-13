@@ -49,6 +49,7 @@ scripts/inspect-loans-schema.js
 scripts/admin-withdraw.js
 scripts/deposit-vault.js
 scripts/withdraw-vault.js
+scripts/loop-withdraw-vault.js
 
 # Backup files (e.g. Cargo.lock.bak) — never ship.
 *.bak

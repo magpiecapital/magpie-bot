@@ -1,0 +1,97 @@
+name: LTV literal guard
+
+# Pre-merge guard against the class of bug that hit prod on 2026-06-13:
+# src/api/cosign-borrow.js had a hardcoded `TIER_LTV = { 0: 30, 1: 25, 2: 20 }`
+# memecoin ladder applied to EVERY borrow regardless of collateral category.
+# RWA users picking "RWA Standard" (option 2 = 70% LTV in rwa_loan_tiers)
+# were silently downgraded to memecoin Standard (20%). 12 loans were
+# underpaid; total ~23 SOL of make-good to ship.
+#
+# The single source of truth for borrow LTV is services/loan-tier-resolver.js
+# (getTierByOption / getEligibleTiers). Any file that re-implements the
+# ladder with literal numbers is a divergence risk — even if "currently
+# right", it WILL drift the next time the operator tunes a tier.
+#
+# This guard greps every borrow/quote path for the literal patterns:
+#   { 0: 30, 1: 25, 2: 20 }      (memecoin ladder — what bit us)
+#   { 0: 50, 1: 60, 2: 70 }      (RWA ladder — same risk going forward)
+#   ltv_pct: 30, ltv_pct: 25, …  (object-literal tier defs outside the
+#                                 resolver's allowlist)
+#
+# Allowlist (literal LTVs are intentional here and may remain):
+#   - src/services/loan-tier-resolver.js (the source of truth itself)
+#   - src/commands/lend.js                (LP risk ladder, not borrow LTV)
+#   - migrations/                         (DB seed data)
+#   - scripts/remediate-rwa-ltv-misroute.js (frozen historical snapshot)
+#   - magpie-site/src/lib/db.ts            (site-fallback default — survived
+#                                          earlier audit, runs only when bot
+#                                          API is unreachable)
+#
+# Anywhere else that needs the LTV ladder MUST import from
+# loan-tier-resolver and call getTierByOption / getEligibleTiers. The
+# resolver is the single chokepoint; tune the ladder there, every
+# surface picks it up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ltv-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Forbid hardcoded TIER_LTV maps outside the resolver
+        run: |
+          set -e
+          echo "Scanning for hardcoded LTV ladders…"
+          # Match the exact bug pattern + the RWA twin. Allow whitespace
+          # variation but require the literal numbers we know.
+          # Require `=` immediately before the literal so we only
+          # match real assignments, not the same literal inside a
+          # comment explaining the historical bug. Allow whitespace
+          # between fields.
+          MEMECOIN_PATTERN='=[[:space:]]*\{[[:space:]]*0:[[:space:]]*30[[:space:]]*,[[:space:]]*1:[[:space:]]*25[[:space:]]*,[[:space:]]*2:[[:space:]]*20[[:space:]]*\}'
+          RWA_PATTERN='=[[:space:]]*\{[[:space:]]*0:[[:space:]]*50[[:space:]]*,[[:space:]]*1:[[:space:]]*60[[:space:]]*,[[:space:]]*2:[[:space:]]*70[[:space:]]*\}'
+
+          # Files that legitimately encode these literals (the resolver,
+          # seed migrations, the historical-frozen remediation script).
+          # scripts/verify-tier-resolution.js intentionally references the
+          # historical bug pattern in its comments (it's the test that asserts
+          # the pattern has been removed from real code), so it's allowlisted.
+          ALLOWLIST_REGEX='^(src/services/loan-tier-resolver\.js|migrations/.*\.sql|scripts/remediate-rwa-ltv-misroute\.js|scripts/verify-tier-resolution\.js)$'
+
+          HITS=0
+          for pattern in "$MEMECOIN_PATTERN" "$RWA_PATTERN"; do
+            while IFS= read -r match; do
+              file="${match%%:*}"
+              if echo "$file" | grep -qE "$ALLOWLIST_REGEX"; then
+                continue
+              fi
+              echo "::error file=$file::Hardcoded LTV ladder forbidden — use getTierByOption from loan-tier-resolver. Match: $match"
+              HITS=$((HITS+1))
+            done < <(grep -rnE "$pattern" --include='*.js' --include='*.ts' --include='*.tsx' src/ scripts/ magpie-site/src/ 2>/dev/null || true)
+          done
+
+          if [ "$HITS" -gt 0 ]; then
+            echo ""
+            echo "Found $HITS hardcoded LTV ladder(s) outside the allowlist."
+            echo "Fix: import { getTierByOption } from 'src/services/loan-tier-resolver.js'"
+            echo "     and call await getTierByOption({ category, option })."
+            exit 1
+          fi
+          echo "OK — no forbidden LTV literals found."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Synthetic tier resolution test
+        run: node scripts/verify-tier-resolution.js
