@@ -173,6 +173,19 @@ function renderPipUpsideAlert(p) {
   return p?.text || "";
 }
 
+function renderLimitCloseStalenessNudge(p) {
+  const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
+  return [
+    `*Quick check on a limit order*`,
+    "",
+    `Your ${dirLabel} order #${p.order_id} on ${p.collateral_symbol} has been armed for ${p.days_old} days and the trigger is roughly ${p.distance_pct}% from current price.`,
+    "",
+    `It might still be the plan — or you might have set it and forgotten. Want to keep it active, or cancel and free the slot?`,
+    "",
+    `_This is a one-time nudge — we won't ask again unless the order sits another month._`,
+  ].join("\n");
+}
+
 function renderEnginePreflightFailed(p) {
   const failures = Array.isArray(p?.failures) ? p.failures : [];
   const lines = [
@@ -198,6 +211,7 @@ const RENDERERS = {
   limit_close_cancelled:       renderLimitCloseCancelled,
   limit_close_action_required: renderLimitCloseActionRequired,
   limit_close_intervention: renderLimitCloseIntervention,
+  limit_close_staleness_nudge: renderLimitCloseStalenessNudge,
   engine_preflight_failed:  renderEnginePreflightFailed,
   pip_upside_alert:         renderPipUpsideAlert,
   // Downside alert reuses the same renderer — the watcher pre-renders
@@ -275,6 +289,12 @@ async function tick(bot) {
                       `lcint:decline:${row.payload.order_id}`)
                 .text("Cancel order",
                       `lcint:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_staleness_nudge") {
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard()
+                .text("Keep active", `lcstale:keep:${row.payload.order_id}`)
+                .text("Cancel order", `lcstale:cancel:${row.payload.order_id}`);
               extra = { reply_markup: kb };
             }
             await bot.api.sendMessage(Number(u.telegram_id), text, {
