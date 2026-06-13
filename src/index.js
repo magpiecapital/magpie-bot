@@ -151,6 +151,7 @@ import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
 import { startEngineTopupWatcher } from "./services/engine-topup-watcher.js";
+import { startLcOperatorAlerts } from "./services/lc-operator-alerts.js";
 import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
@@ -771,6 +772,11 @@ bot.start({
     // LIMIT_CLOSE_ENGINE_AUDIT.md — if this drains, every engine fire
     // reverts with topup_transfer_failed and no orders execute.
     setTimeout(() => startEngineTopupWatcher(bot), 65_000);
+    // Operator fire/failure alerts on limit-close orders. Polls every 60s
+    // for fired/partial_fired/failed orders past a cursor and DMs the
+    // operator. Critical for "perfected" demo readiness — operator sees
+    // every fire + failure in real time.
+    setTimeout(() => startLcOperatorAlerts(bot), 70_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
