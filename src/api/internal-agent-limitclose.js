@@ -27,9 +27,41 @@
  */
 import { query } from "../db/pool.js";
 import { constantTimeEqual } from "./auth-utils.js";
-import { runArmPreflight } from "../services/limit-close-preflight.js";
+import { armOrder } from "../services/limit-close-arm-core.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
+
+// HTTP status mapping for arm-core error strings. The agent path needs
+// to translate the shared error codes into the HTTP shape the x402
+// service is already documented against. Defaults to 409 (conflict)
+// when an error isn't explicitly mapped — most arm-core errors are
+// "we won't proceed because of state" which is the canonical 409.
+const ARM_ERROR_STATUS = {
+  // shape errors → 400
+  invalid_trigger_kind: 400,
+  invalid_trigger_direction: 400,
+  invalid_trigger_value: 400,
+  trigger_value_out_of_range: 400,
+  invalid_slippage_bps: 400,
+  invalid_sell_destination: 400,
+  invalid_loan_id: 400,
+  invalid_expires_at: 400,
+  invalid_source: 400,
+  invalid_cap_bps: 400,
+  // ownership / state → 404 / 409
+  loan_not_found_for_user: 404,
+  loan_not_active: 409,
+  loan_below_minimum_size: 409,
+  collateral_not_enabled: 409,
+  rwa_collateral_not_supported_in_v1: 409,
+  trigger_would_fire_immediately: 409,
+  sl_below_solvency: 409,
+  loan_already_has_active_order: 409,
+  // concurrency → 429
+  user_concurrency_cap_reached: 429,
+  // server-side failures → 500
+  insert_failed: 500,
+};
 
 // Operator kill switch — set LIMIT_CLOSE_AGENT_DISABLED=1 to disable
 // the x402 agent arm path WITHOUT affecting TG-armed orders or any
@@ -175,58 +207,51 @@ export async function handleAgentLimitCloseArm(req) {
     return { status: 403, body: { error: "delegation_expired" } };
   }
 
-  // ── Loan ownership + state ──────────────────────────────────
-  // The agent supplied user_wallet AND loan_id; we re-derive
-  // user_id from the delegation and require the loan to belong to
-  // that same user. This is the load-bearing check that an agent
-  // authorized for wallet A cannot arm an order on wallet B's loan.
-  const { rows: [loan] } = await query(
-    `SELECT l.id, l.loan_id, l.status,
-            l.original_loan_amount_lamports::text AS owed,
-            l.collateral_mint,
-            l.collateral_amount::text AS collateral_amount_raw,
-            u.id AS owner_user_id
+  // ── Loan ownership pre-check (wallet binding) ──────────────────
+  // The agent supplied user_wallet AND loan_id. armOrder() looks up
+  // (user_id, loan_id) directly, but it does NOT verify that the
+  // delegation.user_id actually owns the wallet the agent claims to
+  // be operating against. That's the load-bearing agent-specific check:
+  // an agent authorized for wallet A cannot arm an order on wallet B's
+  // loan, even if both wallets are linked to the same telegram user.
+  //
+  // We resolve the (user_wallet, delegation.user_id) tuple here so we
+  // can return the agent-flavored loan_not_found_for_wallet error
+  // before armOrder is even called. We also pull loan.loan_id so the
+  // response body keeps its existing shape (agents key off it).
+  const { rows: [walletGuard] } = await query(
+    `SELECT l.loan_id::text AS loan_id_chain,
+            l.original_loan_amount_lamports::text AS owed
        FROM loans l
-       JOIN users u ON u.id = l.user_id
-       JOIN wallets w ON w.user_id = u.id AND w.public_key = $1
+       JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
       WHERE l.user_id = $2 AND l.loan_id = $3`,
     [userWallet, delegation.user_id, loanIdRaw],
   );
-  if (!loan) {
+  if (!walletGuard) {
     return { status: 404, body: { error: "loan_not_found_for_wallet" } };
   }
-  if (loan.status !== "active") {
-    return { status: 409, body: { error: "loan_not_active", loan_status: loan.status } };
-  }
-  if (BigInt(loan.owed) < MIN_LOAN_LAMPORTS) {
-    return { status: 409, body: { error: "loan_below_minimum_size" } };
-  }
 
-  // ── Collateral allowlist (mirrors TG path) ──────────────────
-  const { rows: [mintRow] } = await query(
-    `SELECT enabled, category, symbol, liquidity_usd FROM supported_mints WHERE mint = $1`,
-    [loan.collateral_mint],
-  );
-  if (!mintRow || !mintRow.enabled) {
-    return { status: 409, body: { error: "collateral_not_enabled" } };
-  }
-  if (["stock", "etf", "metal"].includes(mintRow.category)) {
-    return { status: 409, body: { error: "rwa_collateral_not_supported_in_v1" } };
-  }
-
-  // ── Delegation BOUNDS check ─────────────────────────────────
-  // (a) per-order notional ceiling
-  if (BigInt(loan.owed) > BigInt(delegation.max_per_order_lamports)) {
+  // ── Delegation BOUNDS — agent-consent ceilings ──────────────────
+  // These are NOT in armOrder() because they're consent boundaries
+  // the borrower set when they ran /agent_authorize. armOrder is the
+  // user-level safety floor; this is the agent-specific consent ceiling.
+  //
+  // (a) per-order notional cap. The borrower said "this agent may arm
+  // orders up to X SOL each" — refuse if the loan itself is larger.
+  if (BigInt(walletGuard.owed) > BigInt(delegation.max_per_order_lamports)) {
     return {
       status: 403,
       body: {
         error: "order_exceeds_delegation_cap",
-        loan_owed_lamports: loan.owed,
+        loan_owed_lamports: walletGuard.owed,
         max_per_order_lamports: delegation.max_per_order_lamports,
       },
     };
   }
-  // (b) slippage ceiling
+  // (b) slippage cap — borrower set a max acceptable slippage. Hard 403
+  // not a clamp: if the agent's request exceeds the consent ceiling we
+  // reject loud so the agent can request a lower number or the borrower
+  // can update their delegation.
   if (slippageBps > delegation.max_slippage_bps) {
     return {
       status: 403,
@@ -237,7 +262,8 @@ export async function handleAgentLimitCloseArm(req) {
       },
     };
   }
-  // (c) concurrent-orders ceiling (count only orders this agent armed for this user)
+  // (c) per-agent concurrent-orders cap. Counts only orders THIS agent
+  // armed for THIS user — different from armOrder's user-wide cap.
   const { rows: [activeCount] } = await query(
     `SELECT COUNT(*)::int AS n
        FROM limit_close_orders
@@ -258,191 +284,71 @@ export async function handleAgentLimitCloseArm(req) {
     };
   }
 
-  // ── Pre-flight liquidity check (Layer 1) ─────────────────────
+  // ── Hand off to armOrder() ──────────────────────────────────
+  // Everything beyond this point — loan state, collateral allowlist,
+  // pre-flight quote, immediate-fire guard, SL solvency floor,
+  // liquidity-aware slippage bump, per-user concurrency, INSERT with
+  // UNIQUE-partial-index dup-arm protection — is shared with the
+  // TG/site path so we let armOrder() own it. Single source of truth
+  // for arm-time gates: any new safety check added there applies to
+  // all three surfaces automatically.
   //
-  // Quote Jupiter at current state. If the order can't clear at the
-  // user's slippage right now, reject with a suggested slippage. This
-  // catches "you typed 1% but your collateral trades at 12% impact"
-  // BEFORE the user is armed and silently failing weeks later when
-  // their trigger hits.
-  //
-  // The check is fail-open on Jupiter outages (advisory) — the engine's
-  // runtime safety floor is the actual guarantee. Layer 2 (TWAP) and
-  // Layer 3 (intervention) handle the dynamic-liquidity case at fire
-  // time.
-  const preflightCap = autoEscalate ? delegation.max_slippage_bps : slippageBps;
-  const preflight = await runArmPreflight({
-    collateralMint: loan.collateral_mint,
-    collateralAmountRaw: loan.collateral_amount_raw,
+  // The cap we pass is the delegation's slippage ceiling so the engine
+  // has the consent-bounded headroom for auto-escalation. We snapshot
+  // the cap at arm time (NOT read it live each tick) so a borrower
+  // tightening the delegation later doesn't strand orders the agent
+  // already armed under the previous consent.
+  const capBps = autoEscalate ? delegation.max_slippage_bps : slippageBps;
+  const armResult = await armOrder({
+    userId: delegation.user_id,
+    source: "agent_x402",
+    sourceAgentPubkey: agentPubkey,
+    loanIdChain: loanIdRaw,
+    triggerKind,
+    triggerValueMicro,
+    triggerDirection,
+    slippageBps,
     sellDestination,
-    // Use the EFFECTIVE max we could ever clear at — that's the cap if
-    // auto-escalate is on, the literal slippage otherwise. Catches the
-    // case "even at the cap we can't fill" while NOT rejecting "you
-    // can't fill at 200 bps but you opted into escalating to 500".
-    slippageBps: preflightCap,
-    loanOwedLamports: loan.owed,
-    protocolFeeBps: 100,
+    expiresAt,
+    autoEscalate,
+    capBps,
+    preflightProtocolFeeBps: 100,
+    // Preserve the x402-tx audit trail in the notes column. armOrder
+    // appends its own context (direction, slippage-bump, etc.) on top.
+    armNote: `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; direction=${triggerDirection}; auto_escalate=${autoEscalate} cap=${capBps}bps`,
   });
-  if (!preflight.ok) {
+
+  if (!armResult.ok) {
+    const status = ARM_ERROR_STATUS[armResult.error] || 409;
     return {
-      status: 409,
+      status,
       body: {
-        error: preflight.reason,
-        detail: preflight.detail,
-        suggested_slippage_bps: preflight.suggestedSlippageBps,
-        your_slippage_bps: preflight.yourSlippageBps,
-        cap_used_for_check_bps: preflightCap,
+        error: armResult.error,
+        ...(armResult.detail != null ? { detail: armResult.detail } : {}),
+        ...(armResult.suggestedSlippageBps != null
+          ? { suggested_slippage_bps: armResult.suggestedSlippageBps,
+              your_slippage_bps: armResult.yourSlippageBps,
+              cap_used_for_check_bps: capBps }
+          : {}),
       },
     };
   }
-  // Pre-flight passed (or advisory-passed when Jupiter unreachable).
-  // Persist what we saw so we can later detect "liquidity has gotten
-  // worse since arm" in the engine's failure-reason notes.
-  const preflightSlippageQuotedBps = preflight.advisory ? null : preflightCap;
-  const preflightProceedsLamports  = preflight.advisory ? null : (preflight.proceedsLamports || null);
-  const preflightQuotedAtIso       = preflight.advisory ? null : (preflight.quotedAtIso || new Date().toISOString());
 
-  // ── Immediate-fire + SL solvency guards (mirrors arm-core PRs #114) ─
-  // Same gates the TG/site path runs. Implemented inline here because
-  // the agent endpoint duplicates the INSERT logic rather than calling
-  // armOrder() — a fuller refactor is queued as a follow-up. For now,
-  // narrow port keeps the two paths aligned on safety.
-  let currentMicrosForLater = null;
-  try {
-    if (triggerKind === "mc_usd" || triggerKind === "price_usd") {
-      const { getPriceInUsdCrossSourced } = await import("../services/price.js");
-      const currentUsdPerDisplayed = await getPriceInUsdCrossSourced(loan.collateral_mint);
-      if (currentUsdPerDisplayed && currentUsdPerDisplayed > 0) {
-        let currentMicros = null;
-        if (triggerKind === "price_usd") {
-          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6));
-        } else if (triggerKind === "mc_usd" && mintRow.supply) {
-          currentMicros = BigInt(Math.round(currentUsdPerDisplayed * 1e6)) * BigInt(mintRow.supply);
-        }
-        if (currentMicros != null) {
-          currentMicrosForLater = currentMicros;
-          if (triggerDirection === "above" && triggerValueMicro <= currentMicros) {
-            return { status: 409, body: { error: "trigger_would_fire_immediately", direction: "above" } };
-          }
-          if (triggerDirection === "below" && triggerValueMicro >= currentMicros) {
-            return { status: 409, body: { error: "trigger_would_fire_immediately", direction: "below" } };
-          }
-        }
-      }
-    }
-  } catch { /* fail-open: engine re-checks at fire time */ }
+  const orderId = armResult.orderId;
 
-  // SL solvency floor — same math as PR #114 in arm-core.
-  if (triggerDirection === "below" && preflight.proceedsLamports != null && currentMicrosForLater != null && currentMicrosForLater > 0n) {
-    const triggerProceedsEstimate = (BigInt(preflight.proceedsLamports) * triggerValueMicro) / currentMicrosForLater;
-    const ownedBI = BigInt(loan.owed);
-    const owedWithBuffer = (ownedBI * 105n) / 100n;
-    if (triggerProceedsEstimate < owedWithBuffer) {
-      return {
-        status: 409,
-        body: {
-          error: "sl_below_solvency",
-          owed_lamports: ownedBI.toString(),
-          required_proceeds_lamports: owedWithBuffer.toString(),
-          estimated_proceeds_at_trigger_lamports: triggerProceedsEstimate.toString(),
-          shortfall_lamports: (owedWithBuffer - triggerProceedsEstimate).toString(),
-        },
-      };
-    }
-  }
-
-  // ── Liquidity-aware initial slippage bump ───────────────────
-  // Mirrors arm-core's logic from PR #86. Agents requesting the default
-  // 200 bps initial against a thin token will see their first attempt
-  // revert and waste a tick before auto-escalation. Bumping the initial
-  // to a token-liquidity-appropriate floor saves that round-trip.
-  // Hard constraint specific to the agent path: NEVER bump above the
-  // borrower's stated delegation.max_slippage_bps. The delegation is the
-  // borrower's stated worst-case-acceptable; we never widen past it.
-  const liqUsd = Number(mintRow.liquidity_usd ?? 0);
-  let liquidityFloorBps = 0;
-  if (liqUsd <= 0) liquidityFloorBps = 0;                       // unknown → no bump
-  else if (liqUsd >= 100_000) liquidityFloorBps = 0;             // deep
-  else if (liqUsd >= 25_000) liquidityFloorBps = 300;            // mid
-  else if (liqUsd >= 5_000) liquidityFloorBps = 500;             // thin
-  else liquidityFloorBps = 1000;                                  // very thin
-  const originalRequestedBps = slippageBps;
-  const appliedInitialBps =
-    liquidityFloorBps > 0 && slippageBps < liquidityFloorBps
-      ? Math.min(liquidityFloorBps, delegation.max_slippage_bps)
-      : slippageBps;
-
-  // ── INSERT — UNIQUE partial index catches dup-arm races ──────
-  //
-  // For auto-escalation we snapshot the borrower's delegation cap into
-  // max_slippage_bps_cap at arm time. If the borrower later tightens
-  // the delegation (revoke + re-authorize with a lower cap), the engine
-  // still honors THIS order's original ceiling — preventing a surprise
-  // mid-flight tightening from breaking an order the borrower already
-  // consented to.
-  //
-  // If auto_escalate is false, we still set max_slippage_bps_cap to the
-  // initial slippage (i.e. no headroom for escalation). The engine
-  // treats current == cap as "no further escalation possible" which is
-  // exactly the non-escalating behavior.
-  const capBps = autoEscalate ? delegation.max_slippage_bps : slippageBps;
-
-  let inserted;
-  try {
-    inserted = await query(
-      `INSERT INTO limit_close_orders
-         (user_id, loan_id, trigger_kind, trigger_value_micro,
-          trigger_direction,
-          slippage_bps, sell_destination, expires_at,
-          source, source_agent_pubkey, status, armed_at,
-          auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
-          preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
-          notes)
-       VALUES ($1, $2, $3, $4,
-               $5,
-               $6, $7, $8,
-               'agent_x402', $9, 'armed', NOW(),
-               $10, $11, $12,
-               $13, $14, $15,
-               $16)
-       RETURNING id, armed_at`,
-      [delegation.user_id, loan.id, triggerKind, triggerValueMicro.toString(),
-       triggerDirection,
-       appliedInitialBps, sellDestination, expiresAt,
-       agentPubkey,
-       autoEscalate, capBps, appliedInitialBps,
-       preflightSlippageQuotedBps, preflightProceedsLamports, preflightQuotedAtIso,
-       `armed via x402 tx ${x402TxSignature.slice(0, 16)}...; ` +
-       `direction=${triggerDirection}; ` +
-       `auto_escalate=${autoEscalate} cap=${capBps}bps; ` +
-       (appliedInitialBps !== originalRequestedBps
-         ? `initial slippage bumped ${originalRequestedBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)}); `
-         : "") +
-       `preflight=${preflight.advisory ? "advisory" : "passed"}`],
-    );
-  } catch (err) {
-    if (/duplicate key value violates unique constraint/i.test(err.message)) {
-      return { status: 409, body: { error: "loan_already_has_active_order" } };
-    }
-    console.error("[internal-agent-limitclose] insert failed:", err.message);
-    return { status: 500, body: { error: "insert_failed" } };
-  }
-
-  const orderId = inserted.rows[0].id;
-
-  // Borrower wasn't the actor here — DM them so they know an
-  // authorized agent just armed an order on their loan. Best-effort:
-  // if the enqueue fails the order is still armed (correct), they
-  // just don't get the immediate ping.
+  // armOrder already enqueues no notification — DMing the borrower is a
+  // per-surface decision. For agent path: ALWAYS DM (the borrower wasn't
+  // the actor; they need to know their delegated agent fired off an arm).
+  // Best-effort — enqueue failure does not roll back the arm.
   try {
     await query(
       `INSERT INTO pending_notifications (user_id, channel, kind, payload, status)
          VALUES ($1, 'tg', 'limit_close_armed', $2::jsonb, 'pending')`,
       [delegation.user_id, JSON.stringify({
         order_id: orderId,
-        loan_id_chain: loan.loan_id,
+        loan_id_chain: walletGuard.loan_id_chain,
         trigger_label: `${triggerKind}=${triggerValueMicro.toString()}`,
-        slippage_bps: slippageBps,
+        slippage_bps: armResult.initialSlippageBpsApplied,
         sell_destination: sellDestination,
         source: "agent_x402",
         source_agent_pubkey: agentPubkey,
@@ -452,17 +358,19 @@ export async function handleAgentLimitCloseArm(req) {
     console.warn("[internal-agent-limitclose] arm-DM enqueue failed:", err.message?.slice(0, 200));
   }
 
+  const appliedInitialBps   = armResult.initialSlippageBpsApplied;
+  const originalRequestedBps = armResult.initialSlippageBpsRequested;
   return {
     status: 200,
     body: {
       ok: true,
       order_id: orderId,
-      loan_id: loan.loan_id,
+      loan_id: walletGuard.loan_id_chain,
       trigger_kind: triggerKind,
       trigger_value_micro: triggerValueMicro.toString(),
       slippage_bps: appliedInitialBps,
       sell_destination: sellDestination,
-      armed_at: inserted.rows[0].armed_at,
+      armed_at: armResult.armedAt,
       expires_at: expiresAt,
       source: "agent_x402",
       source_agent_pubkey: agentPubkey,
@@ -470,12 +378,11 @@ export async function handleAgentLimitCloseArm(req) {
       max_slippage_bps_cap: capBps,
       initial_slippage_bps: appliedInitialBps,
       // Surface the bump so the agent can log / present it to the user.
-      // Only present when an actual bump landed.
       ...(appliedInitialBps !== originalRequestedBps
         ? {
             slippage_bps_requested: originalRequestedBps,
-            liquidity_floor_bps: liquidityFloorBps,
-            liquidity_usd: liqUsd,
+            liquidity_floor_bps: armResult.liquidityTierFloorBps,
+            liquidity_usd: armResult.liquidityUsd,
           }
         : {}),
     },
