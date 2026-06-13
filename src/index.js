@@ -163,6 +163,7 @@ import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
+import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -829,6 +830,13 @@ bot.start({
     // wallet-scoped filtering on the dashboard never silently drops
     // a loan due to stale/wrong program_id.
     setTimeout(() => startLoanProgramIdHealer(bot), 115_000);
+    // Loan actual-received watchdog — backfills + verifies the
+    // on-chain SOL delta per borrow row. Catches the class of bug
+    // where the dashboard shows ~$1 more "received" than the
+    // borrower's wallet actually went up by (2026-06-13 audit
+    // finding — protocol takes account-creation rent out of loan
+    // proceeds without reflecting it in loan_amount_lamports).
+    setTimeout(() => startLoanReceivedWatchdog(bot), 130_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
