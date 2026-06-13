@@ -26,8 +26,22 @@ import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+import { getRuntimeConfigBps } from "./runtime-config.js";
 
-export const REFERRAL_REWARD_BPS = 500; // 5% of fee
+// Fallback used when governance_config.referral_reward_bps can't be
+// read (DB outage or unset key). MGP-001 ratified the live value to
+// 1000 (10%); the runtime reader takes precedence.
+export const REFERRAL_REWARD_BPS_FALLBACK = 1_000; // 10%
+export const REFERRAL_REWARD_BPS = REFERRAL_REWARD_BPS_FALLBACK;
+
+/**
+ * Read the LIVE referral reward bps from governance_config. Mirrors
+ * getHolderRewardBps / getLpLoyaltyRewardBps. Any governance vote that
+ * changes referral_reward_bps takes effect within runtime-config TTL.
+ */
+export async function getReferralRewardBps() {
+  return getRuntimeConfigBps("referral_reward_bps", REFERRAL_REWARD_BPS_FALLBACK);
+}
 export const MIN_LOAN_LAMPORTS = 10_000_000n; // 0.01 SOL minimum to accrue
 export const MIN_CLAIM_LAMPORTS = 5_000_000n; // 0.005 SOL minimum to claim
 export const MIN_LENDER_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL safety floor on lender
@@ -66,7 +80,8 @@ export async function accrueFromLoan({ refereeUserId, loanDbId, feeLamports, eve
   const referrerId = rows[0]?.referred_by;
   if (!referrerId) return null;
 
-  const reward = (fee * BigInt(REFERRAL_REWARD_BPS)) / 10_000n;
+  const liveBps = await getReferralRewardBps();
+  const reward = (fee * BigInt(liveBps)) / 10_000n;
   if (reward <= 0n) return null;
 
   try {
@@ -77,7 +92,7 @@ export async function accrueFromLoan({ refereeUserId, loanDbId, feeLamports, eve
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'accrued')
        ON CONFLICT (loan_db_id, event_type) DO NOTHING
        RETURNING id`,
-      [referrerId, refereeUserId, loanDbId, eventType, fee.toString(), reward.toString(), REFERRAL_REWARD_BPS],
+      [referrerId, refereeUserId, loanDbId, eventType, fee.toString(), reward.toString(), liveBps],
     );
     return r.rows[0]?.id ?? null;
   } catch (err) {

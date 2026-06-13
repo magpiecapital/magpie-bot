@@ -206,11 +206,12 @@ async function authenticateRequest(req) {
 async function handleLpLoyalty(req, url) {
   const wallet = url.searchParams.get("wallet");
   if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
-  const { getLpLoyaltyByWallet, LP_LOYALTY_REWARD_BPS } = await import(
+  const { getLpLoyaltyByWallet, getLpLoyaltyRewardBps } = await import(
     "../services/lp-loyalty.js"
   );
   const info = await getLpLoyaltyByWallet(wallet);
   if (!info) return { status: 400, body: { error: "Invalid wallet" } };
+  const liveBps = await getLpLoyaltyRewardBps();
   return {
     status: 200,
     body: {
@@ -222,8 +223,8 @@ async function handleLpLoyalty(req, url) {
       lifetime_lamports: info.lifetime_lamports.toString(),
       paid_lamports: info.paid_lamports.toString(),
       distributions_received: info.distributions_received,
-      reward_bps: LP_LOYALTY_REWARD_BPS,
-      reward_pct: LP_LOYALTY_REWARD_BPS / 100,
+      reward_bps: liveBps,
+      reward_pct: liveBps / 100,
       // INTENTIONALLY OMITTED: weighted_deposit_at, next snapshot timing.
       // Same operator-private pattern as $MAGPIE holders.
       auto_distribute: true,
@@ -306,9 +307,12 @@ async function handleReferrals(req, url) {
   if (!wallet) {
     return { status: 400, body: { error: "Provide ?wallet=<address>" } };
   }
-  const { getReferralSummaryByWallet, REFERRAL_REWARD_BPS, MIN_CLAIM_LAMPORTS } =
+  const { getReferralSummaryByWallet, getReferralRewardBps, MIN_CLAIM_LAMPORTS } =
     await import("../services/referral-rewards.js");
-  const summary = await getReferralSummaryByWallet(wallet);
+  const [summary, liveReferralBps] = await Promise.all([
+    getReferralSummaryByWallet(wallet),
+    getReferralRewardBps(),
+  ]);
   if (!summary) {
     return {
       status: 404,
@@ -337,8 +341,8 @@ async function handleReferrals(req, url) {
       share_link: tgShareLink,           // backward-compat (TG audience)
       site_share_link: siteShareLink,    // for the magpie.capital audience
       tg_share_link: tgShareLink,        // explicit alias
-      reward_bps: REFERRAL_REWARD_BPS,
-      reward_pct: REFERRAL_REWARD_BPS / 100,
+      reward_bps: liveReferralBps,
+      reward_pct: liveReferralBps / 100,
       min_claim_lamports: MIN_CLAIM_LAMPORTS.toString(),
       referred_count: summary.referred_count,
       borrowed_count: summary.borrowed_count,
