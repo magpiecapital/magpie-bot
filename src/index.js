@@ -161,6 +161,7 @@ import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
+import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -810,6 +811,11 @@ bot.start({
     // after the live incident). Defense-in-depth on top of the
     // real-time on-join filter.
     setTimeout(() => startImpersonatorWatchdog(bot), 95_000);
+    // Canary watcher — reads engine_canary_runs (written by the
+    // engine every hour) and DMs operator on consecutive failures.
+    // The actual canary RUNS in the magpie-limitclose engine; this
+    // is the bot-side observation surface.
+    setTimeout(() => startCanaryWatcher(bot), 105_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
