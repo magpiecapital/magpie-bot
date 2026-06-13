@@ -16,14 +16,18 @@ import { ensureWallet } from "../services/wallet.js";
 import { getSupportedBalances } from "../services/deposits.js";
 import { collateralValueLamports } from "../services/price.js";
 import { getLoanLimits } from "../services/loan-limits.js";
+import { getEligibleTiers, MEMECOIN_TIERS } from "../services/loan-tier-resolver.js";
 
-const TIERS = [
-  { name: "Express",  ltv: 30, days: 2, feeBps: 300 },
-  { name: "Quick",    ltv: 25, days: 3, feeBps: 200 },
-  { name: "Standard", ltv: 20, days: 7, feeBps: 150 },
-];
-
-const STANDARD = TIERS[2]; // safest recommended tier
+// Memecoin-tier shape for the headline "Standard tier" framing. Mixed-
+// category holdings (some memecoin, some RWA) get headlined as memecoin
+// Standard since that's the conservative case; per-holding lines below
+// resolve each token's correct tier set.
+const STANDARD = {
+  name: MEMECOIN_TIERS[2].label.split(" ")[0] || "Standard",
+  ltv: MEMECOIN_TIERS[2].ltv,
+  days: MEMECOIN_TIERS[2].days,
+  feeBps: MEMECOIN_TIERS[2].feeBps,
+};
 
 function fmtSol(n) {
   if (n < 0.001) return "<0.001";
@@ -71,7 +75,10 @@ export async function handleUnlock(ctx) {
     );
   }
 
-  // Compute borrow potential for each token
+  // Compute borrow potential for each token. Resolve per-token tiers so
+  // RWA holdings show their higher-LTV ladder while memecoins show the
+  // existing 30/25/20 ladder. getSupportedBalances exposes `category`
+  // since the tier-resolver wiring (PR #108).
   const enriched = await Promise.all(balances.map(async (b) => {
     let valueLamports = null;
     try {
@@ -82,35 +89,43 @@ export async function handleUnlock(ctx) {
       );
     } catch { /* fall through */ }
     const valueSol = valueLamports != null ? Number(valueLamports) / 1e9 : null;
+    const tierSet = await getEligibleTiers({ category: b.category });
     return {
       ...b,
       valueSol,
+      tierSet,
       // Borrow at each tier (post-fee receive)
       tiers: valueSol != null
-        ? TIERS.map((t) => {
+        ? tierSet.map((t) => {
             const gross = valueSol * (t.ltv / 100);
             const fee = gross * (t.feeBps / 10_000);
-            return { ...t, receiveSol: gross - fee, repaySol: gross };
+            return {
+              name: t.label.split(" ")[0] || t.label,
+              ltv: t.ltv, days: t.days, feeBps: t.feeBps,
+              receiveSol: gross - fee, repaySol: gross,
+            };
           })
         : null,
     };
   }));
 
-  // Rank by Standard-tier receive (the safest recommended)
+  // Rank by last-tier-in-set (safest = lowest LTV for memecoin, highest
+  // for RWA — both represent the longest-term "safest" option per category).
+  const safestIdx = (e) => e.tiers ? e.tiers.length - 1 : 0;
   enriched.sort((a, b) => {
-    const av = a.tiers ? a.tiers[2].receiveSol : -1;
-    const bv = b.tiers ? b.tiers[2].receiveSol : -1;
+    const av = a.tiers ? a.tiers[safestIdx(a)].receiveSol : -1;
+    const bv = b.tiers ? b.tiers[safestIdx(b)].receiveSol : -1;
     return bv - av;
   });
 
-  // Total potential on Standard tier (with per-wallet limits respected)
+  // Total potential on each holding's last tier (with per-wallet limits respected)
   const limits = await getLoanLimits(user.id);
   const maxOutstandingSol = Number(limits.maxOutstanding) / 1e9;
   const availableSol = Number(limits.availableToBorrow) / 1e9;
 
   const totalPotentialSol = enriched.reduce((acc, e) => {
     if (!e.tiers) return acc;
-    return acc + e.tiers[2].receiveSol;
+    return acc + e.tiers[safestIdx(e)].receiveSol;
   }, 0);
   // What they could ACTUALLY borrow given limits
   const realisticPotentialSol = Math.min(totalPotentialSol, availableSol);
@@ -140,12 +155,14 @@ export async function handleUnlock(ctx) {
       shown++;
       continue;
     }
-    const std = t.tiers[2];
+    // Use first + last in the resolved set so the line works for both
+    // memecoin (Express/Standard) and RWA (RWA Express/RWA Standard).
+    const std = t.tiers[t.tiers.length - 1];
     if (std.receiveSol < 0.001) continue; // skip dust
     const expr = t.tiers[0];
     lines.push(
       `• *${t.symbol}* — \`${t.humanAmount.toLocaleString(undefined, { maximumFractionDigits: 4 })}\` tokens`,
-      `  → Up to \`${fmtSol(std.receiveSol)} SOL\` (Standard) · \`${fmtSol(expr.receiveSol)} SOL\` (Express)`,
+      `  → Up to \`${fmtSol(std.receiveSol)} SOL\` (${std.name}) · \`${fmtSol(expr.receiveSol)} SOL\` (${expr.name})`,
     );
     shown++;
   }

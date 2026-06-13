@@ -6,12 +6,7 @@
  */
 import { query } from "../db/pool.js";
 import { getPriceInSol } from "../services/price.js";
-
-const TIERS = {
-  1: { ltv: 30, days: 2, feeBps: 300, label: "Express" },
-  2: { ltv: 25, days: 3, feeBps: 200, label: "Quick" },
-  3: { ltv: 20, days: 7, feeBps: 150, label: "Standard" },
-};
+import { getEligibleTiers } from "../services/loan-tier-resolver.js";
 
 function usage(ctx) {
   return ctx.reply(
@@ -30,7 +25,7 @@ export async function handleSimulate(ctx) {
   if (!Number.isFinite(amount) || amount <= 0) return usage(ctx);
 
   const { rows } = await query(
-    `SELECT mint, symbol, name, decimals FROM supported_mints
+    `SELECT mint, symbol, name, decimals, category FROM supported_mints
      WHERE enabled = TRUE AND (UPPER(symbol) = UPPER($1) OR mint = $1)
      LIMIT 1`,
     [arg],
@@ -61,6 +56,16 @@ export async function handleSimulate(ctx) {
 
   const collateralValueSol = amount * priceSol;
 
+  // Resolve tier set by category. RWA (stock/etf/metal) returns the
+  // higher-LTV / longer-term / higher-fee schedule out of rwa_loan_tiers;
+  // memecoin (and uncategorized) gets MEMECOIN_TIERS. Same resolver as
+  // borrow.js so /simulate previews match what /borrow will actually offer.
+  const resolved = await getEligibleTiers({ category: token.category });
+  // User-facing tier picker is 1-indexed; resolver returns option-indexed.
+  // Build the same lookup shape simulate.js historically used: {1, 2, 3}.
+  const TIERS = {};
+  resolved.forEach((t, i) => { TIERS[String(i + 1)] = t; });
+
   const tierList = tierStr ? [TIERS[tierStr]].filter(Boolean) : Object.values(TIERS);
   if (tierList.length === 0) return usage(ctx);
 
@@ -78,8 +83,13 @@ export async function handleSimulate(ctx) {
     const fee = gross * (t.feeBps / 10_000);
     const receive = gross - fee;
     const liquidationPriceSol = (gross / 1.1) / amount; // price at which ratio drops to 1.1x
+    // Resolver-built labels for RWA already include LTV/days/fee; strip
+    // them out of the header line so we don't double-print.
+    const headerLabel = (t.label && t.label.includes("LTV"))
+      ? t.label.replace(/.*\(([^)]+)\).*/, "$1") || t.label
+      : t.label;
     lines.push(
-      `*${t.ltv}% LTV · ${t.days}d (${t.label})*`,
+      `*${t.ltv}% LTV · ${t.days}d (${headerLabel})*`,
       `  Receive:     ${receive.toFixed(6)} SOL`,
       `  Repay:       ${gross.toFixed(6)} SOL`,
       `  Liq. price:  ${liquidationPriceSol.toFixed(9)} SOL/token`,
@@ -94,8 +104,9 @@ export async function handleSimulate(ctx) {
   // Estimated memecoin sell slippage: assume 2% as a conservative midpoint.
   // (Long-tail tokens often 5%+, larger ones <1%; 2% is fair averaged.)
   const ESTIMATED_SELL_SLIPPAGE_PCT = 2.0;
-  // Hardest tier (Standard 20% LTV / 1.5% fee) for the comparison
-  const standardTier = TIERS["3"];
+  // "Hardest" tier — last in the resolved set (typically longest-term + lowest LTV
+  // for memecoin = Standard; for RWA = RWA Standard at 70% LTV / 30d / 5% fee).
+  const standardTier = resolved[resolved.length - 1];
   const standardGross = collateralValueSol * (standardTier.ltv / 100);
   const standardFee = standardGross * (standardTier.feeBps / 10_000);
   const sellSlippageCost = collateralValueSol * (ESTIMATED_SELL_SLIPPAGE_PCT / 100);

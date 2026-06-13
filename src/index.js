@@ -150,6 +150,9 @@ import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
 import { startLenderBalanceWatcher } from "./services/lender-balance-watcher.js";
+import { startEngineTopupWatcher } from "./services/engine-topup-watcher.js";
+import { startLcOperatorAlerts } from "./services/lc-operator-alerts.js";
+import { startEngineHeartbeatWatcher } from "./services/engine-heartbeat-watcher.js";
 import { startAutoProtect } from "./services/auto-protect.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
@@ -771,6 +774,19 @@ bot.start({
     setTimeout(() => startPriceSnapshotter(), 80_000);
     // Overnight safety: DMs admin if lender wallet drops below safe thresholds
     setTimeout(() => startLenderBalanceWatcher(bot), 60_000);
+    // Same pattern for the limit-close engine topup wallet. P0 from
+    // LIMIT_CLOSE_ENGINE_AUDIT.md — if this drains, every engine fire
+    // reverts with topup_transfer_failed and no orders execute.
+    setTimeout(() => startEngineTopupWatcher(bot), 65_000);
+    // Operator fire/failure alerts on limit-close orders. Polls every 60s
+    // for fired/partial_fired/failed orders past a cursor and DMs the
+    // operator. Critical for "perfected" demo readiness — operator sees
+    // every fire + failure in real time.
+    setTimeout(() => startLcOperatorAlerts(bot), 70_000);
+    // Engine heartbeat — DMs operator with WARN/CRITICAL/EMERGENCY tiers
+    // if the limit-close engine stops ticking. Pairs with the engine's
+    // tick-time writeHeartbeat() in magpie-limitclose PR #9.
+    setTimeout(() => startEngineHeartbeatWatcher(bot), 75_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
