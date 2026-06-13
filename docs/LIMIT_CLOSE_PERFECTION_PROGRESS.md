@@ -1,6 +1,6 @@
 # Limit-Close Perfection — Progress Summary
 
-> **Status:** Two waves shipped. Wave 1 (2026-06-12 → early 2026-06-13): 11 PRs, foundational observability + safety. Wave 2 (2026-06-13 evening): 18 additional PRs across 4 repos covering structural refactor, fire-time safety, x402 economics, agent preflight, user-facing polish, reliability backup generator, engine activity rollups. Demo-readiness criteria below.
+> **Status:** Three waves shipped. Wave 1 (2026-06-12 → early 2026-06-13): 11 PRs, foundational observability + safety. Wave 2 (2026-06-13 evening): 18 additional PRs across 4 repos covering structural refactor, fire-time safety, x402 economics, agent preflight, user-facing polish, reliability backup generator, engine activity rollups. Wave 3 (2026-06-13 full-day autonomous loop): 11 more PRs covering synthetic canary fire validation, in-place order modification, agent quickstart docs, RWA-loan invisibility fix, vigil unstuck, impersonator watchdog, marketplace sales-CTAs.
 >
 > **Operator mandate** (2026-06-12 21:xx, reaffirmed 2026-06-13): "we can't stop until the limit sale build for both the regular protocol and the x402 are PERFECTED. We need this to change the landscape of the entire space." Followed by: "keep going. We need to work long and meticulously with the limit order setup for human + x402."
 
@@ -16,7 +16,10 @@ From `LIMIT_CLOSE_ENGINE_AUDIT.md` section 4, demo-readiness requires:
 | At least one SL fire executed live | ❌ Pending operator test | #114, #116, #8 unblock; test via #119 |
 | At least one x402-agent-armed order executed | ❌ Pending agent integration | #121 + #131 + #134 (preflight) |
 | `/lc-status` shows fires correctly | ✅ Shipped | #113 |
-| `/lc-perf` historical analytics | ✅ Shipped | #127 (+ #136 engine-activity section) |
+| `/lc-perf` historical analytics | ✅ Shipped | #127 (+ #136 engine-activity section + #147 canary pass-rate) |
+| Synthetic canary fire (end-to-end validation without on-chain risk) | ✅ Shipped | bot #144 + engine #14 |
+| In-place order modification (no cancel/re-arm gap) | ✅ Shipped | bot #148 + x402 #29 |
+| Agent quickstart docs (third-party self-serve) | ✅ Shipped | x402 #30 |
 | Operator receives DM notifications for each fire | ✅ Shipped | #118 |
 | Engine topup wallet balance alerts wired | ✅ Shipped | #117 |
 | Engine-side borrower-balance pre-flight check | ✅ Shipped | #8 (engine) + #116 (renderer) |
@@ -196,7 +199,40 @@ For x402 agent:
 
 ---
 
-## 5. Open items / known gaps (refreshed 2026-06-13)
+## 2c. PRs shipped Wave 3 (2026-06-13 — full-day autonomous loop)
+
+> Continuation of perfection sprint under operator's full-day autonomous-loop mandate: "complete the limit-order strategy for both the x402 and humans … work on them all day today in loop autonomously."
+
+### Limit-close core shipped this wave
+
+| # | Repo | Title | Purpose |
+|---|---|---|---|
+| [#144](https://github.com/magpiecapital/magpie-bot/pull/144) | magpie-bot | engine_canary_runs migration + bot watcher | Bot side of the synthetic canary system. Hourly canary alert tiers (WARN at 2 consec fails, CRIT at 3+). |
+| [#14](https://github.com/magpiecapital/magpie-limitclose/pull/14) | magpie-limitclose | Synthetic fire-path canary | Engine runs the FULL production fire-path read surface every hour against a recent loan as template. Persists per-check JSONB. "Would a real fire succeed RIGHT NOW" signal without on-chain risk. |
+| [#146](https://github.com/magpiecapital/magpie-bot/pull/146) | magpie-bot | /lc-status canary display | Engine sub-pane shows latest canary pass/fail + per-check failure detail. |
+| [#147](https://github.com/magpiecapital/magpie-bot/pull/147) | magpie-bot | /lc-perf canary pass-rate | Historical canary pass-rate over window; last-failure age. |
+| [#148](https://github.com/magpiecapital/magpie-bot/pull/148) | magpie-bot | **In-place order modification** | Shared `modifyOrder()` core + `/modifyorder` TG command + `/api/v1/internal/agent/limit-close/modify` endpoint. Order stays armed throughout — no cancel/re-arm market-move window. Race-safe via WHERE status='armed'. |
+| [#29](https://github.com/magpiecapital/magpie-x402/pull/29) | magpie-x402 | PATCH /agent/limit-close/modify | Free x402 forwarder for the modify endpoint. Pairs with #148. |
+| [#30](https://github.com/magpiecapital/magpie-x402/pull/30) | magpie-x402 | **Agent quickstart doc** | Full end-to-end docs for third-party agents: authorization, every endpoint, sample code, error reference, best practices. Closes the biggest x402 adoption blocker — no more reading source. |
+
+### Supporting infrastructure shipped this wave
+
+| # | Repo | Title | Purpose |
+|---|---|---|---|
+| [#142](https://github.com/magpiecapital/magpie-bot/pull/142) | magpie-bot | Impersonator watchdog | 30-min auto-scan against IMPERSONATION_PATTERNS. Catches impersonators who slipped past on-join filter during bot-down windows or before a relevant pattern was added. |
+| [#143](https://github.com/magpiecapital/magpie-bot/pull/143) | magpie-bot | Vigil filter fix | Catches tickets at status='open' (escalated path) — were sitting unanswered for 37h+. |
+| [#145](https://github.com/magpiecapital/magpie-bot/pull/145) | magpie-bot | RWA program_id drift fix + self-monitor probe | V2 RWA loans were silently mis-tagged with V1's program_id; \$SPCX loan was invisible from dashboard. Two loans backfilled; recordLoan now fail-closes; self-monitor probes for future drift. |
+| [#56](https://github.com/magpiecapital/magpie-site/pull/56) | magpie-site | Marketplace clickable tier cards | Every tier card on /marketplace is now a Link to /dashboard?category=X&tier=N. "Start borrowing at this tier →" CTA. Dashboard reads params, auto-expands first eligible holding. Sales-mentality posture. |
+
+### Outage-resilience fortified this wave
+
+| # | Repo | Title | Purpose |
+|---|---|---|---|
+| (already shipped Wave 2) | site #53 | Auto-restart backup generator | Site bot-watchdog calls Railway redeploy after 3 consecutive misses. Operator still owes the RAILWAY_API_TOKEN env vars. |
+
+---
+
+## 5. Open items / known gaps (refreshed 2026-06-13 — Wave 3 close)
 
 | Gap | Priority | Action |
 |---|---|---|
@@ -205,11 +241,15 @@ For x402 agent:
 | Live first x402-agent fire validation | P0 | Agent integration + preflight (now free via #134) |
 | `RAILWAY_API_TOKEN` / `SERVICE_ID` / `ENVIRONMENT_ID` env vars on Vercel | P1 | One-time operator action — activates auto-restart backup generator (magpie-site#53) |
 | Sell-first-then-repay pattern | P1 | Anchor program change; multi-week; covered in audit. Mitigated today by SL solvency floor (#114) + engine pre-check (#8) + user DM (#116) |
+| TP + SL multi-leg on same loan | P2 | UNIQUE-constraint refactor + executor concurrency review. Today's `loan_already_has_active_order` is the blocker. |
 | TWAP path live validation | P2 | Will exercise during demo recording |
-| Synthetic canary fire (periodic dry-run) | P2 | Foundation in place (engine has `LIMIT_CLOSE_DRY_RUN` env); needs marker column + watcher |
+| Stress test fixture (synthetic concurrent fires) | P3 | Validates the engine's CONCURRENCY=5 + atomic claim hold under load |
 | `recoverStuckFiring` live exercise | P3 | Not yet hit in production; existing engine logic |
-| ~~Agent endpoint → `armOrder()` refactor~~ | RESOLVED | #131 — single source of truth across surfaces |
+| ~~Synthetic canary fire~~ | RESOLVED | bot #144 + engine #14 |
+| ~~In-place order modification~~ | RESOLVED | #148 + x402 #29 |
+| ~~Agent endpoint → `armOrder()` refactor~~ | RESOLVED | #131 |
 | ~~Tier resolver wiring on simulate/unlock/community-pip~~ | RESOLVED | #123 |
+| ~~Agent docs / quickstart~~ | RESOLVED | x402 #30 |
 
 ---
 
