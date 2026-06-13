@@ -162,6 +162,7 @@ import { startLimitCloseStalenessWatcher } from "./services/limit-close-stalenes
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
+import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -820,6 +821,14 @@ bot.start({
     // The actual canary RUNS in the magpie-limitclose engine; this
     // is the bot-side observation surface.
     setTimeout(() => startCanaryWatcher(bot), 105_000);
+    // Loan program_id healer — every 10 min, scans non-closed loans
+    // and auto-corrects any DB row whose stored program_id disagrees
+    // with the on-chain owner of loan_pda. Defense-in-depth layer
+    // alongside the write-time on-chain authoritative check in
+    // recordLoan + the self-monitor drift probe. Ensures user-facing
+    // wallet-scoped filtering on the dashboard never silently drops
+    // a loan due to stale/wrong program_id.
+    setTimeout(() => startLoanProgramIdHealer(bot), 115_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
