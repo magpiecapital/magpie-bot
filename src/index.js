@@ -158,6 +158,8 @@ import { startAiConversationDigest } from "./services/ai-conversation-digest.js"
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
+import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
+import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -453,6 +455,7 @@ registerMyTicketsCallbacks(bot);
 // The vigil's timer starts later via startSupportVigil() from inside
 // the runtime startup section.
 registerSupportVigilCallbacks(bot);
+registerLcStalenessCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
@@ -794,6 +797,10 @@ bot.start({
     // if the limit-close engine stops ticking. Pairs with the engine's
     // tick-time writeHeartbeat() in magpie-limitclose PR #9.
     setTimeout(() => startEngineHeartbeatWatcher(bot), 75_000);
+    // Limit-close staleness sweeper — every 6h DMs users whose armed
+    // orders are old AND trigger far from current price. One-time
+    // nudge per order. See feedback_tg_changes_careful.
+    setTimeout(() => startLimitCloseStalenessWatcher(), 90_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
