@@ -127,6 +127,16 @@ export async function armOrder({
   capBps = null,
   preflightProtocolFeeBps = 100,
   armNote = null,
+  // dryRun: run every validation and gate but skip the INSERT and
+  // skip the per-user concurrency cap (a dry-run is a question, not
+  // a commitment of a slot). Used by the agent x402 preflight
+  // endpoint so agents can confirm an arm would succeed before
+  // paying. Returns the same ok/error shape as a real arm —
+  // callers can treat dryRun success exactly like a live arm
+  // would-have-succeeded. Setting dryRun=true does NOT enqueue
+  // notifications either (none happen in armOrder anyway today,
+  // but the contract holds).
+  dryRun = false,
 }) {
   // ── Shape validation ─────────────────────────────────────────
   if (!VALID_TRIGGER_KINDS.has(triggerKind)) {
@@ -290,13 +300,18 @@ export async function armOrder({
   } catch { /* fail-open: engine is the source of truth */ }
 
   // ── Per-user concurrency cap ────────────────────────────────
-  const { rows: [activeCount] } = await query(
-    `SELECT COUNT(*)::int AS n FROM limit_close_orders
-       WHERE user_id = $1 AND status = 'armed'`,
-    [userId],
-  );
-  if (activeCount.n >= MAX_ACTIVE_ORDERS_PER_USER) {
-    return { ok: false, error: "user_concurrency_cap_reached", detail: { active: activeCount.n, cap: MAX_ACTIVE_ORDERS_PER_USER } };
+  // Skipped in dryRun mode — a preflight is a question not a slot
+  // commitment, and the agent might be running this to decide which
+  // of several candidate orders to actually arm.
+  if (!dryRun) {
+    const { rows: [activeCount] } = await query(
+      `SELECT COUNT(*)::int AS n FROM limit_close_orders
+         WHERE user_id = $1 AND status = 'armed'`,
+      [userId],
+    );
+    if (activeCount.n >= MAX_ACTIVE_ORDERS_PER_USER) {
+      return { ok: false, error: "user_concurrency_cap_reached", detail: { active: activeCount.n, cap: MAX_ACTIVE_ORDERS_PER_USER } };
+    }
   }
 
   // ── Pre-flight Jupiter quote ────────────────────────────────
@@ -364,7 +379,31 @@ export async function armOrder({
     }
   }
 
-  // ── INSERT ──
+  // ── INSERT (skipped in dryRun) ──
+  // In dryRun mode all the gates above passed and we return ok=true
+  // without persisting any state. The caller (typically the agent
+  // preflight endpoint) treats this as "yes, a real arm with these
+  // exact params would succeed right now." Note that 'right now' is
+  // a momentary fact — liquidity can shift between preflight and
+  // arm. Agents should treat preflight as a strong hint, not a
+  // contractual reservation.
+  if (dryRun) {
+    return {
+      ok: true,
+      dryRun: true,
+      orderId: null,
+      armedAt: null,
+      loan,
+      mint: mintRow,
+      preflightAdvisory: advisory,
+      initialSlippageBpsRequested: originalInitialBps,
+      initialSlippageBpsApplied: appliedInitialBps,
+      liquidityTierFloorBps: liquidityFloorBps,
+      liquidityUsd: liqUsd,
+      triggerDirection,
+    };
+  }
+
   let inserted;
   try {
     inserted = await query(
