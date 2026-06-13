@@ -34,6 +34,56 @@ const TIERS = [
 
 let lastAlertedAt = 0;
 let lastAlertedTier = null;
+// "alive but degraded" tracking (e.g. last_tick_status='jupiter_degraded').
+// Distinct from lastAlertedTier — staleness tier and external-dep status
+// are independent failure modes that need independent alert/recovery
+// state. Both can be active at once if Jupiter dies AND the engine
+// then stops ticking; we DM each transition exactly once.
+let lastAlertedDegradedStatus = null;
+let lastDegradedAlertAt = 0;
+const DEGRADED_RE_ALERT_MS = 6 * 60 * 60 * 1000; // re-DM every 6h if still degraded
+
+const DEGRADED_STATUS_COPY = {
+  // Per-tick Jupiter probe failed 2+ consecutive times. Engine alive
+  // but cannot read prices, so no orders are firing. Usually a Jupiter
+  // outage, sometimes our IP getting rate-limited.
+  jupiter_degraded: {
+    title: "Engine degraded: Jupiter unreachable",
+    action: "Check status.jup.ag and the engine logs. Orders are NOT firing while this is active.",
+  },
+};
+
+async function emitDegradedAlert(bot, adminTgId, status, row) {
+  const copy = DEGRADED_STATUS_COPY[status] || {
+    title: `Engine degraded: ${status}`,
+    action: "Unknown degraded status — check engine logs.",
+  };
+  const now = Date.now();
+  const reAlertDue = lastAlertedDegradedStatus === status
+    ? (now - lastDegradedAlertAt > DEGRADED_RE_ALERT_MS)
+    : true;
+  if (!reAlertDue) return;
+  try {
+    await bot.api.sendMessage(
+      adminTgId,
+      [
+        `${copy.title}`,
+        "",
+        `Service: \`limit_close_watcher\` (magpie-limitclose)`,
+        `Last tick: just now`,
+        `Last tick status: \`${status}\``,
+        `Armed orders right now: ${row.armed_count}`,
+        "",
+        `Action: ${copy.action}`,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+    lastAlertedDegradedStatus = status;
+    lastDegradedAlertAt = now;
+  } catch (err) {
+    console.warn("[engine-heartbeat-watch] degraded DM failed:", err.message?.slice(0, 80));
+  }
+}
 
 async function tick(bot) {
   const adminTgId = getAdminId();
@@ -42,7 +92,7 @@ async function tick(bot) {
   let row;
   try {
     const r = await query(
-      `SELECT last_tick_at, armed_count
+      `SELECT last_tick_at, last_tick_status, armed_count
          FROM engine_heartbeats
         WHERE id = 1 AND service = 'limit_close_watcher'`,
     );
@@ -62,13 +112,31 @@ async function tick(bot) {
   // Find the most severe tier we've crossed.
   const crossed = [...TIERS].reverse().find((t) => staleMs >= t.stale_ms);
   if (!crossed) {
-    // Healthy — clear alert state so a future outage re-alerts.
-    if (lastAlertedTier) {
-      // Recovery DM (low-noise; only fires once per recovery)
+    // Heartbeat is fresh. But the engine can be "alive but degraded"
+    // — e.g. last_tick_status = 'jupiter_degraded' means the engine is
+    // ticking fine but its upstream price source is dead, so orders
+    // silently can't fire. Surface that as its own alert path so the
+    // operator knows the engine is alive AND that there's a problem.
+    const status = row.last_tick_status || "ok";
+    if (status !== "ok") {
+      await emitDegradedAlert(bot, adminTgId, status, row);
+    } else if (lastAlertedDegradedStatus) {
+      // Recovery from a previous degraded state (jupiter back up, etc.)
       try {
         await bot.api.sendMessage(
           adminTgId,
-          `✅ Engine back online — last tick ${Math.round(staleMs / 1000)}s ago, ${row.armed_count} armed.`,
+          `Engine status back to 'ok' (was '${lastAlertedDegradedStatus}'). ${row.armed_count} armed.`,
+          { parse_mode: "Markdown" },
+        );
+      } catch { /* noop */ }
+      lastAlertedDegradedStatus = null;
+    }
+    // Standard "engine back online from stale" recovery DM
+    if (lastAlertedTier) {
+      try {
+        await bot.api.sendMessage(
+          adminTgId,
+          `Engine back online — last tick ${Math.round(staleMs / 1000)}s ago, ${row.armed_count} armed.`,
           { parse_mode: "Markdown" },
         );
       } catch { /* noop */ }
