@@ -378,6 +378,69 @@ async function probeStaleSupport(bot) {
  * Operator-stated mandate: "make sure we have parameters in place
  * for this to NEVER happen again." Probe is the early-warning leg.
  */
+/**
+ * Loan program_id drift probe — alerts if DB program_id disagrees
+ * with the on-chain owner of the loan PDA.
+ *
+ * Background: 2026-06-13 incident — V2 RWA loans were silently
+ * recorded with V1's program_id because recordLoan's fall-through
+ * default. The wallet-scoped filter in the dashboard re-derives
+ * loan PDAs using the DB program_id; when it's wrong the loan
+ * silently disappears from the user's UI. Operator caught it via
+ * a missing $SPCX loan.
+ *
+ * This probe samples the most-recent N active loans, looks up each
+ * on-chain owner, and compares to the stored program_id. Any
+ * mismatch is flagged. Sample size kept small (N=20) so the probe
+ * stays cheap; coverage by recency catches new mis-records fast
+ * while old loans get caught by the next full backfill.
+ */
+async function probeLoanProgramIdDrift(bot) {
+  const KIND = "loan_program_id_drift";
+  let mismatches = [];
+  let scanned = 0;
+  try {
+    const { rows } = await query(
+      `SELECT id, loan_pda, program_id FROM loans
+        WHERE status = 'active'
+          AND loan_pda IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 20`,
+    );
+    scanned = rows.length;
+    if (scanned === 0) return;
+    const { Connection, PublicKey } = await import("@solana/web3.js");
+    const conn = new Connection(process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
+    for (const r of rows) {
+      try {
+        const info = await conn.getAccountInfo(new PublicKey(r.loan_pda));
+        if (!info?.owner) continue;
+        const onChain = info.owner.toBase58();
+        if (onChain !== r.program_id) {
+          mismatches.push({ id: r.id, loan_pda: r.loan_pda, db: r.program_id, chain: onChain });
+        }
+      } catch { /* RPC blip — skip; next probe will retry */ }
+    }
+  } catch (err) {
+    console.warn("[self-monitor] loan_program_id_drift probe threw:", err.message);
+    return;
+  }
+  const isBad = mismatches.length > 0;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    const detail = mismatches.slice(0, 5)
+      .map((m) => `loan #${m.id} db=${m.db.slice(0, 8)}… chain=${m.chain.slice(0, 8)}…`)
+      .join("; ");
+    await alertIfNew(bot, KIND,
+      `Loan program_id drift: ${mismatches.length} of ${scanned} sampled active loans have DB program_id != on-chain owner. ` +
+      `These loans will silently disappear from wallet-scoped UI. Detail: ${detail}. Run the backfill script to repair.`,
+      mismatches.length >= 3 ? "crit" : "warn",
+    );
+  } else {
+    await alertRecovery(bot, KIND, `Loan program_id matches on-chain for ${scanned} sampled active loans.`);
+  }
+}
+
 async function probeCreditCoverage(bot) {
   const KIND = "credit_coverage_gap";
   let audit;
@@ -417,6 +480,7 @@ async function tick(bot) {
       probeMigrationsFailed(bot).catch((e) => console.warn("[self-monitor] migrations probe threw:", e.message)),
       probeTwapWatchdogMisses(bot).catch((e) => console.warn("[self-monitor] twap_watchdog probe threw:", e.message)),
       probeEngineTopupWallet(bot).catch((e) => console.warn("[self-monitor] engine_topup probe threw:", e.message)),
+      probeLoanProgramIdDrift(bot).catch((e) => console.warn("[self-monitor] program_drift probe threw:", e.message)),
       probeStaleSupport(bot).catch((e) => console.warn("[self-monitor] stale_support probe threw:", e.message)),
       probeCreditCoverage(bot).catch((e) => console.warn("[self-monitor] credit_coverage probe threw:", e.message)),
     ]);
