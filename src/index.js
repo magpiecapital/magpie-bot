@@ -256,6 +256,11 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
   bot.command(["lc-status", "lcstatus", "lc_status"], lcStatus.handleLcStatus);
   const lcPerf = await import("./commands/lc-perf.js");
   bot.command(["lc-perf", "lcperf", "lc_perf"], lcPerf.handleLcPerf);
+  const scanImp = await import("./commands/scan-impersonators.js");
+  bot.command(
+    ["scan-impersonators", "scanimpersonators", "scan_impersonators"],
+    scanImp.handleScanImpersonators,
+  );
 }
 // F-4 multi-step approval — second-admin sign-off for sensitive commands.
 // Default gated commands: enablemint, disablemint, broadcast (tunable via
