@@ -441,6 +441,205 @@ export async function handleAgentLimitCloseGet(req, params) {
 }
 
 /**
+ * POST /api/v1/internal/agent/limit-close/preflight
+ *
+ * Same body shape as /arm. Runs every gate armOrder runs (collateral
+ * allowlist, runArmPreflight, immediate-fire guard, SL solvency floor,
+ * liquidity bump derivation) but does NOT INSERT a row and does NOT
+ * count against the per-user concurrency cap.
+ *
+ * Why this exists: agents pay x402 per /arm call. A rejected /arm
+ * burns the agent's fee with no value back. /preflight is FREE (no
+ * x402 ladder on the magpie-x402 side) and lets the agent ask "would
+ * this exact arm succeed right now?" — economically rational for
+ * agents to call before paying.
+ *
+ * Returns the same { ok: true, ... } shape as /arm on success and the
+ * same error codes on failure. The only difference is dryRun=true is
+ * surfaced in the response so the agent can distinguish a preflight
+ * result from a real arm.
+ *
+ * The preflight check is a strong hint, not a contractual reservation.
+ * Liquidity can shift between preflight and arm, so a successful
+ * preflight does NOT guarantee a subsequent arm will succeed. Agents
+ * should still be prepared to handle arm-time rejections.
+ */
+export async function handleAgentLimitClosePreflight(req) {
+  if (!INTERNAL_API_TOKEN) {
+    return { status: 503, body: { error: "service_not_configured" } };
+  }
+  if (!constantTimeEqual(req.headers["x-internal-token"], INTERNAL_API_TOKEN)) {
+    return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  // No agentArmDisabled() check here — preflight is read-only and
+  // returning useful info even while the kill switch is on lets
+  // agents know to back off cleanly.
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return { status: 400, body: { error: "Invalid JSON body" } };
+  }
+
+  // Same shape parsing as /arm. Default direction 'above' for back-compat.
+  const userWallet       = String(body?.user_wallet ?? "");
+  const agentPubkey      = String(body?.agent_pubkey ?? "");
+  const loanIdRaw        = String(body?.loan_id ?? "");
+  const triggerKind      = String(body?.trigger_kind ?? "");
+  const triggerDirection = String(body?.trigger_direction ?? "above");
+  const triggerValueMicroRaw = String(body?.trigger_value_micro ?? "");
+  const slippageBpsRaw   = body?.slippage_bps;
+  const sellDestination  = String(body?.sell_destination ?? "sol").toLowerCase();
+  const expiresAt        = body?.expires_at ? String(body.expires_at) : null;
+  const autoEscalateRaw  = body?.auto_escalate_slippage;
+  const autoEscalate     = autoEscalateRaw === true;
+
+  // Shape validation (same set as /arm)
+  if (!isValidPubkey(userWallet))  return bad("invalid_user_wallet");
+  if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
+  if (!/^\d+$/.test(loanIdRaw))    return bad("invalid_loan_id");
+  if (!VALID_TRIGGER_KINDS.has(triggerKind)) return bad("invalid_trigger_kind");
+  if (!VALID_TRIGGER_DIRECTIONS.has(triggerDirection)) return bad("invalid_trigger_direction");
+  if (!/^\d+$/.test(triggerValueMicroRaw))   return bad("invalid_trigger_value");
+  let triggerValueMicro;
+  try { triggerValueMicro = BigInt(triggerValueMicroRaw); } catch { return bad("invalid_trigger_value"); }
+  if (triggerValueMicro < MIN_TRIGGER_VALUE_MICRO || triggerValueMicro > MAX_TRIGGER_VALUE_MICRO) {
+    return bad("trigger_value_out_of_range");
+  }
+  if (!Number.isInteger(slippageBpsRaw) || slippageBpsRaw < 10 || slippageBpsRaw > MAX_INITIAL_SLIPPAGE_BPS_PROTOCOL) {
+    return bad("invalid_slippage_bps");
+  }
+  const slippageBps = slippageBpsRaw;
+  if (!VALID_DESTINATIONS.has(sellDestination)) return bad("invalid_sell_destination");
+  if (expiresAt && Number.isNaN(Date.parse(expiresAt))) return bad("invalid_expires_at");
+
+  // Delegation lookup (same auth model as /arm)
+  const { rows: [delegation] } = await query(
+    `SELECT id,
+            max_per_order_lamports::text AS max_per_order_lamports,
+            max_active_orders,
+            max_slippage_bps,
+            expires_at,
+            user_id
+       FROM agent_delegations
+      WHERE user_wallet = $1
+        AND agent_pubkey = $2
+        AND action = 'limit_close'
+        AND status = 'active'`,
+    [userWallet, agentPubkey],
+  );
+  if (!delegation) {
+    return { status: 403, body: { error: "no_active_delegation" } };
+  }
+  if (delegation.expires_at && new Date(delegation.expires_at) < new Date()) {
+    return { status: 403, body: { error: "delegation_expired" } };
+  }
+
+  // Wallet binding + loan owed lookup (same as /arm)
+  const { rows: [walletGuard] } = await query(
+    `SELECT l.loan_id::text AS loan_id_chain,
+            l.original_loan_amount_lamports::text AS owed
+       FROM loans l
+       JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
+      WHERE l.user_id = $2 AND l.loan_id = $3`,
+    [userWallet, delegation.user_id, loanIdRaw],
+  );
+  if (!walletGuard) {
+    return { status: 404, body: { error: "loan_not_found_for_wallet" } };
+  }
+
+  // Delegation BOUNDS (same as /arm)
+  if (BigInt(walletGuard.owed) > BigInt(delegation.max_per_order_lamports)) {
+    return {
+      status: 403,
+      body: {
+        error: "order_exceeds_delegation_cap",
+        loan_owed_lamports: walletGuard.owed,
+        max_per_order_lamports: delegation.max_per_order_lamports,
+      },
+    };
+  }
+  if (slippageBps > delegation.max_slippage_bps) {
+    return {
+      status: 403,
+      body: {
+        error: "slippage_exceeds_delegation_cap",
+        requested_bps: slippageBps,
+        max_allowed_bps: delegation.max_slippage_bps,
+      },
+    };
+  }
+  // Note: per-agent concurrency cap is INTENTIONALLY skipped on preflight
+  // for the same reason armOrder skips user concurrency in dryRun — a
+  // preflight is a question, not a slot commitment.
+
+  // Hand off to armOrder() in dryRun mode
+  const capBps = autoEscalate ? delegation.max_slippage_bps : slippageBps;
+  const armResult = await armOrder({
+    userId: delegation.user_id,
+    source: "agent_x402",
+    sourceAgentPubkey: agentPubkey,
+    loanIdChain: loanIdRaw,
+    triggerKind,
+    triggerValueMicro,
+    triggerDirection,
+    slippageBps,
+    sellDestination,
+    expiresAt,
+    autoEscalate,
+    capBps,
+    preflightProtocolFeeBps: 100,
+    dryRun: true,
+  });
+
+  if (!armResult.ok) {
+    const status = ARM_ERROR_STATUS[armResult.error] || 409;
+    return {
+      status,
+      body: {
+        ok: false,
+        preflight: true,
+        error: armResult.error,
+        ...(armResult.detail != null ? { detail: armResult.detail } : {}),
+        ...(armResult.suggestedSlippageBps != null
+          ? { suggested_slippage_bps: armResult.suggestedSlippageBps,
+              your_slippage_bps: armResult.yourSlippageBps,
+              cap_used_for_check_bps: capBps }
+          : {}),
+      },
+    };
+  }
+
+  const appliedInitialBps   = armResult.initialSlippageBpsApplied;
+  const originalRequestedBps = armResult.initialSlippageBpsRequested;
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      preflight: true,
+      would_arm: true,
+      loan_id: walletGuard.loan_id_chain,
+      trigger_kind: triggerKind,
+      trigger_value_micro: triggerValueMicro.toString(),
+      slippage_bps: appliedInitialBps,
+      sell_destination: sellDestination,
+      auto_escalate_slippage: autoEscalate,
+      max_slippage_bps_cap: capBps,
+      initial_slippage_bps: appliedInitialBps,
+      // Same liquidity-bump surfacing as /arm
+      ...(appliedInitialBps !== originalRequestedBps
+        ? {
+            slippage_bps_requested: originalRequestedBps,
+            liquidity_floor_bps: armResult.liquidityTierFloorBps,
+            liquidity_usd: armResult.liquidityUsd,
+          }
+        : {}),
+    },
+  };
+}
+
+/**
  * GET /api/v1/internal/agent/limit-close/list?agent=<pubkey>&status=<armed|all>
  *
  * List orders armed by this agent. Default status filter is 'armed'
