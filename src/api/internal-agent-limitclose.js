@@ -57,6 +57,7 @@ const ARM_ERROR_STATUS = {
   trigger_would_fire_immediately: 409,
   sl_below_solvency: 409,
   loan_already_has_active_order: 409,
+  loan_already_has_active_order_in_direction: 409,
   // concurrency → 429
   user_concurrency_cap_reached: 429,
   // server-side failures → 500
