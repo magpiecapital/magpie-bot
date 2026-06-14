@@ -3,6 +3,7 @@ import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2 } from "../solana/program
 import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+import { getBurnSummary } from "../services/magpie-burns.js";
 
 // Helper: fetch a single pool's on-chain snapshot for the /stats roll-up.
 // Pool layouts are identical between V1 and V2 across the fields we read
@@ -204,6 +205,16 @@ export async function handleStats(ctx) {
       }
     } catch { /* migration 059 not applied yet — degrade silently */ }
 
+    // $MAGPIE BURNED — read from the magpie_burns ledger so the figure
+    // sums every burn path (default-driven, manual operator burns, future
+    // buybacks). Single source of truth shared with the site /api/v1/stats
+    // endpoint, Pip, and the dashboard tile. Degrades silently on missing
+    // migration 061.
+    let burnSummary = null;
+    try {
+      burnSummary = await getBurnSummary();
+    } catch { /* migration 061 not applied yet — degrade silently */ }
+
     // HEADLINE: lifetime cumulative SOL ever borrowed — DB SUM across
     // all loan rows (pool-agnostic; both V1 and V2 borrows land in
     // `loans` via the same recordLoan path). On-chain `totalBorrowed`
@@ -269,6 +280,23 @@ export async function handleStats(ctx) {
               ? [row("Pending distribute", `${fmtSol(defaultsAwaitingDistribution.toString())} SOL`)] : []),
             ...(magpieBurnPendingCount > 0 || magpieBurnedCount > 0
               ? [row("$MAGPIE burns", `${magpieBurnedCount} done / ${magpieBurnPendingCount} pending`)] : []),
+          ]
+        : []),
+      // $MAGPIE BURNED — supply contraction headline. Renders whenever
+      // the ledger has any entry (always true once the migration's
+      // baseline-burn seed lands).
+      ...(burnSummary && BigInt(burnSummary.total_raw) > 0n
+        ? [
+            ``,
+            `$MAGPIE BURNED (supply contraction)`,
+            row("Total burned", `${burnSummary.total_tokens} $MAGPIE`),
+            row("Burn events", String(burnSummary.burn_count)),
+            ...(BigInt(burnSummary.by_source.liquidation_default) > 0n
+              ? [row("  via defaults", `${burnSummary.by_source_tokens.liquidation_default}`)] : []),
+            ...(BigInt(burnSummary.by_source.manual) > 0n
+              ? [row("  manual", `${burnSummary.by_source_tokens.manual}`)] : []),
+            ...(BigInt(burnSummary.by_source.buyback) > 0n
+              ? [row("  buybacks", `${burnSummary.by_source_tokens.buyback}`)] : []),
           ]
         : []),
       RULE,
