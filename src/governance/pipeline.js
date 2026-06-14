@@ -143,12 +143,39 @@ export async function processProposal(proposal) {
       // Close-time mode — DB-backed snapshot. No file to find/verify.
       snapshotIdForTally = closeSnapshotId;
     } else {
-      // Activation-mode (legacy): load the operator-private snapshot file.
-      snapshotPath = findSnapshotFile(proposal.snapshot_id ?? proposalId);
-      if (!snapshotPath) {
-        await log("tally", "failed", { snapshot_dir: SNAPSHOT_DIR }, "no_snapshot_file_found", Date.now() - t0);
-        await markPipelineError(proposalId, "no_snapshot_file_found");
-        return "pipeline_error";
+      // Activation-mode. Prefer the DB-loaded snapshot when present —
+      // this is the only path that works on Railway (the operator's
+      // .magpie-private/snapshots/ filesystem isn't deployed). Falls
+      // back to the on-disk file only when the DB doesn't carry the
+      // snapshot yet (operator-CLI close-time tally bootstrap path).
+      //
+      // 2026-06-14: this DB-first fallback exists because MGP-001
+      // ratified silently in the DB but the autopilot threw
+      // no_snapshot_file_found every 5 min for 15+ hours, blocking
+      // implementation_plan execution. See
+      // [[project_magpie_outage_2026_06_14_neon_quota]] note about the
+      // adjacent autopilot silent-failure that surfaced the same day.
+      const registrySnapshotId = proposal.snapshot_id ?? proposalId;
+      let snapshotInDb = false;
+      try {
+        const { loadEligibleVotersFromDb } = await import("./tally.js");
+        const eligible = await loadEligibleVotersFromDb(registrySnapshotId);
+        snapshotInDb = !!(eligible && eligible.size > 0);
+      } catch { /* fall through to file lookup */ }
+      if (snapshotInDb) {
+        snapshotIdForTally = registrySnapshotId;
+      } else {
+        snapshotPath = findSnapshotFile(registrySnapshotId);
+        if (!snapshotPath) {
+          await log("tally", "failed", { snapshot_dir: SNAPSHOT_DIR }, "no_snapshot_file_found", Date.now() - t0);
+          await markPipelineError(proposalId, "no_snapshot_file_found");
+          await operatorDm(
+            `AUTOPILOT HALT: ${proposalId} — snapshot not in DB and no on-disk file found at ${SNAPSHOT_DIR}. ` +
+              `Either upload the snapshot JSON to the bot, populate governance_snapshot_weights for snapshot_id=${registrySnapshotId}, ` +
+              `or set the proposal to snapshot_mode='at_close' for future runs.`,
+          );
+          return "pipeline_error";
+        }
       }
     }
     // questionId MUST match what the vote-submission API stored. Votes
@@ -412,6 +439,40 @@ async function markPipelineError(proposalId, reason) {
       WHERE proposal_id = $2`,
     [reason, proposalId],
   );
+  // 2026-06-14: paged-failure alert. Operator should hear about any
+  // sustained pipeline_error within a tick or two, not when they
+  // happen to look at logs 15 hours later (MGP-001 close-day pattern).
+  //
+  // We only alert if THIS is a NEW error (no anomaly_flags entry was
+  // already there) OR if the same error has now been observed at
+  // least PIPELINE_ERROR_ALERT_THRESHOLD ticks in a row. The
+  // governance_autopilot_state.last_run_status table already
+  // distinguishes consecutive vs first-time via the previous record;
+  // we re-page once per N consecutive failures so the operator
+  // doesn't get spammed during sustained outages.
+  try {
+    const { rows: [agg] } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM governance_proposal_step_audit
+        WHERE proposal_id = $1
+          AND status IN ('failed','halted')
+          AND step_at > NOW() - INTERVAL '1 hour'`,
+      [proposalId],
+    );
+    const recentFailures = agg?.n ?? 1;
+    // Page on first failure AND every 12th failure after (5min ticks
+    // -> 12 = ~1h apart). Anything in between is the silent middle
+    // where the operator already got the first alert.
+    if (recentFailures === 1 || recentFailures % 12 === 0) {
+      await operatorDm(
+        `AUTOPILOT FAILED: ${proposalId} pipeline returned \`${reason}\` ` +
+          `(consecutive recent failures in last hour: ${recentFailures}). ` +
+          `Check /gov-status. Auto-paging resumes every ~1h until resolved.`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[gov-autopilot] page-on-error helper threw: ${err.message?.slice(0, 120)}`);
+  }
 }
 
 /**
