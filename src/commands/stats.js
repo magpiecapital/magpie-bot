@@ -262,8 +262,15 @@ export async function handleStats(ctx) {
       row("Protocol reserve (10%)",`${fmtSol(reserveAccrued.toString())} SOL`),
       row("Total accruing",        `${fmtSol(totalAccrued.toString())} SOL`),
       ``,
-      `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
-      ...snapshotHistoryRows,
+      // Prior-snapshots section only renders once at least one snapshot
+      // has happened. Until then, hide the section entirely — operator
+      // prefers terse output over an empty placeholder.
+      ...(priorSnapshots.length > 0
+        ? [
+            `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
+            ...snapshotHistoryRows,
+          ]
+        : []),
       // Defaulted-loan profit section. Only renders when ANY meaningful
       // signal is present, to avoid noisy empty rows on fresh deploys.
       ...((defaultProfitLifetime > 0n || defaultedLoansWithProfit > 0 ||
