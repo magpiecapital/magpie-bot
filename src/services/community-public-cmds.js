@@ -1248,7 +1248,7 @@ export async function handleCommunityFaq(ctx) {
     `Yes — zero penalty. You only pay the upfront tier fee (Express 3% / Quick 2% / Standard 1.5%).`,
     ``,
     `*"Why are the terms so short?"*`,
-    `Short terms + low LTV are why our lifetime liquidation rate stays under 1% across 299+ loans. Memecoin volatility is high; long terms would mean way more liquidations. Live count: /liquidations`,
+    `Short terms + low LTV keep our liquidation rate low — memecoin volatility is high and long terms would mean way more liquidations. For the exact current rate, see /stats (live from on-chain data).`,
     ``,
     `*"Can I switch tiers mid-loan?"*`,
     `No — close the loan with /repay, then open a new one in the tier you want.`,
