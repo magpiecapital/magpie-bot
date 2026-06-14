@@ -811,6 +811,15 @@ bot.start({
     // Loan reconciler — proactively syncs DB state with on-chain truth
     // every 5 min. Catches partial-repay/extend/liquidation drift.
     setTimeout(() => startLoanReconciler(), 45_000);
+    // Liquidation economics watcher (2026-06-14 policy, Phase 1A) —
+    // tracks per-default principal vs sale proceeds and the
+    // pre-computed 70/10/10/10 distribution splits. Data capture
+    // only; the actual SOL routing happens in Phase 2. $MAGPIE
+    // collateral defaults stay 'magpie_burn_pending' until the
+    // operator manually conducts the burn.
+    import("./services/liquidation-economics-watcher.js").then((m) =>
+      m.startLiquidationEconomicsWatcher(),
+    );
     // Exploit-detector — auto-bans wallets/users matching the
     // pump-and-borrow attack pattern, alerts on weaker signals.
     // Multi-signal requirement (outcome + profile) keeps false-positive
