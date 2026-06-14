@@ -175,8 +175,10 @@ import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
+import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
 import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
+import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -894,6 +896,10 @@ bot.start({
     // wallet-scoped filtering on the dashboard never silently drops
     // a loan due to stale/wrong program_id.
     setTimeout(() => startLoanProgramIdHealer(bot), 115_000);
+    // engine_program_id NULL sentinel — DMs admin if any post-2026-06-13
+    // limit_close_orders row is missing engine_program_id. Closes the
+    // silent-wrong-pool-fire failure mode flagged in the V3 audit.
+    setTimeout(() => startLimitCloseEngineProgramIdSentinel(bot), 120_000);
     // Loan actual-received watchdog — backfills + verifies the
     // on-chain SOL delta per borrow row. Catches the class of bug
     // where the dashboard shows ~$1 more "received" than the
@@ -906,6 +912,11 @@ bot.start({
     // limit-close shipped 2026-06-13; this watcher closes the loop
     // by announcing when production validates it.
     setTimeout(() => startFirstV2FireWatcher(bot), 145_000);
+    // First V3 limit-close fire watcher — two prongs: celebrate the first
+    // successful V3 fire AND alert on the first V3 fire FAILURE so the
+    // operator hears about a broken executeRepayLoanV3 path BEFORE more
+    // orders pile up. Closes the V3-engine-readiness gap from the audit.
+    setTimeout(() => startLimitCloseFirstV3FireWatcher(bot), 150_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
