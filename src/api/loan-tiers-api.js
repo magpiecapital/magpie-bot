@@ -46,12 +46,19 @@ export async function handleLoanTiers(req, url) {
   }
 
   const isRwa = ["stock", "etf", "metal"].includes(categoryRaw);
+  // Report which source the tiers actually came from so callers can
+  // tell V2-DB-tunable rwa_loan_tiers apart from V3-baked V3_RWA_TIERS
+  // without having to know about env-flag routing.
+  const v3RwaRoutingOn = !!process.env.PROGRAM_ID_V3 && process.env.ROUTE_RWA_TO_V3 === "true";
+  const source = isRwa
+    ? (v3RwaRoutingOn ? "V3_RWA_TIERS" : "rwa_loan_tiers")
+    : "MEMECOIN_TIERS";
   return {
     status: 200,
     headers: { "Cache-Control": "public, max-age=60, s-maxage=60" },
     body: {
       category: categoryRaw,
-      source: isRwa ? "rwa_loan_tiers" : "MEMECOIN_TIERS",
+      source,
       tiers: tiers.map((t) => ({
         option: t.option,
         ltv_pct: t.ltv,
