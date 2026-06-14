@@ -162,6 +162,64 @@ async function showPerf(ctx, windowKey) {
     [V1_PROGRAM_ID, V2_PROGRAM_ID],
   );
 
+  // ── Trailing-stop telemetry ──
+  // Trailing rolls live in trailing_distance_bps (mig 057). Counting
+  // armed/fired separately lets the operator see if trailing stops
+  // are actually firing more often than fixed SLs — the strategic
+  // argument for trailing is "fires later in pumps, captures more
+  // upside before retracing". The fire rate spread vs fixed SL is
+  // what tells us if the strategy is working.
+  let trailingSummary = null;
+  try {
+    const { rows: trailRows } = await query(
+      `SELECT status, COUNT(*)::int AS n
+         FROM limit_close_orders
+        WHERE trailing_distance_bps IS NOT NULL ${sqlClause}
+        GROUP BY status`,
+    );
+    if (trailRows.length > 0) {
+      const tally = { armed: 0, fired: 0, failed: 0, cancelled: 0, expired: 0 };
+      for (const r of trailRows) {
+        if (tally[r.status] != null) tally[r.status] = r.n;
+      }
+      const trailTotal = tally.fired + tally.failed;
+      const trailFireRate = trailTotal > 0 ? ((tally.fired / trailTotal) * 100).toFixed(1) : "—";
+      trailingSummary = { ...tally, fireRate: trailFireRate };
+    }
+  } catch (err) {
+    console.warn("[lc-perf] trailing telemetry read failed:", err.message?.slice(0, 80));
+  }
+
+  // ── Bracket telemetry — count loans with BOTH TP and SL armed ──
+  // A bracket isn't a row in its own right; it's two rows on the same
+  // loan with opposite directions. We count distinct loans that have
+  // at least one of each direction armed simultaneously OR ever had
+  // a sibling auto-cancel (which proves a bracket existed).
+  let bracketSummary = null;
+  try {
+    const { rows: [bracketActive] } = await query(
+      `SELECT COUNT(*)::int AS n FROM (
+         SELECT loan_id
+           FROM limit_close_orders
+          WHERE status = 'armed' ${sqlClause}
+          GROUP BY loan_id
+         HAVING COUNT(DISTINCT COALESCE(trigger_direction, 'above')) = 2
+       ) sub`,
+    );
+    const { rows: [bracketHistorical] } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM limit_close_orders
+        WHERE cancellation_reason IN ('sibling_order_fired', 'user_cancelled_bracket')
+        ${sqlClause}`,
+    );
+    bracketSummary = {
+      currentlyActive: bracketActive?.n || 0,
+      historicalEvents: bracketHistorical?.n || 0,
+    };
+  } catch (err) {
+    console.warn("[lc-perf] bracket telemetry read failed:", err.message?.slice(0, 80));
+  }
+
   // ── Net-to-user totals (dollars users got back through the engine) ──
   const { rows: [econ] } = await query(
     `SELECT
@@ -293,6 +351,19 @@ async function showPerf(ctx, windowKey) {
           return `• ${label.padEnd(20)} total ${p.n}  fired ${p.fired}  armed ${p.armed}`;
         })),
     "",
+    ...(trailingSummary ? [
+      "*Trailing-stop orders:*",
+      `• Armed: ${trailingSummary.armed}  ·  Fired: ${trailingSummary.fired}  ·  Failed: ${trailingSummary.failed}`,
+      `• Cancelled: ${trailingSummary.cancelled}  ·  Expired: ${trailingSummary.expired}`,
+      `• Trailing fire rate: *${trailingSummary.fireRate}%* (of attempts)`,
+      "",
+    ] : []),
+    ...(bracketSummary && (bracketSummary.currentlyActive + bracketSummary.historicalEvents) > 0 ? [
+      "*Brackets (TP + SL on same loan):*",
+      `• Currently active: ${bracketSummary.currentlyActive} loan${bracketSummary.currentlyActive === 1 ? "" : "s"}`,
+      `• Bracket events in window: ${bracketSummary.historicalEvents} (siblings auto-cancelled or user-cancelled together)`,
+      "",
+    ] : []),
     "*Economic totals (fired only):*",
     `• Total proceeds:   ${fmtSol(econ?.total_proceeds)} SOL`,
     `• Loans repaid:     ${fmtSol(econ?.total_repaid)} SOL`,
