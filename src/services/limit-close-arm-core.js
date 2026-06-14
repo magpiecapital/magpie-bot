@@ -125,6 +125,20 @@ export async function armOrder({
   // is incompatible with triggerDirection='above' (TP fires at a
   // fixed target by definition); validated below.
   trailingDistanceBps = null,
+  // TP/SL ladder support. Fraction of loan collateral closed when
+  // this leg fires, in basis points (10000 = 100% = full close).
+  // The DB trigger (migration 064) enforces SUM(slice_pct) <= 10000
+  // across all armed legs per (loan_id, trigger_direction), so this
+  // function just needs to forward a valid integer 1..10000. Default
+  // 10000 preserves pre-ladder single-leg behavior for callers that
+  // don't pass it (TG /tp without slice, site arm without slice picker).
+  //
+  // Engine note: until the magpie-limitclose partial-fill PR ships,
+  // env LIMIT_CLOSE_LADDER_ENABLED gates whether < 10000 is accepted
+  // at all — the bot won't let users arm a ladder the engine can't
+  // honor end-to-end. See limit-close-arm-core.js LADDER_ENABLED
+  // check below.
+  slicePct = 10000,
   slippageBps,
   sellDestination = "sol",
   expiresAt = null,
@@ -163,6 +177,22 @@ export async function armOrder({
   }
   if (!VALID_DESTINATIONS.has(sellDestination)) {
     return { ok: false, error: "invalid_sell_destination" };
+  }
+  // ── Slice (ladder) validation ────────────────────────────────
+  if (!Number.isInteger(slicePct) || slicePct <= 0 || slicePct > 10000) {
+    return { ok: false, error: "invalid_slice_pct", detail: { allowed_range_bps: [1, 10000] } };
+  }
+  // Engine-side partial-fill ships separately. Until then, refuse any
+  // slice < 100% so the bot never accepts a ladder it can't honor.
+  // Operator unblocks by setting LIMIT_CLOSE_LADDER_ENABLED=true once
+  // the magpie-limitclose partial_repay PR has rolled out.
+  const LADDER_ENABLED = process.env.LIMIT_CLOSE_LADDER_ENABLED === "true";
+  if (slicePct < 10000 && !LADDER_ENABLED) {
+    return {
+      ok: false,
+      error: "ladder_not_yet_enabled",
+      detail: "Partial-slice TP/SL is rolling out — for now, slice_pct must be 100% (10000 bps). Engine support ships next.",
+    };
   }
   // Trailing validation. Bounded same as the migration's CHECK constraint.
   if (trailingDistanceBps != null) {
@@ -493,6 +523,7 @@ export async function armOrder({
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
           engine_program_id,
           trailing_distance_bps, peak_price_micros,
+          slice_pct,
           notes)
        VALUES ($1, $2, $3, $4,
                $5,
@@ -502,7 +533,8 @@ export async function armOrder({
                $14, $15, $16,
                $17,
                $18, $19,
-               $20)
+               $20,
+               $21)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
        triggerDirection,
@@ -521,20 +553,25 @@ export async function armOrder({
        loan.program_id || null,
        trailingDistanceBps,
        peakAtArm != null ? peakAtArm.toString() : null,
+       slicePct,
        armNote
          || (appliedInitialBps !== originalInitialBps
-           ? `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
-           : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}`)],
+           ? `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}%` : ""}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+           : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}%` : ""}`)],
     );
   } catch (err) {
+    // Slice-sum trigger (migration 064): TP/SL ladder exceeds 100%.
+    // Surface as a structured error so UI can show the over-allocation.
+    if (/TP\/SL ladder exceeds 100/i.test(err.message || "")) {
+      return {
+        ok: false,
+        error: "ladder_sum_exceeds_100",
+        detail: err.message?.slice(0, 240),
+      };
+    }
+    // (Legacy migration 047 UNIQUE is dropped by 064, but tolerate
+    // any other DB-level duplicate signal in case rollouts overlap.)
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
-      // Post migration 047, the UNIQUE is (loan_id, trigger_direction).
-      // The error means an armed TP already exists when caller asked
-      // for a TP, OR an armed SL already exists when caller asked for
-      // SL. The OTHER direction is still open for arming. Detail tells
-      // the caller which side they collided on so the UI can suggest
-      // "you already have a TP on this loan — modify or cancel it,
-      // OR arm a stop-loss instead".
       return {
         ok: false,
         error: "loan_already_has_active_order_in_direction",
