@@ -167,10 +167,9 @@ export async function handleAgentBuildRepay(req) {
   // Per-user lock check (defense-in-depth). Mirrors cosign-borrow +
   // agent-manage. Skip silently if we can't resolve a user_id.
   if (loan.borrower_wallet) {
-    const { rows: [walletRow] } = await query(
-      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-      [loan.borrower_wallet],
-    );
+    const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+    const resolvedUserId = await resolveWalletOwner(loan.borrower_wallet);
+    const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
     if (walletRow?.user_id) {
       const lockReject = await rejectIfLocked(walletRow.user_id);
       if (lockReject) return lockReject;

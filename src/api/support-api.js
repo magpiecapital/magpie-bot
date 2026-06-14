@@ -71,10 +71,9 @@ export async function handleSupportTickets(req, url) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
   }
 
-  const { rows: [w] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [wallet],
-  );
+  const { resolveWalletOwner: resolveOwner1 } = await import("../services/wallet-owner-resolver.js");
+  const wUserId = await resolveOwner1(wallet);
+  const w = wUserId ? { user_id: wUserId } : null;
   if (!w) {
     return { status: 200, body: { linked: false, tickets: [] } };
   }
@@ -190,10 +189,9 @@ export async function handleSupportDeleteTicket(req) {
   if (!sigOk) return { status: 401, body: { error: "Signature does not match signer" } };
 
   // Look up user to gate on the kill-switch BEFORE consuming a nonce.
-  const { rows: [linked] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [signerPubkey],
-  );
+  const { resolveWalletOwner: resolveOwner2 } = await import("../services/wallet-owner-resolver.js");
+  const linkedUserId = await resolveOwner2(signerPubkey);
+  const linked = linkedUserId ? { user_id: linkedUserId } : null;
   if (!linked) {
     return { status: 403, body: { error: "Signer wallet is not linked to a Magpie account" } };
   }
@@ -217,13 +215,16 @@ export async function handleSupportDeleteTicket(req) {
   // Single statement so a non-owner / wrong-status case gets the same
   // 404 as a non-existent id (no enumeration disclosure). Return user_id
   // so we can fire the security alert after deletion.
+  // We already resolved linked.user_id via the canonical resolver above,
+  // so use it directly here instead of the bug-prone inline LIMIT-1 sub-
+  // query. Keeps tickets deletable by the SAME user whose ban-check ran.
   const { rows } = await query(
     `DELETE FROM support_tickets
        WHERE id = $2
          AND status = 'closed'
-         AND user_id = (SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1)
+         AND user_id = $3
        RETURNING user_id`,
-    [signerPubkey, ticketId],
+    [signerPubkey, ticketId, linked.user_id],
   );
   if (rows.length === 0) {
     return {

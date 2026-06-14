@@ -181,10 +181,13 @@ export async function handleSyncLoan(req) {
       };
     }
     const borrowerStr = onChainNew.borrower.toBase58();
-    const { rows: [walletRow] } = await query(
-      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-      [borrowerStr],
-    );
+    // Resolve to the TG-linked user_id when available — same wallet
+    // can have multiple rows in wallets (site_native + imported); we
+    // want the user who'll actually run /repay etc. See
+    // src/services/wallet-owner-resolver.js.
+    const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+    const resolvedUserId = await resolveWalletOwner(borrowerStr);
+    const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
     if (!walletRow) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
       // agent borrow whose synthetic user was already created by the
