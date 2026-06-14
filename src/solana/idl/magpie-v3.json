@@ -97,7 +97,16 @@
       "docs": [
         "Emergency admin withdrawal — transfer wSOL directly from vault to authority.",
         "Only callable by the pool authority. Use this to recover funds that were",
-        "deposited outside the share-based deposit flow."
+        "deposited outside the share-based deposit flow.",
+        "Emergency admin withdrawal — transfer wSOL directly from vault to",
+        "authority, BYPASSING share accounting. Intended use: recover funds",
+        "that were sent directly to the vault outside the share-based deposit",
+        "flow (misroutes, fee dust, etc.). The on-chain enforcement below",
+        "guarantees the admin can NEVER drain share-backed deposits, so LP",
+        "accounting can never silently break — a class of bug that bit V1/V2",
+        "(admin_withdraw had no on-chain excess-only guard, so a careless",
+        "--all drain would leave pool.total_deposits over-stated and lock",
+        "LPs out of subsequent withdraws)."
       ],
       "discriminator": [
         160,
@@ -1627,6 +1636,11 @@
       "code": 6019,
       "name": "InvalidCategory",
       "msg": "Invalid category. Must be 0 (memecoin) or 1 (RWA)."
+    },
+    {
+      "code": 6020,
+      "name": "AdminWithdrawWouldDrainLpFunds",
+      "msg": "admin_withdraw refused: would drain share-backed LP deposits. Only excess (vault_balance - total_deposits) is admin-withdrawable."
     }
   ],
   "types": [

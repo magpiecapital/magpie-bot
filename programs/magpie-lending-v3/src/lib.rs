@@ -269,10 +269,29 @@ pub mod magpie_lending {
     /// Emergency admin withdrawal — transfer wSOL directly from vault to authority.
     /// Only callable by the pool authority. Use this to recover funds that were
     /// deposited outside the share-based deposit flow.
+    /// Emergency admin withdrawal — transfer wSOL directly from vault to
+    /// authority, BYPASSING share accounting. Intended use: recover funds
+    /// that were sent directly to the vault outside the share-based deposit
+    /// flow (misroutes, fee dust, etc.). The on-chain enforcement below
+    /// guarantees the admin can NEVER drain share-backed deposits, so LP
+    /// accounting can never silently break — a class of bug that bit V1/V2
+    /// (admin_withdraw had no on-chain excess-only guard, so a careless
+    /// --all drain would leave pool.total_deposits over-stated and lock
+    /// LPs out of subsequent withdraws).
     pub fn admin_withdraw(ctx: Context<AdminWithdraw>, amount: u64) -> Result<()> {
         require!(amount > 0, ErrorCode::InvalidAmount);
 
         let pool = &ctx.accounts.pool;
+        let vault_balance = ctx.accounts.loan_token_vault.amount;
+        // Reserve total_deposits worth of tokens for share-backed LPs — only
+        // the EXCESS over that is admin-withdrawable. If misrouted dust has
+        // been sent directly, vault_balance > total_deposits and excess is
+        // positive; otherwise excess is 0 and admin_withdraw refuses.
+        let excess = vault_balance
+            .checked_sub(pool.total_deposits)
+            .ok_or(ErrorCode::AdminWithdrawWouldDrainLpFunds)?;
+        require!(amount <= excess, ErrorCode::AdminWithdrawWouldDrainLpFunds);
+
         let authority_key = pool.authority.key();
         let seeds = &[
             b"pool".as_ref(),
@@ -420,16 +439,36 @@ pub mod magpie_lending {
 
         // Update position
         let position = &mut ctx.accounts.position;
+        // Capture pre-mutation values for the proportional reduction math
+        // below; computing them BEFORE the share subtraction avoids the
+        // post-hoc "add shares back" trick V1/V2 used (which involved an
+        // .unwrap() that read confusingly even if mathematically safe).
+        let position_shares_before = position.shares;
+        let position_deposited_before = position.deposited_amount;
         position.shares = position
             .shares
             .checked_sub(shares)
             .ok_or(ErrorCode::MathOverflow)?;
-        // Reduce deposited_amount proportionally
-        let deposit_reduction = shares
-            .checked_mul(position.deposited_amount)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(position.shares.checked_add(shares).unwrap())
-            .unwrap_or(position.deposited_amount);
+        // Reduce deposited_amount proportionally — use u128 intermediate so
+        // (shares × position.deposited_amount) doesn't overflow u64 for
+        // larger LP balances. The V1/V2 form `shares.checked_mul(deposited)`
+        // overflowed once shares × deposited crossed ~1.8e19, which is the
+        // root cause of the ~0.14 SOL withdraw cap operator hit during the
+        // 2026-06-13 remediation. This form has headroom up to u128.
+        let deposit_reduction = if position_shares_before == 0 {
+            0u64
+        } else {
+            let num = (shares as u128)
+                .checked_mul(position_deposited_before as u128)
+                .ok_or(ErrorCode::MathOverflow)?;
+            let div = num
+                .checked_div(position_shares_before as u128)
+                .ok_or(ErrorCode::MathOverflow)?;
+            // Saturating cast: a div result larger than position.deposited
+            // _amount means the proportional reduction would consume the
+            // entire deposited balance — cap there rather than overflow.
+            u64::try_from(div).unwrap_or(position_deposited_before)
+        };
         position.deposited_amount = position
             .deposited_amount
             .saturating_sub(deposit_reduction);
@@ -1903,4 +1942,6 @@ pub enum ErrorCode {
     PriceTimestampWentBackwards,
     #[msg("Invalid category. Must be 0 (memecoin) or 1 (RWA).")]
     InvalidCategory,
+    #[msg("admin_withdraw refused: would drain share-backed LP deposits. Only excess (vault_balance - total_deposits) is admin-withdrawable.")]
+    AdminWithdrawWouldDrainLpFunds,
 }
