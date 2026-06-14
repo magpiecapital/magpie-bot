@@ -32,6 +32,7 @@ import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 
 export const MAGPIE_MINT = new PublicKey(
   "9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump",
@@ -626,14 +627,18 @@ export async function snapshotAndDistribute() {
     return null;
   }
 
-  // Pre-flight: lender must cover the entire pool + safety reserve.
-  // Skipped in snapshot-only mode since no SOL moves during the snapshot.
-  const lender = loadLenderKeypair();
+  // Pre-flight: the distributor wallet must cover the entire pool +
+  // safety reserve. Skipped in snapshot-only mode since no SOL moves
+  // during the snapshot. As of 2026-06-14 this reads from the dedicated
+  // rewards distributor wallet (set via REWARDS_DISTRIBUTOR_PRIVATE_KEY);
+  // until the operator flips that env var on Railway it transparently
+  // falls back to the lender wallet, preserving prior behaviour.
+  const distributor = getRewardsDistributorKeypair();
   if (!snapshotOnly) {
-    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-    if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+    if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
       console.warn(
-        `[holder-rewards] Distribution skipped: lender ${lenderBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+        `[holder-rewards] Distribution skipped: distributor ${distributorBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
       );
       return null;
     }
@@ -811,11 +816,11 @@ export async function retryAccruedPayouts() {
   );
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
-  const lender = loadLenderKeypair();
+  const distributor = getRewardsDistributorKeypair();
   const totalNeeded = rows.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
-  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-  if (lenderBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn("[holder-rewards] Retry skipped: lender too low");
+  const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+  if (distributorBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn("[holder-rewards] Retry skipped: distributor balance too low");
     return { retried: 0, paid: 0, skipped: rows.length };
   }
 
@@ -826,14 +831,14 @@ export async function retryAccruedPayouts() {
     for (const r of batch) {
       tx.add(
         SystemProgram.transfer({
-          fromPubkey: lender.publicKey,
+          fromPubkey: distributor.publicKey,
           toPubkey: new PublicKey(r.wallet_address),
           lamports: BigInt(r.reward_lamports),
         }),
       );
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
         commitment: "confirmed",
       });
       await query(
@@ -886,26 +891,26 @@ export async function claimHolderRewards({ walletAddress }) {
       };
     }
 
-    const lender = loadLenderKeypair();
-    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-    if (lenderBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
+    const distributor = getRewardsDistributorKeypair();
+    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+    if (distributorBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
       await client.query("ROLLBACK");
       return {
         ok: false,
         reason: "treasury_low",
-        treasury_lamports: lenderBalance,
+        treasury_lamports: distributorBalance,
         required_lamports: total,
       };
     }
 
     const tx = new Transaction().add(
       SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
+        fromPubkey: distributor.publicKey,
         toPubkey: recipient,
         lamports: total,
       }),
     );
-    const signature = await sendAndConfirmTransaction(connection, tx, [lender], {
+    const signature = await sendAndConfirmTransaction(connection, tx, [distributor], {
       commitment: "confirmed",
     });
 
