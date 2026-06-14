@@ -80,31 +80,43 @@ function renderLimitCloseIntervention(p) {
 
 function renderLimitCloseArmed(p) {
   const agentLine = agentAttribution(p);
+  const direction = p.trigger_direction === "below" ? "stop" : "profit target";
   return [
-    `*Limit-close armed* — order #${p.order_id}`,
+    `*Auto-sell set up* — order #${p.order_id}`,
     ``,
     `Loan: #${p.loan_id_chain}`,
-    `Trigger: ${p.trigger_label}`,
-    `Slippage: ${(p.slippage_bps / 100).toFixed(2)}%`,
-    `Destination: ${p.sell_destination.toUpperCase()}`,
+    `${direction === "stop" ? "Stop at" : "Sell when"}: ${p.trigger_label}`,
+    `Slippage allowance: ${(p.slippage_bps / 100).toFixed(2)}%`,
+    `We pay you in: ${p.sell_destination.toUpperCase()}`,
     agentLine ? `` : null,
     agentLine,
     ``,
-    `I'll repay and sell automatically when the trigger fires.`,
+    `When the target hits, we'll repay your loan and send the proceeds to your wallet automatically.`,
   ].filter((s) => s !== null).join("\n");
 }
 
 function renderLimitCloseFired(p) {
   const agentLine = agentAttribution(p);
+  // Headline switches by direction so the user immediately knows whether
+  // their profit target or their stop hit. Falls back to the generic
+  // "Auto-sell done" if direction wasn't included in the payload.
+  let headline;
+  if (p.trigger_direction === "above") {
+    headline = `*Auto-sell DONE — profit target hit* (order #${p.order_id})`;
+  } else if (p.trigger_direction === "below") {
+    headline = `*Auto-sell DONE — stop triggered* (order #${p.order_id})`;
+  } else {
+    headline = `*Auto-sell DONE* — order #${p.order_id}`;
+  }
   return [
-    `*Limit-close FIRED* — order #${p.order_id}`,
+    headline,
     ``,
-    `Trigger: ${p.trigger_label} hit`,
-    `Repaid: ${fmtSol(p.loan_owed_lamports)} SOL · [tx](https://solscan.io/tx/${p.tx_repay})`,
-    `Sold: ${p.collateral_sold_human} ${p.collateral_symbol} → ${fmtSol(p.proceeds_lamports)} ${p.dest.toUpperCase()} · [tx](https://solscan.io/tx/${p.tx_swap})`,
-    `Fee: ${fmtSol(p.fee_lamports)} ${p.dest.toUpperCase()} (1%)`,
+    `Target: ${p.trigger_label}`,
+    `Repaid your loan: ${fmtSol(p.loan_owed_lamports)} SOL · [view tx](https://solscan.io/tx/${p.tx_repay})`,
+    `Sold ${p.collateral_sold_human} ${p.collateral_symbol} → ${fmtSol(p.proceeds_lamports)} ${p.dest.toUpperCase()} · [view tx](https://solscan.io/tx/${p.tx_swap})`,
+    `Protocol fee: ${fmtSol(p.fee_lamports)} ${p.dest.toUpperCase()} (1%)`,
     ``,
-    `Net to your wallet: *${fmtSol(p.net_to_user_lamports)} ${p.dest.toUpperCase()}*`,
+    `*You received: ${fmtSol(p.net_to_user_lamports)} ${p.dest.toUpperCase()}* — it's in your wallet now.`,
     agentLine ? `` : null,
     agentLine,
   ].filter((s) => s !== null).join("\n");
@@ -138,12 +150,12 @@ function renderLimitCloseFailed(p) {
   const agentLine = agentAttribution(p);
   const friendly = humanizeFailureReason(p.reason);
   return [
-    `*Limit-close FAILED* — order #${p.order_id}`,
+    `*Auto-sell didn't go through* — order #${p.order_id}`,
     ``,
     friendly ? friendly : `Reason: ${p.reason}`,
     p.detail ? `Detail: ${p.detail}` : null,
     ``,
-    `Your loan is *unchanged*. Set a new order with /limitclose or close manually with /repay.`,
+    `Your loan is *unchanged*. You can set a new auto-sell with /limitclose, or repay manually with /repay.`,
     agentLine ? `` : null,
     agentLine,
   ].filter((s) => s !== null).join("\n");
@@ -191,22 +203,22 @@ function renderLimitCloseRetrying(p) {
     ? (Number(p.max_slippage_bps_cap) / 100).toFixed(2)
     : null;
   return [
-    `*Working on your limit-close — order #${p.order_id}*`,
+    `*Working on your auto-sell — order #${p.order_id}*`,
     "",
-    `Your trigger hit, but the first execution would have exceeded the slippage allowance.`,
+    `Your target just hit. The first sell would have exceeded your slippage allowance, so we're retrying with a slightly wider one.`,
     "",
-    `*Slippage:* ${prevPct}% → ${newPct}%${capPct ? ` _(cap ${capPct}%)_` : ""}`,
+    `*Slippage:* ${prevPct}% → ${newPct}%${capPct ? ` _(your cap: ${capPct}%)_` : ""}`,
     "",
-    `The engine retries automatically every ~30 seconds and steps the slippage up until it fills or hits your cap. No action needed — we'll DM you with the receipt when it lands.`,
+    `We auto-retry every ~30 seconds, stepping the slippage up each time until either the sell goes through or we hit your cap. No action needed — we'll DM you the receipt when it lands.`,
     "",
-    `_If price drops back below your trigger before we fill, the order stays armed and waits._`,
+    `_If the price drops back below your target before we fill, the order stays armed and waits for the next move._`,
   ].join("\n");
 }
 
 function renderLimitCloseCancelled(p) {
   const agentLine = agentAttribution(p);
   return [
-    `*Limit-close cancelled* — order #${p.order_id}`,
+    `*Auto-sell cancelled* — order #${p.order_id}`,
     ``,
     `Reason: ${p.reason}`,
     agentLine ? `` : null,

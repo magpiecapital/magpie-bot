@@ -549,24 +549,31 @@ export function registerBorrowCallbacks(bot) {
     state.stage = "await_exits";
     pending.set(ctx.chat.id, state);
     const symbol = state.selected.symbol;
+    // Plain-language button labels. We keep the TP / SL acronyms inside
+    // the parentheses so power users still see the familiar shorthand,
+    // but the lead verb makes the action obvious to a first-time user.
     const kb = new InlineKeyboard()
-      .text("TP @ 2x", "borrow:exits:tp").text("SL @ 0.7x", "borrow:exits:sl").row()
-      .text("Bracket (TP + SL)", "borrow:exits:bracket").row()
-      .text("Custom TP", "borrow:exits:custom_tp").text("Custom SL", "borrow:exits:custom_sl").row()
-      .text("TP Ladder", "borrow:exits:ladder_tp").text("SL Ladder", "borrow:exits:ladder_sl").row()
+      .text("Sell at 2x (take profit)", "borrow:exits:tp").row()
+      .text("Sell at 0.7x (stop loss)", "borrow:exits:sl").row()
+      .text("Both — protect up & down", "borrow:exits:bracket").row()
+      .text("Custom profit target", "borrow:exits:custom_tp")
+      .text("Custom loss limit", "borrow:exits:custom_sl").row()
+      .text("Profit ladder (stages up)", "borrow:exits:ladder_tp").row()
+      .text("Loss ladder (stages down)", "borrow:exits:ladder_sl").row()
       .text("Skip — set later", "borrow:exits:skip").row()
       .text("← Change tier", "borrow:exits:retier").text("✕ Cancel", "borrow:cancel");
     await ctx.editMessageText(
       [
-        `*Set your exit strategy for ${symbol}*`,
+        `*Set your auto-sell plan for ${symbol}*`,
         "",
-        "Pre-arm now and your exits fire the moment your trigger hits — no need to come back and set them after.",
+        "Pick a plan now and we'll auto-sell your collateral the moment your target hits — no need to babysit the chart or come back later.",
         "",
-        "• *TP / SL* — one-tap at 2x / 0.7x",
-        "• *Bracket* — both legs at once",
-        "• *Custom* — type your own strike (e.g. `5x`, `$0.02`, `30m mc`)",
-        "• *Ladder* — sell in tranches across multiple targets",
-        "• *Skip* — execute the borrow only; set exits later via /takeprofit /stoploss",
+        "• *Sell at 2x* — auto-sell if price *doubles* (locks in gains). Also called \"take profit\" or _TP_.",
+        "• *Sell at 0.7x* — auto-sell if price drops *30%* (limits losses). Also called \"stop loss\" or _SL_.",
+        "• *Both* — set both an upside and a downside trigger. Whichever hits first wins.",
+        "• *Custom* — type your own target (e.g. `5x`, `$0.02`, `30m mc`, `-30%`).",
+        "• *Ladder* — sell in stages at multiple targets instead of all at once.",
+        "• *Skip* — borrow only; you can set sells later with /takeprofit or /stoploss.",
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
@@ -797,9 +804,9 @@ export function registerBorrowCallbacks(bot) {
       let kb = new InlineKeyboard();
       if (!allLegsArmed) {
         kb = kb
-          .text("TP @ 2x", `borrow:protect:tp:${result.loanId}`)
-          .text("SL @ 0.7x", `borrow:protect:sl:${result.loanId}`)
-          .text("Bracket (both)", `borrow:protect:bracket:${result.loanId}`)
+          .text("Sell at 2x (lock profit)", `borrow:protect:tp:${result.loanId}`).row()
+          .text("Sell at 0.7x (cap loss)", `borrow:protect:sl:${result.loanId}`).row()
+          .text("Both — protect both sides", `borrow:protect:bracket:${result.loanId}`)
           .row();
       }
       try {
@@ -832,11 +839,14 @@ export function registerBorrowCallbacks(bot) {
           "",
           // If exits already armed, skip the "protect this loan?" pitch.
           allLegsArmed
-            ? "/positions to check status · /limitorders to manage exits"
-            : "🛡 *Protect this loan?* Tap a button above or use",
+            ? "/positions to check status · /limitorders to manage auto-sells"
+            : "*Want to set an auto-sell?* Tap a button above, or type:",
           allLegsArmed
             ? null
-            : `\`/takeprofit ${result.loanId} at 2x\` · \`/stoploss ${result.loanId} at 0.7x\``,
+            : `\`/takeprofit ${result.loanId} at 2x\` (sell when up 2x)`,
+          allLegsArmed
+            ? null
+            : `\`/stoploss ${result.loanId} at 0.7x\` (sell if down 30%)`,
           allLegsArmed ? null : "",
           allLegsArmed ? null : "/positions to check status · /share to flex on the timeline",
         ].filter((l) => l != null).join("\n"),
@@ -907,17 +917,21 @@ export function registerBorrowCallbacks(bot) {
     state.stage = kind === "custom_tp" ? "await_custom_tp_input" : "await_custom_sl_input";
     pending.set(ctx.chat.id, state);
     await ctx.answerCallbackQuery();
-    const side = kind === "custom_tp" ? "take-profit" : "stop-loss";
+    const headline = kind === "custom_tp"
+      ? `*Auto-sell when price goes UP — ${state.selected.symbol}*`
+      : `*Auto-sell when price drops DOWN — ${state.selected.symbol}*`;
     await ctx.editMessageText(
       [
-        `*Custom ${side} strike for ${state.selected.symbol}*`,
+        headline,
         "",
-        "Type your trigger. Anything works:",
-        "• `5x` — 5× current price",
-        "• `$0.02` — exact USD price",
-        "• `30m mc` — market cap",
-        "• `0.0025 sol` — SOL-denominated",
-        kind === "custom_sl" ? "• `0.7x` or `-30%` — for stop-loss" : "• `+50%` — % gain",
+        "Type the price you want us to sell at. We accept these formats:",
+        "• `5x` — when price is 5× current",
+        "• `$0.02` — exact dollar price",
+        "• `30m mc` — when token's market cap hits 30 million",
+        "• `0.0025 sol` — exact SOL price",
+        kind === "custom_sl"
+          ? "• `0.7x` or `-30%` — when price drops to 70% (i.e. 30% off)"
+          : "• `+50%` — when price is up 50%",
         "",
         "Or tap *Back* to pick a different option.",
       ].join("\n"),
@@ -945,11 +959,13 @@ export function registerBorrowCallbacks(bot) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
-        `*${side === "tp" ? "Take-profit" : "Stop-loss"} ladder for ${state.selected.symbol}*`,
+        `*${side === "tp" ? "Profit ladder (sell on the way UP)" : "Loss-defense ladder (sell on the way DOWN)"} — ${state.selected.symbol}*`,
         "",
-        "Each leg sells a slice at its own trigger. Heads up: every leg",
-        "pays the same origination fee on its re-borrow, so 3-leg ladders",
-        "cost ~3× more in fees than a single exit.",
+        side === "tp"
+          ? "Sell your collateral in stages as the price climbs, instead of all at one target. You'll lock in some gains early and let some ride higher."
+          : "Sell your collateral in stages as the price drops, instead of all at one stop. You'll protect some capital early while leaving room for a recovery.",
+        "",
+        "_Heads up: each step is a separate sell + re-borrow, so 3 steps cost ~3× the loan fee of a single exit._",
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
