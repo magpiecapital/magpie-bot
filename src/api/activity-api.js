@@ -33,14 +33,12 @@ export async function handleActivity(req, url) {
   }
   const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(url.searchParams.get("limit") || `${DEFAULT_LIMIT}`, 10)));
 
-  const { rows: [u] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [wallet],
-  );
-  if (!u) {
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(wallet);
+  if (!resolvedUserId) {
     return { status: 200, body: { linked: false, events: [] } };
   }
-  const userId = u.user_id;
+  const userId = resolvedUserId;
 
   // Pull each event type independently. Each query is O(few-hundred) at
   // worst given the table sizes, and the indexes on user_id make them

@@ -70,10 +70,11 @@ export async function handleWalletsList(req, url) {
   if (!isValidPubkey(wallet)) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
   }
-  const { rows: [linked] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [wallet],
-  );
+  // Prefer TG-linked user (canonical), site_native otherwise. See
+  // src/services/wallet-owner-resolver.js.
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(wallet);
+  const linked = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!linked) {
     return { status: 200, body: { linked: false, wallets: [] } };
   }

@@ -619,11 +619,16 @@ export async function handleCosignBorrow(req) {
             return { status: 400, body: { error: "Collateral value computed to zero" } };
           }
           const proposedLoanLamports = Math.floor((Number(valueLamports) * ltv) / 100);
-          // Resolve user_id (linked wallet → user; or null if standalone)
-          const { rows: [walletRow] } = await query(
-            `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-            [borrowerPubkeyStr],
-          );
+          // Resolve user_id (linked wallet → user; or null if standalone).
+          // Uses the canonical resolver so we ALWAYS pick the TG-linked
+          // user_id when one exists. Without this, a wallet that has
+          // both a site_native row and an imported-into-TG row would
+          // attribute the loan to the older site_native user — and the
+          // user wouldn't see the loan in TG /repay. Caused operator
+          // report on V3 SPCX loan id=720 on 2026-06-14.
+          const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+          const resolvedUserId = await resolveWalletOwner(borrowerPubkeyStr);
+          const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
           // Per-user soft-lock check (operator can lock individual
           // users via /lock_user during investigations). Fires only if
           // we resolved a user_id — unlinked wallets can't be locked
@@ -778,10 +783,12 @@ export async function handleCosignBorrow(req) {
         recordedLoanPda = loanAccountKey.toBase58();
         const onChainLoan = await program.account.loan.fetch(loanAccountKey);
         const borrowerStr = borrowerAccountKey.toBase58();
-        const { rows: [walletRow] } = await query(
-          `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-          [borrowerStr],
-        );
+        // Same TG-preferring resolver as the proposed-loan-lamports gate
+        // above. Both must agree or recordLoan attributes to a different
+        // user than the gates validated.
+        const { resolveWalletOwner: resolveWalletOwnerForRecord } = await import("../services/wallet-owner-resolver.js");
+        const recordUserId = await resolveWalletOwnerForRecord(borrowerStr);
+        const walletRow = recordUserId ? { user_id: recordUserId } : null;
         if (walletRow) {
           await recordLoan({
             userId: walletRow.user_id,

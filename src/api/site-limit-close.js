@@ -214,10 +214,20 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
     return { ok: false, status: 500, error: "nonce_check_failed" };
   }
 
-  // Wallet ownership + custodial check
+  // Wallet ownership + custodial check.
+  // Prefer the TG-linked wallet row when multiple exist; see
+  // src/services/wallet-owner-resolver.js. We need encrypted_secret
+  // here so we can't use the helper directly — inline the same
+  // ranking so the chosen row is consistent with /repay etc.
   const { rows: [walletRow] } = await query(
-    `SELECT user_id, encrypted_secret, source
-       FROM wallets WHERE public_key = $1 LIMIT 1`,
+    `SELECT w.user_id, w.encrypted_secret, w.source
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id <> 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
     [signerPubkey],
   );
   if (!walletRow) {
@@ -248,8 +258,17 @@ export async function handleSiteLimitCloseList(req, url) {
   const wallet = url.searchParams.get("wallet") || "";
   if (!isValidPubkey(wallet)) return { status: 400, body: { error: "invalid_wallet" } };
 
+  // Same TG-preferring ranking as the arm path so the list shows
+  // orders for the wallet's canonical user_id.
   const { rows: [walletRow] } = await query(
-    `SELECT user_id, encrypted_secret FROM wallets WHERE public_key = $1 LIMIT 1`,
+    `SELECT w.user_id, w.encrypted_secret
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id <> 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
     [wallet],
   );
   if (!walletRow) {
