@@ -92,6 +92,11 @@ function parseLimitCloseArgs(text, direction = "above") {
   let slippage_bps = 200;
   let dest = "sol";
   let expire_iso = null;
+  // TP/SL ladder slice (migration 064). Default 100% (10000 bps) =
+  // single-leg full close, matching pre-ladder behavior. User opts in
+  // with `slice=25%` to arm a 25% leg, leaving 75% available for
+  // additional legs at other price targets.
+  let slice_pct = 10000;
 
   // Natural-language path: "at <value>" where <value> is either:
   //   - "<N>x"     → multiplier semantic
@@ -198,8 +203,21 @@ function parseLimitCloseArgs(text, direction = "above") {
       const parsed = parseExpiry(v);
       if (!parsed.ok) return parsed;
       expire_iso = parsed.iso;
+    } else if (k === "slice") {
+      // Accepted forms: "25%", "25", "2500bps". Bps stored as integer
+      // 1..10000. Sum across armed legs per (loan_id, direction) is
+      // enforced at INSERT time by migration 064's trigger.
+      const raw = String(v).replace(/%$/, "").replace(/bps$/i, "").trim();
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return { ok: false, error: `Invalid slice: \`${v}\`. Use a percent like \`slice=25%\`.` };
+      }
+      slice_pct = /bps$/i.test(v) ? Math.round(n) : Math.round(n * 100);
+      if (slice_pct < 1 || slice_pct > 10000) {
+        return { ok: false, error: "Slice must be between 0.01% and 100%." };
+      }
     } else {
-      return { ok: false, error: `Unknown option \`${k}=\`. Allowed: mc=, price=, slip=, dest=, expire=` };
+      return { ok: false, error: `Unknown option \`${k}=\`. Allowed: mc=, price=, slip=, dest=, expire=, slice=` };
     }
   }
 
@@ -208,7 +226,7 @@ function parseLimitCloseArgs(text, direction = "above") {
   }
   return {
     ok: true,
-    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso, multiplier },
+    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso, multiplier, slice_pct },
   };
 }
 
@@ -350,6 +368,7 @@ export async function handleLimitClose(ctx, direction = "above") {
     slippageBps: slippage_bps,
     sellDestination: dest,
     expiresAt: expire_iso,
+    slicePct: parseResult.parsed.slice_pct,
   });
 
   if (!armed.ok) {
@@ -366,6 +385,10 @@ export async function handleLimitClose(ctx, direction = "above") {
           return `Loan is below the 1 SOL minimum for limit-close orders.`;
         case "collateral_not_enabled":
           return `Collateral token is not currently enabled in the protocol.`;
+        case "invalid_slice_pct":
+          return `Slice must be between 0.01% and 100%. Try \`slice=25%\` for a 25% leg.`;
+        case "fractional_slice_not_supported_today":
+          return `Today's on-chain protocol only supports full close per leg. Multi-target arming at different prices IS supported — e.g. \`/takeprofit ${loan_id} at 1.5x\` AND \`/takeprofit ${loan_id} at 2x\`. First to trigger fires; the other auto-cancels.`;
         case "rwa_collateral_not_supported_in_v1":
           // Unreachable since 2026-06-13 (PR C flipped the arm-core
           // gate; RWA collateral is now arm-eligible end-to-end via the
@@ -936,6 +959,7 @@ export async function handleLimitOrders(ctx) {
             lc.armed_at, lc.expires_at,
             lc.trailing_distance_bps,
             lc.peak_price_micros::text AS peak_price_micros,
+            COALESCE(lc.slice_pct, 10000) AS slice_pct,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
             m.symbol AS collateral_symbol,
@@ -1003,9 +1027,14 @@ export async function handleLimitOrders(ctx) {
       const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
       peakLine = `\n   ~ peak $${fmt(peakUsd)} (floor floats with each new high)`;
     }
+    // Slice badge — surfaces ladder legs. Hidden for the default 100%
+    // case to keep single-leg display unchanged. Showing "slice 25%"
+    // tells the user this is one rung of a multi-target plan.
+    const slicePct = Number(r.slice_pct) || 10000;
+    const sliceBadge = slicePct < 10000 ? ` · slice ${(slicePct / 100).toFixed(slicePct % 100 === 0 ? 0 : 1)}%` : "";
     lines.push(
       `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
-      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}${sliceBadge}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
       "",
     );
   }
