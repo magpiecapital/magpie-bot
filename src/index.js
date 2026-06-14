@@ -774,6 +774,13 @@ bot.start({
     // auto-closes after 7d total of silence.
     import("./services/support-vigil.js").then((m) => m.startSupportVigil(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
+    // Neon quota watcher — hourly probe of Neon's HTTP API; pages
+    // the operator when usage crosses NEON_ALERT_THRESHOLD_PCT (default
+    // 70%) on compute or storage. Closes the 2026-06-14 outage class
+    // ([[project_magpie_outage_2026_06_14_neon_quota]]) by giving us a
+    // 24h+ heads-up before the quota cliff. Silent no-op if NEON_API_KEY
+    // / NEON_PROJECT_ID aren't set.
+    import("./services/neon-quota-watcher.js").then((m) => m.startNeonQuotaWatcher());
     // Extend-loan fee-wallet watcher — mitigates v1 Anchor Finding 1
     // (SECURITY-AUDIT-ANCHOR-2026-06-09.md). Polls confirmed program
     // sigs every 30s, audits extend_loan instructions, applies a
