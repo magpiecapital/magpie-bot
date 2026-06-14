@@ -382,6 +382,11 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("trailingstop", lc.handleTrailingStop);
   bot.command("ts", lc.handleTrailingStop); // memorable shortcut
   bot.command("sl", lc.handleStopLoss);
+  // Bracket = TP + SL on the same loan in a single command. Atomic:
+  // if leg 2 fails, leg 1 is rolled back so users never end up in a
+  // half-armed state. Schema/engine already allow TP+SL on same loan
+  // (migration 047 + sibling-cancel on fire).
+  bot.command(["bracket", "tpsl", "protectboth"], lc.handleBracket);
   bot.command("limitorders", lc.handleLimitOrders);
   bot.command("takeprofitorders", lc.handleLimitOrders);
   bot.command("tps", lc.handleLimitOrders);
