@@ -1,10 +1,11 @@
 /**
  * $MAGPIE Holder Rewards.
  *
- * Economics: 10% of every loan fee accrues to a holder reward pool.
- * Sourced from the protocol's 20% fee slice — LPs are unaffected (still
- * earn full 80%). Weekly snapshots distribute the pool pro-rata across
- * all on-chain $MAGPIE holders, filtering out system/DEX/CEX addresses.
+ * Economics: 70% of every loan fee accrues to a holder reward pool
+ * (post-MGP-001). The remaining 30% splits across LPs / referrers /
+ * protocol reserve. Weekly snapshots distribute the pool pro-rata
+ * across all on-chain $MAGPIE holders, filtering out
+ * system/DEX/CEX addresses.
  *
  * Holders claim their earned SOL via /claimholder (or the dashboard).
  *
