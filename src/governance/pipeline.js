@@ -259,7 +259,15 @@ export async function processProposal(proposal) {
     // which is persisted to governance_snapshots.hash_sha256 for
     // audit. Non-hash anomaly checks (vote spikes, vote-shape sanity)
     // still run for close-time mode below.
-    if (!closeSnapshotId) {
+    // File-hash tamper-detection only runs when we're using the
+    // on-disk file path. The DB-fallback path added in #203 uses
+    // governance_snapshot_weights as the trusted source; integrity is
+    // already enforced by the unique-per-(snapshot_id, voter) row
+    // semantics + the DB connection's auth surface. Without the
+    // `&& snapshotPath` guard, readFileSync(null) throws ENOENT and
+    // the pipeline fails at the anomaly step even after the DB tally
+    // succeeded — exactly the MGP-001 close-day pattern.
+    if (!closeSnapshotId && snapshotPath) {
       // Canonical hash comes from the registry (set at activation time, never
       // edited). The pipeline rejects the run if the on-disk snapshot's hash
       // doesn't match — an attacker who tampered with the snapshot file
