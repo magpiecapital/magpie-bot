@@ -1004,12 +1004,14 @@ export async function handleFundPool(ctx) {
       "Usage: `/fundpool <sol_amount|max|N%> [pool]`\n\n" +
       "• `/fundpool 5` → 5 SOL into memecoin pool (v1)\n" +
       "• `/fundpool max v2` → all lender SOL (minus 0.2 reserve) into RWA pool\n" +
-      "• `/fundpool 50% v2` → half of lender SOL into RWA pool",
+      "• `/fundpool 50% v2` → half of lender SOL into RWA pool\n" +
+      "• `/fundpool 2 v3` → 2 SOL into v3 pool (requires PROGRAM_ID_V3 env)",
       { parse_mode: "Markdown" },
     );
   }
   const isV2 = ["v2", "v2b", "rwa", "rwas", "stocks"].includes(poolArg);
-  const poolLabel = isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)";
+  const isV3 = ["v3"].includes(poolArg);
+  const poolLabel = isV3 ? "v3 pool" : (isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)");
 
   try {
     const { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
@@ -1039,16 +1041,19 @@ export async function handleFundPool(ctx) {
     }
 
     const { connection } = await import("../solana/connection.js");
-    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2 } = await import("../solana/program.js");
+    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } = await import("../solana/program.js");
     const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
     const { parseAmountInput, clampToMax } = await import("../lib/amount-input.js");
 
-    // Route to v1 or v2b based on the pool arg. If v2 was requested but
-    // PROGRAM_ID_V2 isn't configured (e.g., local dev), fail clearly.
+    // Route to v1 / v2b / v3 based on the pool arg. If v2 or v3 was
+    // requested but their PROGRAM_ID env isn't configured, fail clearly.
     if (isV2 && !PROGRAM_ID_V2) {
       return ctx.reply("❌ v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
     }
-    const programId = isV2 ? PROGRAM_ID_V2 : PROGRAM_ID;
+    if (isV3 && !PROGRAM_ID_V3) {
+      return ctx.reply("❌ v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
+    }
+    const programId = isV3 ? PROGRAM_ID_V3 : (isV2 ? PROGRAM_ID_V2 : PROGRAM_ID);
     const program = getProgramForSigner(lender, programId);
 
     // Read actual on-chain balance, parse input against it (handles "max"/"50%"
