@@ -186,6 +186,20 @@ function renderLimitCloseStalenessNudge(p) {
   ].join("\n");
 }
 
+function renderLimitCloseNearTrigger(p) {
+  const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
+  const moveDir  = p.trigger_direction === "below" ? "drops" : "moves up";
+  return [
+    `*Your ${dirLabel} is close to firing*`,
+    "",
+    `${p.collateral_symbol} is within ~${p.distance_pct}% of your trigger on order #${p.order_id}. If price ${moveDir} a touch more, the engine will repay the loan and sell automatically.`,
+    "",
+    `If your plan changed, you can /modify ${p.order_id} (tighten or widen the trigger) or /cancel ${p.order_id} now. Otherwise sit tight — we've got it.`,
+    "",
+    `_One-time nudge per arm — you won't see this again until you re-arm or modify._`,
+  ].join("\n");
+}
+
 function renderEnginePreflightFailed(p) {
   const failures = Array.isArray(p?.failures) ? p.failures : [];
   const lines = [
@@ -212,6 +226,7 @@ const RENDERERS = {
   limit_close_action_required: renderLimitCloseActionRequired,
   limit_close_intervention: renderLimitCloseIntervention,
   limit_close_staleness_nudge: renderLimitCloseStalenessNudge,
+  limit_close_near_trigger:    renderLimitCloseNearTrigger,
   engine_preflight_failed:  renderEnginePreflightFailed,
   pip_upside_alert:         renderPipUpsideAlert,
   // Downside alert reuses the same renderer — the watcher pre-renders
