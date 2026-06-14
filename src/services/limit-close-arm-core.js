@@ -184,19 +184,20 @@ export async function armOrder({
   }
   // Migration 064 keeps slice_pct as scaffolding: the column exists but
   // every armed leg is implicitly full-close (slice = 10000) until a
-  // future on-chain instruction supports fractional collateral release.
-  // Today's on-chain partial_repay only reduces debt — it doesn't
-  // release fractional collateral — so a slice<100% arm can't be
-  // honored end-to-end. Refuse it explicitly so users never see a
-  // misleading "armed" status on something the engine can't fire as
-  // promised. The env flag is here for the day the partial-close
-  // instruction lands; flipping it to true is part of that rollout.
+  // ladder semantics — when LIMIT_CLOSE_LADDER_ENABLED=true and the
+  // paired engine PR has rolled out, slice<100% arms a real ladder
+  // leg. The engine fires it by: full repay → swap slice → re-borrow
+  // remainder → migrate sibling armed orders to new loan_id. See
+  // migration 065 for the columns + sum-cap trigger that store this.
+  // When the env flag is OFF (default), refuse slice<100% with a
+  // clear message so users never see a misleading "armed" status on
+  // something the engine can't honor end-to-end.
   const LADDER_ENABLED = process.env.LIMIT_CLOSE_LADDER_ENABLED === "true";
   if (slicePct < 10000 && !LADDER_ENABLED) {
     return {
       ok: false,
       error: "fractional_slice_not_supported_today",
-      detail: "Today's on-chain protocol only supports full close per leg. For now, every TP/SL leg is implicitly 100%. Multi-target arming at different prices IS supported — arm a TP at 1.5x AND another at 2x; first to trigger fires, the other auto-cancels.",
+      detail: "Partial-slice TP/SL is rolling out. For now, slice must be 100%. Multi-target arming at different prices IS supported today — arm a TP at 1.5x AND another at 2x; first to trigger fires, the other auto-cancels.",
     };
   }
   // Trailing validation. Bounded same as the migration's CHECK constraint.
@@ -516,6 +517,38 @@ export async function armOrder({
     ? (currentMicrosForLater != null ? currentMicrosForLater : triggerBI)
     : null;
 
+  // ── Ladder group resolution (migration 065) ──────────────────
+  // When slice<100% (LIMIT_CLOSE_LADDER_ENABLED), this arm is a ladder
+  // leg. Find an existing ladder group on the same (loan_id, direction)
+  // and JOIN it — that way all legs share the same group UUID and the
+  // engine can migrate them together to a new loan_id after a leg
+  // fires + re-borrows on remainder. If no existing group, create one
+  // and snapshot the loan's collateral_amount as the absolute reference
+  // ("10%" always means 10% of THIS amount, never drifts).
+  let ladderGroupId = null;
+  let originalCollateralAmountForArm = null;
+  if (slicePct < 10000) {
+    const { rows: [existingGroup] } = await query(
+      `SELECT ladder_group_id, original_collateral_amount::text AS original_amount
+         FROM limit_close_orders
+        WHERE loan_id = $1
+          AND COALESCE(trigger_direction, 'above') = $2
+          AND status = 'armed'
+          AND ladder_group_id IS NOT NULL
+        LIMIT 1`,
+      [loan.id, triggerDirection],
+    );
+    if (existingGroup?.ladder_group_id) {
+      ladderGroupId = existingGroup.ladder_group_id;
+      originalCollateralAmountForArm = existingGroup.original_amount;
+    } else {
+      // New ladder group — generate UUID, snapshot collateral.
+      const { randomUUID } = await import("node:crypto");
+      ladderGroupId = randomUUID();
+      originalCollateralAmountForArm = loan.collateral_amount_raw;
+    }
+  }
+
   let inserted;
   try {
     inserted = await query(
@@ -529,6 +562,8 @@ export async function armOrder({
           engine_program_id,
           trailing_distance_bps, peak_price_micros,
           slice_pct,
+          ladder_group_id,
+          original_collateral_amount,
           notes)
        VALUES ($1, $2, $3, $4,
                $5,
@@ -539,7 +574,9 @@ export async function armOrder({
                $17,
                $18, $19,
                $20,
-               $21)
+               $21,
+               $22,
+               $23)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
        triggerDirection,
@@ -549,27 +586,32 @@ export async function armOrder({
        advisory ? null : effectiveCap,
        advisory ? null : (preflight.proceedsLamports || null),
        advisory ? null : (preflight.quotedAtIso || new Date().toISOString()),
-       // engine_program_id: source-of-truth for which Solana program the
-       // fill engine targets when this order fires. Pulled from the
-       // loan row (loans.program_id) which is itself derived from the
-       // on-chain owner of the loan PDA at recordLoan time. Engine
-       // treats NULL as legacy-V1 for back-compat with pre-2026-06-13
-       // rows; new arms always populate this.
        loan.program_id || null,
        trailingDistanceBps,
        peakAtArm != null ? peakAtArm.toString() : null,
        slicePct,
+       ladderGroupId,
+       originalCollateralAmountForArm,
        armNote
          || (appliedInitialBps !== originalInitialBps
-           ? `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}%` : ""}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
-           : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}%` : ""}`)],
+           ? `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}% ladder=${ladderGroupId?.slice(0,8)}` : ""}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+           : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}% ladder=${ladderGroupId?.slice(0,8)}` : ""}`)],
     );
   } catch (err) {
+    // Migration 065's sum-cap trigger: SUM(slice_pct) > 10000 across
+    // armed legs per (loan_id, direction). Surface as a structured
+    // error so the UI shows the over-allocation cleanly.
+    if (/TP\/SL ladder exceeds 100/i.test(err.message || "")) {
+      return {
+        ok: false,
+        error: "ladder_sum_exceeds_100",
+        detail: err.message?.slice(0, 240),
+      };
+    }
     // Migration 047's per-direction UNIQUE is dropped by 064 so multi-
     // target arming is allowed. Tolerate the duplicate-key signal in
     // case a stale replica is still using the pre-064 schema during
-    // rollout. The 064 deploy is single-step (no overlap window
-    // expected) so this branch should never fire in practice.
+    // rollout.
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
       return {
         ok: false,
