@@ -110,12 +110,37 @@ function renderLimitCloseFired(p) {
   ].filter((s) => s !== null).join("\n");
 }
 
+// Translates engine failure reason codes into one-line plain-language
+// explanations. Falls back to the raw code for unknown reasons so we
+// never silently drop information.
+function humanizeFailureReason(reason) {
+  switch (reason) {
+    case "max_retries_exceeded":
+      return "We retried for ~5 minutes, escalating slippage toward your cap each time, but couldn't fill within your limit. Usually means liquidity dried up.";
+    case "wallet_changed_since_borrow":
+      return "The wallet that opened this loan no longer holds the collateral. Limit orders only fire from the original borrower wallet.";
+    case "no_collateral_in_ata_post_repay":
+      return "The repay landed but the collateral wasn't where we expected at sell time — likely moved out mid-trigger.";
+    case "swap_failed_collateral_in_wallet":
+      return "The repay landed but the sell failed. The collateral is back in your wallet, ready to sell manually or via a fresh limit order.";
+    case "twap_window_exceeded":
+      return "We sliced the sell to fit your slippage cap, but the slow-trickle window ran out before all chunks filled.";
+    case "twap_window_exceeded_partial":
+      return "Some TWAP chunks filled, but the window expired before completing the rest. Check /positions for the partial state.";
+    case "wallet_changed_during_twap":
+      return "The wallet changed mid-TWAP. We stopped the slicing to protect remaining collateral.";
+    default:
+      return null; // unknown — caller falls back to raw reason line
+  }
+}
+
 function renderLimitCloseFailed(p) {
   const agentLine = agentAttribution(p);
+  const friendly = humanizeFailureReason(p.reason);
   return [
     `*Limit-close FAILED* — order #${p.order_id}`,
     ``,
-    `Reason: ${p.reason}`,
+    friendly ? friendly : `Reason: ${p.reason}`,
     p.detail ? `Detail: ${p.detail}` : null,
     ``,
     `Your loan is *unchanged*. Set a new order with /limitclose or close manually with /repay.`,
