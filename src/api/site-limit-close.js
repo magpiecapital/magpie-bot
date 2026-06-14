@@ -602,10 +602,16 @@ export async function handleSiteLimitCloseArm(req) {
  *   Slippage?: <bps integer>    — change slippage_bps
  *   Dest?: sol | usdc           — change sell_destination
  *   Expires?: <ISO|none>        — change expires_at (or "none" to clear)
+ *   Trailing?: <bps|"none">     — change trailing_distance_bps (50-5000 bps)
+ *                                  or "none" to clear trailing (back to fixed SL).
+ *                                  First-time enable seeds peak_price_micros from
+ *                                  live price; later changes recompute trigger
+ *                                  from the existing peak so the new distance is
+ *                                  live on the next watcher tick.
  *   Wallet: <pubkey>
  *   IssuedAt: <ISO>
  *
- * At least one of Price / MC / Slippage / Dest / Expires required.
+ * At least one of Price / MC / Slippage / Dest / Expires / Trailing required.
  *
  * Pairs with magpie-bot#148 (modifyOrder core) + magpie-x402#29
  * (x402 forwarder). Brings site users to parity with TG and agent
@@ -655,6 +661,18 @@ export async function handleSiteLimitCloseModify(req) {
       updates.expiresAt = new Date(fields.Expires).toISOString();
     }
   }
+  if (fields.Trailing !== undefined) {
+    const t = String(fields.Trailing).toLowerCase();
+    if (t === "none" || t === "off" || t === "0") {
+      updates.trailingDistanceBps = null;
+    } else {
+      const bps = Number(t);
+      if (!Number.isInteger(bps) || bps < 50 || bps > 5000) {
+        return { status: 400, body: { error: "invalid_trailing_distance_bps", detail: "Trailing must be an integer in [50, 5000] bps, or 'none' to clear." } };
+      }
+      updates.trailingDistanceBps = bps;
+    }
+  }
   if (Object.keys(updates).length === 0) {
     return { status: 400, body: { error: "no_changes_supplied" } };
   }
@@ -676,6 +694,8 @@ export async function handleSiteLimitCloseModify(req) {
       invalid_expires_at: 400,
       trigger_would_fire_immediately: 409,
       no_changes_supplied: 400,
+      invalid_trailing_distance_bps: 400,
+      trailing_only_valid_on_stop_loss: 409,
     };
     return {
       status: statusMap[r.error] || 409,
@@ -693,6 +713,10 @@ export async function handleSiteLimitCloseModify(req) {
       sell_destination: r.order.sell_destination,
       expires_at: r.order.expires_at,
       updated_at: r.order.updated_at,
+      // Echo trailing state so the dashboard can update its in-memory
+      // armed-order view without a separate refetch round-trip.
+      trailing_distance_bps: r.order.trailing_distance_bps ?? null,
+      peak_price_micros: r.order.peak_price_micros ?? null,
     },
   };
 }
