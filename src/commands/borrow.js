@@ -772,19 +772,44 @@ export function registerBorrowCallbacks(bot) {
       }
     }
 
+    // ── Phase 1: submit borrow tx ──────────────────────────────────
+    // This block CAN legitimately fail and surface as "Borrow failed."
+    // Below this point, the loan exists on-chain and we MUST never
+    // tell the user it failed — even if the post-tx rendering breaks.
+    let result;
     try {
-      const result = await executeBorrow({
+      result = await executeBorrow({
         userId: state.userId,
         collateralMint: state.selected.mint,
         collateralAmountRaw: state.collateralRaw,
         collateralValueLamports: currentValueLamports,
         loanOption: option,
       });
+    } catch (err) {
+      console.error("Borrow failed (pre-tx or tx submission):", err);
+      const friendly = translateTxError(err, { flow: "borrow" });
+      await say(friendly, {
+        parse_mode: "Markdown",
+        reply_markup: errorActionKeyboard({ flow: "borrow", errorKind: "tx_error" }),
+      });
+      return;
+    }
 
-      const loanAmountPreFee = Math.floor((currentValueLamports * tier.ltv) / 100);
-      const fee = Math.floor((loanAmountPreFee * tier.feeBps) / 10_000);
-      const loanAmountAfterFee = loanAmountPreFee - fee;
+    // ✓ LOAN EXISTS ON-CHAIN from here down. The user MUST receive a
+    // confirmation that includes the tx signature. Any post-tx error
+    // (DB write, exit arming, card render) is surfaced as a NOTE on
+    // top of a success confirmation — never as a generic "Borrow
+    // failed" message. The 2026-06-14 incident: Markdown render failed
+    // → catch block translated it to "Borrow failed" → user thought
+    // their loan didn't exist when it actually did. Operator: "this
+    // can NEVER happen again."
 
+    const loanAmountPreFee = Math.floor((currentValueLamports * tier.ltv) / 100);
+    const fee = Math.floor((loanAmountPreFee * tier.feeBps) / 10_000);
+    const loanAmountAfterFee = loanAmountPreFee - fee;
+
+    let recordLoanFailed = false;
+    try {
       await recordLoan({
         userId: state.userId,
         loanId: result.loanId,
@@ -800,85 +825,178 @@ export function registerBorrowCallbacks(bot) {
         borrowerWallet,
       });
       await incrementBorrowed(state.userId, loanAmountPreFee);
-
-      // Auto-arm pre-selected exits BEFORE rendering the card so the
-      // user sees confirmation in the same message. Failures are
-      // surfaced per-leg without aborting the borrow.
-      const exitArmResults = await armConfiguredExits({
-        userId: state.userId,
-        loanIdChain: result.loanId,
-        collateralMint: state.selected.mint,
-        exits: state.exits,
-      }).catch((err) => {
-        console.warn("[borrow] armConfiguredExits threw:", err.message);
-        return [{ ok: false, label: "Auto-arm", error: "internal_error" }];
-      });
-      const exitsSummary = renderExitsSummary(exitArmResults);
-      const allLegsArmed = exitArmResults.length > 0 && exitArmResults.every((r) => r.ok);
-
-      pending.delete(ctx.chat.id);
-
-      // Build inline keyboard. Hide the one-tap TP/SL/Bracket row if
-      // every pre-selected exit already armed — otherwise leave it so
-      // the user can add or retry protection.
-      let kb = new InlineKeyboard();
-      if (!allLegsArmed) {
-        kb = kb
-          .text("Sell at 2x (lock profit)", `borrow:protect:tp:${result.loanId}`).row()
-          .text("Sell at 0.7x (cap loss)", `borrow:protect:sl:${result.loanId}`).row()
-          .text("Both — protect both sides", `borrow:protect:bracket:${result.loanId}`)
-          .row();
-      }
-      try {
-        const { getOrCreateCode } = await import("../services/referrals.js");
-        const { shareBorrow } = await import("../services/share-moments.js");
-        const code = await getOrCreateCode(state.userId);
-        const card = shareBorrow({
-          symbol: state.selected.symbol,
-          receiveLamports: loanAmountAfterFee,
-          ltvPct: tier.ltv,
-          durationDays: tier.days,
-          referralCode: code,
-        });
-        kb = kb
-          .url("𝕏 Share to Twitter", card.twitterUrl)
-          .url("📨 Tell a friend", card.telegramShareUrl);
-      } catch { /* share row non-critical */ }
-
-      await say(
-        [
-          "✅ *Loan funded*",
-          "",
-          `Received: *${fmtSol(loanAmountAfterFee)} SOL*`,
-          `Repay by due date: *${fmtSol(loanAmountPreFee)} SOL*`,
-          `Term: ${tier.days} days at ${tier.ltv}% LTV`,
-          "",
-          `[View tx](https://solscan.io/tx/${result.signature})`,
-          exitsSummary ? "" : null,
-          exitsSummary,
-          "",
-          // If exits already armed, skip the "protect this loan?" pitch.
-          allLegsArmed
-            ? "/positions to check status · /limitorders to manage auto-sells"
-            : "*Want to set an auto-sell?* Tap a button above, or type:",
-          allLegsArmed
-            ? null
-            : `\`/takeprofit ${result.loanId} at 2x\` (sell when up 2x)`,
-          allLegsArmed
-            ? null
-            : `\`/stoploss ${result.loanId} at 0.7x\` (sell if down 30%)`,
-          allLegsArmed ? null : "",
-          allLegsArmed ? null : "/positions to check status · /share to flex on the timeline",
-        ].filter((l) => l != null).join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: kb },
-      );
     } catch (err) {
-      console.error("Borrow failed:", err);
-      const friendly = translateTxError(err, { flow: "borrow" });
-      await say(friendly, {
-        parse_mode: "Markdown",
-        reply_markup: errorActionKeyboard({ flow: "borrow", errorKind: "tx_error" }),
+      recordLoanFailed = true;
+      console.error("[borrow] recordLoan failed AFTER on-chain success — sync-loan will rescue:", err.message);
+      // sync-loan watcher recovers DB-side state from the on-chain loan_pda
+      // independently, so this is a soft failure for the user but worth
+      // logging at error level for the operator.
+    }
+
+    // Auto-arm pre-selected exits. Failures are per-leg and don't abort.
+    const exitArmResults = await armConfiguredExits({
+      userId: state.userId,
+      loanIdChain: result.loanId,
+      collateralMint: state.selected.mint,
+      exits: state.exits,
+    }).catch((err) => {
+      console.warn("[borrow] armConfiguredExits threw:", err.message);
+      return [{ ok: false, label: "Auto-arm", error: "internal_error" }];
+    });
+    const exitsSummary = renderExitsSummary(exitArmResults);
+    const allLegsArmed = exitArmResults.length > 0 && exitArmResults.every((r) => r.ok);
+    const anyExitFailed = exitArmResults.some((r) => !r.ok);
+
+    pending.delete(ctx.chat.id);
+
+    // Build inline keyboard. Always include the protect buttons when
+    // an exit failed or wasn't requested — gives the user a one-tap
+    // recovery path.
+    let kb = new InlineKeyboard();
+    if (!allLegsArmed) {
+      kb = kb
+        .text("Sell at 2x (lock profit)", `borrow:protect:tp:${result.loanId}`).row()
+        .text("Sell at 0.7x (cap loss)", `borrow:protect:sl:${result.loanId}`).row()
+        .text("Both — protect both sides", `borrow:protect:bracket:${result.loanId}`)
+        .row();
+    }
+    try {
+      const { getOrCreateCode } = await import("../services/referrals.js");
+      const { shareBorrow } = await import("../services/share-moments.js");
+      const code = await getOrCreateCode(state.userId);
+      const card = shareBorrow({
+        symbol: state.selected.symbol,
+        receiveLamports: loanAmountAfterFee,
+        ltvPct: tier.ltv,
+        durationDays: tier.days,
+        referralCode: code,
       });
+      kb = kb
+        .url("𝕏 Share to Twitter", card.twitterUrl)
+        .url("📨 Tell a friend", card.telegramShareUrl);
+    } catch { /* share row non-critical */ }
+
+    // ── Phase 2: render the funded-loan card ──────────────────────
+    // Try Markdown first; if Telegram rejects the formatting for ANY
+    // reason, fall back to a plain-text confirmation. If even plain
+    // text fails (Telegram down, etc.), fall back to a minimal
+    // sendMessage. The user must ALWAYS see "loan funded" — never a
+    // "borrow failed" miscommunication for a borrow that actually
+    // succeeded.
+
+    const markdownLines = [
+      "✅ *Loan funded*",
+      "",
+      `Received: *${fmtSol(loanAmountAfterFee)} SOL*`,
+      `Repay by due date: *${fmtSol(loanAmountPreFee)} SOL*`,
+      `Term: ${tier.days} days at ${tier.ltv}% LTV`,
+      "",
+      `[View tx](https://solscan.io/tx/${result.signature})`,
+      exitsSummary ? "" : null,
+      exitsSummary,
+      anyExitFailed ? "" : null,
+      anyExitFailed ? "*An exit failed to arm — tap a button below to retry.*" : null,
+      "",
+      allLegsArmed
+        ? "/positions to check status · /limitorders to manage auto-sells"
+        : "*Want to set an auto-sell?* Tap a button above, or type:",
+      allLegsArmed
+        ? null
+        : `\`/takeprofit ${result.loanId} at 2x\` (sell when up 2x)`,
+      allLegsArmed
+        ? null
+        : `\`/stoploss ${result.loanId} at 0.7x\` (sell if down 30%)`,
+      allLegsArmed ? null : "",
+      allLegsArmed ? null : "/positions to check status · /share to flex on the timeline",
+    ].filter((l) => l != null);
+
+    const plainTextLines = [
+      "Loan funded successfully",
+      "",
+      `Received: ${fmtSol(loanAmountAfterFee)} SOL`,
+      `Repay by due date: ${fmtSol(loanAmountPreFee)} SOL`,
+      `Term: ${tier.days} days at ${tier.ltv}% LTV`,
+      `Loan #${result.loanId}`,
+      "",
+      `Tx: https://solscan.io/tx/${result.signature}`,
+      exitsSummary ? "" : null,
+      // Strip markdown stars from the summary for the plain-text version.
+      exitsSummary ? exitsSummary.replace(/\*/g, "") : null,
+      anyExitFailed ? "" : null,
+      anyExitFailed ? "An exit failed to arm — tap a button below to retry." : null,
+      "",
+      allLegsArmed
+        ? "Run /positions to check status, /limitorders to manage auto-sells."
+        : "Tap a button below to set up auto-sells, or use /takeprofit and /stoploss.",
+    ].filter((l) => l != null);
+
+    let renderedOk = false;
+    try {
+      await say(markdownLines.join("\n"), {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+        reply_markup: kb,
+      });
+      renderedOk = true;
+    } catch (mdErr) {
+      console.error(
+        `[borrow] Markdown card render failed for loan ${result.loanId}, falling back to plain text:`,
+        mdErr.message,
+      );
+    }
+
+    if (!renderedOk) {
+      try {
+        await say(plainTextLines.join("\n"), {
+          disable_web_page_preview: true,
+          reply_markup: kb,
+        });
+        renderedOk = true;
+      } catch (plainErr) {
+        console.error(
+          `[borrow] Plain-text card ALSO failed for loan ${result.loanId}:`,
+          plainErr.message,
+        );
+      }
+    }
+
+    if (!renderedOk) {
+      // Last resort: a fresh sendMessage (not an edit) with no
+      // formatting and no keyboard. Even if the original message id
+      // has gone stale, this lands as a new chat message and the user
+      // sees the confirmation.
+      try {
+        await ctx.api.sendMessage(
+          ctx.chat.id,
+          `Loan #${result.loanId} funded successfully. You received ${fmtSol(loanAmountAfterFee)} SOL. Tx: https://solscan.io/tx/${result.signature}. Run /positions to manage it.`,
+        );
+      } catch (finalErr) {
+        console.error(
+          `[borrow] Even fresh sendMessage failed for loan ${result.loanId}:`,
+          finalErr.message,
+        );
+        // We've exhausted retries. The loan exists, the DB row exists,
+        // /positions will show it. Operator will see the error logs.
+      }
+    }
+
+    // Notify operator if anything went sideways after on-chain success.
+    if (!renderedOk || recordLoanFailed || anyExitFailed) {
+      try {
+        const { notifyAdmin, getNotifyBot } = await import("../services/admin-notify.js");
+        const issues = [
+          recordLoanFailed ? "recordLoan failed" : null,
+          !renderedOk ? "card render failed" : null,
+          anyExitFailed ? "exit arm failed" : null,
+        ].filter(Boolean).join(", ");
+        const adminBot = getNotifyBot();
+        if (adminBot) {
+          await notifyAdmin(
+            adminBot,
+            `/borrow post-tx issue on loan ${result.loanId} (user ${state.userId}): ${issues}. Tx: ${result.signature}`,
+          );
+        }
+      } catch { /* admin alert is best-effort */ }
     }
   }
 
