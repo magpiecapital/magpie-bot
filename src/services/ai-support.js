@@ -2451,24 +2451,55 @@ const TOOL_HANDLERS = {
   },
 
   propose_borrow: async ({ token, collateral_amount, tier }, { userId }) => {
-    // Tier lookup matches src/commands/borrow.js LTV_TIERS.
-    const TIERS = {
-      express: { option: 0, ltv: 30, days: 2, feeBps: 300, label: "Express" },
-      quick: { option: 1, ltv: 25, days: 3, feeBps: 200, label: "Quick" },
-      standard: { option: 2, ltv: 20, days: 7, feeBps: 150, label: "Standard" },
-    };
-    const t = TIERS[String(tier || "").toLowerCase()];
-    if (!t) return toolError("bad_tier", null, "Tier must be express, quick, or standard.");
-
     // Resolve token → mint via supported_mints. Must be enabled.
+    // category drives the tier ladder (memecoin vs RWA) — read it on
+    // the same query so we can pick the right ladder below.
+    //
+    // 2026-06-13 fix: previously hardcoded memecoin LTV/fee/days here,
+    // which meant Pip's borrow CARD showed 0.534 SOL (20% LTV / 1.5%
+    // fee / 7d) for RWA collateral while the on-chain V2 tx would
+    // actually issue a 2.55 SOL / 5% fee / 30d loan. User signed
+    // expecting the smaller number but Phantom prompted for the V2
+    // amount, eroding trust. Resolve the tier from rwa_loan_tiers
+    // for stock/etf/metal categories, falling back to memecoin tiers
+    // for everything else — same source of truth as the TG /borrow
+    // command (src/services/loan-tier-resolver.js).
     const trimmed = String(token || "").trim().replace(/^\$/, "");
     const isMintLike = trimmed.length >= 32;
     const lookup = isMintLike
-      ? await query(`SELECT mint, symbol, decimals, enabled FROM supported_mints WHERE mint = $1 LIMIT 1`, [trimmed])
-      : await query(`SELECT mint, symbol, decimals, enabled FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [trimmed]);
+      ? await query(`SELECT mint, symbol, decimals, enabled, category FROM supported_mints WHERE mint = $1 LIMIT 1`, [trimmed])
+      : await query(`SELECT mint, symbol, decimals, enabled, category FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [trimmed]);
     const mintRow = lookup.rows[0];
     if (!mintRow) return toolError("token_not_supported", null, `${trimmed} isn't a supported collateral. Tell the user to check /tokens for the list.`);
     if (!mintRow.enabled) return toolError("token_disabled", null, `${mintRow.symbol} is currently disabled as collateral. Tell the user — they should pick a different token or wait until it's re-enabled.`);
+
+    // Resolve the right tier ladder for this collateral's category, then
+    // pick the requested label out of it. RWA categories (stock/etf/metal)
+    // route through rwa_loan_tiers (50%/60%/70% LTV); everything else
+    // gets MEMECOIN_TIERS (30%/25%/20%). Source of truth =
+    // src/services/loan-tier-resolver.js (same one the TG /borrow
+    // command uses).
+    const { getEligibleTiers } = await import("./loan-tier-resolver.js");
+    const ladder = await getEligibleTiers({ category: mintRow.category });
+    // Map "express"/"quick"/"standard" → tier option index. Pip prompts
+    // the user with these three labels regardless of category; the
+    // underlying option index lines up because both ladders use option
+    // 0/1/2 in increasing-LTV order.
+    const tierIndexByName = { express: 0, quick: 1, standard: 2 };
+    const requestedTierName = String(tier || "").toLowerCase();
+    const optIdx = tierIndexByName[requestedTierName];
+    if (optIdx == null) return toolError("bad_tier", null, "Tier must be express, quick, or standard.");
+    const resolved = ladder.find((row) => row.option === optIdx);
+    if (!resolved) return toolError("bad_tier", null, `Tier ${requestedTierName} isn't available for this collateral category right now.`);
+    const t = {
+      option: resolved.option,
+      ltv: resolved.ltv,
+      days: resolved.days,
+      feeBps: resolved.feeBps,
+      // Strip the "(Express)" / "(RWA Express)" parenthetical so Pip's
+      // text stays in the conversational register.
+      label: (resolved.label.match(/\(([^)]+)\)\s*$/)?.[1] || resolved.label).replace(/^RWA\s+/i, ""),
+    };
 
     // CRITICAL: verify DB decimals match on-chain ground truth before doing
     // any value math. A drift here silently 1000x's the user's loan size in
@@ -2542,6 +2573,10 @@ const TOOL_HANDLERS = {
         collateral_mint: mintRow.mint,
         collateral_symbol: mintRow.symbol,
         collateral_decimals: mintRow.decimals,
+        // Authoritative category from supported_mints. Site uses this
+        // to route the borrow tx to V1 (memecoin) vs V2 (RWA) without
+        // having to re-fetch /api/v1/tokens at sign-time.
+        collateral_category: mintRow.category || null,
         collateral_amount_raw: collateralAmountRaw,
         collateral_ui_amount: String(uiAmount),
         collateral_value_lamports: collateralValueLamports.toString(),
