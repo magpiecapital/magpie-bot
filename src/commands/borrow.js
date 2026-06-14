@@ -231,16 +231,25 @@ export function registerBorrowCallbacks(bot) {
     // RWA collateral (stock/etf/metal) lands the higher-LTV ladder
     // out of rwa_loan_tiers; memecoin (and uncategorized) get MEMECOIN_TIERS.
     const tiers = await getEligibleTiers({ category: state.selected.category });
+    // Telegram inline-button labels visually truncate around 30-40 chars
+    // on mobile — RWA tiers' full label "50% LTV · 7d · 2.5% fee
+    // (RWA Express) → ~1.2345 SOL" cut off the receive amount to
+    // "→ ~..." in the UI (operator screenshot 2026-06-13). Render the
+    // full breakdown in the message body (Markdown, no length limit)
+    // and keep buttons short.
     const kb = new InlineKeyboard();
-    for (const t of tiers) {
+    const tierLines = tiers.map((t) => {
       const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
       const fee = loanSol * (t.feeBps / 10_000);
       const receive = loanSol - fee;
+      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
+      const shortName = shortMatch ? shortMatch[1] : t.label;
       kb.text(
-        `${t.label} → ~${receive.toFixed(4)} SOL`,
+        `${shortName} — ${receive.toFixed(4)} SOL`,
         `borrow:tier:${t.option}`,
       ).row();
-    }
+      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
+    });
     kb.text("✕ Cancel", "borrow:cancel");
 
     const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
@@ -252,8 +261,9 @@ export function registerBorrowCallbacks(bot) {
         riskBlock || null,
         "",
         "*Choose a loan tier:*",
-        "_(amount shown is what you receive after tier fee)_",
+        ...tierLines,
         "",
+        "_Amount shown is what you receive after the tier fee._",
         "⏱ _This quote expires in 60 seconds._",
       ].filter((l) => l != null).join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
@@ -291,17 +301,22 @@ export function registerBorrowCallbacks(bot) {
     pending.set(ctx.chat.id, state);
 
     // Same category-aware tier resolution as the prior flow.
+    // See note above on tier-label truncation on mobile — render the
+    // breakdown in the message body and keep button labels short.
     const tiers = await getEligibleTiers({ category: state.selected.category });
     const kb = new InlineKeyboard();
-    for (const t of tiers) {
+    const tierLines = tiers.map((t) => {
       const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
       const fee = loanSol * (t.feeBps / 10_000);
       const receive = loanSol - fee;
+      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
+      const shortName = shortMatch ? shortMatch[1] : t.label;
       kb.text(
-        `${t.label} → ~${receive.toFixed(4)} SOL`,
+        `${shortName} — ${receive.toFixed(4)} SOL`,
         `borrow:tier:${t.option}`,
       ).row();
-    }
+      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
+    });
     kb.text("✕ Cancel", "borrow:cancel");
 
     const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
@@ -314,8 +329,9 @@ export function registerBorrowCallbacks(bot) {
         riskBlock || null,
         "",
         "*Choose a loan tier:*",
-        "_(amount shown is what you receive after tier fee)_",
+        ...tierLines,
         "",
+        "_Amount shown is what you receive after the tier fee._",
         "⏱ _This quote expires in 60 seconds._",
       ].filter((l) => l != null).join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
