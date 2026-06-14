@@ -1830,8 +1830,8 @@ Mandatory tool triggers — pattern → tool:
 - User says "topup", "add collateral", "lower my LTV", "protect from liquidation", "boost health" → \`propose_topup\` (ask for amount if not given).
 - User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
-- User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
-- User says "stop loss", "stoploss", "sl at X", "set a stop", "auto-exit if it dumps", "sell if BONK drops X%", "protect downside at $Y" → \`propose_stop_loss\`. CRITICAL: never guess the floor. User must specify a multiplier (< 1, e.g. 0.7x = 70% of current), an explicit USD price floor ($0.001), OR a market cap floor ($10M). If they don't specify, ASK with a concrete suggestion ("Want me to set it at 0.7x current — that's a 30% drop?"). After arming, the engine autonomously closes + sells if the floor breaks. 1% protocol fee. TP + SL on the same loan IS allowed — if user wants both, call propose_take_profit then propose_stop_loss in sequence.
+- User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. **STRIKE PARSING:** the tool's \`target_text\` argument accepts EVERY natural form: "17M mc", "17,000,000 MC", "17 million market cap", "$0.005", "0.005 usd", "2x", "+50%". Always pass the user's literal phrase as \`target_text\` rather than parsing it yourself — the bot has one canonical parser that matches TG /tp exactly. Only use \`multiplier\` / \`target_usd\` / \`mc_usd\` when YOU computed the value (e.g. "let me set it at 2× current"). If the user is vague ("set a TP"), ASK with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. **Works on memecoin V1 + xStock V3 collateral** (the engine routes via the loan's engine_program_id automatically — never tell users TP isn't available for their pool type). Multi-target arming IS supported: a user can arm TWO TPs at different prices on the same loan; the first to trigger fires (full close), the other auto-cancels.
+- User says "stop loss", "stoploss", "sl at X", "set a stop", "auto-exit if it dumps", "sell if BONK drops X%", "protect downside at $Y" → \`propose_stop_loss\`. **STRIKE PARSING:** pass user's literal phrase as \`target_text\` ("5M mc", "$0.001", "down 30%", "-30%", "0.7x"). If they're vague, ASK with a concrete suggestion ("Want me to set it at 0.7x current — that's a 30% drop?"). After arming, the engine autonomously closes + sells if the floor breaks. 1% protocol fee. **Works on memecoin V1 + xStock V3 collateral.** TP + SL on the same loan IS allowed (a "bracket") — if user wants both, call propose_take_profit then propose_stop_loss in sequence, OR suggest /bracket as the one-command equivalent.
 - User says "trailing stop", "trail my stop", "trailing 10%", "follow the price up but stop if it drops", "lock in gains with a moving stop" → \`propose_trailing_stop\`. Trailing stops are a stop-loss variant where the floor floats UP with each new high (never down). User specifies a distance (10% means "fire if price drops 10% from the most recent peak"). Default suggestion: 10–15%. Distance must be between 0.5% and 50%. Trailing only works on loans they want to PROTECT (downside) — it's not a take-profit. Explain plainly: "as long as price keeps making new highs, the floor moves with it; the first time price drops your distance, it fires." 1% protocol fee on proceeds, same as TP.
 - User says "show my take profits", "what limits do I have armed", "any take-profits set", "show my stops", "what's protecting my loans" → \`list_my_take_profits\`. After the call, group by loan and label each by its \`kind\` field (take_profit / stop_loss / trailing_stop) NOT just the trigger value. For loans listed in \`bracket_loan_ids\`, narrate "you have a bracket (TP + SL) on loan #X" instead of two independent orders. For trailing orders, surface \`trailing_distance_pct\` and \`peak_price_usd\` so users see the floating floor — e.g. "trailing 10%, peak $0.0047". If empty, suggest setting one with \`propose_take_profit\`, \`propose_stop_loss\`, \`propose_trailing_stop\`, or \`/bracket\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
@@ -1849,6 +1849,67 @@ call \`list_my_loans\` first — that's the most common intent in support.
 
 After tool results come back, interpret them and answer in plain language.
 Do NOT just dump raw JSON to the user.
+
+═══════════════════════════════════════════════════════════════════
+LIMIT-ORDER DEEP KNOWLEDGE — HOW TP/SL/TRAILING/BRACKETS ACTUALLY WORK
+═══════════════════════════════════════════════════════════════════
+This block exists so users can ask you ANYTHING about limit orders
+and get a confident, correct answer. Internalize it. Refer back to it
+when users ask "what happens if...", "can I...", "what about...".
+
+POOL COVERAGE (always-current as of 2026-06-14):
+- TP/SL/trailing/bracket all work on **V1 (memecoin)** and **V3 (RWA — xStocks, ETFs, metals)** collateral. V2 (legacy RWA) is still supported for repay/extend on existing V2 loans, but new RWA borrows now route to V3.
+- The engine knows which pool to fire against because every armed order stamps \`engine_program_id\` at arm time (sourced from the loan's on-chain owner). Cross-pool fires are structurally impossible.
+- Users NEVER need to know which pool their loan is in. Don't surface pool details unless they ask explicitly.
+
+WHAT THE ENGINE ACTUALLY DOES ON FIRE (TP or SL):
+1. Re-confirms trigger is still hit via cross-sourced oracle (Jupiter + DexScreener + Pyth) — single-source disagreement reverts the order; both must agree.
+2. Runs a Jupiter pre-flight quote to confirm the swap would clear at the slippage cap.
+3. Pulls SOL from operator's reserve wallet to cover the borrower's repay (if borrower wallet is low) — borrower repays the operator from sale proceeds at settlement, netted out automatically.
+4. Calls \`repay_loan\` on-chain (closes loan, releases collateral to borrower's ATA).
+5. Swaps the released collateral via Jupiter to the user's chosen destination (SOL default, USDC optional).
+6. Sends net proceeds (after 1% protocol fee + reserve refund) to user.
+- Whole sequence is typically 5-10 seconds end-to-end.
+
+FILL GUARANTEE LADDER (Layer 1 → 2 → 3):
+- Layer 1: if single-block proceeds don't cover loan + fee at the user's slippage, the engine auto-escalates slippage 1.5× per attempt, up to the user's stated cap.
+- Layer 2: at cap, the engine slices into N TWAP chunks and fires one per tick.
+- Layer 3: if even TWAP can't fit at cap, the engine DMs the user asking permission to widen the cap. Never widens silently.
+
+ORDER STATUSES (what you might see):
+- \`armed\`: waiting for trigger.
+- \`firing\`: claimed by an engine tick; about to send the repay tx.
+- \`twap_in_progress\`: filling in chunks. Each chunk fires one per tick.
+- \`awaiting_user\`: Layer 3 — engine DMed the user for permission to widen slippage. Order is paused until they answer.
+- \`fired\`: successfully closed + sold. Proceeds in wallet.
+- \`partial_fired\`: TWAP didn't fill all chunks before time ran out — partial proceeds delivered.
+- \`failed\`: terminal failure — collateral may be in user's wallet if repay succeeded but swap didn't. Read \`explain_my_take_profit\` for the lifecycle.
+- \`cancelled\`: user-cancelled or sibling auto-cancelled.
+- \`expired\`: hit \`expires_at\` without triggering.
+
+DIRECTIONS:
+- TP (\`trigger_direction='above'\`): fires when price reaches OR EXCEEDS the trigger.
+- SL (\`trigger_direction='below'\`): fires when price reaches OR FALLS BELOW the trigger.
+- Trailing SL (\`trailing_distance_bps\` is set, direction='below'): the floor floats with each new peak — once price drops by the distance from the most recent peak, it fires. Never moves down.
+
+MULTI-TARGET ARMING (today's semantics):
+- A user can arm TWO TPs on the same loan at different prices, AND two SLs, AND a trailing stop. The engine fires whichever triggers first; the rest auto-cancel because the loan closes after the first fire.
+- Use case: "TP at 1.5x AND a backup TP at 2x" — whichever hits first wins.
+- The TRUE partial-sell ladder ("sell 70% at 16M, 10% at 17M, etc.") is being built but ships LATER. For now, every armed leg is implicitly full-close on first trigger. If a user asks for a partial-sell ladder, tell them: "Multi-target arming is live today (set N targets, first to hit closes the position). True partial sells across multiple price points are coming in a follow-up — would the first-to-hit version work for now?"
+
+BRACKETS:
+- /bracket arms a TP + SL atomically. Both stay armed; first to trigger fires; the other auto-cancels with reason='sibling_order_fired'. Use \`/bracket\` (TG) or call propose_take_profit then propose_stop_loss in sequence (Pip).
+
+WHAT CAN'T HAPPEN (so don't tell users it might):
+- Cross-pool fire: order armed against a V1 loan WILL NOT fire against a V3 loan. Bound at arm time.
+- Silent slippage widening: engine never exceeds the user's stated max_slippage_bps_cap without DMing first.
+- Drain via outer-tx attack: cosign-borrow allowlist + engine fire-path program allowlist (V1, V2, V3 only) block this structurally.
+
+COSTS THE USER ACTUALLY PAYS:
+- 1% protocol fee on proceeds at fire time.
+- Swap slippage (capped at their stated max).
+- ~0.005-0.01 SOL in priority fees + ATA rent (refunded as much as possible from reserve).
+- NO origination fee on the limit order itself — that fee was paid at borrow time.
 
 ═══════════════════════════════════════════════════════════════════
 INQUIRY PLAYBOOK — HOW TO TRIAGE WHAT USERS ACTUALLY WANT
@@ -2075,15 +2136,17 @@ const TOOLS = [
     description:
       "Prepare a TAKE-PROFIT (limit-close-and-sell) proposal the user can arm with one tap on the site. Use when the user wants to set an autonomous sell-on-target on an active loan — 'sell my $PEPE when it 2x's', 'auto take profit at $0.005', 'lock in if BONK goes 4x', 'set a limit order'. " +
       "The site renders an inline confirmation card with the resolved target USD price + slippage cap + an Arm take-profit button. Pip does NOT execute the arm — the borrower wallet signs the magpie: limit-close-arm/v1 envelope which the bot validates + INSERTs. " +
-      "EXACTLY ONE of multiplier OR target_usd OR mc_usd must be set: multiplier=2 means '2× current price'; target_usd=0.005 means 'sell at $0.005/token'; mc_usd=150000000 means 'sell when MC hits $150M'. " +
+      "PASS ONE of: multiplier OR target_usd OR mc_usd OR target_text. target_text is the EASIEST option — pass the user's literal phrase like '17M mc', '17,000,000 MC', '17 million market cap', '$0.005', or '2x' and the bot parses it the same way TG /tp does. Use target_text whenever the user gives you a free-form strike; only use the structured fields when YOU computed the value (e.g. 2x of current price). " +
+      "multiplier=2 means '2× current price'; target_usd=0.005 means 'sell at $0.005/token'; mc_usd=150000000 means 'sell when MC hits $150M'. " +
       "If the user only says 'set a take-profit' without a target, ask them what target (default suggestion: 2x).",
     input_schema: {
       type: "object",
       properties: {
         loan_id: { type: "string", description: "The numeric loan ID to arm a take-profit on. Required." },
-        multiplier: { type: "number", description: "Multiplier of current price (e.g. 2 for 2x). Server resolves to a concrete USD price at arm time." },
-        target_usd: { type: "number", description: "Explicit USD price per token (e.g. 0.005)." },
-        mc_usd: { type: "number", description: "Explicit market cap in USD (e.g. 150000000 for $150M)." },
+        target_text: { type: "string", description: "Natural-language strike — pass the user's literal phrase. Examples: '17M mc', '17,000,000 MC', '17 million market cap', '$0.005', '0.005 usd', '2x', '+50%'. Preferred over structured fields when the user provides a free-form target." },
+        multiplier: { type: "number", description: "Multiplier of current price (e.g. 2 for 2x). Use when YOU compute the multiplier; prefer target_text for user input." },
+        target_usd: { type: "number", description: "Explicit USD price per token (e.g. 0.005). Use when YOU computed it." },
+        mc_usd: { type: "number", description: "Explicit market cap in USD (e.g. 150000000 for $150M). Use when YOU computed it." },
         slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
         sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
         expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
@@ -2095,15 +2158,17 @@ const TOOLS = [
     name: "propose_stop_loss",
     description:
       "Prepare a STOP-LOSS (downside limit-close) proposal the user can arm with one tap. Use when the user wants to set an autonomous downside exit: 'set a stop loss at -30%', 'auto-exit if BONK drops 40%', 'protect downside at $0.001', 'sl at 0.7x'. " +
-      "EXACTLY ONE of multiplier OR target_usd OR mc_usd must be set: multiplier=0.7 means 'sell at 70% of current price' (must be < 1); target_usd=0.001 means 'sell if price drops to $0.001/token'; mc_usd=10000000 means 'sell if MC falls to $10M'. " +
+      "PASS ONE of: multiplier OR target_usd OR mc_usd OR target_text. target_text is the EASIEST option — pass the user's literal phrase like '5M mc', '5,000,000 MC', '$0.001', 'down 30%', '-30%', '0.7x' and the bot parses it the same way TG /sl does. " +
+      "multiplier=0.7 means 'sell at 70% of current price' (must be < 1); target_usd=0.001 means 'sell if price drops to $0.001/token'; mc_usd=10000000 means 'sell if MC falls to $10M'. " +
       "If the user only says 'set a stop loss' without a level, ASK with a concrete suggestion ('Want me to set it at 0.7x current — that's a 30% drop?'). After arming, the engine autonomously sells if the floor breaks. 1% protocol fee on proceeds. Pairs with propose_take_profit on the same loan — TP + SL together is allowed.",
     input_schema: {
       type: "object",
       properties: {
         loan_id: { type: "string", description: "The numeric loan ID to arm a stop-loss on. Required." },
-        multiplier: { type: "number", description: "Multiplier of current price (e.g. 0.7 for 70%). Must be < 1." },
-        target_usd: { type: "number", description: "Explicit USD price floor per token (e.g. 0.001)." },
-        mc_usd: { type: "number", description: "Explicit market cap floor in USD (e.g. 10000000 for $10M)." },
+        target_text: { type: "string", description: "Natural-language downside strike — pass the user's literal phrase. Examples: '5M mc', '5,000,000 MC', '$0.001', 'down 30%', '-30%', '0.7x'. Preferred over structured fields when the user provides a free-form target." },
+        multiplier: { type: "number", description: "Multiplier of current price (e.g. 0.7 for 70%). Must be < 1. Use when YOU computed it." },
+        target_usd: { type: "number", description: "Explicit USD price floor per token (e.g. 0.001). Use when YOU computed it." },
+        mc_usd: { type: "number", description: "Explicit market cap floor in USD (e.g. 10000000 for $10M). Use when YOU computed it." },
         slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
         sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
         expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
@@ -2817,7 +2882,26 @@ const TOOL_HANDLERS = {
     };
   },
 
-  propose_take_profit: async ({ loan_id, multiplier, target_usd, mc_usd, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+  propose_take_profit: async ({ loan_id, multiplier, target_usd, mc_usd, target_text, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+    // If the user gave a natural-language strike, parse it now so the rest
+    // of this handler sees structured (multiplier / target_usd / mc_usd).
+    // See [[feedback_single_source_of_truth]] — same parser as TG /tp.
+    if (target_text && [multiplier, target_usd, mc_usd].every((x) => x == null)) {
+      const { parseStrike } = await import("../lib/strike-price-parser.js");
+      const parsed = parseStrike(target_text, { bareNumberDefaultKind: "mc_usd" });
+      if (!parsed.ok) {
+        return toolError("bad_target_text", parsed.error,
+          `Couldn't understand the target "${target_text}". Ask the user for a specific value like "$17M mc", "$0.005", or "2x".`);
+      }
+      if (parsed.impliedDirection === "below") {
+        return toolError("downside_target_in_tp", null,
+          "That's a downside target — use propose_stop_loss, not propose_take_profit.");
+      }
+      if (parsed.kind === "multiplier") multiplier = parsed.multiplier;
+      else if (parsed.kind === "mc_usd") mc_usd = Number(parsed.valueMicro) / 1e6;
+      else if (parsed.kind === "price_usd") target_usd = Number(parsed.valueMicro) / 1e6;
+      else return toolError("unsupported_target_kind", parsed.kind, "Use an explicit price or market cap.");
+    }
     // Validate target: exactly ONE of multiplier / target_usd / mc_usd
     const targetCount = [multiplier, target_usd, mc_usd].filter((x) => x != null).length;
     if (targetCount !== 1) {
@@ -2915,7 +2999,24 @@ const TOOL_HANDLERS = {
   // envelope, just a different direction byte). Pip surfaces both the
   // resolved floor and the current price so the user has a clear
   // "drop of X% from here" mental model before signing.
-  propose_stop_loss: async ({ loan_id, multiplier, target_usd, mc_usd, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+  propose_stop_loss: async ({ loan_id, multiplier, target_usd, mc_usd, target_text, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+    // Natural-language strike → structured. Same parser as TG /sl + propose_take_profit.
+    if (target_text && [multiplier, target_usd, mc_usd].every((x) => x == null)) {
+      const { parseStrike } = await import("../lib/strike-price-parser.js");
+      const parsed = parseStrike(target_text, { bareNumberDefaultKind: "price_usd" });
+      if (!parsed.ok) {
+        return toolError("bad_target_text", parsed.error,
+          `Couldn't understand the target "${target_text}". Ask the user for a specific value like "$0.001", "$5M mc", "down 30%", or "0.7x".`);
+      }
+      if (parsed.impliedDirection === "above") {
+        return toolError("upside_target_in_sl", null,
+          "That's an upside target — use propose_take_profit, not propose_stop_loss.");
+      }
+      if (parsed.kind === "multiplier") multiplier = parsed.multiplier;
+      else if (parsed.kind === "mc_usd") mc_usd = Number(parsed.valueMicro) / 1e6;
+      else if (parsed.kind === "price_usd") target_usd = Number(parsed.valueMicro) / 1e6;
+      else return toolError("unsupported_target_kind", parsed.kind, "Use an explicit price or market cap.");
+    }
     const targetCount = [multiplier, target_usd, mc_usd].filter((x) => x != null).length;
     if (targetCount !== 1) {
       return toolError(

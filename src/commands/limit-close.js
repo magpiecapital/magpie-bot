@@ -28,6 +28,7 @@ import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
 import { runArmPreflight } from "../services/limit-close-preflight.js";
 import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
+import { parseStrike } from "../lib/strike-price-parser.js";
 
 const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL eligibility floor
 const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -98,72 +99,66 @@ function parseLimitCloseArgs(text, direction = "above") {
   // additional legs at other price targets.
   let slice_pct = 10000;
 
-  // Natural-language path: "at <value>" where <value> is either:
-  //   - "<N>x"     → multiplier semantic
-  //   - "$<num>m"  → market cap USD
-  //   - "$<num>"   → USD price target
+  // Natural-language path: "at <value>" — the value can be ANY shape
+  // the shared strike-price parser accepts. Examples:
+  //   at 17M                  →  $17M MC (bare big numbers default to MC)
+  //   at 17m mc               →  $17M MC (explicit kind word)
+  //   at 17,000,000 MC        →  $17M MC (commas tolerated)
+  //   at 17 million market cap →  $17M MC (number words tolerated)
+  //   at $0.005               →  $0.005 USD price
+  //   at 0.0025 sol           →  0.0025 SOL price
+  //   at 2x / 0.7x            →  multiplier (resolved to USD price downstream)
+  //   at -30% / down 30%      →  -30% multiplier (SL only)
+  //   at +50% / up 50%        →  +50% multiplier (TP only)
+  // Operator mandate (2026-06-14): all these forms MUST work the same
+  // across TG, Pip, and the site. See src/lib/strike-price-parser.js.
   for (let i = 1; i < filtered.length; i++) {
     const t = filtered[i];
 
-    // Handle "at <value>" — consume i+1 too.
+    // Handle "at <value [more words]>" — slurp everything until we hit
+    // a key=value token or end of input. That way "at 17 million market
+    // cap" works as one logical value even though it's 4 tokens.
     if (t.toLowerCase() === "at" && i + 1 < filtered.length) {
-      const v = filtered[i + 1];
-      // Stop-loss percent: "-30%" / "-5%"
-      const mPct = v.match(/^-([0-9]+(?:\.[0-9]+)?)%$/);
-      if (mPct) {
-        if (direction !== "below") {
-          return { ok: false, error: "Percent-drop targets (e.g. `at -30%`) are only valid for /stoploss." };
-        }
-        const p = Number(mPct[1]);
-        if (!Number.isFinite(p) || p <= 0 || p >= 100) {
-          return { ok: false, error: "Stop-loss percent must be between 0% and 100% (e.g. `at -30%`)." };
-        }
-        multiplier = 1 - (p / 100); // 30% drop → 0.7x of current
+      const slurpedParts = [];
+      let j = i + 1;
+      while (j < filtered.length) {
+        const next = filtered[j];
+        // key=value tokens end the slurp.
+        if (/^([a-z_]+)=/i.test(next)) break;
+        slurpedParts.push(next);
+        j++;
+      }
+      const rawValue = slurpedParts.join(" ");
+      // bareNumberDefaultKind hint: SL uses price_usd by default (most
+      // SL targets are USD price drops), TP uses mc_usd for big numbers.
+      // The parser only uses this when the input is bare ("17"); explicit
+      // kind words always win.
+      const parsed = parseStrike(rawValue, {
+        bareNumberDefaultKind: direction === "below" ? "price_usd" : undefined,
+      });
+      if (!parsed.ok) {
+        return { ok: false, error: parsed.error };
+      }
+      // Direction sanity: percent-move and multiplier targets carry
+      // their own implied direction. Reject mismatches loudly.
+      if (parsed.impliedDirection && parsed.impliedDirection !== direction) {
+        return {
+          ok: false,
+          error: parsed.impliedDirection === "below"
+            ? "That's a downside target — use /stoploss, not /takeprofit."
+            : "That's an upside target — use /takeprofit, not /stoploss.",
+        };
+      }
+      if (parsed.kind === "multiplier") {
+        // Caller resolves to USD price using cross-sourced oracle.
+        multiplier = parsed.multiplier;
         trigger_kind = "price_usd";
-        i++; continue;
+      } else {
+        trigger_kind = parsed.kind;
+        trigger_value_micro = parsed.valueMicro;
       }
-      // multiplier: "2x", "1.5x" (TP) or "0.7x", "0.5x" (SL)
-      const mMul = v.match(/^([0-9]+(?:\.[0-9]+)?)x$/i);
-      if (mMul) {
-        const n = Number(mMul[1]);
-        if (!Number.isFinite(n) || n <= 0) {
-          return { ok: false, error: "Multiplier must be a positive number (e.g. `at 2x`, `at 0.7x`)." };
-        }
-        if (direction === "below") {
-          if (n >= 1) {
-            return { ok: false, error: "Stop-loss multiplier must be < 1x (e.g. `at 0.7x` = sell at 70% of current). Use /takeprofit for upside targets." };
-          }
-        } else {
-          if (n <= 1) {
-            return { ok: false, error: "Take-profit multiplier must be > 1x (e.g. `at 2x`). Use /stoploss for downside targets." };
-          }
-        }
-        multiplier = n;
-        trigger_kind = "price_usd"; // resolved to actual USD value before INSERT
-        i++; // consume value
-        continue;
-      }
-      // market cap: "$130m", "150M"
-      const mMc = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)([KMBkmb])$/);
-      if (mMc) {
-        trigger_kind = "mc_usd";
-        const parsed = parseMcOrPrice(mMc[1] + mMc[2], "mc");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-        i++;
-        continue;
-      }
-      // USD price: "$0.005" or "0.005"
-      const mPrice = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)$/);
-      if (mPrice) {
-        trigger_kind = "price_usd";
-        const parsed = parseMcOrPrice(mPrice[1], "price_usd");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-        i++;
-        continue;
-      }
-      return { ok: false, error: `Couldn't parse target after "at": \`${v}\`. Try \`at 2x\` or \`at $150m\` or \`at $0.005\`.` };
+      i = j - 1; // outer loop increment will move us past the consumed slurp
+      continue;
     }
 
     // Power-user path: key=value
@@ -172,23 +167,23 @@ function parseLimitCloseArgs(text, direction = "above") {
     const k = m[1].toLowerCase();
     const v = m[2];
     if (k === "mc") {
-      trigger_kind = "mc_usd";
-      const parsed = parseMcOrPrice(v, "mc");
-      if (!parsed.ok) return parsed;
-      trigger_value_micro = parsed.micro;
-    } else if (k === "price") {
-      // Default unit is USD unless v ends in "sol"
-      if (/sol$/i.test(v)) {
-        trigger_kind = "price_sol";
-        const parsed = parseMcOrPrice(v.replace(/sol$/i, ""), "price_sol");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-      } else {
-        trigger_kind = "price_usd";
-        const parsed = parseMcOrPrice(v, "price_usd");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
+      // Route through the shared parser so commas, kind words, and
+      // magnitude words all work in key=value form too.
+      const parsed = parseStrike(v, { bareNumberDefaultKind: "mc_usd" });
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      if (parsed.kind === "multiplier") {
+        return { ok: false, error: "Use `at 2x` syntax for multipliers (not `mc=`)." };
       }
+      trigger_kind = parsed.kind;
+      trigger_value_micro = parsed.valueMicro;
+    } else if (k === "price") {
+      const parsed = parseStrike(v, { bareNumberDefaultKind: "price_usd" });
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      if (parsed.kind === "multiplier") {
+        return { ok: false, error: "Use `at 2x` syntax for multipliers (not `price=`)." };
+      }
+      trigger_kind = parsed.kind;
+      trigger_value_micro = parsed.valueMicro;
     } else if (k === "slip") {
       const parsed = parseSlippage(v);
       if (!parsed.ok) return parsed;
