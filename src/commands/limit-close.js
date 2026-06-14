@@ -499,6 +499,141 @@ export async function handleStopLoss(ctx) {
   return handleLimitClose(ctx, "below");
 }
 
+/* ─── /trailingstop ────────────────────────────────────────────── */
+//
+// Trailing-stop variant of /stoploss. Floor floats with the highest
+// observed price; fires when price retraces from peak by the user's
+// distance. The watcher updates peak_price_micros each tick (see
+// magpie-limitclose watcher trailing block + migration 057).
+//
+// Forms accepted:
+//   /trailingstop 1234 10%
+//   /trailingstop 1234 trail=10%
+//   /trailingstop 1234 trail=1000bps
+//   /trailingstop 1234 10% slip=3%
+//
+// Implementation is intentionally direct rather than delegating to
+// handleLimitClose because trailing changes the shape of "target":
+// there isn't an explicit price/multiplier — the trail distance is
+// the whole thing.
+export async function handleTrailingStop(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const text = (ctx.message?.text || "").trim();
+
+  // Pull /trailingstop off the front. Everything after is args.
+  const m = text.match(/^\/\S+\s+(.+)$/);
+  if (!m) {
+    return ctx.reply(
+      "*Usage*\n\n" +
+      "`/trailingstop <loan_id> <distance>`\n\n" +
+      "Examples:\n" +
+      "`/trailingstop 1234 10%`  (sell if price retraces 10% from peak)\n" +
+      "`/trailingstop 1234 trail=15% slip=3%`\n\n" +
+      "Distance must be 0.5%-50%. Floor floats with each new high — fires when price drops that % from the peak observed since arm.",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const rest = m[1].trim().split(/\s+/);
+  const loan_id = rest[0];
+  if (!/^\d+$/.test(loan_id)) {
+    return ctx.reply("`<loan_id>` must be a positive integer. Try `/positions` to see your loans.", { parse_mode: "Markdown" });
+  }
+
+  // Trailing distance can be the bare token (e.g. "10%") or trail=...
+  let trailingDistanceBps = null;
+  let slippage_bps = 200; // default 2%
+  for (const tok of rest.slice(1)) {
+    const trailM = tok.match(/^(?:trail=)?(\d+(?:\.\d+)?)(%|bps)?$/i);
+    const slipM = tok.match(/^slip=(\d+(?:\.\d+)?)(%|bps)?$/i);
+    if (slipM) {
+      const v = Number(slipM[1]);
+      const unit = (slipM[2] || "%").toLowerCase();
+      const bps = unit === "bps" ? Math.round(v) : Math.round(v * 100);
+      if (!Number.isInteger(bps) || bps < 10 || bps > 2500) {
+        return ctx.reply("`slip=` must be in 0.1%-25% (10-2500 bps).", { parse_mode: "Markdown" });
+      }
+      slippage_bps = bps;
+    } else if (trailingDistanceBps == null && trailM) {
+      const v = Number(trailM[1]);
+      const unit = (trailM[2] || "%").toLowerCase();
+      const bps = unit === "bps" ? Math.round(v) : Math.round(v * 100);
+      if (!Number.isInteger(bps) || bps < 50 || bps > 5000) {
+        return ctx.reply("Trailing distance must be 0.5%-50% (50-5000 bps).", { parse_mode: "Markdown" });
+      }
+      trailingDistanceBps = bps;
+    }
+  }
+  if (trailingDistanceBps == null) {
+    return ctx.reply("Missing trailing distance. Try `/trailingstop 1234 10%`.", { parse_mode: "Markdown" });
+  }
+
+  const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // Trailing arms need a starting trigger value. Same pattern as the
+  // site endpoint: synthetic multiplier = 1 - trailing/10000 resolved
+  // against current price seeds triggerValueMicro and peak_price_micros.
+  const { rows: [loanForMint] } = await query(
+    `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id = $2`,
+    [user.id, loan_id],
+  );
+  if (!loanForMint) {
+    return ctx.reply(`Loan #${loan_id} not found in your account.`);
+  }
+  const multiplier = 1 - (trailingDistanceBps / 10_000);
+  const r = await resolveMultiplierToPrice(loanForMint.collateral_mint, multiplier, { allowBelowOne: true });
+  if (!r.ok) {
+    return ctx.reply(r.error, { parse_mode: "Markdown" });
+  }
+
+  const armed = await armOrder({
+    userId: user.id,
+    source: "tg",
+    loanIdChain: String(loan_id),
+    triggerKind: "price_usd",
+    triggerValueMicro: r.triggerValueMicro.toString(),
+    triggerDirection: "below",
+    trailingDistanceBps,
+    slippageBps: slippage_bps,
+    sellDestination: "sol",
+  });
+
+  if (!armed.ok) {
+    const friendly = (() => {
+      switch (armed.error) {
+        case "trailing_only_valid_on_stop_loss":
+          return "Internal error — trailing was sent with wrong direction.";
+        case "invalid_trailing_distance_bps":
+          return "Trailing distance must be 0.5%-50% (50-5000 bps).";
+        case "loan_already_has_active_order_in_direction":
+          return `You already have a stop-loss on loan #${loan_id}. \`/cancellimitorder <id>\` first, OR \`/modifyorder <id>\` in place.`;
+        case "loan_not_found_for_user":
+          return `Loan #${loan_id} not found in your account.`;
+        case "loan_below_minimum_size":
+          return "Loan is below the 1 SOL minimum for limit-close orders.";
+        case "user_concurrency_cap_reached":
+          return `You have ${armed.detail?.active} active limit orders (max ${armed.detail?.cap}). Cancel one first.`;
+        default:
+          return `Couldn't arm trailing stop: ${armed.error}`;
+      }
+    })();
+    return ctx.reply(friendly, { parse_mode: "Markdown" });
+  }
+
+  const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+  return ctx.reply([
+    `*Trailing stop armed* on loan #${loan_id}`,
+    "",
+    `Distance: *${(trailingDistanceBps / 100).toFixed(1)}%* below peak`,
+    `Current price: $${fmt(r.currentUsd)}`,
+    `Initial floor: $${fmt(r.targetUsd)} (-${(trailingDistanceBps / 100).toFixed(1)}%)`,
+    `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
+    "",
+    `Floor rises with each new high. Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`,
+    `Order ID: \`${armed.orderId}\` — \`/limitorders\` to view, \`/cancellimitorder ${armed.orderId}\` to cancel.`,
+  ].join("\n"), { parse_mode: "Markdown" });
+}
+
 /* ─── /limitorders ─────────────────────────────────────────────── */
 
 // Age tag: "3d ago" / "5h ago" / "12m ago"
