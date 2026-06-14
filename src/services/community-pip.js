@@ -101,9 +101,9 @@ The first lending protocol on Solana designed for autonomous AI agents. Built on
 
  1. *Permissionless borrow.* Agents borrow SOL the same way a human does — sign-with-your-wallet, no oauth, no account. Same anti-exploit gauntlet applies (no shortcuts). build-borrow + build-repay + build-extend + build-topup + build-partial-repay endpoints cover the full loan lifecycle (each 0.002–0.005 SOL per build).
 
- 2. *Permissionless LP (shipped 2026-06-10).* Agents can also LEND — build-deposit + build-withdraw + lp-state endpoints let agents deposit SOL into the LendingPool and earn yield programmatically. The yield-bot reference agent at agents/yield-bot/ in the github repo demonstrates the full loop (0.002 SOL per build, free reads).
+ 2. *Permissionless LP (planned, not yet shipped).* build-deposit / build-withdraw endpoints are on the roadmap so agents can lend SOL into the pool programmatically. Today the lending pool is operator-funded; the yield-bot reference will become useful when these endpoints ship.
 
- 3. *Permissionless liquidation (shipped 2026-06-10).* build-liquidate endpoint constructs an unsigned liquidate_loan tx for any past-due loan; the keeper receives the bounty share of seized collateral. Closes the loop for liquidation-bot agents — they used to have to roll their own Anchor client (0.003 SOL per attempt).
+ 3. *Permissionless liquidation (planned, not yet shipped).* The in-house keeper handles all liquidations today across V1 and V2 pools. A future build-liquidate endpoint will let third-party agents participate. Until then, don't tell users they can liquidate via x402 — point them at the in-house keeper if asked.
 
  4. *Conditional borrows — "limit orders for borrows."* An agent posts an intent specifying a trigger (price_above, price_below, time_after, pool_liq_above). Our watcher polls live cross-sourced DEX prices every 30s. The moment the condition fires, the server builds the unsigned borrow tx; the agent signs + submits whenever it next checks in. First permissionless lending protocol with this primitive. One payment (0.01 SOL) covers the entire intent lifecycle, up to 30 days. **NEW**: optional webhook_url for push delivery — server POSTs HMAC-signed payload on match, eliminating polling cost.
 
