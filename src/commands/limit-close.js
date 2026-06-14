@@ -768,6 +768,36 @@ export async function handleBracket(ctx) {
   const slResolved = await resolveLeg(sl, true);
   if (!slResolved.ok) return ctx.reply(`SL leg: ${slResolved.error}`, { parse_mode: "Markdown" });
 
+  // Shared friendly mapper for arm-core error codes — surfaces the
+  // common cases in plain language so users don't see raw enum
+  // strings. Defaults to a generic fallback that names the leg.
+  function legFriendly(leg, err) {
+    switch (err) {
+      case "loan_already_has_active_order_in_direction":
+        return `${leg} leg failed — there's already a ${leg === "TP" ? "take-profit" : "stop-loss / trailing stop"} armed on this loan. Cancel it first with /cancellimitorder, or use /modifyorder to adjust in place.`;
+      case "trigger_would_fire_immediately":
+        return `${leg} leg failed — that trigger would fire RIGHT NOW. Pick a target on the unfired side.`;
+      case "sl_below_solvency":
+        return `${leg} leg failed — the SL floor is below what's needed to cover the loan (you'd liquidate before SL fires). Pick a tighter floor.`;
+      case "loan_not_found_for_user":
+        return `${leg} leg failed — loan #${loan_id} not found in your account.`;
+      case "loan_not_active":
+        return `${leg} leg failed — this loan isn't active.`;
+      case "loan_below_minimum_size":
+        return `${leg} leg failed — loan is below the 1 SOL minimum for limit-close orders.`;
+      case "user_concurrency_cap_reached":
+        return `${leg} leg failed — you've hit the active-order cap. Cancel one first.`;
+      case "collateral_not_enabled":
+        return `${leg} leg failed — this collateral isn't currently enabled in the protocol.`;
+      case "invalid_slippage_bps":
+        return `${leg} leg failed — slippage value is out of range.`;
+      case "preflight_failed":
+        return `${leg} leg failed — Jupiter pre-flight couldn't price the sell. Try again or use looser slippage.`;
+      default:
+        return `${leg} leg failed: \`${err || "unknown"}\``;
+    }
+  }
+
   // Arm leg 1 (TP). If this fails for ANY reason — duplicate-direction
   // index hit, oracle disagreement, etc. — bail before touching SL.
   const tpArm = await armOrder({
@@ -781,7 +811,7 @@ export async function handleBracket(ctx) {
     sellDestination: sell_destination,
   });
   if (!tpArm.ok) {
-    return ctx.reply(`Couldn't arm TP leg: \`${tpArm.error}\`. Bracket NOT armed.`, { parse_mode: "Markdown" });
+    return ctx.reply(`${legFriendly("TP", tpArm.error)}\n\n_Bracket NOT armed._`, { parse_mode: "Markdown" });
   }
 
   // Arm leg 2 (SL). If this fails, roll back TP via cancelOrder so the
@@ -804,7 +834,7 @@ export async function handleBracket(ctx) {
       console.warn(`[bracket] rollback of TP ${tpArm.orderId} failed:`, err.message?.slice(0, 100));
     }
     return ctx.reply(
-      `Couldn't arm SL leg: \`${slArm.error}\`. TP leg #${tpArm.orderId} was rolled back so you're not half-armed.`,
+      `${legFriendly("SL", slArm.error)}\n\n_TP leg #${tpArm.orderId} was rolled back so you're not half-armed._`,
       { parse_mode: "Markdown" },
     );
   }
