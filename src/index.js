@@ -378,6 +378,9 @@ bot.command("crosspost", handleCommunityCrosspost);
   // liquidation edge is the user's choice; the engine still charges
   // the fee on proceeds either way.
   bot.command("stoploss", lc.handleStopLoss);
+  // Trailing-stop variant — the trigger floats with peak. See migration 057.
+  bot.command("trailingstop", lc.handleTrailingStop);
+  bot.command("ts", lc.handleTrailingStop); // memorable shortcut
   bot.command("sl", lc.handleStopLoss);
   bot.command("limitorders", lc.handleLimitOrders);
   bot.command("takeprofitorders", lc.handleLimitOrders);
