@@ -118,8 +118,30 @@ async function lookupReferrerForBorrower(borrowerWallet) {
   };
 }
 
+// Safety buffer left in the lender wallet beyond the distributable
+// transfer amount. Covers tx fee + a tiny operational reserve. Tx fee
+// is ~5000 lamports, but we round up generously so the lender never
+// drops below a usable threshold from this code path. Note: this is
+// only used when REWARDS_DISTRIBUTOR_PUBKEY is set (i.e., we're about
+// to actually move SOL); the DB-ledger-only path doesn't need it.
+const LENDER_RESERVE_LAMPORTS = 10_000_000n; // 0.01 SOL
+
 /**
  * Distribute one liquidation_economics row.
+ *
+ * SAFETY ORDER (2026-06-14):
+ *   1. Resolve referrer + compute final shares.
+ *   2. If on-chain transfer is enabled (REWARDS_DISTRIBUTOR_PUBKEY set),
+ *      pre-flight the lender's SOL balance. If insufficient, leave the
+ *      row at 'awaiting_distribution' (DON'T claim) so the next tick
+ *      can retry. This makes the credits + transfer atomic-on-failure:
+ *      either both happen or neither does.
+ *   3. Claim the row by flipping to 'distributing'.
+ *   4. Credit the four pool ledgers.
+ *   5. Move (holder + LP + referrer) lamports on-chain to the
+ *      distributor wallet (if enabled).
+ *   6. Flip row to 'distributed' on success, 'distribute_error' on
+ *      partial failure for operator review.
  *
  * Returns { ok: boolean, reason?: string } — never throws to caller.
  */
@@ -128,8 +150,46 @@ async function distributeOne(row) {
     userId: null, referrerUserId: null,
   }));
 
-  // Step 1: claim the row by flipping status. If a concurrent tick
-  // beat us to it, we get zero rows back and bail.
+  // Compute final shares first so the pre-flight check sees the same
+  // amounts the credits + transfer will use. Referrer rollover happens
+  // here before any claim or credit.
+  let holderShare = BigInt(row.holder_share_lamports || "0");
+  const lpShare = BigInt(row.lp_loyalty_share_lamports || "0");
+  let refShare = BigInt(row.referrer_share_lamports || "0");
+  const reserveShare = BigInt(row.protocol_reserve_share_lamports || "0");
+  const hasReferrer = refLookup.referrerUserId != null;
+  if (!hasReferrer && refShare > 0n) {
+    holderShare = holderShare + refShare;
+    refShare = 0n;
+  }
+  const transferAmount = holderShare + lpShare + refShare;
+
+  // Pre-flight lender balance check (only when on-chain move is
+  // enabled). If lender doesn't have enough SOL for the transfer +
+  // reserve, leave the row at 'awaiting_distribution' so the next
+  // tick can retry — no claim, no credits, no SOL motion. This is
+  // the gate that makes the rest of distributeOne atomic-on-failure.
+  if (REWARDS_DISTRIBUTOR_PUBKEY && transferAmount > 0n) {
+    try {
+      const lenderBal = BigInt(await connection.getBalance(
+        getLenderKeypairForTransfer()?.publicKey,
+      ));
+      if (lenderBal < transferAmount + LENDER_RESERVE_LAMPORTS) {
+        console.warn(
+          `[liq-distribute] loan ${row.loan_id} skipped — lender balance ` +
+          `${(Number(lenderBal) / 1e9).toFixed(4)} SOL < required ` +
+          `${(Number(transferAmount + LENDER_RESERVE_LAMPORTS) / 1e9).toFixed(4)} SOL. Will retry next tick.`,
+        );
+        return { ok: false, reason: "lender_balance_too_low" };
+      }
+    } catch (err) {
+      console.warn(`[liq-distribute] loan ${row.loan_id} balance check failed: ${err.message?.slice(0, 80)} — skipping for retry`);
+      return { ok: false, reason: "balance_check_failed" };
+    }
+  }
+
+  // Claim the row by flipping status. If a concurrent tick beat us to
+  // it, we get zero rows back and bail.
   const claim = await query(
     `UPDATE liquidation_economics
         SET distribution_status = 'distributing',
@@ -144,39 +204,84 @@ async function distributeOne(row) {
     return { ok: false, reason: "claim_lost_race" };
   }
 
-  // From here on: do best-effort credits + flip to 'distributed' or
-  // 'distribute_error' at the end.
-  let holderShare = BigInt(row.holder_share_lamports || "0");
-  const lpShare = BigInt(row.lp_loyalty_share_lamports || "0");
-  let refShare = BigInt(row.referrer_share_lamports || "0");
-  const reserveShare = BigInt(row.protocol_reserve_share_lamports || "0");
-
-  // Referrer rollover. If the borrower has no referrer, fold the
-  // referrer slice into the holder credit. The 80%-to-holders rule
-  // documented in the changelog and Pip.
-  const hasReferrer = refLookup.referrerUserId != null;
-  if (!hasReferrer && refShare > 0n) {
-    holderShare = holderShare + refShare;
-    refShare = 0n;
-  }
-
   const errors = [];
 
-  // Credit holder pool
+  // SAFETY ORDER: on-chain transfer FIRST (most likely to fail —
+  // network blip, RPC timeout, etc.). Only after the SOL physically
+  // moves do we credit the DB ledgers. This way:
+  //
+  //   - Transfer fails → no ledger credits land. Row flips back to
+  //     'awaiting_distribution' so the next tick retries cleanly.
+  //     Lender wallet untouched, distributor wallet untouched.
+  //   - Transfer succeeds → SOL is in CHCAM. Ledger credits then
+  //     reflect that. DB writes are very reliable; partial credit
+  //     failures degrade to 'distribute_error' for operator review
+  //     and the SOL stays in CHCAM (still recoverable).
+  //
+  // Without REWARDS_DISTRIBUTOR_PUBKEY set, the on-chain path is
+  // skipped and the watcher behaves DB-ledger-only as before.
+  let transferSig = null;
+  if (REWARDS_DISTRIBUTOR_PUBKEY && transferAmount > 0n) {
+    const lender = getLenderKeypairForTransfer();
+    if (!lender) {
+      errors.push("on_chain_transfer: LENDER_PRIVATE_KEY missing");
+    } else {
+      try {
+        const tx = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: lender.publicKey,
+            toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
+            // BigInt precision: SOL amounts here are bounded by the
+            // sale_proceeds of a single liquidation (max ~10s of SOL
+            // realistically), comfortably under 2^53. Number() is safe.
+            lamports: Number(transferAmount),
+          }),
+        );
+        transferSig = await sendAndConfirmTransaction(connection, tx, [lender], {
+          commitment: "confirmed",
+          maxRetries: 3,
+        });
+        console.log(
+          `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
+          `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
+          `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${transferSig.slice(0, 24)}…`,
+        );
+      } catch (err) {
+        errors.push(`on_chain_transfer: ${err.message?.slice(0, 80)}`);
+      }
+    }
+  }
+
+  // If the on-chain transfer failed, revert the claim so the next
+  // tick gets to retry cleanly. No ledger credits have happened yet.
+  if (errors.length > 0) {
+    await query(
+      `UPDATE liquidation_economics
+          SET distribution_status = 'awaiting_distribution',
+              updated_at = NOW()
+        WHERE id = $1 AND distribution_status = 'distributing'`,
+      [row.id],
+    );
+    console.warn(`[liq-distribute] loan ${row.loan_id} reverted to awaiting_distribution — errors=${errors.join("; ")}`);
+    return { ok: false, reason: errors.join("; ") };
+  }
+
+  // SOL is in CHCAM (or on-chain path was skipped). Credit the four
+  // pool ledgers now. Partial failures here are unlikely (DB writes
+  // very reliable) but if any occur, mark distribute_error so the
+  // operator can manually reconcile.
   try {
     const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
     if (holderShare > 0n) await creditHolderPoolDirect(holderShare);
   } catch (err) {
     errors.push(`holder: ${err.message?.slice(0, 80)}`);
   }
-  // Credit LP loyalty pool
   try {
     const { creditLpLoyaltyPoolDirect } = await import("./lp-loyalty.js");
     if (lpShare > 0n) await creditLpLoyaltyPoolDirect(lpShare);
   } catch (err) {
     errors.push(`lp: ${err.message?.slice(0, 80)}`);
   }
-  // Credit protocol reserve
   try {
     const { creditProtocolReserveDirect } = await import("./protocol-reserve.js");
     if (reserveShare > 0n) {
@@ -189,7 +294,6 @@ async function distributeOne(row) {
   } catch (err) {
     errors.push(`reserve: ${err.message?.slice(0, 80)}`);
   }
-  // Insert referral row (only if there's a referrer)
   if (hasReferrer && refShare > 0n) {
     try {
       await query(
@@ -205,53 +309,11 @@ async function distributeOne(row) {
           DEFAULT_PROFIT_EVENT_TYPE,
           row.net_profit_lamports?.toString() || "0",
           refShare.toString(),
-          // Stored bps for transparency. Pre-computed against MGP-001's 1000.
           1000,
         ],
       );
     } catch (err) {
       errors.push(`referral: ${err.message?.slice(0, 80)}`);
-    }
-  }
-
-  // On-chain SOL move: lender → rewards distributor wallet, for the
-  // amount this row's profit credited into the distributable pools
-  // (holder + LP + referrer slices). The protocol reserve stays in
-  // the lender wallet as a buffer.
-  //
-  // Gated on REWARDS_DISTRIBUTOR_PUBKEY being set. Without it, the
-  // watcher stays DB-ledger-only and behaves identically to the
-  // pre-2026-06-14 version. On-chain failures are non-fatal — they
-  // log and degrade to 'distribute_error' so an operator can review,
-  // but they don't corrupt the credited ledgers (those already landed).
-  if (errors.length === 0 && REWARDS_DISTRIBUTOR_PUBKEY) {
-    const transferAmount = holderShare + lpShare + refShare;
-    if (transferAmount > 0n) {
-      const lender = getLenderKeypairForTransfer();
-      if (!lender) {
-        errors.push("on_chain_transfer: LENDER_PRIVATE_KEY missing");
-      } else {
-        try {
-          const tx = new Transaction().add(
-            SystemProgram.transfer({
-              fromPubkey: lender.publicKey,
-              toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
-              lamports: Number(transferAmount),
-            }),
-          );
-          const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
-            commitment: "confirmed",
-            maxRetries: 3,
-          });
-          console.log(
-            `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
-            `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
-            `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${sig.slice(0, 24)}…`,
-          );
-        } catch (err) {
-          errors.push(`on_chain_transfer: ${err.message?.slice(0, 80)}`);
-        }
-      }
     }
   }
 
