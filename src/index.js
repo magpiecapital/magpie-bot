@@ -396,6 +396,9 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("cancellimitorder", lc.handleCancelLimitOrder);
   bot.command("canceltp", lc.handleCancelLimitOrder);
   bot.command("cancelsl", lc.handleCancelLimitOrder);
+  // Cancels both legs of a bracket on a loan in one shot — companion
+  // to /bracket so users don't have to /cancellimitorder twice.
+  bot.command(["cancelbracket", "canceltpsl"], lc.handleCancelBracket);
   // In-place order modification — change trigger / slippage / dest /
   // expires without canceling. Order stays armed throughout so users
   // can fine-tune without a market-move gap.
