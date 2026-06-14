@@ -224,7 +224,7 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
        FROM wallets w
        JOIN users u ON u.id = w.user_id
       WHERE w.public_key = $1
-      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id <> 0) DESC,
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
                w.is_active DESC,
                w.created_at DESC
       LIMIT 1`,
@@ -265,7 +265,7 @@ export async function handleSiteLimitCloseList(req, url) {
        FROM wallets w
        JOIN users u ON u.id = w.user_id
       WHERE w.public_key = $1
-      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id <> 0) DESC,
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
                w.is_active DESC,
                w.created_at DESC
       LIMIT 1`,
