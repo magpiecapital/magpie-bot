@@ -672,7 +672,7 @@ const VIBE_ROTATORS = [
   // 6. Command nudge — /how rotation
   () => `📚 New to Magpie? \`/how\` walks through the borrow → repay flow in 5 steps.`,
   // 7. Holder rewards reminder
-  () => `💎 \$MAGPIE holders earn *10%* of all protocol loan fees, distributed in SOL on a randomized 5-10 day cadence. \`/holders\` for the full mechanic.`,
+  () => `💎 \$MAGPIE holders earn *70%* of all protocol loan fees, distributed in SOL on a randomized 5-10 day cadence. \`/holders\` for the full mechanic.`,
   // 8. Safety reminder (rotates with the four-handle trust line)
   () => `🛡 Quick reminder: Magpie has *exactly four* official accounts. Anyone else claiming to be us is a scammer. Verify at magpie.capital/links.`,
   // 9. Two-surface reminder
