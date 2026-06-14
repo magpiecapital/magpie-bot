@@ -687,6 +687,8 @@ export async function handleLimitOrders(ctx) {
             COALESCE(lc.trigger_direction, 'above') AS trigger_direction,
             lc.slippage_bps, lc.sell_destination, lc.status,
             lc.armed_at, lc.expires_at,
+            lc.trailing_distance_bps,
+            lc.peak_price_micros::text AS peak_price_micros,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
             m.symbol AS collateral_symbol,
@@ -720,7 +722,13 @@ export async function handleLimitOrders(ctx) {
     const r = rows[i];
     const trig = fmtTrigger(r.trigger_kind, BigInt(r.trigger_value_micro));
     const slip = (r.slippage_bps / 100).toFixed(r.slippage_bps < 200 ? 2 : 1);
-    const directionPill = r.trigger_direction === "below" ? "*SL*" : "*TP*";
+    // Trailing stops get their own pill so users can spot them at a glance.
+    // Direction is always 'below' for trailing — checked in the schema —
+    // so the trailing pill replaces the bare SL one rather than stacking.
+    const isTrailing = r.trailing_distance_bps != null;
+    const directionPill = isTrailing
+      ? `*TRAIL ${(r.trailing_distance_bps / 100).toFixed(1)}%*`
+      : (r.trigger_direction === "below" ? "*SL*" : "*TP*");
     // RWA badge — visible cue that this order routes through the V2
     // pool. Helps users mentally model why their stock-token TP might
     // pause Sat/Sun (engine weekend-fire skip for RWA TPs, PR #18 in
@@ -740,9 +748,17 @@ export async function handleLimitOrders(ctx) {
       else if (abs < 10) distLine = `\n   ~ ${abs.toFixed(1)}% from trigger`;
       else distLine = `\n   ~ ${Math.round(abs)}% from trigger`;
     }
+    // Trailing peak line — surfaces the moving high so users see what
+    // their effective floor is tracking. Watcher refreshes peak each tick.
+    let peakLine = "";
+    if (isTrailing && r.peak_price_micros) {
+      const peakUsd = Number(r.peak_price_micros) / 1e6;
+      const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+      peakLine = `\n   ~ peak $${fmt(peakUsd)} (floor floats with each new high)`;
+    }
     lines.push(
       `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
-      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${distLine}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
       "",
     );
   }
@@ -779,6 +795,8 @@ export async function handleLimitOrders(ctx) {
  *   slip=<2%|200bps|200>       — sets slippage_bps
  *   dest=<sol|usdc>            — sets sell_destination
  *   expires=<YYYY-MM-DD|ISO>   — sets expires_at, or "none" to clear
+ *   trailing=<10%|1000bps>     — converts SL to trailing (SL only),
+ *                                or "none" to clear back to regular SL
  *
  * To change trigger_kind, trigger_direction, or loan_id: use /cancel + /takeprofit.
  */
@@ -797,6 +815,8 @@ export async function handleModifyLimitOrder(ctx) {
         "• `/modifyorder 412 slip=3% dest=usdc`",
         "• `/modifyorder 412 expires=2026-06-30`",
         "• `/modifyorder 412 expires=none` (clear expiration)",
+        "• `/modifyorder 412 trailing=10%` (convert SL → trailing 10%)",
+        "• `/modifyorder 412 trailing=none` (back to regular SL)",
         "",
         "_Order stays armed — no cancel/re-arm gap._",
       ].join("\n"),
@@ -844,8 +864,25 @@ export async function handleModifyLimitOrder(ctx) {
       if (val.toLowerCase() === "none") updates.expiresAt = null;
       else if (Number.isNaN(Date.parse(val))) return ctx.reply(`\`expires=${val}\` couldn't be parsed.`, { parse_mode: "Markdown" });
       else updates.expiresAt = new Date(val).toISOString();
+    } else if (key === "trailing" || key === "trail") {
+      // trailing=10%   set/update trailing distance (SL only)
+      // trailing=1000bps   same in bps
+      // trailing=none   clear trailing (back to regular SL)
+      const lower = val.toLowerCase();
+      if (lower === "none" || lower === "off" || lower === "0") {
+        updates.trailingDistanceBps = null;
+      } else {
+        let bps;
+        if (lower.endsWith("%")) bps = Math.round(parseFloat(lower) * 100);
+        else if (lower.endsWith("bps")) bps = Math.round(parseFloat(lower));
+        else bps = Math.round(parseFloat(lower) * 100); // bare number → percent
+        if (!Number.isFinite(bps) || bps < 50 || bps > 5000) {
+          return ctx.reply(`\`trailing=${val}\` must be 0.5%–50% (50–5000 bps).`, { parse_mode: "Markdown" });
+        }
+        updates.trailingDistanceBps = bps;
+      }
     } else {
-      return ctx.reply(`Unknown field \`${key}\`. Supported: price, mc, slip, dest, expires.`, { parse_mode: "Markdown" });
+      return ctx.reply(`Unknown field \`${key}\`. Supported: price, mc, slip, dest, expires, trailing.`, { parse_mode: "Markdown" });
     }
   }
 
@@ -871,11 +908,30 @@ export async function handleModifyLimitOrder(ctx) {
       invalid_expires_at: "Expires couldn't be parsed.",
       trigger_would_fire_immediately: "That new trigger would fire RIGHT NOW. Pick a target on the unfired side.",
       no_changes_supplied: "No changes supplied.",
+      invalid_trailing_distance_bps: "Trailing must be 0.5%–50% (50–5000 bps).",
+      trailing_only_valid_on_stop_loss: "Trailing only makes sense on a stop-loss (direction=below). This order is a take-profit.",
     };
     return ctx.reply(friendly[result.error] || `Modify failed: \`${result.error}\``, { parse_mode: "Markdown" });
   }
 
   const o = result.order;
+  // Trailing line — surfaces the new floating-floor distance + the
+  // seeded peak so the user can sanity-check the conversion.
+  let trailingLine = null;
+  if (o.trailing_distance_bps != null) {
+    const pct = (o.trailing_distance_bps / 100).toFixed(1);
+    if (o.peak_price_micros) {
+      const peakUsd = Number(o.peak_price_micros) / 1e6;
+      const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+      trailingLine = `Trailing: ${pct}% (peak $${fmt(peakUsd)} — floor floats with each new high)`;
+    } else {
+      trailingLine = `Trailing: ${pct}%`;
+    }
+  } else if (result.changedFields.includes("trailing_distance_bps")) {
+    // Trailing was just CLEARED — show that explicitly so the user
+    // doesn't wonder if their /modifyorder did nothing.
+    trailingLine = "Trailing: cleared (regular stop-loss)";
+  }
   return ctx.reply(
     [
       `*Order #${o.id} updated.*`,
@@ -884,6 +940,7 @@ export async function handleModifyLimitOrder(ctx) {
       o.trigger_value_micro ? `New trigger: \`${o.trigger_value_micro}\` micros` : null,
       `Slippage: ${(o.slippage_bps / 100).toFixed(2)}%`,
       `Destination: ${(o.sell_destination || "").toUpperCase()}`,
+      trailingLine,
       o.expires_at ? `Expires: ${new Date(o.expires_at).toISOString().slice(0, 10)}` : "Expires: never",
       "",
       "_Order stays armed — engine picks up new values on its next tick._",
