@@ -38,10 +38,34 @@ export const MEMECOIN_TIERS = [
   { option: 2, ltv: 20, days: 7, feeBps: 150, label: "20% LTV · 7d · 1.5% fee (Standard)" },
 ];
 
+// V3-program RWA ladder. The values are baked into the V3 program
+// on-chain (see magpie_lending_v3.json + project memory
+// "magpie-v3-mainnet-live"). This is the source of truth used when a
+// new RWA borrow routes to V3 (i.e., PROGRAM_ID_V3 is set AND
+// ROUTE_RWA_TO_V3=true). We hardcode rather than read DB because the
+// on-chain program enforces these exact values — any DB drift would
+// just cause silent borrow failures.
+export const V3_RWA_TIERS = [
+  { option: 0, ltv: 50, days: 7,  feeBps: 250, label: "50% LTV · 7d · 2.5% fee (RWA Express V3)" },
+  { option: 1, ltv: 60, days: 15, feeBps: 350, label: "60% LTV · 15d · 3.5% fee (RWA Quick V3)" },
+  { option: 2, ltv: 70, days: 30, feeBps: 500, label: "70% LTV · 30d · 5% fee (RWA Standard V3)" },
+];
+
 // Categories that route to the RWA tier set. Source of truth for the
 // vocabulary lives in src/solana/program.js (RWA_CATEGORIES); we mirror
 // it here to avoid circular imports between solana + services layers.
 const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
+
+// Read the V3 routing flags via env (avoid importing program.js here to
+// keep the resolver dependency-free and circular-import-safe). The
+// resolver only needs to know IF V3 will handle RWA borrows; it doesn't
+// need the PublicKey itself.
+function isRwaRoutingToV3() {
+  return (
+    !!process.env.PROGRAM_ID_V3 &&
+    process.env.ROUTE_RWA_TO_V3 === "true"
+  );
+}
 
 // Short cache so a borrow flow that touches getEligibleTiers multiple
 // times within the same tick doesn't re-query the DB. 30s is well below
@@ -95,6 +119,14 @@ async function getRwaTiersFromDb() {
  */
 export async function getEligibleTiers({ category }) {
   if (category && RWA_CATEGORIES.has(category)) {
+    // When the env says RWA borrows now route to V3, return the
+    // V3-baked ladder so site + TG picker show the right options.
+    // V2-routed RWA still reads from the DB-tunable rwa_loan_tiers.
+    // Existing loans aren't affected — they keep their own program_id
+    // and continue to repay/extend against whatever program issued them.
+    if (isRwaRoutingToV3()) {
+      return V3_RWA_TIERS;
+    }
     return await getRwaTiersFromDb();
   }
   return MEMECOIN_TIERS;
