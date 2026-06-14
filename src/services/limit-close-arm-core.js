@@ -617,6 +617,13 @@ export async function modifyOrder({
   slippageBps,
   sellDestination,
   expiresAt,
+  // Trailing-stop adjustment. Three shapes:
+  //   undefined  — leave unchanged
+  //   null OR 0  — clear trailing on this order (regular SL again)
+  //   50..5000   — set/update trailing distance (only valid on SL)
+  // Transitioning a regular SL → trailing reseeds peak_price_micros
+  // from the live price so the floating floor starts at "today".
+  trailingDistanceBps,
 }) {
   // ── Load current order state for re-validation ─────────────
   const conditions = ["status = 'armed'"];
@@ -636,7 +643,9 @@ export async function modifyOrder({
             trigger_kind, trigger_value_micro::text AS trigger_value_micro,
             COALESCE(trigger_direction, 'above') AS trigger_direction,
             slippage_bps, sell_destination, expires_at,
-            max_slippage_bps_cap, source, source_agent_pubkey
+            max_slippage_bps_cap, source, source_agent_pubkey,
+            trailing_distance_bps,
+            peak_price_micros::text AS peak_price_micros
        FROM limit_close_orders
       WHERE id = $1 AND ${conditions.join(" AND ")}`,
     params,
@@ -682,19 +691,49 @@ export async function modifyOrder({
     }
     updates.expires_at = expiresAt;
   }
+  // Trailing-stop adjustment. Mirrors the shape validation in armOrder
+  // so a caller can't squeeze invalid values past modify that arm would
+  // have rejected. Peak seeding happens further down once we know the
+  // current price.
+  let seedPeakFromCurrent = false;
+  if (trailingDistanceBps !== undefined) {
+    if (trailingDistanceBps === null || trailingDistanceBps === 0) {
+      // Clearing trailing. Only meaningful if it was actually set.
+      if (current.trailing_distance_bps != null) {
+        updates.trailing_distance_bps = null;
+        updates.peak_price_micros = null;
+      }
+    } else {
+      if (!Number.isInteger(trailingDistanceBps) || trailingDistanceBps < 50 || trailingDistanceBps > 5000) {
+        return { ok: false, error: "invalid_trailing_distance_bps", detail: { allowed_range_bps: [50, 5000] } };
+      }
+      if (current.trigger_direction !== "below") {
+        return { ok: false, error: "trailing_only_valid_on_stop_loss", detail: { direction: current.trigger_direction } };
+      }
+      updates.trailing_distance_bps = trailingDistanceBps;
+      // First-time enable: seed peak from current price so the floating
+      // floor starts at "today" rather than the original trigger.
+      if (current.trailing_distance_bps == null) {
+        seedPeakFromCurrent = true;
+      }
+    }
+  }
 
-  if (Object.keys(updates).length === 0) {
+  if (Object.keys(updates).length === 0 && !seedPeakFromCurrent) {
     return { ok: false, error: "no_changes_supplied" };
   }
 
-  // ── Immediate-fire re-check (best-effort) for new trigger ───
+  // ── Immediate-fire re-check + peak seed (best-effort) ─────────
   // Mirrors armOrder's guard. Skips for price_sol (denominator moves)
   // and fails-open on oracle hiccup — engine re-checks at fire time.
-  if (updates.trigger_value_micro && (current.trigger_kind === "mc_usd" || current.trigger_kind === "price_usd")) {
+  // Same fetch double-duties as the peak-price seed when this modify
+  // is transitioning a regular SL → trailing.
+  const needPriceFetch =
+    (updates.trigger_value_micro && (current.trigger_kind === "mc_usd" || current.trigger_kind === "price_usd")) ||
+    seedPeakFromCurrent;
+  if (needPriceFetch) {
     try {
       const { getPriceInUsdCrossSourced } = await import("./price.js");
-      // We need the collateral mint for the price read. Pull from the
-      // loan row tied to this order.
       const { rows: [loan] } = await query(
         `SELECT collateral_mint FROM loans WHERE id = $1`,
         [current.loan_id],
@@ -702,13 +741,10 @@ export async function modifyOrder({
       if (loan) {
         const currentUsd = await getPriceInUsdCrossSourced(loan.collateral_mint);
         if (currentUsd && currentUsd > 0) {
-          let currentMicros = null;
-          if (current.trigger_kind === "price_usd") {
-            currentMicros = BigInt(Math.round(currentUsd * 1e6));
-          }
-          // mc_usd would need supply; skip if not trivially derivable —
-          // engine still catches at fire time.
-          if (currentMicros != null) {
+          const currentMicros = BigInt(Math.round(currentUsd * 1e6));
+          // Immediate-fire re-check, only for price_usd (mc_usd needs supply
+          // and we skip — engine catches at fire time).
+          if (updates.trigger_value_micro && current.trigger_kind === "price_usd") {
             const newBi = BigInt(updates.trigger_value_micro);
             if (current.trigger_direction === "above" && newBi <= currentMicros) {
               return { ok: false, error: "trigger_would_fire_immediately", detail: { direction: "above" } };
@@ -717,9 +753,14 @@ export async function modifyOrder({
               return { ok: false, error: "trigger_would_fire_immediately", detail: { direction: "below" } };
             }
           }
+          // Peak seed: start the trailing floor at today's price so the
+          // first watcher tick has a meaningful baseline to bump from.
+          if (seedPeakFromCurrent) {
+            updates.peak_price_micros = currentMicros.toString();
+          }
         }
       }
-    } catch { /* fail-open: engine re-checks at fire time */ }
+    } catch { /* fail-open: engine re-checks at fire time, peak self-heals on first tick */ }
   }
 
   // ── UPDATE ───────────────────────────────────────────────────
@@ -767,7 +808,9 @@ export async function modifyOrder({
       WHERE id = $${orderIdPos}
         AND ${updateConditions.join(" AND ")}
       RETURNING id, trigger_value_micro::text AS trigger_value_micro,
-                slippage_bps, sell_destination, expires_at, updated_at`,
+                slippage_bps, sell_destination, expires_at, updated_at,
+                trailing_distance_bps,
+                peak_price_micros::text AS peak_price_micros`,
     updateParams,
   );
   if (r.rows.length === 0) {
