@@ -1828,6 +1828,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
+- User says "trailing stop", "trail my stop", "trailing 10%", "follow the price up but stop if it drops", "lock in gains with a moving stop" → \`propose_trailing_stop\`. Trailing stops are a stop-loss variant where the floor floats UP with each new high (never down). User specifies a distance (10% means "fire if price drops 10% from the most recent peak"). Default suggestion: 10–15%. Distance must be between 0.5% and 50%. Trailing only works on loans they want to PROTECT (downside) — it's not a take-profit. Explain plainly: "as long as price keeps making new highs, the floor moves with it; the first time price drops your distance, it fires." 1% protocol fee on proceeds, same as TP.
 - User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
 - User says "what would I net at 2x", "how much SOL if I set a 3x take-profit", "if I locked in at 1.5x what do I get", "is it worth arming a TP at X" → \`simulate_take_profit\` with their loan_id + multiplier. After the call, report net_to_user_sol as the headline ("you'd net ~X SOL after fees and slippage"). Always include the caveat from result.note about prices changing. Surface result.arm_hint as a one-tap command if the projection looks good. If error is present, narrate the error.note verbatim.
@@ -2083,6 +2084,24 @@ const TOOLS = [
         expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
       },
       required: ["loan_id"],
+    },
+  },
+  {
+    name: "propose_trailing_stop",
+    description:
+      "Prepare a TRAILING-STOP proposal. Trailing stops are stop-losses with a floating floor — the floor moves UP with each new high, never down. Use when the user wants to ride momentum upside but auto-exit on a pullback: 'set a trailing 10%', 'trail my stop', 'sell if it drops 15% from peak', 'follow the price up'. " +
+      "REQUIRED: distance_pct between 0.5 and 50. If the user says 'trailing stop' without a number, ask: 'How wide a trail — 10% is the common default? (Tighter = quicker exit, looser = more room to ride.)' " +
+      "Site renders an inline confirmation card; borrower wallet signs the magpie: limit-close-arm/v1 envelope with the Trailing field. Pip does NOT execute the arm. 1% protocol fee on proceeds (same as TP).",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to arm a trailing stop on. Required." },
+        distance_pct: { type: "number", description: "Trailing distance as a percent (e.g. 10 = 10%, so floor = peak × 0.90). Range 0.5..50. Required." },
+        slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
+        sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
+        expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
+      },
+      required: ["loan_id", "distance_pct"],
     },
   },
   {
@@ -2833,6 +2852,91 @@ const TOOL_HANDLERS = {
         String(loan.loan_id).slice(-6) +
         "`. Mention the target in human terms (e.g. 'at 2× current' or 'at $0.005') and the slippage cap. " +
         "DO NOT lecture them about how take-profit works — the card explains it. If the user picked a multiplier, mention the resolved USD price so they have a concrete number.",
+    };
+  },
+
+  // Trailing-stop proposal — sibling to propose_take_profit, but the
+  // proposed action's "target" is a floating floor (peak × (1 - distance))
+  // rather than a fixed price. The borrower's wallet still signs the same
+  // magpie: limit-close-arm/v1 envelope; the site SDK encodes the Trailing
+  // field instead of Target. Pip surfaces the resolved current price + the
+  // initial floor so the user has concrete numbers before signing.
+  propose_trailing_stop: async ({ loan_id, distance_pct, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+    const distPct = Number(distance_pct);
+    if (!Number.isFinite(distPct) || distPct < 0.5 || distPct > 50) {
+      return toolError(
+        "bad_distance",
+        null,
+        "Trailing distance must be between 0.5% and 50%. Common default is 10%. Ask the user to pick a number.",
+      );
+    }
+    const distanceBps = Math.round(distPct * 100);
+
+    const slipPct = slippage_pct != null ? Number(slippage_pct) : 2;
+    if (!Number.isFinite(slipPct) || slipPct < 0.1 || slipPct > 10) {
+      return toolError("bad_slippage", null, "Slippage must be between 0.5% and 10%.");
+    }
+    const slippageBps = Math.round(slipPct * 100);
+    const dest = sell_to === "usdc" ? "usdc" : "sol";
+
+    // Validate the loan belongs to the user + is active.
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals, sm.category, sm.enabled
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    if (loan.status !== "active") {
+      return toolError("loan_not_active", null, `This loan is ${loan.status}, not active. Trailing stop only works on active loans.`);
+    }
+    if (!loan.enabled) {
+      return toolError("collateral_not_enabled", null, "This collateral isn't currently enabled in the protocol.");
+    }
+    if (signerPubkey && loan.borrower_wallet && signerPubkey !== loan.borrower_wallet) {
+      return toolError(
+        "wrong_signer_wallet",
+        `loan.borrower=${loan.borrower_wallet} signer=${signerPubkey}`,
+        `That loan was opened by ${loan.borrower_wallet.slice(0,4)}…${loan.borrower_wallet.slice(-4)}. Tell the user to switch wallets in Phantom before arming the trailing stop.`,
+      );
+    }
+
+    // Resolve the current price so we can surface the initial floor.
+    // Fails-open (best-effort) — if the price read hiccups, the arm path
+    // still seeds peak at sign time. Pip just can't quote a number here.
+    let currentUsd = null;
+    let initialFloorUsd = null;
+    try {
+      const { getPriceInUsdCrossSourced } = await import("./price.js");
+      currentUsd = await getPriceInUsdCrossSourced(loan.collateral_mint);
+      if (currentUsd && currentUsd > 0) {
+        initialFloorUsd = currentUsd * (1 - distanceBps / 10_000);
+      }
+    } catch { /* fail-open */ }
+
+    return {
+      action_proposed: {
+        type: "trailing_stop",
+        loan_id: loan.loan_id,
+        collateral_symbol: loan.symbol,
+        distance_bps: distanceBps,
+        distance_pct: distPct,
+        current_usd: currentUsd,
+        initial_floor_usd: initialFloorUsd,
+        slippage_bps: slippageBps,
+        sell_destination: dest,
+        order_expire: expire || null,
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction:
+        "Respond with ONE short line introducing the trailing-stop card. Refer to the loan as `#" +
+        String(loan.loan_id).slice(-6) +
+        "`. Mention the distance (e.g. 'trailing 10%') and, if current_usd is set, the resolved initial floor in plain prose " +
+        "(e.g. 'starts at ~$0.0042 — that's 10% below today's $0.0047 — and the floor floats UP with each new high'). " +
+        "Do NOT lecture; the card handles the rest. If current_usd came back null, just say the floor will seed at sign time.",
     };
   },
 
