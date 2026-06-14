@@ -399,6 +399,13 @@ export async function handleSiteLimitCloseList(req, url) {
  *   Slippage: 200               (optional, default 200, bps)
  *   Dest: sol                   (optional, default sol)
  *   Expire: 30d                 (optional, days or hours)
+ *   Slice: 7000                 (optional, default 10000 = 100% = full close.
+ *                                Set <10000 to arm a LADDER LEG that sells
+ *                                slice/10000 of original collateral when
+ *                                this leg fires. arm-core stamps a shared
+ *                                ladder_group_id when siblings exist on the
+ *                                same loan/direction. Migration 065 trigger
+ *                                enforces SUM(slice) <= 10000.)
  *   Nonce: <random_base58_or_uuid>
  *   IssuedAt: <ISO timestamp>
  * ───────────────────────────────────────────────────────────────── */
@@ -497,6 +504,22 @@ export async function handleSiteLimitCloseArm(req) {
   }
   const dest = (fields.Dest || "sol").toLowerCase();
 
+  // ── Slice (ladder leg) parsing ──
+  // Optional Slice: <bps>  field on the envelope. When set <10000, this
+  // arm is a ladder leg (one of N siblings sharing a ladder_group_id).
+  // The bot's arm-core stamps ladder_group_id + original_collateral_amount
+  // when slicePct<10000. Multiple legs from the same loan/direction with
+  // sum(slice_pct)<=10000 are enforced by the migration-065 trigger.
+  let slicePctApplied = 10000;
+  if (fields.Slice !== undefined) {
+    const raw = String(fields.Slice).trim();
+    const s = Number(raw);
+    if (!Number.isInteger(s) || s < 1 || s > 10000) {
+      return { status: 400, body: { error: "invalid_slice_pct", detail: "Slice must be an integer in [1, 10000] bps (0.01%–100%)." } };
+    }
+    slicePctApplied = s;
+  }
+
   // Expire parsing — "30d" / "12h"
   let expiresAt = null;
   if (fields.Expire) {
@@ -540,7 +563,8 @@ export async function handleSiteLimitCloseArm(req) {
     slippageBps,
     sellDestination: dest,
     expiresAt,
-    armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}) by ${auth.signerPubkey.slice(0, 8)}…`,
+    slicePct: slicePctApplied,
+    armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}${slicePctApplied < 10000 ? ` slice=${(slicePctApplied/100).toFixed(0)}%` : ""}) by ${auth.signerPubkey.slice(0, 8)}…`,
   });
   if (!armed.ok) {
     return {
