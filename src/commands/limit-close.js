@@ -1147,6 +1147,61 @@ export async function handleModifyLimitOrder(ctx) {
   );
 }
 
+/* ─── /cancelbracket ───────────────────────────────────────────── */
+//
+// Cancels ALL armed limit-close orders on a single loan in one shot.
+// Companion to /bracket — if a user runs /bracket and changes their
+// mind, today they'd need /cancellimitorder twice (once per leg).
+//
+//   /cancelbracket 1234
+//
+// Returns a summary of which orders were cancelled. WHERE status='armed'
+// is the race guard against the engine flipping an order to 'firing' on
+// this tick — too-late cancels become "0 orders cancelled" with the
+// same audit trail as a single /cancellimitorder race.
+export async function handleCancelBracket(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const text = (ctx.message?.text || "").trim();
+  const m = text.match(/^\/\S+\s+(\d+)/);
+  if (!m) {
+    return ctx.reply("Usage: `/cancelbracket <loan_id>`", { parse_mode: "Markdown" });
+  }
+  const loanIdChain = m[1];
+  const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // Scope by user_id at the SQL layer so a stale or guessed loan_id
+  // can't cancel another user's orders. Loan match is via the FK
+  // resolved from the chain loan_id the user typed.
+  const { rows } = await query(
+    `UPDATE limit_close_orders
+        SET status = 'cancelled',
+            cancellation_reason = 'user_cancelled_bracket',
+            updated_at = NOW()
+      WHERE user_id = $1
+        AND status = 'armed'
+        AND loan_id = (SELECT id FROM loans WHERE user_id = $1 AND loan_id = $2 LIMIT 1)
+      RETURNING id, COALESCE(trigger_direction, 'above') AS trigger_direction,
+                trailing_distance_bps`,
+    [user.id, loanIdChain],
+  );
+  if (rows.length === 0) {
+    return ctx.reply(
+      `No armed orders found on loan #${loanIdChain}. (Either no bracket was set, or it already fired/cancelled.)`,
+    );
+  }
+  const lines = rows.map((r) => {
+    const label = r.trailing_distance_bps != null
+      ? `TRAIL ${(r.trailing_distance_bps / 100).toFixed(1)}%`
+      : r.trigger_direction === "below" ? "SL" : "TP";
+    return `• ${label} #${r.id}`;
+  });
+  return ctx.reply(
+    [`*Cancelled ${rows.length} order${rows.length === 1 ? "" : "s"}* on loan #${loanIdChain}:`, "", ...lines].join("\n"),
+    { parse_mode: "Markdown" },
+  );
+}
+
 /* ─── /cancellimitorder ────────────────────────────────────────── */
 
 export async function handleCancelLimitOrder(ctx) {
