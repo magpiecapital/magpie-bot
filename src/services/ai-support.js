@@ -1830,7 +1830,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
 - User says "stop loss", "stoploss", "sl at X", "set a stop", "auto-exit if it dumps", "sell if BONK drops X%", "protect downside at $Y" → \`propose_stop_loss\`. CRITICAL: never guess the floor. User must specify a multiplier (< 1, e.g. 0.7x = 70% of current), an explicit USD price floor ($0.001), OR a market cap floor ($10M). If they don't specify, ASK with a concrete suggestion ("Want me to set it at 0.7x current — that's a 30% drop?"). After arming, the engine autonomously closes + sells if the floor breaks. 1% protocol fee. TP + SL on the same loan IS allowed — if user wants both, call propose_take_profit then propose_stop_loss in sequence.
 - User says "trailing stop", "trail my stop", "trailing 10%", "follow the price up but stop if it drops", "lock in gains with a moving stop" → \`propose_trailing_stop\`. Trailing stops are a stop-loss variant where the floor floats UP with each new high (never down). User specifies a distance (10% means "fire if price drops 10% from the most recent peak"). Default suggestion: 10–15%. Distance must be between 0.5% and 50%. Trailing only works on loans they want to PROTECT (downside) — it's not a take-profit. Explain plainly: "as long as price keeps making new highs, the floor moves with it; the first time price drops your distance, it fires." 1% protocol fee on proceeds, same as TP.
-- User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
+- User says "show my take profits", "what limits do I have armed", "any take-profits set", "show my stops", "what's protecting my loans" → \`list_my_take_profits\`. After the call, group by loan and label each by its \`kind\` field (take_profit / stop_loss / trailing_stop) NOT just the trigger value. For loans listed in \`bracket_loan_ids\`, narrate "you have a bracket (TP + SL) on loan #X" instead of two independent orders. For trailing orders, surface \`trailing_distance_pct\` and \`peak_price_usd\` so users see the floating floor — e.g. "trailing 10%, peak $0.0047". If empty, suggest setting one with \`propose_take_profit\`, \`propose_stop_loss\`, \`propose_trailing_stop\`, or \`/bracket\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
 - User says "what would I net at 2x", "how much SOL if I set a 3x take-profit", "if I locked in at 1.5x what do I get", "is it worth arming a TP at X" → \`simulate_take_profit\` with their loan_id + multiplier. After the call, report net_to_user_sol as the headline ("you'd net ~X SOL after fees and slippage"). Always include the caveat from result.note about prices changing. Surface result.arm_hint as a one-tap command if the projection looks good. If error is present, narrate the error.note verbatim.
 - User says "what would I get with a trailing 10%", "how much SOL if I trail 15%", "is a trailing stop worth it on my loan", "should I trail 5% or 10%" → \`simulate_trailing_stop\` with their loan_id + distance_pct. Report net_to_user_sol as headline ("you'd net ~X SOL if the floor fires today"). ALWAYS narrate result.note verbatim — the worst-case framing matters because users tend to anchor on the current price. Surface result.arm_hint as a one-tap command.
@@ -3346,6 +3346,9 @@ const TOOL_HANDLERS = {
   list_my_take_profits: async (_args, { userId }) => {
     const { rows } = await query(
       `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
+              COALESCE(lco.trigger_direction, 'above') AS trigger_direction,
+              lco.trailing_distance_bps,
+              lco.peak_price_micros::text AS peak_price_micros,
               lco.slippage_bps, lco.sell_destination, lco.status, lco.armed_at, lco.expires_at,
               lco.source, lco.source_agent_pubkey,
               l.loan_id::text AS chain_loan_id,
@@ -3359,23 +3362,56 @@ const TOOL_HANDLERS = {
         LIMIT 50`,
       [userId],
     );
+    // Derive bracket grouping: loans with BOTH a TP and SL armed get
+    // flagged so Pip can describe them as "you have a bracket on loan
+    // #X" instead of listing two independent orders. Same logic as
+    // /lc-perf's bracket count.
+    const directionsPerLoan = new Map();
+    for (const r of rows) {
+      const s = directionsPerLoan.get(r.chain_loan_id) || new Set();
+      s.add(r.trigger_direction);
+      directionsPerLoan.set(r.chain_loan_id, s);
+    }
+    const bracketLoans = [...directionsPerLoan.entries()]
+      .filter(([, dirs]) => dirs.size > 1)
+      .map(([loanId]) => loanId);
+
     return {
       count: rows.length,
-      orders: rows.map((r) => ({
-        order_id: r.id,
-        loan_id: r.chain_loan_id,
-        collateral_symbol: r.collateral_symbol,
-        trigger_kind: r.trigger_kind,
-        trigger_value_micro: r.trigger_value_micro,
-        trigger_human: formatTriggerHuman(r.trigger_kind, r.trigger_value_micro),
-        slippage_pct: (r.slippage_bps / 100).toFixed(2),
-        sell_destination: r.sell_destination,
-        status: r.status,
-        armed_at: r.armed_at,
-        expires_at: r.expires_at,
-        source: r.source,
-        source_agent_pubkey: r.source_agent_pubkey,
-      })),
+      // Loans where Pip should narrate "bracket protection" rather
+      // than listing TP and SL independently. Empty array if none.
+      bracket_loan_ids: bracketLoans,
+      orders: rows.map((r) => {
+        const isTrailing = r.trailing_distance_bps != null;
+        // Order kind summary for Pip — preferred over Pip inferring from
+        // direction alone. Keeps the narrative crisp.
+        const kind = isTrailing
+          ? "trailing_stop"
+          : r.trigger_direction === "below" ? "stop_loss" : "take_profit";
+        return {
+          order_id: r.id,
+          loan_id: r.chain_loan_id,
+          collateral_symbol: r.collateral_symbol,
+          kind,
+          trigger_direction: r.trigger_direction,
+          trigger_kind: r.trigger_kind,
+          trigger_value_micro: r.trigger_value_micro,
+          trigger_human: formatTriggerHuman(r.trigger_kind, r.trigger_value_micro),
+          // Trailing-only fields — null on non-trailing rows so Pip
+          // can ignore them cleanly.
+          trailing_distance_pct: isTrailing ? Number((r.trailing_distance_bps / 100).toFixed(2)) : null,
+          peak_price_usd: isTrailing && r.peak_price_micros
+            ? Number((Number(r.peak_price_micros) / 1e6).toFixed(8))
+            : null,
+          slippage_pct: (r.slippage_bps / 100).toFixed(2),
+          sell_destination: r.sell_destination,
+          status: r.status,
+          armed_at: r.armed_at,
+          expires_at: r.expires_at,
+          source: r.source,
+          source_agent_pubkey: r.source_agent_pubkey,
+        };
+      }),
     };
   },
 
