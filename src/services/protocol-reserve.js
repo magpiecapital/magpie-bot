@@ -69,6 +69,45 @@ export async function accrueToProtocolReserve({ loanDbId, feeLamports, eventType
 }
 
 /**
+ * Credit a pre-computed lamport amount directly to the protocol
+ * reserve pool. Same idempotency model as accrueToProtocolReserve
+ * (INSERT a protocol_reserve_events row first; if it duplicates,
+ * skip the pool counter bump). Used by the Phase 2
+ * liquidation-distribution-watcher, which has already done the
+ * fraction math against the defaulted-loan net profit. Idempotency
+ * key is (loan_db_id, event_type) — caller should use a distinct
+ * event_type like 'default_profit' so it doesn't collide with
+ * the regular fee-side accrual.
+ */
+export async function creditProtocolReserveDirect({ loanDbId, lamports, eventType }) {
+  const amt = BigInt(lamports);
+  if (amt <= 0n) return null;
+  try {
+    const ins = await query(
+      `INSERT INTO protocol_reserve_events
+         (loan_db_id, event_type, fee_lamports, reward_lamports, reward_bps)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (loan_db_id, event_type) DO NOTHING
+       RETURNING id`,
+      [loanDbId, eventType, amt.toString(), amt.toString(), 10000],
+    );
+    if (ins.rows.length === 0) return null; // duplicate — already accrued
+    await query(
+      `UPDATE protocol_reserve_pool
+          SET accrued_lamports = accrued_lamports + $1::numeric,
+              last_accrual_at = NOW(),
+              updated_at = NOW()
+        WHERE id = 1`,
+      [amt.toString()],
+    );
+    return amt;
+  } catch (err) {
+    console.error("[protocol-reserve] direct credit failed:", err.message);
+    return null;
+  }
+}
+
+/**
  * Current reserve pool state — read-only.
  */
 export async function getProtocolReserveState() {
