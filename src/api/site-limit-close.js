@@ -288,6 +288,7 @@ export async function handleSiteLimitCloseList(req, url) {
   if (loanIds.length > 0) {
     const r = await query(
       `SELECT id, loan_id, trigger_kind, trigger_value_micro::text AS trigger_value_micro,
+              COALESCE(trigger_direction, 'above') AS trigger_direction,
               slippage_bps, sell_destination, status,
               armed_at, expires_at,
               max_slippage_bps_cap, auto_escalate_slippage,
@@ -304,22 +305,39 @@ export async function handleSiteLimitCloseList(req, url) {
   // Eligibility annotation per loan — same checks the arm endpoint
   // will apply. Surface it here so the UI can disable the Arm button
   // for ineligible loans with a clear reason.
-  const armedByLoan = new Map(
-    orders.filter((o) => o.status === "armed").map((o) => [Number(o.loan_id), o]),
+  //
+  // 2026-06-13: split eligibility by direction. A loan may legitimately
+  // have BOTH a TP (above) and SL (below) armed at once — the unique
+  // index since migration 047 is (loan_id, trigger_direction), not
+  // just loan_id. The site can offer TP independently of SL, so we
+  // emit eligibility per slot.
+  const armedAboveByLoan = new Set(
+    orders.filter((o) => o.status === "armed" && o.trigger_direction === "above").map((o) => Number(o.loan_id)),
+  );
+  const armedBelowByLoan = new Set(
+    orders.filter((o) => o.status === "armed" && o.trigger_direction === "below").map((o) => Number(o.loan_id)),
   );
   const annotated = loans.map((l) => {
-    const reasons = [];
-    if (BigInt(l.owed_lamports) < MIN_LOAN_LAMPORTS) reasons.push("loan_below_minimum_size");
-    if (!l.collateral_enabled) reasons.push("collateral_not_enabled");
+    const baseReasons = [];
+    if (BigInt(l.owed_lamports) < MIN_LOAN_LAMPORTS) baseReasons.push("loan_below_minimum_size");
+    if (!l.collateral_enabled) baseReasons.push("collateral_not_enabled");
     // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible
-    // for limit-close. The engine's V2 fill path landed in PR B; arm-core
+    // for limit-close. Engine's V2 fill path landed in PR B; arm-core
     // applies a weekend-aware initial-slippage bump for thin RWA routes.
-    if (armedByLoan.has(Number(l.id))) reasons.push("loan_already_has_active_order");
+    const tpReasons = [...baseReasons];
+    const slReasons = [...baseReasons];
+    if (armedAboveByLoan.has(Number(l.id))) tpReasons.push("take_profit_already_armed");
+    if (armedBelowByLoan.has(Number(l.id))) slReasons.push("stop_loss_already_armed");
+    // Back-compat: pre-2026-06-13 callers read is_eligible_for_takeprofit
+    // + ineligibility_reasons. Keep them representing the TP slot so
+    // older site bundles don't break mid-deploy.
     return {
       ...l,
       owed_sol: Number(l.owed_lamports) / 1e9,
-      is_eligible_for_takeprofit: reasons.length === 0,
-      ineligibility_reasons: reasons,
+      is_eligible_for_takeprofit: tpReasons.length === 0,
+      ineligibility_reasons: tpReasons,
+      is_eligible_for_stoploss: slReasons.length === 0,
+      stoploss_ineligibility_reasons: slReasons,
     };
   });
 
@@ -342,7 +360,13 @@ export async function handleSiteLimitCloseList(req, url) {
  *   magpie: limit-close-arm/v1
  *   From: <signer_wallet>
  *   LoanId: <chain_loan_id>
- *   Target: 2x                  (multiplier; OR Price: 0.005 OR MC: 150m)
+ *   Direction: above            (optional; "above" = take-profit, "below"
+ *                                = stop-loss. Defaults to "above" for
+ *                                back-compat with pre-2026-06-13 sites.)
+ *   Target: 2x                  (multiplier; OR Price: 0.005 OR MC: 150m.
+ *                                For Direction: below, multiplier MUST be
+ *                                < 1 (e.g. 0.7x = "sell if price drops
+ *                                to 70% of current").)
  *   Slippage: 200               (optional, default 200, bps)
  *   Dest: sol                   (optional, default sol)
  *   Expire: 30d                 (optional, days or hours)
@@ -353,6 +377,15 @@ export async function handleSiteLimitCloseArm(req) {
   const auth = await authSignedEnvelope(req, "limit-close-arm/v1", ["LoanId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   const { userId, fields } = auth;
+
+  // ── Parse direction ──
+  // 2026-06-13: site now supports stop-loss arming. Old envelopes that
+  // don't include Direction get the historical default of "above" (TP).
+  const triggerDirection = (fields.Direction || "above").toLowerCase();
+  if (triggerDirection !== "above" && triggerDirection !== "below") {
+    return { status: 400, body: { error: "invalid_direction", detail: "Direction must be 'above' (take-profit) or 'below' (stop-loss)." } };
+  }
+  const isSl = triggerDirection === "below";
 
   // ── Parse target ──
   let triggerKind = null;
@@ -365,8 +398,17 @@ export async function handleSiteLimitCloseArm(req) {
     const m = fields.Target.match(/^([0-9]+(?:\.[0-9]+)?)x$/i);
     if (m) {
       const mult = Number(m[1]);
-      if (!Number.isFinite(mult) || mult <= 1) {
+      if (!Number.isFinite(mult) || mult <= 0) {
         return { status: 400, body: { error: "invalid_target_multiplier" } };
+      }
+      // TP must be > 1x, SL must be < 1x. Mixing them up is almost
+      // always a UX bug (e.g. SL form submitting "2x"); fail loud so
+      // the site can surface a useful error.
+      if (!isSl && mult <= 1) {
+        return { status: 400, body: { error: "invalid_target_multiplier", detail: "Take-profit multiplier must be > 1× (e.g. 2× to fire when price doubles). For a downside target, set Direction: below and use a multiplier < 1× (e.g. 0.7×)." } };
+      }
+      if (isSl && mult >= 1) {
+        return { status: 400, body: { error: "invalid_target_multiplier", detail: "Stop-loss multiplier must be < 1× (e.g. 0.7× to fire when price drops to 70% of current). For an upside target, set Direction: above and use a multiplier > 1×." } };
       }
       // Resolve later, after we have the loan + mint.
       multiplierUsed = mult;
@@ -419,7 +461,11 @@ export async function handleSiteLimitCloseArm(req) {
       [userId, fields.LoanId],
     );
     if (!loanLite) return { status: 404, body: { error: "loan_not_found_for_signer" } };
-    const r = await resolveMultiplierToPrice(loanLite.collateral_mint, multiplierUsed);
+    // allowBelowOne is the contract with resolveMultiplierToPrice — it
+    // rejects mismatched direction/multiplier pairs as a defense-in-
+    // depth backstop. We've already validated above, but pass through
+    // so a future caller bypassing our checks still gets the guard.
+    const r = await resolveMultiplierToPrice(loanLite.collateral_mint, multiplierUsed, { allowBelowOne: isSl });
     if (!r.ok) return { status: 502, body: { error: "multiplier_resolve_failed", detail: r.error } };
     triggerKind = "price_usd";
     triggerValueMicro = r.triggerValueMicro;
@@ -434,10 +480,11 @@ export async function handleSiteLimitCloseArm(req) {
     loanIdChain: fields.LoanId,
     triggerKind,
     triggerValueMicro,
+    triggerDirection,
     slippageBps,
     sellDestination: dest,
     expiresAt,
-    armNote: `armed via site by ${auth.signerPubkey.slice(0, 8)}…`,
+    armNote: `armed via site (${isSl ? "SL" : "TP"}) by ${auth.signerPubkey.slice(0, 8)}…`,
   });
   if (!armed.ok) {
     return {
