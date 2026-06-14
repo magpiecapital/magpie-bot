@@ -43,6 +43,12 @@ export const PROGRAM_ID_V3 = process.env.PROGRAM_ID_V3
   ? new PublicKey(process.env.PROGRAM_ID_V3)
   : null;
 const ROUTE_MEMECOINS_TO_V3 = process.env.ROUTE_MEMECOINS_TO_V3 === "true";
+// 2026-06-14: when V3 launches with the genuine 50/60/70% RWA tier ladder,
+// flip this to "true" to route NEW RWA borrows to V3 instead of V2.
+// Existing V2 RWA loans continue to serve from V2 because each loan
+// row stores its own program_id (loans.program_id), so repay/extend/
+// liquidate paths are program-loyal — they don't read this flag.
+const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
 
 // Categories that should route to v2 once it's deployed. Source of truth
 // for the category vocabulary lives in supported_mints.category — keep in
@@ -66,19 +72,27 @@ export function isRwaCategory(category) {
 /**
  * Pick the program ID for a NEW borrow against the given collateral category.
  *
- *   RWA (stock/etf/metal) → v2 (if configured)
+ *   RWA (stock/etf/metal) → v3 (if configured AND ROUTE_RWA_TO_V3=true)
+ *                          otherwise v2 (if configured), otherwise v1
  *   memecoin (default)    → v3 (if configured AND ROUTE_MEMECOINS_TO_V3=true)
  *                          otherwise v1
+ *
+ * Existing loans repay against THEIR original program (loans.program_id);
+ * this routing only governs NEW borrows. Operator flips routing flags
+ * one category at a time so the V3 rollout is staged.
  *
  * Fail-safe: when in doubt, return v1, which is the deployed-and-tested
  * program. The env-gating means v3 only activates when the operator
  * explicitly confirms deploy + readiness.
  */
 export function chooseProgramIdForCategory(category) {
-  if (PROGRAM_ID_V2 && RWA_CATEGORIES.has(category)) return PROGRAM_ID_V2;
-  if (PROGRAM_ID_V3 && ROUTE_MEMECOINS_TO_V3 && !RWA_CATEGORIES.has(category)) {
-    return PROGRAM_ID_V3;
+  if (RWA_CATEGORIES.has(category)) {
+    if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
+    if (PROGRAM_ID_V2) return PROGRAM_ID_V2;
+    return PROGRAM_ID;
   }
+  // Non-RWA path
+  if (PROGRAM_ID_V3 && ROUTE_MEMECOINS_TO_V3) return PROGRAM_ID_V3;
   return PROGRAM_ID;
 }
 
