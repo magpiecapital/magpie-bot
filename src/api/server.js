@@ -404,10 +404,10 @@ async function handleCreditHistory(req, url) {
     return { status: 400, body: { error: "Provide ?wallet=<address>" } };
   }
 
-  const { rows: [w] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1`, [wallet],
-  );
-  if (!w) return { status: 404, body: { error: "Wallet not found" } };
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const wUserId = await resolveWalletOwner(wallet);
+  if (!wUserId) return { status: 404, body: { error: "Wallet not found" } };
+  const w = { user_id: wUserId };
 
   const { getScoreHistory } = await import("../services/credit-score.js");
   const history = await getScoreHistory(w.user_id, 50);
@@ -623,13 +623,13 @@ async function handleLoans(req, url) {
     return { status: 400, body: { error: "Provide ?wallet=<address>" } };
   }
 
-  const { rows: [w] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1`, [wallet],
-  );
-  if (!w) {
+  const { resolveWalletOwner: resolveOwner3 } = await import("../services/wallet-owner-resolver.js");
+  const wUserId2 = await resolveOwner3(wallet);
+  if (!wUserId2) {
     // Unknown wallet — return empty (not an error: dashboard may render zero state)
     return { status: 200, body: { wallet, active: [], history: [] } };
   }
+  const w = { user_id: wUserId2 };
 
   const { rows: allUserRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,

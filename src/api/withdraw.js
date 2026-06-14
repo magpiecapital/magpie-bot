@@ -222,10 +222,11 @@ export async function handleSiteWithdraw(req) {
   }
 
   // ── Gate 5: ownership — signer must be a linked wallet ──
-  const { rows: [walletRow] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [signerPubkey],
-  );
+  // Prefer the TG-linked user_id when present so withdraw activity
+  // is attributed to the human's TG identity (matches /repay et al).
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(signerPubkey);
+  const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!walletRow) {
     return {
       status: 403,
