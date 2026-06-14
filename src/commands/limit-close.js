@@ -687,6 +687,8 @@ export async function handleLimitOrders(ctx) {
             COALESCE(lc.trigger_direction, 'above') AS trigger_direction,
             lc.slippage_bps, lc.sell_destination, lc.status,
             lc.armed_at, lc.expires_at,
+            lc.trailing_distance_bps,
+            lc.peak_price_micros::text AS peak_price_micros,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
             m.symbol AS collateral_symbol,
@@ -720,7 +722,13 @@ export async function handleLimitOrders(ctx) {
     const r = rows[i];
     const trig = fmtTrigger(r.trigger_kind, BigInt(r.trigger_value_micro));
     const slip = (r.slippage_bps / 100).toFixed(r.slippage_bps < 200 ? 2 : 1);
-    const directionPill = r.trigger_direction === "below" ? "*SL*" : "*TP*";
+    // Trailing stops get their own pill so users can spot them at a glance.
+    // Direction is always 'below' for trailing — checked in the schema —
+    // so the trailing pill replaces the bare SL one rather than stacking.
+    const isTrailing = r.trailing_distance_bps != null;
+    const directionPill = isTrailing
+      ? `*TRAIL ${(r.trailing_distance_bps / 100).toFixed(1)}%*`
+      : (r.trigger_direction === "below" ? "*SL*" : "*TP*");
     // RWA badge — visible cue that this order routes through the V2
     // pool. Helps users mentally model why their stock-token TP might
     // pause Sat/Sun (engine weekend-fire skip for RWA TPs, PR #18 in
@@ -740,9 +748,17 @@ export async function handleLimitOrders(ctx) {
       else if (abs < 10) distLine = `\n   ~ ${abs.toFixed(1)}% from trigger`;
       else distLine = `\n   ~ ${Math.round(abs)}% from trigger`;
     }
+    // Trailing peak line — surfaces the moving high so users see what
+    // their effective floor is tracking. Watcher refreshes peak each tick.
+    let peakLine = "";
+    if (isTrailing && r.peak_price_micros) {
+      const peakUsd = Number(r.peak_price_micros) / 1e6;
+      const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+      peakLine = `\n   ~ peak $${fmt(peakUsd)} (floor floats with each new high)`;
+    }
     lines.push(
       `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
-      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${distLine}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
       "",
     );
   }
