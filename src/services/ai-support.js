@@ -1828,6 +1828,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "extend my loan", "push the due date", "need more time", "rollover" → \`propose_extend\`.
 - User says "partial repay", "pay down some", "reduce what I owe by X" → \`propose_partial_repay\`.
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. CRITICAL: never guess the target. The user must specify a multiplier (2x), an explicit USD price ($0.005), OR a market cap ($150M). If they don't specify, ASK first with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. RWA / xStock collateral isn't supported in v1 (return the error message; don't propose).
+- User says "stop loss", "stoploss", "sl at X", "set a stop", "auto-exit if it dumps", "sell if BONK drops X%", "protect downside at $Y" → \`propose_stop_loss\`. CRITICAL: never guess the floor. User must specify a multiplier (< 1, e.g. 0.7x = 70% of current), an explicit USD price floor ($0.001), OR a market cap floor ($10M). If they don't specify, ASK with a concrete suggestion ("Want me to set it at 0.7x current — that's a 30% drop?"). After arming, the engine autonomously closes + sells if the floor breaks. 1% protocol fee. TP + SL on the same loan IS allowed — if user wants both, call propose_take_profit then propose_stop_loss in sequence.
 - User says "trailing stop", "trail my stop", "trailing 10%", "follow the price up but stop if it drops", "lock in gains with a moving stop" → \`propose_trailing_stop\`. Trailing stops are a stop-loss variant where the floor floats UP with each new high (never down). User specifies a distance (10% means "fire if price drops 10% from the most recent peak"). Default suggestion: 10–15%. Distance must be between 0.5% and 50%. Trailing only works on loans they want to PROTECT (downside) — it's not a take-profit. Explain plainly: "as long as price keeps making new highs, the floor moves with it; the first time price drops your distance, it fires." 1% protocol fee on proceeds, same as TP.
 - User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
@@ -2080,6 +2081,26 @@ const TOOLS = [
         multiplier: { type: "number", description: "Multiplier of current price (e.g. 2 for 2x). Server resolves to a concrete USD price at arm time." },
         target_usd: { type: "number", description: "Explicit USD price per token (e.g. 0.005)." },
         mc_usd: { type: "number", description: "Explicit market cap in USD (e.g. 150000000 for $150M)." },
+        slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
+        sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
+        expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
+      },
+      required: ["loan_id"],
+    },
+  },
+  {
+    name: "propose_stop_loss",
+    description:
+      "Prepare a STOP-LOSS (downside limit-close) proposal the user can arm with one tap. Use when the user wants to set an autonomous downside exit: 'set a stop loss at -30%', 'auto-exit if BONK drops 40%', 'protect downside at $0.001', 'sl at 0.7x'. " +
+      "EXACTLY ONE of multiplier OR target_usd OR mc_usd must be set: multiplier=0.7 means 'sell at 70% of current price' (must be < 1); target_usd=0.001 means 'sell if price drops to $0.001/token'; mc_usd=10000000 means 'sell if MC falls to $10M'. " +
+      "If the user only says 'set a stop loss' without a level, ASK with a concrete suggestion ('Want me to set it at 0.7x current — that's a 30% drop?'). After arming, the engine autonomously sells if the floor breaks. 1% protocol fee on proceeds. Pairs with propose_take_profit on the same loan — TP + SL together is allowed.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to arm a stop-loss on. Required." },
+        multiplier: { type: "number", description: "Multiplier of current price (e.g. 0.7 for 70%). Must be < 1." },
+        target_usd: { type: "number", description: "Explicit USD price floor per token (e.g. 0.001)." },
+        mc_usd: { type: "number", description: "Explicit market cap floor in USD (e.g. 10000000 for $10M)." },
         slippage_pct: { type: "number", description: "Slippage cap as a percent (e.g. 2 for 2%). Default 2%. Range 0.5..10." },
         sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
         expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
@@ -2865,6 +2886,99 @@ const TOOL_HANDLERS = {
         String(loan.loan_id).slice(-6) +
         "`. Mention the target in human terms (e.g. 'at 2× current' or 'at $0.005') and the slippage cap. " +
         "DO NOT lecture them about how take-profit works — the card explains it. If the user picked a multiplier, mention the resolved USD price so they have a concrete number.",
+    };
+  },
+
+  // Stop-loss proposal — mirrors propose_take_profit but with
+  // direction='below' semantics and a < 1 multiplier check. The site
+  // SDK and engine arm path treat SL and TP symmetrically (same signed
+  // envelope, just a different direction byte). Pip surfaces both the
+  // resolved floor and the current price so the user has a clear
+  // "drop of X% from here" mental model before signing.
+  propose_stop_loss: async ({ loan_id, multiplier, target_usd, mc_usd, slippage_pct, sell_to, expire }, { userId, signerPubkey }) => {
+    const targetCount = [multiplier, target_usd, mc_usd].filter((x) => x != null).length;
+    if (targetCount !== 1) {
+      return toolError(
+        "missing_or_ambiguous_target",
+        null,
+        "Ask the user for a specific floor: a multiplier ('at 0.7x' = sell at 70% of current), an explicit USD price floor ('at $0.001'), OR a market-cap floor ('at $10M'). Don't guess — confirm.",
+      );
+    }
+    if (multiplier != null && (!Number.isFinite(multiplier) || multiplier >= 1 || multiplier <= 0)) {
+      return toolError("bad_multiplier", null, "Stop-loss multiplier must be > 0 and < 1 (e.g. 0.7 = sell at 70% of current).");
+    }
+
+    const slipPct = slippage_pct != null ? Number(slippage_pct) : 2;
+    if (!Number.isFinite(slipPct) || slipPct < 0.1 || slipPct > 10) {
+      return toolError("bad_slippage", null, "Slippage must be between 0.5% and 10%.");
+    }
+    const slippageBps = Math.round(slipPct * 100);
+    const dest = sell_to === "usdc" ? "usdc" : "sol";
+
+    const { rows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals, sm.category, sm.enabled
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = rows[0];
+    if (loan.status !== "active") {
+      return toolError("loan_not_active", null, `This loan is ${loan.status}, not active. Stop-loss only works on active loans.`);
+    }
+    if (!loan.enabled) {
+      return toolError("collateral_not_enabled", null, "This collateral isn't currently enabled in the protocol.");
+    }
+    if (signerPubkey && loan.borrower_wallet && signerPubkey !== loan.borrower_wallet) {
+      return toolError(
+        "wrong_signer_wallet",
+        `loan.borrower=${loan.borrower_wallet} signer=${signerPubkey}`,
+        `That loan was opened by ${loan.borrower_wallet.slice(0,4)}…${loan.borrower_wallet.slice(-4)}. Tell the user to switch wallets in Phantom before arming the stop-loss.`,
+      );
+    }
+
+    // Resolve multiplier → concrete USD floor. Same allowBelowOne=true
+    // shape that /stoploss's TG handler uses so semantics stay
+    // identical between channels.
+    let resolvedMultiplier = null;
+    let currentUsd = null;
+    let targetUsdResolved = null;
+    if (multiplier != null) {
+      const { resolveMultiplierToPrice } = await import("./limit-close-arm-core.js");
+      const r = await resolveMultiplierToPrice(loan.collateral_mint, multiplier, { allowBelowOne: true });
+      if (!r.ok) return toolError("multiplier_resolve_failed", r.error,
+        "Couldn't resolve the multiplier floor right now — tell the user to try an explicit USD price instead.");
+      resolvedMultiplier = multiplier;
+      currentUsd = r.currentUsd;
+      targetUsdResolved = r.targetUsd;
+    } else if (target_usd != null) {
+      targetUsdResolved = Number(target_usd);
+      try {
+        const { getPriceInUsdCrossSourced } = await import("./price.js");
+        currentUsd = await getPriceInUsdCrossSourced(loan.collateral_mint);
+      } catch { /* fail-open */ }
+    }
+
+    return {
+      action_proposed: {
+        type: "stop_loss",
+        loan_id: loan.loan_id,
+        collateral_symbol: loan.symbol,
+        multiplier: resolvedMultiplier,
+        current_usd: currentUsd,
+        target_usd: targetUsdResolved,
+        slippage_bps: slippageBps,
+        sell_destination: dest,
+        order_expire: expire || null,
+        expires_at: Date.now() + 5 * 60 * 1000,
+      },
+      _agent_instruction:
+        "Respond with ONE short line introducing the stop-loss card. Refer to the loan as `#" +
+        String(loan.loan_id).slice(-6) +
+        "`. Phrase the floor in PLAIN-language drop terms — e.g. 'a 30% drop from current ($0.003 → $0.0021)' — not just 'at $0.0021'. " +
+        "DO NOT lecture about how SL works; the card explains. If the user picked an explicit USD price, mention the implied drop percent so they have context.",
     };
   },
 
