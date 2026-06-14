@@ -387,10 +387,8 @@ export async function handleLimitClose(ctx, direction = "above") {
           return `Collateral token is not currently enabled in the protocol.`;
         case "invalid_slice_pct":
           return `Slice must be between 0.01% and 100%. Try \`slice=25%\` for a 25% leg.`;
-        case "ladder_not_yet_enabled":
-          return `Partial-slice TP/SL is rolling out — for now, slice must be 100%. Engine support ships next.`;
-        case "ladder_sum_exceeds_100":
-          return `You already have armed legs in this direction totaling close to 100%. Cancel one or shrink your slice.`;
+        case "fractional_slice_not_supported_today":
+          return `Today's on-chain protocol only supports full close per leg. Multi-target arming at different prices IS supported — e.g. \`/takeprofit ${loan_id} at 1.5x\` AND \`/takeprofit ${loan_id} at 2x\`. First to trigger fires; the other auto-cancels.`;
         case "rwa_collateral_not_supported_in_v1":
           // Unreachable since 2026-06-13 (PR C flipped the arm-core
           // gate; RWA collateral is now arm-eligible end-to-end via the
