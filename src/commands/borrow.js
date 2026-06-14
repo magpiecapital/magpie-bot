@@ -12,6 +12,7 @@ import { translateTxError, errorActionKeyboard } from "../services/tx-error-tran
 import { renderRiskBlock } from "../services/token-risk-preview.js";
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
+import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
 
 // Tier schedule is category-aware as of 2026-06-12 migration 040.
 // Memecoins use the legacy 30/25/20 LTV ladder; RWA collateral
@@ -529,8 +530,15 @@ export function registerBorrowCallbacks(bot) {
 
       pending.delete(ctx.chat.id);
 
-      // Build share button — every funded loan is a marketing moment
-      let shareKb;
+      // Build inline keyboard for the funded-loan card. Two rows:
+      //   1. One-tap protection — Arm TP / SL at smart defaults.
+      //      Mirrors the site's post-borrow protection card (PR #71).
+      //      Wires to the borrow:protect:tp / sl callbacks below.
+      //   2. Share buttons — every funded loan is a marketing moment.
+      let kb = new InlineKeyboard()
+        .text("TP @ 2x", `borrow:protect:tp:${result.loanId}`)
+        .text("SL @ 0.7x", `borrow:protect:sl:${result.loanId}`)
+        .row();
       try {
         const { getOrCreateCode } = await import("../services/referrals.js");
         const { shareBorrow } = await import("../services/share-moments.js");
@@ -542,10 +550,10 @@ export function registerBorrowCallbacks(bot) {
           durationDays: tier.days,
           referralCode: code,
         });
-        shareKb = new InlineKeyboard()
+        kb = kb
           .url("𝕏 Share to Twitter", card.twitterUrl)
           .url("📨 Tell a friend", card.telegramShareUrl);
-      } catch { /* non-critical */ }
+      } catch { /* share row non-critical */ }
 
       await ctx.editMessageText(
         [
@@ -557,16 +565,17 @@ export function registerBorrowCallbacks(bot) {
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
           "",
-          // Surface the take-profit feature inline with a concrete
-          // ready-to-run example. This is THE prime moment to mention
-          // it — the user just locked up collateral, they care about
-          // the upside scenario right now.
-          "💡 *Lock in upside?* Set a take-profit:",
-          `\`/takeprofit ${result.loanId} at 2x\``,
+          // Surface protection options — TP locks in upside, SL caps
+          // downside. Either button below arms the corresponding order
+          // at a sensible default; for custom triggers, the
+          // /takeprofit and /stoploss commands accept full multipliers
+          // and USD targets.
+          "🛡 *Protect this loan?* Tap a button below or use",
+          `\`/takeprofit ${result.loanId} at 2x\` · \`/stoploss ${result.loanId} at 0.7x\``,
           "",
           "/positions to check status · /share to flex on the timeline",
         ].join("\n"),
-        { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: shareKb },
+        { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: kb },
       );
     } catch (err) {
       console.error("Borrow failed:", err);
@@ -576,5 +585,92 @@ export function registerBorrowCallbacks(bot) {
         reply_markup: errorActionKeyboard({ flow: "borrow", errorKind: "tx_error" }),
       });
     }
+  });
+
+  // ── Post-borrow protection callbacks ───────────────────────────
+  // One-tap arm from the funded-loan keyboard. Defaults: TP 2×,
+  // SL 0.7×. Custom triggers via /takeprofit /stoploss.
+  bot.callbackQuery(/^borrow:protect:(tp|sl):(\d+)$/, async (ctx) => {
+    const slot = ctx.match[1];
+    const loanIdChain = ctx.match[2];
+    const direction = slot === "sl" ? "below" : "above";
+    const multiplier = slot === "sl" ? 0.7 : 2;
+    const slipBps = slot === "sl" ? 300 : 200;
+
+    let user;
+    try {
+      user = await upsertUser(ctx.from);
+    } catch (err) {
+      console.error("[borrow:protect] upsertUser failed:", err.message);
+      await ctx.answerCallbackQuery("Couldn't verify your account. Try again.");
+      return;
+    }
+
+    // Resolve the loan's collateral mint so we can multiplier→price.
+    const { query } = await import("../db/pool.js");
+    const { rows: [loanLite] } = await query(
+      `SELECT collateral_mint FROM loans
+        WHERE user_id = $1 AND loan_id = $2 AND status = 'active'
+        LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loanLite?.collateral_mint) {
+      await ctx.answerCallbackQuery(`Loan #${loanIdChain} isn't active anymore.`);
+      return;
+    }
+
+    let resolved;
+    try {
+      resolved = await resolveMultiplierToPrice(
+        loanLite.collateral_mint,
+        multiplier,
+        { allowBelowOne: direction === "below" },
+      );
+    } catch (err) {
+      console.warn("[borrow:protect] multiplier resolve threw:", err.message);
+      await ctx.answerCallbackQuery("Price lookup failed. Try /takeprofit or /stoploss manually.");
+      return;
+    }
+    if (!resolved.ok) {
+      await ctx.answerCallbackQuery(resolved.error || "Couldn't resolve target price.");
+      return;
+    }
+
+    const armed = await armOrder({
+      userId: user.id,
+      source: "tg",
+      loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: resolved.triggerValueMicro.toString(),
+      triggerDirection: direction,
+      slippageBps: slipBps,
+      sellDestination: "sol",
+    });
+    if (!armed.ok) {
+      // Most likely cause: the OTHER slot was already armed via prior
+      // tap — schema (mig 047) allows one TP + one SL, not duplicates.
+      const friendly = (() => {
+        switch (armed.error) {
+          case "loan_already_has_active_order_in_direction":
+            return `Already armed — use /modifyorder ${loanIdChain} to change it.`;
+          case "trigger_would_fire_immediately":
+            return `${direction === "below" ? "SL" : "TP"} would fire right now at this price. Skipped.`;
+          case "user_concurrency_cap_reached":
+            return `You're at the limit-order cap. Cancel one first.`;
+          default:
+            return `Couldn't arm (${armed.error || "unknown"}). Try /takeprofit or /stoploss manually.`;
+        }
+      })();
+      await ctx.answerCallbackQuery({ text: friendly, show_alert: true });
+      return;
+    }
+
+    // Confirm via callback toast — don't edit the borrow message so
+    // the share buttons + the other protect button stay tappable.
+    const sideLabel = direction === "below" ? "Stop-loss" : "Take-profit";
+    await ctx.answerCallbackQuery({
+      text: `${sideLabel} armed at ${multiplier}× — /limitorders to view.`,
+      show_alert: false,
+    });
   });
 }
