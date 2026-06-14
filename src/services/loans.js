@@ -256,13 +256,31 @@ export async function executeBorrow({
   // Authority must co-sign to attest the collateral value
   const lenderKeypair = loadLenderKeypair();
 
+  // V3's request_and_fund_loan takes one additional `category` u8 arg
+  // (0 = memecoin, 1 = RWA stock/etf/metal). V1 + V2 take just the 4
+  // pre-existing args. Picking the right shape per program is the
+  // difference between the on-chain ix deserializing cleanly and the
+  // borrower seeing "InstructionDidNotDeserialize" (operator hit this
+  // on 2026-06-14 borrowing SPCX from TG).
+  const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
+  const isV3 = process.env.PROGRAM_ID_V3 && programId.toBase58() === process.env.PROGRAM_ID_V3;
+  const categoryByte = RWA_CATEGORIES.has(category) ? 1 : 0;
+  const ixArgs = isV3
+    ? [
+        new BN(collateralAmountRaw.toString()),
+        loanOption,
+        new BN(collateralValueLamports.toString()),
+        loanId,
+        categoryByte,
+      ]
+    : [
+        new BN(collateralAmountRaw.toString()),
+        loanOption,
+        new BN(collateralValueLamports.toString()),
+        loanId,
+      ];
   const sig = await program.methods
-    .requestAndFundLoan(
-      new BN(collateralAmountRaw.toString()),
-      loanOption,
-      new BN(collateralValueLamports.toString()),
-      loanId,
-    )
+    .requestAndFundLoan(...ixArgs)
     .accounts({
       pool: lendingPool,
       loanTokenVault,
