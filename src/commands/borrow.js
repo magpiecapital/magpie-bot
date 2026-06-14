@@ -195,12 +195,28 @@ async function armConfiguredExits({ userId, loanIdChain, collateralMint, exits }
   }
 }
 
+// Escape Markdown V1 special chars that would otherwise be treated as
+// formatting delimiters by Telegram. We do this on dynamic inputs
+// (error codes from armOrder like "loan_already_has_active_order_in_direction"
+// have many underscores; custom-strike labels may contain * or `) before
+// embedding into the funded-loan card, since an unmatched delimiter
+// makes Telegram refuse to render the whole message ("can't find end
+// of the entity"). Caller wraps the LABELS in this; static text stays
+// authored with intentional bold/italic in source.
+function escapeMd(s) {
+  return String(s)
+    .replace(/_/g, "\\_")
+    .replace(/\*/g, "\\*")
+    .replace(/`/g, "\\`")
+    .replace(/\[/g, "\\[");
+}
+
 function renderExitsSummary(armResults) {
   if (!armResults || armResults.length === 0) return null;
   const lines = armResults.map((r) =>
     r.ok
-      ? `• ${r.label} — armed #${r.orderId}`
-      : `• ${r.label} — failed (${r.error || "unknown"})`,
+      ? `• ${escapeMd(r.label)} — armed #${r.orderId}`
+      : `• ${escapeMd(r.label)} — failed (${escapeMd(r.error || "unknown")})`,
   );
   return ["*Exits:*", ...lines].join("\n");
 }
@@ -548,7 +564,11 @@ export function registerBorrowCallbacks(bot) {
   async function showExitsMenu(ctx, state) {
     state.stage = "await_exits";
     pending.set(ctx.chat.id, state);
-    const symbol = state.selected.symbol;
+    // Escape Markdown V1 specials in the symbol so a token whose ticker
+    // contains an underscore (e.g. some Solana memecoins) doesn't break
+    // the message render. Static decorators (bold/italic) in the body
+    // stay intentional.
+    const symbol = escapeMd(state.selected.symbol);
     // Plain-language button labels. We keep the TP / SL acronyms inside
     // the parentheses so power users still see the familiar shorthand,
     // but the lead verb makes the action obvious to a first-time user.
@@ -568,8 +588,8 @@ export function registerBorrowCallbacks(bot) {
         "",
         "Pick a plan now and we'll auto-sell your collateral the moment your target hits — no need to babysit the chart or come back later.",
         "",
-        "• *Sell at 2x* — auto-sell if price *doubles* (locks in gains). Also called \"take profit\" or _TP_.",
-        "• *Sell at 0.7x* — auto-sell if price drops *30%* (limits losses). Also called \"stop loss\" or _SL_.",
+        "• *Sell at 2x* — auto-sell if price *doubles* (locks in gains). Also called \"take profit\" (TP).",
+        "• *Sell at 0.7x* — auto-sell if price drops *30%* (limits losses). Also called \"stop loss\" (SL).",
         "• *Both* — set both an upside and a downside trigger. Whichever hits first wins.",
         "• *Custom* — type your own target (e.g. `5x`, `$0.02`, `30m mc`, `-30%`).",
         "• *Ladder* — sell in stages at multiple targets instead of all at once.",
@@ -917,9 +937,10 @@ export function registerBorrowCallbacks(bot) {
     state.stage = kind === "custom_tp" ? "await_custom_tp_input" : "await_custom_sl_input";
     pending.set(ctx.chat.id, state);
     await ctx.answerCallbackQuery();
+    const safeSymbol = escapeMd(state.selected.symbol);
     const headline = kind === "custom_tp"
-      ? `*Auto-sell when price goes UP — ${state.selected.symbol}*`
-      : `*Auto-sell when price drops DOWN — ${state.selected.symbol}*`;
+      ? `*Auto-sell when price goes UP — ${safeSymbol}*`
+      : `*Auto-sell when price drops DOWN — ${safeSymbol}*`;
     await ctx.editMessageText(
       [
         headline,
@@ -959,13 +980,13 @@ export function registerBorrowCallbacks(bot) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       [
-        `*${side === "tp" ? "Profit ladder (sell on the way UP)" : "Loss-defense ladder (sell on the way DOWN)"} — ${state.selected.symbol}*`,
+        `*${side === "tp" ? "Profit ladder (sell on the way UP)" : "Loss-defense ladder (sell on the way DOWN)"} — ${escapeMd(state.selected.symbol)}*`,
         "",
         side === "tp"
           ? "Sell your collateral in stages as the price climbs, instead of all at one target. You'll lock in some gains early and let some ride higher."
           : "Sell your collateral in stages as the price drops, instead of all at one stop. You'll protect some capital early while leaving room for a recovery.",
         "",
-        "_Heads up: each step is a separate sell + re-borrow, so 3 steps cost ~3× the loan fee of a single exit._",
+        "Heads up: each step is a separate sell + re-borrow, so 3 steps cost ~3× the loan fee of a single exit.",
       ].join("\n"),
       { parse_mode: "Markdown", reply_markup: kb },
     );
