@@ -336,6 +336,15 @@ async function tick(bot) {
                 .text("Keep active", `lcstale:keep:${row.payload.order_id}`)
                 .text("Cancel order", `lcstale:cancel:${row.payload.order_id}`);
               extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_retrying") {
+              // Lets the user bail mid-retry if they no longer want the
+              // engine to keep escalating. Cancel is hard-cancel — order
+              // moves to status='cancelled'. The callback handler is in
+              // src/index.js under bot.callbackQuery("lcret:cancel:...").
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard()
+                .text("Cancel this order", `lcret:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
             } else if (row.kind === "limit_close_fired") {
               // Receipt-confirmation keyboard. Solscan links are already
               // inline in the body, but tap-once buttons are friendlier
