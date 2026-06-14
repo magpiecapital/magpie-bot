@@ -155,6 +155,55 @@ export async function handleStats(ctx) {
     const totalAccrued = holderAccrued + lpAccrued + reserveAccrued + refAccrued;
     const r = counts[0];
 
+    // ── Defaulted-loan profit (2026-06-14 policy, Phase 1B) ──────
+    // When a non-$MAGPIE collateralized loan defaults, the protocol
+    // sells the seized collateral; the NET profit (proceeds minus
+    // principal lent) is distributed 70/10/10/10 to holders / LP
+    // loyalty / referrer (rolls to holders if none) / protocol reserve.
+    // When $MAGPIE is the collateral, the seized $MAGPIE is burned
+    // instead — operator-manual burn path, recorded but not summed
+    // into the profit total.
+    //
+    // Best-effort reads; missing migration 059 (fresh deploy) degrades
+    // to zeros without crashing /stats.
+    let defaultProfitLifetime = 0n, defaultProfitLast24h = 0n;
+    let defaultedLoansWithProfit = 0;
+    let defaultsAwaitingSale = 0;
+    let defaultsAwaitingDistribution = 0n;
+    let magpieBurnedCount = 0, magpieBurnPendingCount = 0;
+    try {
+      const { rows: [agg] } = await query(
+        `SELECT
+           COALESCE(SUM(net_profit_lamports) FILTER (
+             WHERE net_profit_lamports > 0 AND distribution_status != 'loss'
+           ), 0)::text AS profit_lifetime,
+           COALESCE(SUM(net_profit_lamports) FILTER (
+             WHERE net_profit_lamports > 0
+               AND distribution_status != 'loss'
+               AND sale_detected_at > NOW() - INTERVAL '24 hours'
+           ), 0)::text AS profit_24h,
+           COUNT(*) FILTER (
+             WHERE net_profit_lamports > 0 AND distribution_status != 'loss'
+           )::int AS profitable_count,
+           COUNT(*) FILTER (WHERE distribution_status = 'pending_sale')::int AS pending_sale_count,
+           COALESCE(SUM(net_profit_lamports) FILTER (
+             WHERE distribution_status = 'awaiting_distribution'
+           ), 0)::text AS awaiting_dist,
+           COUNT(*) FILTER (WHERE distribution_status = 'magpie_burn_pending')::int AS magpie_pending,
+           COUNT(*) FILTER (WHERE distribution_status = 'magpie_burned')::int AS magpie_burned
+         FROM liquidation_economics`,
+      );
+      if (agg) {
+        defaultProfitLifetime = BigInt(agg.profit_lifetime || "0");
+        defaultProfitLast24h = BigInt(agg.profit_24h || "0");
+        defaultedLoansWithProfit = Number(agg.profitable_count || 0);
+        defaultsAwaitingSale = Number(agg.pending_sale_count || 0);
+        defaultsAwaitingDistribution = BigInt(agg.awaiting_dist || "0");
+        magpieBurnedCount = Number(agg.magpie_burned || 0);
+        magpieBurnPendingCount = Number(agg.magpie_pending || 0);
+      }
+    } catch { /* migration 059 not applied yet — degrade silently */ }
+
     // HEADLINE: lifetime cumulative SOL ever borrowed — DB SUM across
     // all loan rows (pool-agnostic; both V1 and V2 borrows land in
     // `loans` via the same recordLoan path). On-chain `totalBorrowed`
@@ -204,6 +253,24 @@ export async function handleStats(ctx) {
       ``,
       `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
       ...snapshotHistoryRows,
+      // Defaulted-loan profit section. Only renders when ANY meaningful
+      // signal is present, to avoid noisy empty rows on fresh deploys.
+      ...((defaultProfitLifetime > 0n || defaultedLoansWithProfit > 0 ||
+           defaultsAwaitingSale > 0 || magpieBurnedCount > 0 || magpieBurnPendingCount > 0)
+        ? [
+            ``,
+            `DEFAULTED-LOAN PROFIT (auto to rewards pool)`,
+            row("Lifetime profit", `${fmtSol(defaultProfitLifetime.toString())} SOL`),
+            row("Last 24h",        `${fmtSol(defaultProfitLast24h.toString())} SOL`),
+            row("Profitable defaults", String(defaultedLoansWithProfit)),
+            ...(defaultsAwaitingSale > 0
+              ? [row("Awaiting sale", String(defaultsAwaitingSale))] : []),
+            ...(defaultsAwaitingDistribution > 0n
+              ? [row("Pending distribute", `${fmtSol(defaultsAwaitingDistribution.toString())} SOL`)] : []),
+            ...(magpieBurnPendingCount > 0 || magpieBurnedCount > 0
+              ? [row("$MAGPIE burns", `${magpieBurnedCount} done / ${magpieBurnPendingCount} pending`)] : []),
+          ]
+        : []),
       RULE,
     ];
 
