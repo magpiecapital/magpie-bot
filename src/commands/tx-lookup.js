@@ -16,6 +16,7 @@ import { connection } from "../solana/connection.js";
 const MAGPIE_PROGRAMS = new Set([
   process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh",
   process.env.PROGRAM_ID_V2,
+  process.env.PROGRAM_ID_V3,
   "7tapneCmNwRVEtdeZks4649Q2rf8W1t9tshMN9yHX99P",   // magpie-lending
   "BBYtty9sqWjHzTuoXSNfDCpNtLn6ZjfSfhYEoY6MFP2E",   // magpie-credit-oracle
 ].filter(Boolean));
