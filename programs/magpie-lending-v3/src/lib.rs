@@ -21,13 +21,82 @@ declare_id!("MgpV3TWAPLending111111111111111111111111111");
 /// Basis-point helpers
 const BPS_DENOM: u64 = 10_000;
 
-/// Loan tier configuration (matches existing protocol)
-/// Option 0: Express – 30% LTV, 2 days, 3% fee
-/// Option 1: Quick   – 25% LTV, 3 days, 2% fee
-/// Option 2: Standard– 20% LTV, 7 days, 1.5% fee
-const TIER_LTV_BPS: [u64; 3] = [3_000, 2_500, 2_000];
-const TIER_DURATION_DAYS: [i64; 3] = [2, 3, 7];
-const TIER_FEE_BPS: [u64; 3] = [300, 200, 150];
+// ---------------------------------------------------------------------------
+// Tier ladders — THESE CONSTANTS ARE THE CONTRACT.
+//
+// 2026-06-13 LESSON (paid for in user trust): the prior `rwa_loan_tiers`
+// DB display table advertised 50/60/70% RWA LTVs while the on-chain v2
+// program computed 30/25/20%. Users signed expecting one amount and got
+// another. The cure is to make THIS file the single, authoritative source
+// of tier params, and have every off-chain surface (DB, dashboard, bot,
+// Pip, marketplace) DERIVE from on-chain rather than store its own copy.
+//
+// v3 ships dual tiers — memecoin and RWA — selected at borrow time via
+// the `category` instruction param. The off-chain `rwa_loan_tiers` table
+// in the bot's DB is now a downstream mirror that the migration runner
+// updates from on-chain at startup, never the other way around.
+// ---------------------------------------------------------------------------
+
+const CATEGORY_MEMECOIN: u8 = 0;
+const CATEGORY_RWA: u8 = 1;
+
+/// Memecoin tier ladder. Conservative LTVs because volatility on these
+/// names can be 30%+ in an hour; short terms keep duration risk in check.
+/// Option 0 Express : 30% LTV ·  2 days · 3.0% fee
+/// Option 1 Quick   : 25% LTV ·  3 days · 2.0% fee
+/// Option 2 Standard: 20% LTV ·  7 days · 1.5% fee
+const TIER_MEMECOIN_LTV_BPS: [u64; 3] = [3_000, 2_500, 2_000];
+const TIER_MEMECOIN_DURATION_DAYS: [i64; 3] = [2, 3, 7];
+const TIER_MEMECOIN_FEE_BPS: [u64; 3] = [300, 200, 150];
+
+/// RWA tier ladder for tokenized stocks / ETFs / metals (Backed
+/// xStocks etc.). Intraday vol is typically 1–3% and the holder
+/// profile is closer to traditional investors than memecoin traders.
+/// The protocol can safely offer higher LTV / longer terms / higher
+/// fee. Aspirational design from migration 040 — v3 is where the
+/// numbers actually land in the on-chain program.
+/// Option 0 RWA Express : 50% LTV ·  7 days · 2.5% fee
+/// Option 1 RWA Quick   : 60% LTV · 15 days · 3.5% fee
+/// Option 2 RWA Standard: 70% LTV · 30 days · 5.0% fee
+const TIER_RWA_LTV_BPS: [u64; 3] = [5_000, 6_000, 7_000];
+const TIER_RWA_DURATION_DAYS: [i64; 3] = [7, 15, 30];
+const TIER_RWA_FEE_BPS: [u64; 3] = [250, 350, 500];
+
+/// Resolve tier params from (category, option). Returns
+/// (ltv_bps, fee_bps, duration_days) so the caller can use them
+/// directly. Returns None when category or option is out of range —
+/// caller must surface ErrorCode::InvalidCategory or InvalidLoanOption.
+fn resolve_tier(category: u8, option: u8) -> Option<(u64, u64, i64)> {
+    let i = option as usize;
+    if i >= 3 { return None; }
+    match category {
+        CATEGORY_MEMECOIN => Some((
+            TIER_MEMECOIN_LTV_BPS[i],
+            TIER_MEMECOIN_FEE_BPS[i],
+            TIER_MEMECOIN_DURATION_DAYS[i],
+        )),
+        CATEGORY_RWA => Some((
+            TIER_RWA_LTV_BPS[i],
+            TIER_RWA_FEE_BPS[i],
+            TIER_RWA_DURATION_DAYS[i],
+        )),
+        _ => None,
+    }
+}
+
+/// Reverse-lookup used by extend_loan / partial_repay / off-chain
+/// indexers to recover (ltv_bps, fee_bps, duration_days) from a loan's
+/// stored (category, ltv_bps). The ltv_bps within a category is
+/// uniquely associated with one option index, so this is well-defined.
+fn resolve_tier_for_loan(category: u8, ltv_bps: u16) -> Option<(u64, u64, i64)> {
+    let table: &[u64; 3] = match category {
+        CATEGORY_MEMECOIN => &TIER_MEMECOIN_LTV_BPS,
+        CATEGORY_RWA      => &TIER_RWA_LTV_BPS,
+        _ => return None,
+    };
+    let option = table.iter().position(|&v| v == ltv_bps as u64)? as u8;
+    resolve_tier(category, option)
+}
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -392,15 +461,23 @@ pub mod magpie_lending {
     /// Request and instantly fund a loan from the pool.
     ///
     /// `collateral_amount` – raw token units of collateral to lock.
-    /// `loan_option`       – tier 0/1/2.
+    /// `loan_option`       – tier 0/1/2 within the chosen category.
     /// `collateral_value`  – oracle-supplied value in loan-token units.
     /// `loan_id`           – unique nonce (e.g. unix-ms).
+    /// `category`          – 0 = memecoin (30/25/20% LTV @ 2/3/7d),
+    ///                       1 = RWA stock/etf/metal (50/60/70% @ 7/15/30d).
+    ///                       The cosign authority is responsible for matching
+    ///                       this to the on-chain mint category — if a memecoin
+    ///                       borrow arrives with category=RWA the higher LTV
+    ///                       on a volatile mint becomes a default risk. The
+    ///                       authority signature gates that.
     pub fn request_and_fund_loan(
         ctx: Context<RequestLoan>,
         collateral_amount: u64,
         loan_option: u8,
         collateral_value: u64,
         loan_id: u64,
+        category: u8,
     ) -> Result<()> {
         // Constraints lifted from RequestLoan struct to keep try_accounts under
         // the BPF 4 KB stack limit. Functionally equivalent.
@@ -433,6 +510,9 @@ pub mod magpie_lending {
         require!(loan_option <= 2, ErrorCode::InvalidLoanOption);
         require!(collateral_amount > 0, ErrorCode::InvalidCollateralAmount);
         require!(collateral_value > 0, ErrorCode::InvalidCollateralValue);
+        // Validate category early — before any expensive TWAP / token work —
+        // so a bad caller fails cheaply.
+        require!(category <= 1, ErrorCode::InvalidCategory);
 
         // --- v3 TWAP-based price validation ---
         // Replaces v2's single-spot attestation with a time-weighted
@@ -498,10 +578,8 @@ pub mod magpie_lending {
             ErrorCode::CollateralValueExceedsAttestation
         );
 
-        let tier = loan_option as usize;
-        let ltv_bps = TIER_LTV_BPS[tier];
-        let fee_bps = TIER_FEE_BPS[tier];
-        let duration_days = TIER_DURATION_DAYS[tier];
+        let (ltv_bps, fee_bps, duration_days) =
+            resolve_tier(category, loan_option).ok_or(ErrorCode::InvalidCategory)?;
 
         // Compute loan amount from LTV
         let gross_loan = collateral_value
@@ -615,6 +693,11 @@ pub mod magpie_lending {
         loan.transaction_fee = fee;
         loan.ltv_bps = ltv_bps as u16;
         loan.duration_days = duration_days as u8;
+        // Persist category so extend_loan / partial-repay can resolve the
+        // correct tier ladder later WITHOUT having to look up the mint
+        // category from off-chain again. Avoids "what tier is this" round-
+        // trips that bit V1/V2 in the limit-close engine after migration 040.
+        loan.category = category;
         loan.start_timestamp = now;
         loan.due_timestamp = now
             .checked_add(duration_days.checked_mul(SECONDS_PER_DAY).unwrap())
@@ -645,6 +728,7 @@ pub mod magpie_lending {
             fee,
             ltv_bps: ltv_bps as u16,
             duration_days: duration_days as u8,
+            category,
         });
         Ok(())
     }
@@ -800,14 +884,15 @@ pub mod magpie_lending {
         let loan = &ctx.accounts.loan;
         require!(loan.status == LoanStatus::Active, ErrorCode::LoanNotActive);
 
-        let tier = match loan.ltv_bps {
-            3_000 => 0usize,
-            2_500 => 1,
-            2_000 => 2,
-            _ => return Err(ErrorCode::InvalidLoanOption.into()),
-        };
+        // Resolve tier from the loan's stored (category, option) — the option
+        // is derived from ltv_bps within the category's ladder. RWA Standard
+        // (70%) and memecoin Express (30%) have distinct ltv_bps so the
+        // option-from-ltv inference inside resolve_tier_for_loan is unique
+        // per category.
+        let (_, fee_bps, duration_days) =
+            resolve_tier_for_loan(loan.category, loan.ltv_bps)
+                .ok_or(ErrorCode::InvalidLoanOption)?;
 
-        let fee_bps = TIER_FEE_BPS[tier];
         let extension_fee = loan
             .repay_amount
             .checked_mul(fee_bps)
@@ -858,9 +943,9 @@ pub mod magpie_lending {
 
         let loan_key = ctx.accounts.loan.key();
         let loan = &mut ctx.accounts.loan;
-        let extension = TIER_DURATION_DAYS[tier]
+        let extension = duration_days
             .checked_mul(SECONDS_PER_DAY)
-            .unwrap();
+            .ok_or(ErrorCode::MathOverflow)?;
         loan.due_timestamp = loan
             .due_timestamp
             .checked_add(extension)
@@ -1169,7 +1254,7 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(collateral_amount: u64, loan_option: u8, collateral_value: u64, loan_id: u64)]
+#[instruction(collateral_amount: u64, loan_option: u8, collateral_value: u64, loan_id: u64, category: u8)]
 pub struct RequestLoan<'info> {
     #[account(mut)]
     pub pool: Box<Account<'info, LendingPool>>,
@@ -1645,7 +1730,8 @@ pub struct Loan {
     pub repay_amount: u64,
     /// Fee charged at origination
     pub transaction_fee: u64,
-    /// LTV in basis points (2000, 2500, or 3000)
+    /// LTV in basis points. Memecoin: 2000/2500/3000.
+    /// RWA: 5000/6000/7000. Tier resolved within the loan's category.
     pub ltv_bps: u16,
     /// Loan duration in days
     pub duration_days: u8,
@@ -1661,6 +1747,10 @@ pub struct Loan {
     pub bump: u8,
     /// PDA bump for collateral vault
     pub vault_bump: u8,
+    /// Loan category (0 = memecoin, 1 = RWA). Used by extend_loan to
+    /// pick the right tier ladder without a round-trip to off-chain
+    /// metadata.
+    pub category: u8,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -1708,6 +1798,9 @@ pub struct LoanFunded {
     pub fee: u64,
     pub ltv_bps: u16,
     pub duration_days: u8,
+    /// 0 = memecoin, 1 = RWA. Off-chain indexers can filter loans
+    /// by category without joining against the off-chain mint table.
+    pub category: u8,
 }
 
 #[event]
@@ -1808,4 +1901,6 @@ pub enum ErrorCode {
     PriceImpactPumpDetected,
     #[msg("Price sample timestamp went backwards — clock skew or replay.")]
     PriceTimestampWentBackwards,
+    #[msg("Invalid category. Must be 0 (memecoin) or 1 (RWA).")]
+    InvalidCategory,
 }
