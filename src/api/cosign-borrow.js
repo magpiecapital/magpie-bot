@@ -55,6 +55,15 @@ const V1_PROGRAM_ID = new PublicKey(
 const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2
   ? new PublicKey(process.env.PROGRAM_ID_V2)
   : null;
+// V3 program — once routing flips for RWA (ROUTE_RWA_TO_V3=true), the site
+// builds borrow txs targeting this program. Without including it in the
+// allowlist + magpie-program check, every V3 borrow returns 403 with
+// "instruction program not allowed in co-signed tx". Discovered 2026-06-14
+// when SPCX borrows started failing immediately after V3 routing went live.
+const V3_PROGRAM_ID = process.env.PROGRAM_ID_V3
+  ? new PublicKey(process.env.PROGRAM_ID_V3)
+  : null;
+const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
@@ -86,6 +95,7 @@ const ALLOWED_DISCRIMINATORS = [
 const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
   V1_PROGRAM_ID.toBase58(),
   ...(V2_PROGRAM_ID ? [V2_PROGRAM_ID.toBase58()] : []),
+  ...(V3_PROGRAM_ID ? [V3_PROGRAM_ID.toBase58()] : []),
   "ComputeBudget111111111111111111111111111111",
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
@@ -134,6 +144,7 @@ function loadLenderKeypair() {
 function isMagpieProgram(programIdPk) {
   if (programIdPk.equals(V1_PROGRAM_ID)) return true;
   if (V2_PROGRAM_ID && programIdPk.equals(V2_PROGRAM_ID)) return true;
+  if (V3_PROGRAM_ID && programIdPk.equals(V3_PROGRAM_ID)) return true;
   return false;
 }
 
@@ -312,23 +323,26 @@ export async function handleCosignBorrow(req) {
     }
   }
 
-  // POST-$FATHER GATE: hard-stop on v2 (RWA pool) borrows of memecoins.
-  // The v2 pool is RWA-only by policy. If the tx's program is v2 BUT the
-  // collateral mint's category is not in {stock, etf, metal}, refuse to
-  // co-sign — even if every other gate passes.
-  if (chosenProgramId && V2_PROGRAM_ID && chosenProgramId.equals(V2_PROGRAM_ID)) {
+  // POST-$FATHER GATE: hard-stop on RWA-pool borrows of memecoins.
+  // V2 and V3 are RWA-only by policy. If the tx's program is V2 or V3 BUT
+  // the collateral mint's category is not in {stock, etf, metal}, refuse
+  // to co-sign — even if every other gate passes.
+  const v2Targeted = chosenProgramId && V2_PROGRAM_ID && chosenProgramId.equals(V2_PROGRAM_ID);
+  const v3Targeted = chosenProgramId && V3_PROGRAM_ID && chosenProgramId.equals(V3_PROGRAM_ID);
+  if (v2Targeted || v3Targeted) {
     const cat = collateralMintInTx?.category;
     const RWA_OK = cat === "stock" || cat === "etf" || cat === "metal";
     if (!RWA_OK) {
+      const poolLabel = v3Targeted ? "V3" : "V2";
       console.error(
-        `[cosign-borrow] V2-MEMECOIN BLOCK: v2 pool requested with collateral ` +
+        `[cosign-borrow] ${poolLabel}-MEMECOIN BLOCK: ${poolLabel} pool requested with collateral ` +
           `${collateralMintInTx?.mint ?? "<unknown>"} category=${cat ?? "<null>"}`,
       );
       return {
         status: 403,
         body: {
-          error: "v2 pool is RWA-only",
-          detail: `collateral category "${cat ?? "<null>"}" is not in {stock,etf,metal}; memecoins must use v1`,
+          error: `${poolLabel} pool is RWA-only`,
+          detail: `collateral category "${cat ?? "<null>"}" is not in {stock,etf,metal}; memecoins must use V1`,
         },
       };
     }
@@ -401,9 +415,7 @@ export async function handleCosignBorrow(req) {
   // loan size in lamports, then re-derive collateral value via the
   // cross-sourced oracle (don't trust the client's claimed value).
   try {
-    const magpieIx = tx.instructions.find(
-      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIx = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     if (magpieIx && borrowerSig) {
       const data = magpieIx.data; // Buffer
       // Layout: 8-byte discriminator | amount u64 LE | option u8 | value_lamports u64 LE | loan_id u64 LE
@@ -443,23 +455,47 @@ export async function handleCosignBorrow(req) {
           // The user sees a clear error and is forced to refresh.
           const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
           const ixProgramId = magpieIx.programId;
+          // Expected RWA target depends on the live routing flag: when
+          // ROUTE_RWA_TO_V3 is on AND V3 is configured, RWA borrows must
+          // use V3; otherwise V2 (legacy) is the canonical RWA pool.
+          const expectedRwaProgram = (V3_PROGRAM_ID && ROUTE_RWA_TO_V3)
+            ? V3_PROGRAM_ID
+            : V2_PROGRAM_ID;
+          const expectedRwaLabel = (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) ? "V3" : "V2";
           if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
             return {
               status: 400,
               body: {
                 error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V2 RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
+                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
               },
             };
           }
-          // Also refuse if a memecoin tries to borrow against V2 (the
-          // symmetric mistake — V2 is RWA-only, fee economics differ).
-          if (!isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID)) {
+          // When V3 is the live RWA target, RWA mints must NOT route to V2
+          // (the legacy RWA pool). Surfaces cache-stale clients that still
+          // pick V2 after the operator flipped the routing flag.
+          if (isRwaMint && expectedRwaProgram && !ixProgramId.equals(expectedRwaProgram)) {
             return {
               status: 400,
               body: {
                 error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets V2.`,
+                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again.`,
+              },
+            };
+          }
+          // Also refuse if a memecoin tries to borrow against V2 or V3 (the
+          // symmetric mistake — both are RWA-only, fee economics differ).
+          const memeOnRwaPool =
+            !isRwaMint &&
+            ((V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID)) ||
+              (V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID)));
+          if (memeOnRwaPool) {
+            const targetedLabel = V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
+            return {
+              status: 400,
+              body: {
+                error: "wrong_program_for_collateral",
+                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets ${targetedLabel}.`,
               },
             };
           }
@@ -642,9 +678,7 @@ export async function handleCosignBorrow(req) {
   // before the contract's 120s wall. If the price feed PDA hasn't
   // been initialized yet, init + attest in one shot.
   try {
-    const magpieIxForAttest = tx.instructions.find(
-      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIxForAttest = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     const mintKey = magpieIxForAttest?.keys?.[4]?.pubkey;
     if (mintKey) {
       const mintStr = mintKey.toBase58();
@@ -733,9 +767,7 @@ export async function handleCosignBorrow(req) {
     const { getReadOnlyProgram } = await import("../solana/program.js");
     const { recordLoan } = await import("../services/loans.js");
     const program = getReadOnlyProgram(chosenProgramId);
-    const magpieIx = tx.instructions.find((ix) =>
-      ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIx = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     if (magpieIx) {
       // Loan PDA is at index 2 in the request_and_fund_loan accounts
       // (pool, loan_token_vault, loan, ...). We've already validated
