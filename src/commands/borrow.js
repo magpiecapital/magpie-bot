@@ -555,7 +555,7 @@ export function registerBorrowCallbacks(bot) {
       .text("Custom TP", "borrow:exits:custom_tp").text("Custom SL", "borrow:exits:custom_sl").row()
       .text("TP Ladder", "borrow:exits:ladder_tp").text("SL Ladder", "borrow:exits:ladder_sl").row()
       .text("Skip — set later", "borrow:exits:skip").row()
-      .text("✕ Cancel", "borrow:cancel");
+      .text("← Change tier", "borrow:exits:retier").text("✕ Cancel", "borrow:cancel");
     await ctx.editMessageText(
       [
         `*Set your exit strategy for ${symbol}*`,
@@ -980,6 +980,68 @@ export function registerBorrowCallbacks(bot) {
     }
     await ctx.answerCallbackQuery();
     await showExitsMenu(ctx, state);
+  });
+
+  // Lets user back up from the exits menu to re-pick the tier. We re-
+  // run the tier-selection screen by re-quoting current collateral
+  // value (the cached quote may already be stale at this point — the
+  // user has been sitting in the exits menu for some seconds).
+  bot.callbackQuery("borrow:exits:retier", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    // Clear tier + exits so the user gets a fresh tier picker.
+    delete state.tier;
+    delete state.tierOption;
+    delete state.exits;
+    delete state.stage;
+    pending.set(ctx.chat.id, state);
+    let valueLamports;
+    try {
+      valueLamports = await collateralValueLamports(
+        state.selected.mint,
+        state.collateralRaw,
+        state.selected.decimals,
+      );
+    } catch (err) {
+      console.warn("[borrow:exits:retier] price re-fetch failed:", err.message);
+      await ctx.answerCallbackQuery("Couldn't refresh price. Run /borrow again.");
+      return;
+    }
+    state.collateralValueLamports = valueLamports;
+    state.quotedAt = Date.now();
+    pending.set(ctx.chat.id, state);
+    const tiers = await getEligibleTiers({ category: state.selected.category });
+    const kb = new InlineKeyboard();
+    const tierLines = tiers.map((t) => {
+      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
+      const fee = loanSol * (t.feeBps / 10_000);
+      const receive = loanSol - fee;
+      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
+      const shortName = shortMatch ? shortMatch[1] : t.label;
+      kb.text(
+        `${shortName} — ${receive.toFixed(4)} SOL`,
+        `borrow:tier:${t.option}`,
+      ).row();
+      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
+    });
+    kb.text("✕ Cancel", "borrow:cancel");
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
+        `*Value:* ${fmtSol(valueLamports)} SOL`,
+        "",
+        "*Choose a loan tier:*",
+        ...tierLines,
+        "",
+        "_Amount shown is what you receive after the tier fee._",
+        "⏱ _This quote expires in 60 seconds._",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
   });
 
   // ── Post-borrow protection callbacks ───────────────────────────
