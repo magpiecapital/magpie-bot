@@ -662,7 +662,8 @@ export async function handleBracket(ctx) {
       "Examples:\n" +
       "`/bracket 1234 tp=2x sl=0.7x`\n" +
       "`/bracket 1234 tp=$0.005 sl=$0.001 slip=3%`\n" +
-      "`/bracket 1234 tp=$150m sl=$50m dest=usdc`\n\n" +
+      "`/bracket 1234 tp=$150m sl=$50m dest=usdc`\n" +
+      "`/bracket 1234 tp=2x sl=0.7x expire=30d` (both legs expire in 30 days)\n\n" +
       "Arms BOTH a take-profit and stop-loss. First to fire closes the loan; the other auto-cancels.",
       { parse_mode: "Markdown" },
     );
@@ -698,6 +699,7 @@ export async function handleBracket(ctx) {
   let slRaw = null;
   let slippage_bps = 200;
   let sell_destination = "sol";
+  let expiresAtIso = null;
   for (const tok of rest.slice(1)) {
     const kv = tok.match(/^([a-z_]+)=(.+)$/i);
     if (!kv) continue;
@@ -718,6 +720,20 @@ export async function handleBracket(ctx) {
       const dv = v.toLowerCase();
       if (dv !== "sol" && dv !== "usdc") return ctx.reply("`dest=` must be sol or usdc.", { parse_mode: "Markdown" });
       sell_destination = dv;
+    } else if (k === "expire" || k === "expires") {
+      // Accept relative forms (30d, 12h) or an ISO date. Applies to
+      // BOTH legs — the engine cancels each independently when its
+      // own expires_at hits.
+      const m = v.match(/^(\d+)([dh])$/i);
+      if (m) {
+        const n = Number(m[1]);
+        const ms = m[2].toLowerCase() === "d" ? n * 86_400_000 : n * 3_600_000;
+        expiresAtIso = new Date(Date.now() + ms).toISOString();
+      } else if (!Number.isNaN(Date.parse(v))) {
+        expiresAtIso = new Date(v).toISOString();
+      } else {
+        return ctx.reply(`\`expire=${v}\` couldn't be parsed. Try \`30d\`, \`12h\`, or an ISO date.`, { parse_mode: "Markdown" });
+      }
     }
   }
   if (!tpRaw || !slRaw) {
@@ -809,6 +825,7 @@ export async function handleBracket(ctx) {
     triggerDirection: "above",
     slippageBps: slippage_bps,
     sellDestination: sell_destination,
+    expiresAt: expiresAtIso,
   });
   if (!tpArm.ok) {
     return ctx.reply(`${legFriendly("TP", tpArm.error)}\n\n_Bracket NOT armed._`, { parse_mode: "Markdown" });
@@ -825,6 +842,7 @@ export async function handleBracket(ctx) {
     triggerDirection: "below",
     slippageBps: slippage_bps,
     sellDestination: sell_destination,
+    expiresAt: expiresAtIso,
   });
   if (!slArm.ok) {
     const { cancelOrder } = await import("../services/limit-close-arm-core.js");
@@ -856,6 +874,7 @@ export async function handleBracket(ctx) {
     `TP: ${tpHuman} · order #${tpArm.orderId}`,
     `SL: ${slHuman} · order #${slArm.orderId}`,
     `Slippage: ${(slippage_bps / 100).toFixed(2)}% · proceeds → ${sell_destination.toUpperCase()}`,
+    expiresAtIso ? `Both legs expire: ${new Date(expiresAtIso).toISOString().slice(0, 10)}` : null,
     "",
     `First leg to fire closes the loan and auto-cancels the other.`,
     `\`/limitorders\` to view, \`/cancellimitorder <id>\` to cancel either leg.`,
