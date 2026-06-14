@@ -120,29 +120,41 @@ export function assertProgramMatchesCategory(programId, category) {
   const isRwa = RWA_CATEGORIES.has(category);
   const routesToV2 = PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2);
   const routesToV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
+  const routesToV1 = !routesToV2 && !routesToV3; // default
 
-  // v2 is RWA-only. Memecoin → v2 is the $FATHER class of vulnerability.
+  // Pool semantics as of 2026-06-13 (V3 launch):
+  //   V1: memecoin-only (legacy memecoin lending)
+  //   V2: RWA-only (legacy RWA lending; existing loans still serviced)
+  //   V3: BOTH memecoin AND RWA (dual-tier program — RWA gets the
+  //       50/60/70% ladder, memecoin keeps 30/25/20%)
+  //
+  // Invalid combinations (hard fail):
+  //   V2 + memecoin (the $FATHER class of vulnerability — never)
+  //   V1 + RWA      (RWAs must go to V2 or V3, not V1)
+  //
+  // Pre-2026-06-13 there was a third "V3 + RWA" hard-stop here because
+  // V3 used to be memecoin-only. The 2026-06-14 RWA route-flip
+  // (PR #225 + ROUTE_RWA_TO_V3=true) made V3 the active RWA target,
+  // so that assertion is now stale + actively wrong — it was breaking
+  // /borrow for tokenized stocks. Removed below.
+
   if (routesToV2 && !isRwa) {
     throw new Error(
-      `Program/category mismatch: v2 pool requires RWA category, got "${category ?? "<null>"}". ` +
-        `Memecoins must never route to v2. This is a hard safety stop — review the mint's ` +
+      `Program/category mismatch: V2 pool requires RWA category, got "${category ?? "<null>"}". ` +
+        `Memecoins must never route to V2. This is a hard safety stop — review the mint's ` +
         `supported_mints.category column.`,
     );
   }
-  // v3 is memecoin-only (TWAP-protected lending). RWA should go to v2.
-  if (routesToV3 && isRwa) {
+  if (routesToV1 && isRwa) {
     throw new Error(
-      `Program/category mismatch: v3 pool is for memecoins only, got RWA category "${category}". ` +
-        `RWAs belong in v2 — check chooseProgramIdForCategory.`,
+      `Program/category mismatch: category "${category}" is RWA but program routes to V1. ` +
+        `RWAs belong in V2 (legacy) or V3 — check chooseProgramIdForCategory + the routing env flag.`,
     );
   }
-  // RWA on v1 is also a routing error (RWAs belong in v2).
-  if (!routesToV2 && !routesToV3 && isRwa && PROGRAM_ID_V2) {
-    throw new Error(
-      `Program/category mismatch: category "${category}" is RWA but program routes to v1. ` +
-        `RWAs belong in v2 — check chooseProgramIdForCategory.`,
-    );
-  }
+  // V3 + RWA: VALID — V3 has the new RWA ladder.
+  // V3 + memecoin: VALID — V3 dual-tier supports memecoin too.
+  // V1 + memecoin: VALID — default path.
+  // V2 + RWA: VALID — legacy RWA pool.
 }
 
 /**
