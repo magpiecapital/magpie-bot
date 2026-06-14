@@ -219,7 +219,17 @@ export async function processProposal(proposal) {
         proposalId,
         questionId: "Vote",
         snapshotPath,
-        snapshotId: closeSnapshotId,
+        // 2026-06-14: was `closeSnapshotId` here, which is null on
+        // activation-mode proposals when the DB-snapshot fallback is
+        // in use (#203 + #204). tallyProposal then threw "requires
+        // snapshotId or snapshotPath" because BOTH inputs were null,
+        // and the pipeline kept stalling at verify_recompute_failed.
+        // The verify step should re-use whatever snapshot identifier
+        // the tally step landed on. snapshotIdForTally is set in step
+        // 1 above and is either the DB-fallback registry ID, the
+        // close-time snapshot ID, or null when we're using the file
+        // path (snapshotPath is non-null in that case).
+        snapshotId: snapshotIdForTally,
         expectedSnapshotId: proposal.snapshot_id ?? proposalId,
         capFraction: 0.02,
       });
