@@ -951,7 +951,7 @@ export async function handleCommunityApy(ctx) {
       RULE,
       "```",
       ``,
-      `_Rough estimate — assumes 80% of every loan fee (≈ 2% avg) flows to LPs, annualized over 30 days. Actual yield depends on borrow demand. Past performance ≠ future returns._`,
+      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee (≈ 2% avg) flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
       ``,
       `Deposit at [magpie.capital/earn](${SITE_URL}/earn). See /lend for how it works.`,
     ].join("\n");
@@ -1141,15 +1141,15 @@ export async function handleCommunityCredit(ctx) {
 
 export async function handleCommunityLend(ctx) {
   const text = [
-    `🏦 *Lending into the Magpie pool*`,
+    `*Lending into the Magpie pool*`,
     ``,
-    `Deposit SOL → earn *80% of all protocol loan fees*, pro-rata to your share of the pool.`,
+    `Deposit SOL → earn the *10% LP loyalty share* of every protocol loan fee, paid out on the snapshot cadence (random 5–10 day window) by shares × time held.`,
     ``,
     `*How it works*`,
     `• You deposit SOL → receive pool shares`,
-    `• Borrowers pay fees on every loan (Express 3% / Quick 2% / Standard 1.5%)`,
-    `• 80% of every fee flows back to the LP pool, distributed pro-rata`,
-    `• Withdraw your share + earnings any time`,
+    `• Borrowers pay fees on every loan. Memecoin (v1): Express 3% / Quick 2% / Standard 1.5%. RWA (v3): Express 2.5% / Quick 3.5% / Standard 5%`,
+    `• Per MGP-001 (passed 2026-06-13), every fee splits 70/10/10/10: 70% to \$MAGPIE holders, 10% to LP loyalty, 10% to referrer, 10% to protocol reserve. LPs receive the 10% LP loyalty slice on each snapshot`,
+    `• Withdraw your principal at any time — share value reflects the current vault balance and total shares outstanding`,
     ``,
     `*The trade-off*`,
     `Your SOL backs the loan book. In a flash crash, liquidations might lag price moves — LPs can absorb losses in extreme markets. Short terms + low LTV + the keeper network are designed to keep this rare. Zero LP losses to date.`,
