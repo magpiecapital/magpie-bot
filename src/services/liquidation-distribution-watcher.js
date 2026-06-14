@@ -60,12 +60,40 @@
  *   LIQUIDATION_DISTRIBUTION_TICK_MS    — default 90_000 (1.5 min)
  */
 import { query } from "../db/pool.js";
+import { PublicKey, Keypair, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import bs58 from "bs58";
+import { connection } from "../solana/connection.js";
 
 const TICK_MS = Number(process.env.LIQUIDATION_DISTRIBUTION_TICK_MS) || 90_000;
 const FIRST_TICK_DELAY_MS = 180_000; // wait 3 min after boot so other services init
 const DISABLED = /^(1|true|yes|on)$/i.test(process.env.LIQUIDATION_DISTRIBUTION_DISABLED || "");
 
 const DEFAULT_PROFIT_EVENT_TYPE = "default_profit";
+
+// Optional: pubkey of the rewards distributor wallet. When set, the
+// watcher moves the net profit lamports from the lender wallet to this
+// wallet immediately after crediting the DB ledgers, so the snapshot
+// distributors (which now sign with REWARDS_DISTRIBUTOR_PRIVATE_KEY)
+// have the SOL on hand at payout time. When unset, the watcher stays
+// DB-ledger-only and the SOL stays in the lender wallet (legacy
+// behaviour).
+const REWARDS_DISTRIBUTOR_PUBKEY = process.env.REWARDS_DISTRIBUTOR_PUBKEY
+  ? new PublicKey(process.env.REWARDS_DISTRIBUTOR_PUBKEY)
+  : null;
+
+let _lenderKeypair = null;
+function getLenderKeypairForTransfer() {
+  if (_lenderKeypair) return _lenderKeypair;
+  const b58 = process.env.LENDER_PRIVATE_KEY;
+  if (!b58) return null;
+  try {
+    _lenderKeypair = Keypair.fromSecretKey(bs58.decode(b58));
+    return _lenderKeypair;
+  } catch (err) {
+    console.error("[liq-distribute] LENDER_PRIVATE_KEY decode failed:", err.message);
+    return null;
+  }
+}
 
 let _running = false;
 let _ticking = false;
@@ -183,6 +211,47 @@ async function distributeOne(row) {
       );
     } catch (err) {
       errors.push(`referral: ${err.message?.slice(0, 80)}`);
+    }
+  }
+
+  // On-chain SOL move: lender → rewards distributor wallet, for the
+  // amount this row's profit credited into the distributable pools
+  // (holder + LP + referrer slices). The protocol reserve stays in
+  // the lender wallet as a buffer.
+  //
+  // Gated on REWARDS_DISTRIBUTOR_PUBKEY being set. Without it, the
+  // watcher stays DB-ledger-only and behaves identically to the
+  // pre-2026-06-14 version. On-chain failures are non-fatal — they
+  // log and degrade to 'distribute_error' so an operator can review,
+  // but they don't corrupt the credited ledgers (those already landed).
+  if (errors.length === 0 && REWARDS_DISTRIBUTOR_PUBKEY) {
+    const transferAmount = holderShare + lpShare + refShare;
+    if (transferAmount > 0n) {
+      const lender = getLenderKeypairForTransfer();
+      if (!lender) {
+        errors.push("on_chain_transfer: LENDER_PRIVATE_KEY missing");
+      } else {
+        try {
+          const tx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: lender.publicKey,
+              toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
+              lamports: Number(transferAmount),
+            }),
+          );
+          const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+            commitment: "confirmed",
+            maxRetries: 3,
+          });
+          console.log(
+            `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
+            `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
+            `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${sig.slice(0, 24)}…`,
+          );
+        } catch (err) {
+          errors.push(`on_chain_transfer: ${err.message?.slice(0, 80)}`);
+        }
+      }
     }
   }
 

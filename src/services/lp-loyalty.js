@@ -30,6 +30,7 @@ import { connection } from "../solana/connection.js";
 import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
+import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 import { getRuntimeConfigBps } from "./runtime-config.js";
 
 // Fallback used when governance_config.lp_loyalty_reward_bps can't be
@@ -375,11 +376,12 @@ export async function snapshotAndDistributeLpLoyalty() {
   // Sync from chain so positions are current
   await syncOnChainPositions();
 
-  // Pre-flight lender balance
-  const lender = loadLenderKeypair();
-  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-  if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn(`[lp-loyalty] Skipped: lender balance too low for pool ${pool}`);
+  // Pre-flight distributor balance (REWARDS_DISTRIBUTOR_PRIVATE_KEY,
+  // with backward-compat fallback to LENDER_PRIVATE_KEY).
+  const distributor = getRewardsDistributorKeypair();
+  const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+  if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn(`[lp-loyalty] Skipped: distributor balance too low for pool ${pool}`);
     return null;
   }
 
@@ -476,14 +478,14 @@ export async function snapshotAndDistributeLpLoyalty() {
     for (const r of batch) {
       tx.add(
         SystemProgram.transfer({
-          fromPubkey: lender.publicKey,
+          fromPubkey: distributor.publicKey,
           toPubkey: new PublicKey(r.wallet_address),
           lamports: BigInt(r.reward_lamports),
         }),
       );
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], { commitment: "confirmed" });
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
       await query(
         `UPDATE lp_loyalty_rewards
             SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
@@ -521,9 +523,9 @@ export async function retryAccruedLpLoyaltyPayouts() {
   );
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
-  const lender = loadLenderKeypair();
+  const distributor = getRewardsDistributorKeypair();
   const total = rows.reduce((s, r) => s + BigInt(r.reward_lamports), 0n);
-  const bal = BigInt(await connection.getBalance(lender.publicKey));
+  const bal = BigInt(await connection.getBalance(distributor.publicKey));
   if (bal < total + MIN_LENDER_RESERVE_LAMPORTS) return { retried: 0, paid: 0, skipped: rows.length };
 
   let paid = 0;
@@ -532,13 +534,13 @@ export async function retryAccruedLpLoyaltyPayouts() {
     const tx = new Transaction();
     for (const r of batch) {
       tx.add(SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
+        fromPubkey: distributor.publicKey,
         toPubkey: new PublicKey(r.wallet_address),
         lamports: BigInt(r.reward_lamports),
       }));
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], { commitment: "confirmed" });
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
       await query(
         `UPDATE lp_loyalty_rewards SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2 WHERE id = ANY($1::bigint[])`,
         [batch.map((r) => r.id), sig],
