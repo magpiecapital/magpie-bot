@@ -28,7 +28,12 @@ import {
 } from "@solana/spl-token";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
-import { getReadOnlyProgram, getProgramForSigner } from "../solana/program.js";
+import {
+  getReadOnlyProgram,
+  getProgramForSigner,
+  PROGRAM_ID,
+  PROGRAM_ID_V2,
+} from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { readFileSync } from "node:fs";
 import bs58 from "bs58";
@@ -209,32 +214,74 @@ async function scanAndLiquidate(program, keeper, poolData) {
  */
 export async function startKeeper() {
   const keeper = loadKeeperKeypair();
-  const program = getProgramForSigner(keeper);
-  const [poolPda] = lendingPoolPda(LENDER_PUBKEY);
+
+  // ── Multi-program scan (2026-06-13) ────────────────────────────
+  // Original keeper instantiated ONE program object via
+  // getProgramForSigner(keeper) which defaults to V1. Result: V2
+  // (RWA pool) past-due loans were never liquidated. The 2026-06-13
+  // V1/V2 audit found loan #325 stuck at 95h past due because of this.
+  //
+  // We now build one (program, pool) pair per configured lending program
+  // and tick across all of them in parallel. Each tick re-fetches the
+  // pool to pick up reward / pause / config changes. V2 is included if
+  // PROGRAM_ID_V2 is configured; absent V2 the keeper still works on
+  // V1-only deploys (local dev, fresh staging).
+  const programConfigs = [
+    {
+      label: "V1 (memecoin)",
+      programId: PROGRAM_ID,
+      program: getProgramForSigner(keeper, PROGRAM_ID),
+    },
+  ];
+  if (PROGRAM_ID_V2) {
+    programConfigs.push({
+      label: "V2 (RWA)",
+      programId: PROGRAM_ID_V2,
+      program: getProgramForSigner(keeper, PROGRAM_ID_V2),
+    });
+  }
 
   console.log("[keeper] Liquidation Scavenger starting...");
   console.log(`[keeper] Keeper wallet: ${keeper.publicKey.toBase58()}`);
-  console.log(`[keeper] Pool: ${poolPda.toBase58()}`);
+  for (const cfg of programConfigs) {
+    const [poolPda] = lendingPoolPda(LENDER_PUBKEY, cfg.programId);
+    cfg.poolPda = poolPda;
+    console.log(`[keeper] ${cfg.label} pool: ${poolPda.toBase58()}`);
+  }
   console.log(`[keeper] Poll interval: ${POLL_MS}ms`);
 
-  // Initial pool fetch
-  const poolData = await program.account.lendingPool.fetch(poolPda);
-  console.log(`[keeper] Keeper reward: ${poolData.keeperRewardBps} bps (${poolData.keeperRewardBps / 100}%)`);
+  // Initial pool fetch per program — surfaces V2 misconfiguration at
+  // boot rather than at first liquidation attempt.
+  for (const cfg of programConfigs) {
+    try {
+      const poolData = await cfg.program.account.lendingPool.fetch(cfg.poolPda);
+      console.log(`[keeper] ${cfg.label} keeper reward: ${poolData.keeperRewardBps} bps (${poolData.keeperRewardBps / 100}%)`);
+    } catch (err) {
+      // Don't crash the keeper if V2 pool isn't initialized yet — log
+      // and mark the program disabled for this run. The next restart
+      // after the pool is initialized picks it up.
+      console.warn(`[keeper] ${cfg.label} pool fetch failed: ${err.message?.slice(0, 100)} — skipping this program for the duration of this process`);
+      cfg.disabled = true;
+    }
+  }
 
   const tick = async () => {
-    try {
-      // Re-fetch pool each tick in case reward changed
-      const currentPool = await program.account.lendingPool.fetch(poolPda);
-      const result = await scanAndLiquidate(program, keeper, currentPool);
-
-      if (result.liquidated > 0) {
-        console.log(
-          `[keeper] Scan complete: ${result.liquidated}/${result.scanned} loans liquidated`,
-        );
+    // Run all enabled program scans in parallel — they're independent
+    // and a slow V2 RPC fetch shouldn't gate V1 liquidations.
+    await Promise.all(programConfigs.map(async (cfg) => {
+      if (cfg.disabled) return;
+      try {
+        const currentPool = await cfg.program.account.lendingPool.fetch(cfg.poolPda);
+        const result = await scanAndLiquidate(cfg.program, keeper, currentPool);
+        if (result.liquidated > 0) {
+          console.log(
+            `[keeper] ${cfg.label} scan: ${result.liquidated}/${result.scanned} loans liquidated`,
+          );
+        }
+      } catch (err) {
+        console.error(`[keeper] ${cfg.label} scan error: ${err.message}`);
       }
-    } catch (err) {
-      console.error(`[keeper] Scan error: ${err.message}`);
-    }
+    }));
   };
 
   // Run immediately, then on interval
