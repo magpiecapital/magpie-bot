@@ -366,7 +366,15 @@ export async function handleSiteLimitCloseList(req, url) {
  *   Target: 2x                  (multiplier; OR Price: 0.005 OR MC: 150m.
  *                                For Direction: below, multiplier MUST be
  *                                < 1 (e.g. 0.7x = "sell if price drops
- *                                to 70% of current").)
+ *                                to 70% of current"). Omit when using
+ *                                Trailing: below.)
+ *   Trailing: 1000              (optional; trailing-stop distance in bps,
+ *                                50-5000. ONLY valid with Direction:
+ *                                below. When set, the effective stop
+ *                                floats with the highest observed price
+ *                                — see migration 057. Trailing arms
+ *                                seed peak = current price; explicit
+ *                                Target/Price/MC is ignored.)
  *   Slippage: 200               (optional, default 200, bps)
  *   Dest: sol                   (optional, default sol)
  *   Expire: 30d                 (optional, days or hours)
@@ -386,6 +394,19 @@ export async function handleSiteLimitCloseArm(req) {
     return { status: 400, body: { error: "invalid_direction", detail: "Direction must be 'above' (take-profit) or 'below' (stop-loss)." } };
   }
   const isSl = triggerDirection === "below";
+
+  // ── Parse trailing-distance (optional, SL only) ──
+  let trailingDistanceBps = null;
+  if (fields.Trailing !== undefined) {
+    if (!isSl) {
+      return { status: 400, body: { error: "trailing_only_valid_on_stop_loss", detail: "Trailing: requires Direction: below. Take-profit always fires at a fixed target." } };
+    }
+    const t = Number(String(fields.Trailing).trim());
+    if (!Number.isInteger(t) || t < 50 || t > 5000) {
+      return { status: 400, body: { error: "invalid_trailing_distance_bps", detail: "Trailing must be an integer in [50, 5000] bps (0.5%-50%)." } };
+    }
+    trailingDistanceBps = t;
+  }
 
   // ── Parse target ──
   let triggerKind = null;
@@ -429,8 +450,21 @@ export async function handleSiteLimitCloseArm(req) {
     const usd = n * mul;
     triggerKind = "mc_usd";
     triggerValueMicro = BigInt(Math.round(usd * 1e6));
+  } else if (trailingDistanceBps != null) {
+    // Trailing arms don't need an explicit target — the watcher seeds
+    // peak = current price and computes effective trigger as
+    // peak × (1 - trailing/10000). We still need a triggerKind for
+    // arm-core's downstream logic. Default to price_usd as the most
+    // common; the multiplier-to-price helper below picks up live
+    // price and seeds triggerValueMicro at that × (1-trailing).
+    triggerKind = "price_usd";
+    // Defer triggerValueMicro resolution to the multiplier path —
+    // multiplierUsed = (1 - trailing/10000) accomplishes "set initial
+    // trigger to current-price × that ratio", which is the right seed
+    // for the watcher's first-tick peak.
+    multiplierUsed = 1 - (trailingDistanceBps / 10_000);
   } else {
-    return { status: 400, body: { error: "missing_target", detail: "Provide Target (e.g. 2x), Price ($0.005), or MC ($150m)." } };
+    return { status: 400, body: { error: "missing_target", detail: "Provide Target (e.g. 2x), Price ($0.005), or MC ($150m). For a trailing stop, send Trailing: <bps>." } };
   }
 
   const slippageBps = fields.Slippage ? Number(fields.Slippage) : 200;
@@ -481,10 +515,11 @@ export async function handleSiteLimitCloseArm(req) {
     triggerKind,
     triggerValueMicro,
     triggerDirection,
+    trailingDistanceBps,
     slippageBps,
     sellDestination: dest,
     expiresAt,
-    armNote: `armed via site (${isSl ? "SL" : "TP"}) by ${auth.signerPubkey.slice(0, 8)}…`,
+    armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}) by ${auth.signerPubkey.slice(0, 8)}…`,
   });
   if (!armed.ok) {
     return {
