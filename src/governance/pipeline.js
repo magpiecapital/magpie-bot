@@ -407,8 +407,21 @@ export async function processProposal(proposal) {
         [closeSnapshotId],
       );
       snapshotHash = rows[0]?.hash_sha256 ?? "unknown";
-    } else {
+    } else if (snapshotPath) {
       snapshotHash = createHash("sha256").update(readFileSync(snapshotPath)).digest("hex");
+    } else {
+      // DB-snapshot path (activation mode but operator filesystem
+      // not available on Railway — see step 1 fallback). No file to
+      // hash; pull the deterministic hash that was persisted into
+      // governance_snapshots when the snapshot was created. Matches
+      // the equivalent fallback we apply in the anomaly step so the
+      // announce phase doesn't crash on readFileSync(null).
+      const registrySnapshotId = proposal.snapshot_id ?? proposalId;
+      const { rows } = await query(
+        `SELECT hash_sha256 FROM governance_snapshots WHERE snapshot_id = $1`,
+        [registrySnapshotId],
+      );
+      snapshotHash = rows[0]?.hash_sha256 ?? "unknown";
     }
     const variables = buildVariables({ proposal, tally, outcome, snapshotHash });
     const renderedText = renderTemplate(proposal.announcement_template, variables);

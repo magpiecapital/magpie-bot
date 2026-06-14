@@ -339,6 +339,7 @@ bot.command("pools", handleHolderPool); // alias
 // the handlers ensures it does nothing in groups that haven't opted in.
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
+import { handleBurnConfirm, handleBurnRecord, handleBurnStats } from "./commands/burn-admin.js";
 import { handleVote, handleVotingPower } from "./commands/vote.js";
 import {
   handleNominate,
@@ -456,6 +457,14 @@ bot.command("gov-status", handleGovStatus);
 bot.command("gov_status", handleGovStatus);
 bot.command("gov-confirm-manual", handleGovConfirmManual);
 bot.command("gov_confirm_manual", handleGovConfirmManual);
+
+// $MAGPIE burn ledger admin
+bot.command("burn-confirm", handleBurnConfirm);
+bot.command("burn_confirm", handleBurnConfirm);
+bot.command("burn-record", handleBurnRecord);
+bot.command("burn_record", handleBurnRecord);
+bot.command("burn-stats", handleBurnStats);
+bot.command("burn_stats", handleBurnStats);
 
 // Public voter-engagement commands
 bot.command("vote", handleVote);
