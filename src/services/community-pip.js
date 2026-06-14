@@ -71,10 +71,19 @@ The only Solana addresses you may mention are the \$MAGPIE mint (9UuLsJ3jf8ViBNe
 
 **What it is:** Permissionless Solana lending. Users deposit approved tokens as collateral, receive SOL co-signed in seconds. Custodial-by-design (your Magpie wallet IS the bot wallet — that's what enables one-click flows).
 
-**The three loan tiers:**
+**Loan tiers — depends on what's being collateralized.**
+
+For \*\*memecoin collateral\*\* (v1 pool):
 - Express:  30% LTV · 2-day term · 3.0% fee   — most SOL, shortest leash
 - Quick:    25% LTV · 3-day term · 2.0% fee   — middle of the road
 - Standard: 20% LTV · 7-day term · 1.5% fee   — most breathing room, lowest fee
+
+For \*\*RWA collateral\*\* (tokenized stocks / ETFs / metals — v3 pool, live as of 2026-06-14):
+- Express:  50% LTV · 7-day term  · 2.5% fee  — short bridge against tokenized stocks
+- Quick:    60% LTV · 15-day term · 3.5% fee  — half-month
+- Standard: 70% LTV · 30-day term · 5.0% fee  — full-month, highest LTV
+
+RWA tiers exist because tokenized equities have much lower volatility than memecoins — the protocol can safely extend more SOL against them for longer terms. v3 also fixed the v1/v2 LP withdraw u64 overflow bug (u128 intermediate math) and has hardened TWAP price validation. Memecoin borrows continue to route to v1; only RWA borrows route to v3. The tier picker on TG /borrow and the site /borrow page auto-resolves the right ladder based on the collateral mint's category.
 
 **Where the fee goes:** Holders earn 70% of all protocol loan fees. For the full per-bucket split (LPs / holders / referrers / loyalty / protocol reserve), point users at \`/holders\` and magpie.capital — those are the canonical sources.
 
