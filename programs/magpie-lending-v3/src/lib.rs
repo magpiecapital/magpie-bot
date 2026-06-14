@@ -12,11 +12,11 @@ use anchor_spl::token_interface::{
 // v2 program pubkey (v2b — second keypair after first v2 program was
 // closed to recover rent for re-deploy with anchor-spl 0.32 / spl-token-2022
 // v8 upgrade). Keypair at ~/.config/solana/magpie-lending-v2b.json with
-// v3 — on-chain TWAP. Distinct program ID; v1 (4FEFPeMH...) and v2 (env
-// PROGRAM_ID_V2) continue to serve existing loans untouched. NEW deploy
-// uses a fresh keypair — REPLACE the declare_id! below with the actual
-// address after running `solana-keygen new -o target/deploy/magpie_lending_v3-keypair.json`.
-declare_id!("MgpV3TWAPLending111111111111111111111111111");
+// v3 — on-chain TWAP + dual-tier (memecoin + RWA). Distinct program ID;
+// v1 (4FEFPeMH...) and v2 (env PROGRAM_ID_V2) continue to serve existing
+// loans untouched. Keypair generated 2026-06-13, saved to
+// target/deploy/magpie_lending_v3-keypair.json (gitignored).
+declare_id!("B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP");
 
 /// Basis-point helpers
 const BPS_DENOM: u64 = 10_000;
