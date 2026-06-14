@@ -19,6 +19,18 @@ function getV2Idl() {
   if (!_idlV2) _idlV2 = JSON.parse(readFileSync(idlPathV2, "utf8"));
   return _idlV2;
 }
+// V3 IDL — RWA + memecoin dual-tier program live since 2026-06-13. V3's
+// Loan account adds {collateral_value_at_start, vault_bump, category}
+// after the V1 fields. Reading a V3 Loan with the V1 IDL silently
+// mis-deserializes the appended fields and trips Borsh leftover-bytes
+// errors during program.account.loan.fetch(). recordLoan in cosign-borrow
+// fetches the Loan account post-submit, so it needs the matching IDL.
+const idlPathV3 = path.join(__dirname, "idl", "magpie-v3.json");
+let _idlV3 = null;
+function getV3Idl() {
+  if (!_idlV3) _idlV3 = JSON.parse(readFileSync(idlPathV3, "utf8"));
+  return _idlV3;
+}
 
 export const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || idl.address,
@@ -152,12 +164,17 @@ export function getReadOnlyProgram(programId = PROGRAM_ID) {
   const provider = new AnchorProvider(connection, new Wallet(dummyKp), {
     commitment: "confirmed",
   });
-  // Pick the matching IDL: V1 uses the legacy layout (LendingPool has
-  // fee_wallet); V2 uses the newer layout (authority-routed fees, no
-  // fee_wallet field). Using the wrong IDL silently mis-deserializes
-  // every field past the layout divergence — caught the missing V2
-  // fee_wallet during the 2026-06-12 V2-pool audit.
-  const useIdl = PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2) ? getV2Idl() : idl;
+  // Pick the matching IDL: V1 (legacy), V2 (authority-routed fees),
+  // V3 (RWA + memecoin dual ladder, appended Loan fields). Using the
+  // wrong IDL silently mis-deserializes every field past the layout
+  // divergence — caught the missing V2 fee_wallet during 2026-06-12
+  // and the V3 Loan size mismatch during 2026-06-14.
+  let useIdl = idl;
+  if (PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3)) {
+    useIdl = getV3Idl();
+  } else if (PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2)) {
+    useIdl = getV2Idl();
+  }
   return new Program({ ...useIdl, address: programId.toBase58() }, provider);
 }
 
