@@ -709,13 +709,30 @@ pub mod magpie_lending {
                 )?;
             }
 
-            // pool_cut stays in the vault → depositors earn it automatically
-            // through share appreciation (pool value unchanged while tokens stay)
+            // pool_cut stays in the vault AND must be credited to LPs by
+            // bumping pool.total_deposits — otherwise the withdraw math
+            // (`shares × total_deposits / total_shares`) silently leaves
+            // the yield behind in the vault, unclaimable by LPs. This was
+            // the bug that landed V1/V2 with ~20 SOL of stranded LP yield
+            // accumulating in vault excess; V3 honors the "share
+            // appreciation" promise that the V1/V2 comments made but the
+            // code did not deliver.
+            let pool_cut = fee
+                .checked_sub(protocol_cut)
+                .ok_or(ErrorCode::MathOverflow)?;
 
             let pool = &mut ctx.accounts.pool;
             pool.total_fees_earned = pool
                 .total_fees_earned
                 .checked_add(fee)
+                .ok_or(ErrorCode::MathOverflow)?;
+            // Bump total_deposits by pool_cut so the share-value denominator
+            // reflects the just-retained LP yield. Done at borrow time
+            // because the fee is realized then (taken up-front from
+            // gross_loan, not contingent on repay).
+            pool.total_deposits = pool
+                .total_deposits
+                .checked_add(pool_cut)
                 .ok_or(ErrorCode::MathOverflow)?;
         }
 
@@ -991,10 +1008,23 @@ pub mod magpie_lending {
             .ok_or(ErrorCode::MathOverflow)?;
         let new_due = loan.due_timestamp;
 
+        // Credit LP yield from the retained portion of the extension fee.
+        // Same rationale as request_and_fund_loan (above): pool_cut sits in
+        // the vault; without bumping total_deposits the withdraw math leaves
+        // it stranded. Done here AFTER the protocol_cut transfer is known so
+        // pool_cut is exact.
+        let pool_cut = extension_fee
+            .checked_sub(protocol_cut)
+            .ok_or(ErrorCode::MathOverflow)?;
+
         let pool = &mut ctx.accounts.pool;
         pool.total_fees_earned = pool
             .total_fees_earned
             .checked_add(extension_fee)
+            .ok_or(ErrorCode::MathOverflow)?;
+        pool.total_deposits = pool
+            .total_deposits
+            .checked_add(pool_cut)
             .ok_or(ErrorCode::MathOverflow)?;
 
         emit!(LoanExtended {
