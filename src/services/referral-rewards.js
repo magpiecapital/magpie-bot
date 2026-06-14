@@ -26,6 +26,7 @@ import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 import { getRuntimeConfigBps } from "./runtime-config.js";
 
 // Fallback used when governance_config.referral_reward_bps can't be
@@ -194,15 +195,18 @@ export async function claimReferralEarnings({ userId, recipientPublicKey }) {
       };
     }
 
-    // Verify lender wallet can cover payout + small safety reserve.
-    const lender = loadLenderKeypair();
-    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-    if (lenderBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
+    // Verify the rewards distributor wallet can cover payout + small
+    // safety reserve. Reads REWARDS_DISTRIBUTOR_PRIVATE_KEY if set,
+    // falls back to LENDER_PRIVATE_KEY for backward-compat during
+    // rollout.
+    const distributor = getRewardsDistributorKeypair();
+    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+    if (distributorBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
       await client.query("ROLLBACK");
       return {
         ok: false,
         reason: "treasury_low",
-        treasury_lamports: lenderBalance,
+        treasury_lamports: distributorBalance,
         required_lamports: total,
       };
     }
@@ -211,12 +215,12 @@ export async function claimReferralEarnings({ userId, recipientPublicKey }) {
     // native SOL straight to their wallet.
     const tx = new Transaction().add(
       SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
+        fromPubkey: distributor.publicKey,
         toPubkey: new PublicKey(recipientPublicKey),
         lamports: total,
       }),
     );
-    const signature = await sendAndConfirmTransaction(connection, tx, [lender], {
+    const signature = await sendAndConfirmTransaction(connection, tx, [distributor], {
       commitment: "confirmed",
     });
 
