@@ -29,26 +29,51 @@ async function auditDbConfigUpdate(action) {
   return { verified: true, reason: "config_value_matches_plan" };
 }
 
+const GITHUB_REPO_SLUG = process.env.GITHUB_REPO_SLUG || "magpiecapital/magpie-bot";
+const GITHUB_API_BASE = "https://api.github.com";
+
+/**
+ * Audit branch+PR existence via the GitHub REST API. The previous
+ * implementation shelled out to git + gh, but the Railway container
+ * doesn't include either binary — every audit failed with
+ * "git: not found", stalling MGP-001's pipeline at verification_failed.
+ * The bot repo is public, so unauthenticated REST calls suffice
+ * (60 req/hr/IP — autopilot ticks every 5 min so well under budget).
+ */
 async function auditBotConstantPr(action) {
   const { branch_name } = action;
-  // Verify branch exists on remote
+  const headers = { "Accept": "application/vnd.github+json", "User-Agent": "magpie-autopilot-audit" };
+  // Branch existence
   try {
-    execSync(`git ls-remote --exit-code --heads origin ${branch_name}`, { stdio: "pipe" });
-  } catch {
-    return { verified: false, reason: `branch_not_on_remote: ${branch_name}` };
+    const r = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_REPO_SLUG}/branches/${encodeURIComponent(branch_name)}`,
+      { headers },
+    );
+    if (r.status === 404) {
+      return { verified: false, reason: `branch_not_on_remote: ${branch_name}` };
+    }
+    if (!r.ok) {
+      return { verified: false, reason: `branch_lookup_http_${r.status}` };
+    }
+  } catch (err) {
+    return { verified: false, reason: `branch_lookup_failed: ${err.message?.slice(0, 80)}` };
   }
-  // Verify a PR exists with the branch as head
+  // Open PR for the branch
   try {
-    const out = execSync(
-      `gh pr list --head ${branch_name} --state open --json number,headRefName --jq 'length'`,
-      { stdio: ["ignore", "pipe", "pipe"] },
-    ).toString().trim();
-    const count = Number(out);
-    if (count === 0) {
+    const [owner] = GITHUB_REPO_SLUG.split("/");
+    const r = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_REPO_SLUG}/pulls?head=${owner}:${encodeURIComponent(branch_name)}&state=open`,
+      { headers },
+    );
+    if (!r.ok) {
+      return { verified: false, reason: `pr_lookup_http_${r.status}` };
+    }
+    const list = await r.json();
+    if (!Array.isArray(list) || list.length === 0) {
       return { verified: false, reason: "no_open_pr_for_branch" };
     }
   } catch (err) {
-    return { verified: false, reason: `gh_pr_list_failed: ${err.message}` };
+    return { verified: false, reason: `pr_lookup_failed: ${err.message?.slice(0, 80)}` };
   }
   return { verified: true, reason: "branch_pushed_and_pr_open" };
 }
