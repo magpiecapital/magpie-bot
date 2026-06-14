@@ -98,6 +98,61 @@ export async function handleStats(ctx) {
          COALESCE(SUM(loan_amount_lamports) FILTER (WHERE status = 'active'), 0)::text AS active_lamports
        FROM loans`,
     );
+
+    // ── Snapshot reward tracker (MGP-001 four-channel split) ───────
+    // Operator-requested 2026-06-13: users want to see how much in
+    // fees the protocol has accrued toward each upcoming reward
+    // snapshot, plus a history of prior snapshot distributions.
+    //
+    // INTENTIONALLY OMITTED: next_distribution_at timing — operator
+    // rule (memory: governance_snapshot_internal) keeps the random
+    // 5-10 day window internal so mercenary holders can't time
+    // buy-just-before / dump-just-after the snapshot.
+    //
+    // Queries are best-effort: a fresh deploy that hasn't applied
+    // migration 049 (protocol_reserve_pool) or has empty pool tables
+    // shouldn't crash /stats. Each block catches and degrades to —.
+    let holderAccrued = 0n, lpAccrued = 0n, reserveAccrued = 0n, refAccrued = 0n;
+    let priorSnapshots = [];
+    try {
+      const { rows: [hp] } = await query(
+        `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM magpie_holder_pool WHERE id = 1`,
+      );
+      if (hp?.accr) holderAccrued = BigInt(hp.accr);
+    } catch { /* table absent in old deploys */ }
+    try {
+      const { rows: [lp] } = await query(
+        `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM lp_loyalty_pool WHERE id = 1`,
+      );
+      if (lp?.accr) lpAccrued = BigInt(lp.accr);
+    } catch { /* */ }
+    try {
+      const { rows: [pr] } = await query(
+        `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM protocol_reserve_pool WHERE id = 1`,
+      );
+      if (pr?.accr) reserveAccrued = BigInt(pr.accr);
+    } catch { /* migration 049 not yet applied */ }
+    try {
+      const { rows: [r] } = await query(
+        `SELECT COALESCE(SUM(reward_lamports::numeric) FILTER (WHERE status = 'accrued'), 0)::text AS accr
+           FROM referral_earnings`,
+      );
+      if (r?.accr) refAccrued = BigInt(r.accr);
+    } catch { /* */ }
+    try {
+      const { rows } = await query(
+        `SELECT id,
+                snapshot_at,
+                pool_lamports::text AS pool,
+                holder_count,
+                eligible_count
+           FROM magpie_holder_distributions
+          ORDER BY snapshot_at DESC
+          LIMIT 5`,
+      );
+      priorSnapshots = rows;
+    } catch { /* table absent */ }
+    const totalAccrued = holderAccrued + lpAccrued + reserveAccrued + refAccrued;
     const r = counts[0];
 
     // HEADLINE: lifetime cumulative SOL ever borrowed — DB SUM across
@@ -113,6 +168,19 @@ export async function handleStats(ctx) {
       ? totalVaultUi.toFixed(2)
       : null;
 
+    // Render the prior-snapshot history rows. Each row is one past
+    // distribution; empty array → "first snapshot pending" placeholder.
+    const snapshotHistoryRows = priorSnapshots.length === 0
+      ? [row("(no snapshots yet)", "")]
+      : priorSnapshots
+          .slice()
+          .reverse() // chronological inside the section even though SQL DESC
+          .map((s, idx) => {
+            const date = new Date(s.snapshot_at).toISOString().slice(0, 10);
+            const amount = fmtSol(s.pool);
+            return row(`#${idx + 1} ${date}`, `${amount} SOL → ${s.eligible_count} holders`);
+          });
+
     const codeLines = [
       RULE,
       `LOAN BOOK`,
@@ -126,6 +194,16 @@ export async function handleStats(ctx) {
       row("LP deposited", `${totalDepositsSol} SOL`),
       row("Fees earned", `${totalFeesSol} SOL`),
       vaultSol ? row("Vault", `${vaultSol} wSOL`) : row("Vault", "—"),
+      ``,
+      `REWARDS — ACCRUING TOWARD NEXT SNAPSHOT`,
+      row("$MAGPIE holders (70%)", `${fmtSol(holderAccrued.toString())} SOL`),
+      row("SOL LPs (10%)",        `${fmtSol(lpAccrued.toString())} SOL`),
+      row("Referrers (10%)",       `${fmtSol(refAccrued.toString())} SOL`),
+      row("Protocol reserve (10%)",`${fmtSol(reserveAccrued.toString())} SOL`),
+      row("Total accruing",        `${fmtSol(totalAccrued.toString())} SOL`),
+      ``,
+      `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
+      ...snapshotHistoryRows,
       RULE,
     ];
 
