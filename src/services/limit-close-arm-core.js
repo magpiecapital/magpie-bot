@@ -703,6 +703,13 @@ export async function modifyOrder({
     updateParams.push(val);
   }
   setParts.push("updated_at = NOW()");
+  // 2026-06-13: any modify resets the near-trigger DM gate so a
+  // re-tuned trigger gets a fresh nudge if the new value lands in the
+  // ~10% band. Otherwise users who modified an order would never hear
+  // about the new trigger getting close.
+  if (updates.trigger_value_micro !== undefined) {
+    setParts.push("near_trigger_dm_sent_at = NULL");
+  }
   // Audit note appended so /lc-status armed shows that the order was modified.
   const noteSuffix = ` modified ${new Date().toISOString().slice(0, 19)}Z (${Object.keys(updates).join(",")})`;
   setParts.push(`notes = COALESCE(notes, '') || $${up++}`);
