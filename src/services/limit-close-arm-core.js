@@ -715,6 +715,21 @@ export async function modifyOrder({
       // floor starts at "today" rather than the original trigger.
       if (current.trailing_distance_bps == null) {
         seedPeakFromCurrent = true;
+      } else if (current.trailing_distance_bps !== trailingDistanceBps) {
+        // Distance tightened/loosened on an existing trailing stop.
+        // The watcher only recomputes trigger when it sees a NEW high,
+        // so without this we'd carry the old distance until the next
+        // peak update — meaning "I tightened my trail to 5%" wouldn't
+        // actually take effect until price moved up. Recompute the
+        // effective trigger from the existing peak immediately so the
+        // change is live on the next watcher tick.
+        try {
+          const existingPeak = BigInt(current.peak_price_micros || "0");
+          if (existingPeak > 0n) {
+            const newTrigger = (existingPeak * BigInt(10000 - trailingDistanceBps)) / 10000n;
+            updates.trigger_value_micro = newTrigger.toString();
+          }
+        } catch { /* fall-through; watcher will heal on next high */ }
       }
     }
   }
