@@ -48,33 +48,68 @@ function loadLenderKeypair() {
 }
 
 /**
- * Read the on-chain PriceAttestation account and return its age in seconds
- * (or null if the account doesn't exist / can't be parsed).
+ * Read the on-chain price account and return its age in seconds (or
+ * null if the account doesn't exist / can't be parsed).
  *
- * PriceAttestation layout (from the Anchor IDL):
- *   8     account discriminator
+ * V1 + V2 layout (PriceAttestation account):
+ *   8     discriminator
  *   32    mint
  *   32    pool
  *   32    authority
  *   8     price_lamports (u64)
- *   8     timestamp (i64)
+ *   8     timestamp (i64)    ← offset 112
  *   2     confidence_bps (u16)
  *   1     bump
  *
- * timestamp is at offset 8+32+32+32+8 = 112, length 8 bytes, little-endian.
+ * V3 layout (PriceHistory account — TWAP circular buffer of 32 samples):
+ *   8     discriminator
+ *   32    mint
+ *   32    pool
+ *   32    authority
+ *   1     head_index (u8)    ← offset 104, next-write slot index
+ *   1     count (u8)         ← offset 105, samples populated so far
+ *   6     _padding
+ *   32×16 samples            ← offset 112, each PriceSample is
+ *                                price_lamports:u64 + timestamp:i64
+ *   1     bump
+ *
+ * Latest sample lives at `(head_index - 1 + 32) % 32` when count > 0
+ * (head_index is the NEXT-write index). We read its timestamp directly.
+ *
+ * Reading V3 bytes with the V1/V2 offset returns garbage that gets
+ * interpreted as a wildly out-of-range i64 — observed -685M seconds
+ * on the wire — which would cause this function to declare the feed
+ * "fresh" even when V3's on-chain freshness window has expired.
  */
 export async function getPriceFeedAgeSeconds(mintStr) {
   try {
     const mintPk = new PublicKey(mintStr);
-    // Route to v1 or v2 based on category. Each program has its own pool
-    // and price-feed PDAs — read from the right one.
     const category = await resolveCategory(mintStr);
     const programId = chooseProgramIdForCategory(category);
     const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
     const [priceFeed] = priceFeedPda(mintPk, pool, programId);
     const info = await connection.getAccountInfo(priceFeed);
-    if (!info || info.data.length < 120) return null;
-    const ts = info.data.readBigInt64LE(112);
+    if (!info) return null;
+    const { PROGRAM_ID_V3 } = await import("../solana/program.js");
+    const isV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
+    let ts;
+    if (isV3) {
+      // PriceHistory layout — minimum is disc+mint+pool+authority+
+      // head+count+padding = 104, plus at least one 16-byte sample.
+      if (info.data.length < 120) return null;
+      const headIndex = info.data.readUInt8(104);
+      const count = info.data.readUInt8(105);
+      if (count === 0) return null; // no samples written yet
+      const latestIndex = (headIndex - 1 + 32) % 32;
+      const samplesOffset = 112;
+      const sampleStride = 16; // price_lamports(8) + timestamp(8)
+      const sampleStart = samplesOffset + latestIndex * sampleStride;
+      // timestamp lives 8 bytes into each sample (after price_lamports)
+      ts = info.data.readBigInt64LE(sampleStart + 8);
+    } else {
+      if (info.data.length < 120) return null;
+      ts = info.data.readBigInt64LE(112);
+    }
     const now = BigInt(Math.floor(Date.now() / 1000));
     return Number(now - ts);
   } catch {
