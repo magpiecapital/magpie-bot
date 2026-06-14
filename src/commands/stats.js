@@ -1,5 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
-import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2 } from "../solana/program.js";
+import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
 import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
@@ -64,31 +64,34 @@ export async function handleStats(ctx) {
   if (!lenderPubkey) return ctx.reply("Stats not configured (LENDER_PUBKEY missing).");
 
   try {
-    // Read BOTH pool snapshots in parallel. V2 is the RWA-capable pool
-    // (tokenized stocks etc.); fees flow to the same LENDER_PUBKEY wSOL
-    // ATA via the authority-signed borrow path, so the protocol view of
-    // fees-earned is V1 + V2. If V2 is not configured (env missing), we
-    // gracefully skip — keeps /stats working in dev / staging where only
-    // V1 is set up.
-    const [v1] = await Promise.all([
-      fetchPoolSnapshot(PROGRAM_ID),
-    ]);
+    // Read all three pool snapshots in parallel. V2 is legacy RWA; V3
+    // is the live RWA + memecoin dual-tier pool. Fees flow to the same
+    // LENDER_PUBKEY wSOL ATA across all three programs, so the protocol
+    // view of fees-earned is V1 + V2 + V3. If V2 or V3 is not configured
+    // (env missing) or RPC blips on a per-pool read, we gracefully
+    // continue with whatever loaded — keeps /stats working in dev /
+    // staging where only a subset of pools may be deployed.
+    const v1 = await fetchPoolSnapshot(PROGRAM_ID);
     let v2 = null;
     if (PROGRAM_ID_V2) {
       try { v2 = await fetchPoolSnapshot(PROGRAM_ID_V2); }
       catch (err) {
-        // Don't fail the whole /stats if V2 is uninitialized or RPC blips
-        // on it — just report what we have. Logged so we notice persistent
-        // V2 read failures.
-        console.warn("[stats] V2 pool read failed (continuing with V1 only):", err.message);
+        console.warn("[stats] V2 pool read failed:", err.message);
+      }
+    }
+    let v3 = null;
+    if (PROGRAM_ID_V3) {
+      try { v3 = await fetchPoolSnapshot(PROGRAM_ID_V3); }
+      catch (err) {
+        console.warn("[stats] V3 pool read failed:", err.message);
       }
     }
 
-    const totalDeposits = v1.totalDeposits + (v2?.totalDeposits ?? 0n);
-    const totalFeesEarned = v1.totalFeesEarned + (v2?.totalFeesEarned ?? 0n);
-    const totalLoansIssued = v1.totalLoansIssued + (v2?.totalLoansIssued ?? 0n);
-    const totalLiquidations = v1.totalLiquidations + (v2?.totalLiquidations ?? 0n);
-    const totalVaultUi = (v1.vaultUiSol ?? 0) + (v2?.vaultUiSol ?? 0);
+    const totalDeposits = v1.totalDeposits + (v2?.totalDeposits ?? 0n) + (v3?.totalDeposits ?? 0n);
+    const totalFeesEarned = v1.totalFeesEarned + (v2?.totalFeesEarned ?? 0n) + (v3?.totalFeesEarned ?? 0n);
+    const totalLoansIssued = v1.totalLoansIssued + (v2?.totalLoansIssued ?? 0n) + (v3?.totalLoansIssued ?? 0n);
+    const totalLiquidations = v1.totalLiquidations + (v2?.totalLiquidations ?? 0n) + (v3?.totalLiquidations ?? 0n);
+    const totalVaultUi = (v1.vaultUiSol ?? 0) + (v2?.vaultUiSol ?? 0) + (v3?.vaultUiSol ?? 0);
 
     const { rows: counts } = await query(
       `SELECT
@@ -250,7 +253,7 @@ export async function handleStats(ctx) {
       row("Repaid", String(r.repaid)),
       row("Liquidated", totalLiquidations.toString()),
       ``,
-      `POOL${v2 ? " (V1+V2)" : ""}`,
+      `POOL${(v2 || v3) ? ` (${["V1", v2 ? "V2" : null, v3 ? "V3" : null].filter(Boolean).join("+")})` : ""}`,
       row("LP deposited", `${totalDepositsSol} SOL`),
       row("Fees earned", `${totalFeesSol} SOL`),
       vaultSol ? row("Vault", `${vaultSol} wSOL`) : row("Vault", "—"),
