@@ -554,7 +554,8 @@ export async function handleLimitOrders(ctx) {
             lc.armed_at, lc.expires_at,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
-            m.symbol AS collateral_symbol
+            m.symbol AS collateral_symbol,
+            m.category AS collateral_category
        FROM limit_close_orders lc
        JOIN loans l ON l.id = lc.loan_id
        LEFT JOIN supported_mints m ON m.mint = l.collateral_mint
@@ -585,6 +586,12 @@ export async function handleLimitOrders(ctx) {
     const trig = fmtTrigger(r.trigger_kind, BigInt(r.trigger_value_micro));
     const slip = (r.slippage_bps / 100).toFixed(r.slippage_bps < 200 ? 2 : 1);
     const directionPill = r.trigger_direction === "below" ? "*SL*" : "*TP*";
+    // RWA badge — visible cue that this order routes through the V2
+    // pool. Helps users mentally model why their stock-token TP might
+    // pause Sat/Sun (engine weekend-fire skip for RWA TPs, PR #18 in
+    // the engine repo).
+    const isRwa = ["stock", "etf", "metal"].includes(r.collateral_category);
+    const rwaBadge = isRwa ? " `[RWA]`" : "";
     const sym = r.collateral_symbol ? ` (${r.collateral_symbol})` : "";
     const expiry = r.expires_at ? ` · expires ${new Date(r.expires_at).toISOString().slice(0, 10)}` : "";
     const distPct = distances[i];
@@ -599,7 +606,7 @@ export async function handleLimitOrders(ctx) {
       else distLine = `\n   ~ ${Math.round(abs)}% from trigger`;
     }
     lines.push(
-      `${directionPill}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
+      `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
       `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${distLine}`,
       "",
     );
