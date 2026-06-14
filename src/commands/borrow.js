@@ -538,6 +538,7 @@ export function registerBorrowCallbacks(bot) {
       let kb = new InlineKeyboard()
         .text("TP @ 2x", `borrow:protect:tp:${result.loanId}`)
         .text("SL @ 0.7x", `borrow:protect:sl:${result.loanId}`)
+        .text("Bracket (both)", `borrow:protect:bracket:${result.loanId}`)
         .row();
       try {
         const { getOrCreateCode } = await import("../services/referrals.js");
@@ -589,10 +590,89 @@ export function registerBorrowCallbacks(bot) {
 
   // ── Post-borrow protection callbacks ───────────────────────────
   // One-tap arm from the funded-loan keyboard. Defaults: TP 2×,
-  // SL 0.7×. Custom triggers via /takeprofit /stoploss.
-  bot.callbackQuery(/^borrow:protect:(tp|sl):(\d+)$/, async (ctx) => {
+  // SL 0.7×. Custom triggers via /takeprofit /stoploss. The
+  // 'bracket' slot arms BOTH and rolls back leg-1 if leg-2 fails.
+  bot.callbackQuery(/^borrow:protect:(tp|sl|bracket):(\d+)$/, async (ctx) => {
     const slot = ctx.match[1];
     const loanIdChain = ctx.match[2];
+    // Bracket-specific path: arm TP then SL, roll back if needed.
+    if (slot === "bracket") {
+      let user;
+      try { user = await upsertUser(ctx.from); }
+      catch (err) {
+        console.error("[borrow:protect:bracket] upsertUser failed:", err.message);
+        await ctx.answerCallbackQuery("Couldn't verify your account. Try again.");
+        return;
+      }
+      const { query } = await import("../db/pool.js");
+      const { rows: [loanLite] } = await query(
+        `SELECT collateral_mint FROM loans
+          WHERE user_id = $1 AND loan_id = $2 AND status = 'active'
+          LIMIT 1`,
+        [user.id, loanIdChain],
+      );
+      if (!loanLite?.collateral_mint) {
+        await ctx.answerCallbackQuery(`Loan #${loanIdChain} isn't active anymore.`);
+        return;
+      }
+      let tpResolved, slResolved;
+      try {
+        tpResolved = await resolveMultiplierToPrice(loanLite.collateral_mint, 2);
+        slResolved = await resolveMultiplierToPrice(loanLite.collateral_mint, 0.7, { allowBelowOne: true });
+      } catch (err) {
+        console.warn("[borrow:protect:bracket] resolve threw:", err.message);
+        await ctx.answerCallbackQuery("Price lookup failed. Try /bracket manually.");
+        return;
+      }
+      if (!tpResolved.ok) {
+        await ctx.answerCallbackQuery({ text: tpResolved.error || "TP resolve failed.", show_alert: true });
+        return;
+      }
+      if (!slResolved.ok) {
+        await ctx.answerCallbackQuery({ text: slResolved.error || "SL resolve failed.", show_alert: true });
+        return;
+      }
+      const tpArm = await armOrder({
+        userId: user.id, source: "tg", loanIdChain,
+        triggerKind: "price_usd", triggerValueMicro: tpResolved.triggerValueMicro.toString(),
+        triggerDirection: "above", slippageBps: 200, sellDestination: "sol",
+      });
+      if (!tpArm.ok) {
+        await ctx.answerCallbackQuery({
+          text: tpArm.error === "loan_already_has_active_order_in_direction"
+            ? "TP already armed — bracket needs both legs free."
+            : `Couldn't arm TP (${tpArm.error}).`,
+          show_alert: true,
+        });
+        return;
+      }
+      const slArm = await armOrder({
+        userId: user.id, source: "tg", loanIdChain,
+        triggerKind: "price_usd", triggerValueMicro: slResolved.triggerValueMicro.toString(),
+        triggerDirection: "below", slippageBps: 300, sellDestination: "sol",
+      });
+      if (!slArm.ok) {
+        // Roll back TP so the user isn't half-bracketed.
+        const { cancelOrder } = await import("../services/limit-close-arm-core.js");
+        try {
+          await cancelOrder({ orderId: tpArm.orderId, userId: user.id, reason: "bracket_partial_rollback" });
+        } catch (err) {
+          console.warn(`[borrow:protect:bracket] rollback of TP ${tpArm.orderId} failed:`, err.message?.slice(0, 100));
+        }
+        await ctx.answerCallbackQuery({
+          text: slArm.error === "loan_already_has_active_order_in_direction"
+            ? "SL already armed — TP arm rolled back."
+            : `SL leg failed (${slArm.error}). TP rolled back.`,
+          show_alert: true,
+        });
+        return;
+      }
+      await ctx.answerCallbackQuery({
+        text: `Bracket armed: TP @ 2× #${tpArm.orderId} + SL @ 0.7× #${slArm.orderId}. /limitorders to view.`,
+        show_alert: false,
+      });
+      return;
+    }
     const direction = slot === "sl" ? "below" : "above";
     const multiplier = slot === "sl" ? 0.7 : 2;
     const slipBps = slot === "sl" ? 300 : 200;
