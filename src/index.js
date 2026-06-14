@@ -1,6 +1,17 @@
 import { Bot } from "grammy";
 import "dotenv/config";
 
+// DB-quota guard — installs global unhandledRejection /
+// uncaughtException handlers that detect DB-quota / DB-dead errors
+// and switch the bot to degraded mode INSTEAD of crashing. Closes the
+// 2026-06-14 outage class (Neon compute quota exhausted -> bot crash
+// loops every restart -> ~30 min site-down). See
+// src/lib/db-quota-guard.js for the full rationale and honest scope.
+// MUST be installed before any other import that might queue
+// DB-touching async work — the very first thing after dotenv.
+import { installDbQuotaGuard } from "./lib/db-quota-guard.js";
+installDbQuotaGuard();
+
 // Fail-fast privacy assertion — refuses to start the bot if any
 // public-route handler under src/api/ surfaces telegram_username in
 // a response. This catches regressions BEFORE they ship, so a future

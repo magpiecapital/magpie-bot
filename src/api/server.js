@@ -1653,10 +1653,20 @@ async function router(req, res) {
     const sinceStartup = now - getStartedAt();
     const inGrace = sinceStartup < STARTUP_GRACE_MS;
 
-    // 1. DB ping
+    // 1. DB ping — and if the guard has us in degraded mode, surface
+    // that even when SELECT 1 happens to succeed in a brief window of
+    // recovery. The guard's state is the authoritative "is the DB
+    // layer healthy" signal.
     try {
-      await query("SELECT 1");
-      checks.db = "ok";
+      const { degradedSnapshot } = await import("../lib/db-quota-guard.js");
+      const dbg = degradedSnapshot();
+      if (dbg.degraded) {
+        checks.db = "degraded";
+        reasons.push(`db: ${dbg.reason ?? "degraded"} (since ${Math.round((dbg.ageMs ?? 0) / 1000)}s ago)`);
+      } else {
+        await query("SELECT 1");
+        checks.db = "ok";
+      }
     } catch (err) {
       checks.db = "fail";
       reasons.push(`db: ${err.message}`);
