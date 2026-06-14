@@ -118,6 +118,13 @@ export async function armOrder({
   triggerKind,
   triggerValueMicro,       // BigInt or string
   triggerDirection = "above", // 'above' = take-profit, 'below' = stop-loss
+  // 2026-06-13: trailing-stop support. When trailingDistanceBps is
+  // non-null, the order is a trailing SL — the effective trigger
+  // floats with the highest observed price since arm. Watcher seeds
+  // peak_price_micros at arm time and updates each tick. Trailing
+  // is incompatible with triggerDirection='above' (TP fires at a
+  // fixed target by definition); validated below.
+  trailingDistanceBps = null,
   slippageBps,
   sellDestination = "sol",
   expiresAt = null,
@@ -156,6 +163,15 @@ export async function armOrder({
   }
   if (!VALID_DESTINATIONS.has(sellDestination)) {
     return { ok: false, error: "invalid_sell_destination" };
+  }
+  // Trailing validation. Bounded same as the migration's CHECK constraint.
+  if (trailingDistanceBps != null) {
+    if (!Number.isInteger(trailingDistanceBps) || trailingDistanceBps < 50 || trailingDistanceBps > 5000) {
+      return { ok: false, error: "invalid_trailing_distance_bps", detail: { allowed_range_bps: [50, 5000] } };
+    }
+    if (triggerDirection !== "below") {
+      return { ok: false, error: "trailing_only_valid_on_stop_loss", detail: { direction: triggerDirection } };
+    }
   }
   if (!/^\d+$/.test(String(loanIdChain))) {
     return { ok: false, error: "invalid_loan_id" };
@@ -455,6 +471,16 @@ export async function armOrder({
     };
   }
 
+  // Trailing stops seed peak_price_micros at arm time so the watcher's
+  // first tick has a baseline. Using `currentMicrosForLater` (computed
+  // above as part of the immediate-fire guard) avoids a second oracle
+  // round-trip. Falls back to triggerBI when the immediate-fire guard
+  // didn't get a price quote — the watcher will correct on its first
+  // tick if the real price is higher.
+  const peakAtArm = trailingDistanceBps != null
+    ? (currentMicrosForLater != null ? currentMicrosForLater : triggerBI)
+    : null;
+
   let inserted;
   try {
     inserted = await query(
@@ -466,6 +492,7 @@ export async function armOrder({
           auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
           preflight_slippage_quoted_bps, preflight_proceeds_lamports, preflight_quoted_at,
           engine_program_id,
+          trailing_distance_bps, peak_price_micros,
           notes)
        VALUES ($1, $2, $3, $4,
                $5,
@@ -474,7 +501,8 @@ export async function armOrder({
                $11, $12, $13,
                $14, $15, $16,
                $17,
-               $18)
+               $18, $19,
+               $20)
        RETURNING id, armed_at`,
       [userId, loan.id, triggerKind, triggerBI.toString(),
        triggerDirection,
@@ -491,10 +519,12 @@ export async function armOrder({
        // treats NULL as legacy-V1 for back-compat with pre-2026-06-13
        // rows; new arms always populate this.
        loan.program_id || null,
+       trailingDistanceBps,
+       peakAtArm != null ? peakAtArm.toString() : null,
        armNote
          || (appliedInitialBps !== originalInitialBps
-           ? `armed via ${source}; ${triggerDirection === "below" ? "STOP-LOSS" : "TP"}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
-           : `armed via ${source}; ${triggerDirection === "below" ? "STOP-LOSS" : "TP"}`)],
+           ? `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}; initial slippage bumped ${originalInitialBps}->${appliedInitialBps} bps for ${mintRow.symbol || "thin token"} (liquidity_usd=$${Math.round(liqUsd)})`
+           : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}`)],
     );
   } catch (err) {
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
