@@ -21,6 +21,14 @@ import { getProposal } from "./registry.js";
  * Returns { ok: true } | { ok: false, reason }.
  */
 export function checkSnapshotIntegrity(snapshotPath, expectedHash) {
+  // DB-snapshot fallback path (#203, 2026-06-14) — when the
+  // pipeline ran tally against governance_snapshot_weights instead
+  // of an on-disk file, snapshotPath is null and there's no file
+  // hash to compare. The DB rows are the trusted source on Railway;
+  // skip file integrity check rather than fail the proposal.
+  if (!snapshotPath) {
+    return { ok: true, detail: { skipped: "db_snapshot_no_file_to_hash" } };
+  }
   let bytes;
   try {
     bytes = readFileSync(snapshotPath);
