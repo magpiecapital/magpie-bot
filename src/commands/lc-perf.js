@@ -206,6 +206,12 @@ async function showPerf(ctx, windowKey) {
               COALESCE(SUM(fires_failed), 0)::bigint::text          AS fires_failed,
               COALESCE(SUM(fires_reverted), 0)::bigint::text        AS fires_reverted,
               COALESCE(SUM(errors), 0)::bigint::text                AS errors,
+              -- 2026-06-13: count of RWA TPs the engine intentionally
+              -- skipped during the weekend cutoff window (engine PR #18).
+              -- Column added by bot migration 053; COALESCE makes the
+              -- SELECT survive on a fresh deploy where 053 isn't applied
+              -- yet (NULL would otherwise poison Number(...) below).
+              COALESCE(SUM(rwa_tp_weekend_skipped), 0)::bigint::text AS rwa_tp_weekend_skipped,
               MIN(hour)                                              AS earliest_hour,
               MAX(hour)                                              AS latest_hour
          FROM engine_metrics_hourly
@@ -316,6 +322,12 @@ async function showPerf(ctx, windowKey) {
     lines.push(`• Fires attempted:    ${Number(eng.fires_attempted)} → ${Number(eng.fires_succeeded)} ok · ${Number(eng.fires_failed)} fail · ${Number(eng.fires_reverted)} revert`);
     if (Number(eng.errors) > 0) {
       lines.push(`• Tick errors:        ${Number(eng.errors)}`);
+    }
+    // RWA TP weekend-skip count — only render when nonzero so the
+    // line doesn't clutter weekday output. Engine PR #18 + bot
+    // migration 053.
+    if (Number(eng.rwa_tp_weekend_skipped) > 0) {
+      lines.push(`• RWA TP weekend skips: ${Number(eng.rwa_tp_weekend_skipped)} (held for Mon RTH)`);
     }
   }
 
