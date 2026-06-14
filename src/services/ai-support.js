@@ -1833,6 +1833,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "take profit", "set a limit order", "sell when X 2x's", "auto-sell at $Y", "lock in if it moons" → \`propose_take_profit\`. **STRIKE PARSING:** the tool's \`target_text\` argument accepts EVERY natural form: "17M mc", "17,000,000 MC", "17 million market cap", "$0.005", "0.005 usd", "2x", "+50%". Always pass the user's literal phrase as \`target_text\` rather than parsing it yourself — the bot has one canonical parser that matches TG /tp exactly. Only use \`multiplier\` / \`target_usd\` / \`mc_usd\` when YOU computed the value (e.g. "let me set it at 2× current"). If the user is vague ("set a TP"), ASK with a concrete suggestion ("Want me to set it at 2× current? Or pick a specific price?"). After arming, the engine autonomously closes + sells the moment the target hits — explain this is "hands-off, you don't have to babysit." 1% protocol fee on proceeds. **Works on memecoin V1 + xStock V3 collateral** (the engine routes via the loan's engine_program_id automatically — never tell users TP isn't available for their pool type). Multi-target arming IS supported: a user can arm TWO TPs at different prices on the same loan; the first to trigger fires (full close), the other auto-cancels.
 - User says "stop loss", "stoploss", "sl at X", "set a stop", "auto-exit if it dumps", "sell if BONK drops X%", "protect downside at $Y" → \`propose_stop_loss\`. **STRIKE PARSING:** pass user's literal phrase as \`target_text\` ("5M mc", "$0.001", "down 30%", "-30%", "0.7x"). If they're vague, ASK with a concrete suggestion ("Want me to set it at 0.7x current — that's a 30% drop?"). After arming, the engine autonomously closes + sells if the floor breaks. 1% protocol fee. **Works on memecoin V1 + xStock V3 collateral.** TP + SL on the same loan IS allowed (a "bracket") — if user wants both, call propose_take_profit then propose_stop_loss in sequence, OR suggest /bracket as the one-command equivalent.
 - User says "trailing stop", "trail my stop", "trailing 10%", "follow the price up but stop if it drops", "lock in gains with a moving stop" → \`propose_trailing_stop\`. Trailing stops are a stop-loss variant where the floor floats UP with each new high (never down). User specifies a distance (10% means "fire if price drops 10% from the most recent peak"). Default suggestion: 10–15%. Distance must be between 0.5% and 50%. Trailing only works on loans they want to PROTECT (downside) — it's not a take-profit. Explain plainly: "as long as price keeps making new highs, the floor moves with it; the first time price drops your distance, it fires." 1% protocol fee on proceeds, same as TP.
+- User says "set up a ladder", "scale out", "sell 70% at X and 30% at Y", "take profit in stages", "partial sells at different prices", "70/10/10/10 ladder", or names multiple price targets with slice percentages → \`propose_take_profit_ladder\`. Pass \`legs\` as an array of {strike, slice_pct} where strike is the user's literal phrase ("16M mc", "$0.0017", "1.5x") and slice_pct is the percent of original collateral that leg sells (e.g. 70 for 70%). Sum of slice_pct across legs MUST be <= 100. The engine fires each leg independently: when a strike hits, repay+swap that slice% of collateral, send proceeds to user, re-borrow on the remainder, migrate sibling legs to the new loan_id. Each leg pays its own 1% protocol fee + a borrow origination fee on the re-borrow. If user is vague ("set up a ladder"), suggest a concrete default: "How about 70% at 1.5x, 20% at 2x, 10% at 3x?" The ladder works on V1 memecoin AND V3 RWA collateral — never tell the user it's pool-specific.
 - User says "show my take profits", "what limits do I have armed", "any take-profits set", "show my stops", "what's protecting my loans" → \`list_my_take_profits\`. After the call, group by loan and label each by its \`kind\` field (take_profit / stop_loss / trailing_stop) NOT just the trigger value. For loans listed in \`bracket_loan_ids\`, narrate "you have a bracket (TP + SL) on loan #X" instead of two independent orders. For trailing orders, surface \`trailing_distance_pct\` and \`peak_price_usd\` so users see the floating floor — e.g. "trailing 10%, peak $0.0047". If empty, suggest setting one with \`propose_take_profit\`, \`propose_stop_loss\`, \`propose_trailing_stop\`, or \`/bracket\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
 - User says "what would I net at 2x", "how much SOL if I set a 3x take-profit", "if I locked in at 1.5x what do I get", "is it worth arming a TP at X" → \`simulate_take_profit\` with their loan_id + multiplier. After the call, report net_to_user_sol as the headline ("you'd net ~X SOL after fees and slippage"). Always include the caveat from result.note about prices changing. Surface result.arm_hint as a one-tap command if the projection looks good. If error is present, narrate the error.note verbatim.
@@ -2192,6 +2193,39 @@ const TOOLS = [
         expire: { type: "string", description: "Order expiration as Nd or Nh (e.g. '30d', '12h'). Optional — no expiry by default." },
       },
       required: ["loan_id", "distance_pct"],
+    },
+  },
+  {
+    name: "propose_take_profit_ladder",
+    description:
+      "Prepare a MULTI-LEG TAKE-PROFIT LADDER on a single loan. Use when the user wants to sell PORTIONS of their collateral at different price targets — e.g. 'sell 70% at 16M MC, 10% at 17M, 10% at 18M, and 10% at 19M' or 'I want a ladder: take some profit at 2x and the rest at 3x'. " +
+      "REQUIRED: \`legs\` — an array of 2-6 objects, each {strike, slice_pct}. \`strike\` accepts any natural-language form the parser supports (\"17M mc\", \"$0.005\", \"2x\"). \`slice_pct\` is the percent of THE LOAN'S ORIGINAL COLLATERAL the leg sells, e.g. 70 means 70%. Sum of all slice_pct values MUST be <= 100. Suggest defaults if the user is vague: \"How about 70% at 1.5x, 20% at 2x, 10% at 3x?\" " +
+      "When a leg fires, the engine repays the loan in full, sells exactly slice% of the original collateral, sends proceeds to the user, and re-borrows on the REMAINING collateral at the same tier — the new loan keeps the ladder going. Sibling legs migrate to the new loan_id automatically. 1% protocol fee per leg. Each re-borrow pays its own origination fee. " +
+      "If the user is asking for a single TP (no slices), use propose_take_profit instead. The ladder tool is ONLY for explicit multi-leg setups. " +
+      "Works on V1 memecoin AND V3 RWA collateral.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The numeric loan ID to arm the ladder on. Required." },
+        legs: {
+          type: "array",
+          description: "Ordered list of ladder legs. Each leg fires independently; first to trigger fires first. Sum of slice_pct across all legs must be <= 100.",
+          items: {
+            type: "object",
+            properties: {
+              strike: { type: "string", description: "Strike price as natural language. Examples: '16M mc', '$0.0017', '1.5x'. Pass the user's literal phrase." },
+              slice_pct: { type: "number", description: "Percent of original collateral this leg sells. Range 1..100. Sum across legs <= 100." },
+            },
+            required: ["strike", "slice_pct"],
+          },
+          minItems: 2,
+          maxItems: 6,
+        },
+        slippage_pct: { type: "number", description: "Slippage cap per leg as a percent (e.g. 2 for 2%). Default 2%. Applies to every leg." },
+        sell_to: { type: "string", enum: ["sol", "usdc"], description: "Sell proceeds destination. Default 'sol'." },
+        expire: { type: "string", description: "Per-leg expiration (e.g. '30d'). Optional." },
+      },
+      required: ["loan_id", "legs"],
     },
   },
   {
@@ -2990,6 +3024,136 @@ const TOOL_HANDLERS = {
         String(loan.loan_id).slice(-6) +
         "`. Mention the target in human terms (e.g. 'at 2× current' or 'at $0.005') and the slippage cap. " +
         "DO NOT lecture them about how take-profit works — the card explains it. If the user picked a multiplier, mention the resolved USD price so they have a concrete number.",
+    };
+  },
+
+  // Multi-leg ladder proposal. Walks the legs[] array, parses each
+  // strike via the shared parser, validates slice_pct sum <= 100,
+  // and emits a single action_proposed of type=take_profit_ladder
+  // that the site renders as a multi-row confirmation card. The
+  // borrower wallet signs ONE envelope authorizing all N legs.
+  //
+  // Engine semantics (paired magpie-limitclose PR #24): each leg
+  // fires independently; when one triggers, repay+swap+reborrow
+  // re-locks the remaining collateral as a new loan and sibling
+  // legs migrate to the new loan_id.
+  //
+  // Requires LIMIT_CLOSE_LADDER_ENABLED at arm time on the bot side.
+  // If the flag is off, the proposal is returned with a
+  // disabled=true flag and the LLM should tell the user the ladder
+  // ships after the engine deploy + flag flip.
+  propose_take_profit_ladder: async (
+    { loan_id, legs, slippage_pct, sell_to, expire },
+    { userId, signerPubkey },
+  ) => {
+    if (!Array.isArray(legs) || legs.length < 2 || legs.length > 6) {
+      return toolError("invalid_legs",
+        `legs must be 2-6 entries; got ${Array.isArray(legs) ? legs.length : "non-array"}.`,
+        "Ask the user for at least two ladder legs (e.g. 'sell 70% at 16M, 30% at 18M').");
+    }
+    const slipPct = slippage_pct != null ? Number(slippage_pct) : 2;
+    if (!Number.isFinite(slipPct) || slipPct < 0.1 || slipPct > 10) {
+      return toolError("bad_slippage", null, "Slippage must be between 0.5% and 10%.");
+    }
+    const slippageBps = Math.round(slipPct * 100);
+    const dest = sell_to === "usdc" ? "usdc" : "sol";
+
+    // Validate loan ownership + activeness, same as propose_take_profit.
+    const { rows: loanRows } = await query(
+      `SELECT l.*, sm.symbol, sm.decimals, sm.category, sm.enabled
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [loan_id, userId],
+    );
+    if (!loanRows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
+    const loan = loanRows[0];
+    if (loan.status !== "active") {
+      return toolError("loan_not_active", null, `This loan is ${loan.status}, not active. Ladders only work on active loans.`);
+    }
+    if (!loan.enabled) {
+      return toolError("collateral_not_enabled", null, "This collateral isn't currently enabled in the protocol.");
+    }
+    if (signerPubkey && loan.borrower_wallet && signerPubkey !== loan.borrower_wallet) {
+      return toolError("wrong_signer_wallet",
+        `loan.borrower=${loan.borrower_wallet} signer=${signerPubkey}`,
+        `That loan was opened by ${loan.borrower_wallet.slice(0,4)}…${loan.borrower_wallet.slice(-4)}. Switch the active wallet before arming.`);
+    }
+
+    // Resolve each leg's strike via the shared parser.
+    const { parseStrike } = await import("../lib/strike-price-parser.js");
+    const { resolveMultiplierToPrice } = await import("./limit-close-arm-core.js");
+    const resolvedLegs = [];
+    let totalSlice = 0;
+    for (let i = 0; i < legs.length; i++) {
+      const { strike, slice_pct } = legs[i];
+      if (!Number.isFinite(slice_pct) || slice_pct <= 0 || slice_pct > 100) {
+        return toolError("bad_slice_pct",
+          `leg ${i + 1}: slice_pct must be in (0, 100]; got ${slice_pct}.`,
+          "Ask the user to keep each leg's slice between 1% and 100%.");
+      }
+      totalSlice += slice_pct;
+      if (!strike || typeof strike !== "string") {
+        return toolError("missing_strike", `leg ${i + 1}: strike is required.`);
+      }
+      const parsed = parseStrike(strike, { bareNumberDefaultKind: "mc_usd" });
+      if (!parsed.ok) {
+        return toolError("bad_strike", `leg ${i + 1}: ${parsed.error}`,
+          `Couldn't understand strike "${strike}" on leg ${i + 1}. Suggest a specific value.`);
+      }
+      if (parsed.impliedDirection === "below") {
+        return toolError("downside_strike_in_ladder", null,
+          `Leg ${i + 1} is a downside target. Take-profit ladders only handle upside legs; use propose_stop_loss for downside.`);
+      }
+      // Resolve multiplier → USD price now so all legs are in price_usd terms.
+      let targetUsd = null;
+      if (parsed.kind === "multiplier") {
+        const r = await resolveMultiplierToPrice(loan.collateral_mint, parsed.multiplier);
+        if (!r.ok) return toolError("multiplier_resolve_failed", r.error,
+          `Couldn't resolve multiplier on leg ${i + 1} right now. Tell the user to use an explicit price.`);
+        targetUsd = r.targetUsd;
+      } else if (parsed.kind === "price_usd") {
+        targetUsd = Number(parsed.valueMicro) / 1e6;
+      }
+      resolvedLegs.push({
+        leg_index: i + 1,
+        strike_input: strike,
+        kind: parsed.kind === "multiplier" ? "price_usd" : parsed.kind,
+        value_micro: parsed.kind === "multiplier"
+          ? BigInt(Math.round(targetUsd * 1e6)).toString()
+          : parsed.valueMicro?.toString() || null,
+        target_usd: targetUsd,
+        slice_pct: slice_pct,
+        slice_bps: Math.round(slice_pct * 100),
+        normalized: parsed.normalizedDisplay,
+      });
+    }
+
+    if (totalSlice > 100.0001) {
+      return toolError("ladder_sum_exceeds_100",
+        `legs sum to ${totalSlice.toFixed(2)}% (max 100%).`,
+        `Tell the user their slices add up to ${totalSlice.toFixed(0)}% — they need to shrink one.`);
+    }
+
+    return {
+      action_proposed: {
+        type: "take_profit_ladder",
+        loan_id: loan.loan_id,
+        collateral_symbol: loan.symbol,
+        legs: resolvedLegs,
+        total_slice_pct: Math.round(totalSlice * 100) / 100,
+        slippage_bps: slippageBps,
+        sell_destination: dest,
+        order_expire: expire || null,
+        expires_at: Date.now() + 5 * 60 * 1000,
+        ladder_disabled: process.env.LIMIT_CLOSE_LADDER_ENABLED !== "true",
+      },
+      _agent_instruction:
+        "Respond with ONE short paragraph naming each leg in plain language ('70% at $16M MC, 10% at $17M, 10% at $18M, 10% at $19M'). Mention the loan as `#" +
+        String(loan.loan_id).slice(-6) + "`. " +
+        "If action_proposed.ladder_disabled is true, ADD a one-line note: 'Ladders are rolling out — multi-leg arming becomes live when the engine flag flips. For now I'm queueing this proposal so you can review the legs.' " +
+        "Do NOT explain the engine mechanics; the user can ask if they want details.",
     };
   },
 
