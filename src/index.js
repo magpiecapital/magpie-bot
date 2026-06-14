@@ -813,12 +813,20 @@ bot.start({
     setTimeout(() => startLoanReconciler(), 45_000);
     // Liquidation economics watcher (2026-06-14 policy, Phase 1A) —
     // tracks per-default principal vs sale proceeds and the
-    // pre-computed 70/10/10/10 distribution splits. Data capture
-    // only; the actual SOL routing happens in Phase 2. $MAGPIE
-    // collateral defaults stay 'magpie_burn_pending' until the
-    // operator manually conducts the burn.
+    // pre-computed 70/10/10/10 distribution splits. Data capture only;
+    // the actual ledger credits happen in the distribution watcher
+    // below. $MAGPIE collateral defaults stay 'magpie_burn_pending'
+    // until the operator manually conducts the burn.
     import("./services/liquidation-economics-watcher.js").then((m) =>
       m.startLiquidationEconomicsWatcher(),
+    );
+    // Liquidation distribution watcher (Phase 2) — picks up
+    // 'awaiting_distribution' rows and credits the rewards pool
+    // ledgers via the existing accrual primitives. Idempotent via
+    // row status transitions + per-loan event_type='default_profit'
+    // uniqueness on protocol_reserve_events + referral_earnings.
+    import("./services/liquidation-distribution-watcher.js").then((m) =>
+      m.startLiquidationDistributionWatcher(),
     );
     // Exploit-detector — auto-bans wallets/users matching the
     // pump-and-borrow attack pattern, alerts on weaker signals.
