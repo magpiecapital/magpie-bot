@@ -80,10 +80,9 @@ export async function handlePrefsList(req, url) {
   if (!isValidPubkey(wallet)) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
   }
-  const { rows: [u] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [wallet],
-  );
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(wallet);
+  const u = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!u) {
     return { status: 200, body: { linked: false, prefs: null, recent_actions: [] } };
   }
@@ -207,10 +206,9 @@ export async function handlePrefsSet(req) {
   }
   if (!sigOk) return { status: 401, body: { error: "Signature does not match signer" } };
 
-  const { rows: [linked] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [signerPubkey],
-  );
+  const { resolveWalletOwner: resolveOwner2 } = await import("../services/wallet-owner-resolver.js");
+  const linkedUserId = await resolveOwner2(signerPubkey);
+  const linked = linkedUserId ? { user_id: linkedUserId } : null;
   if (!linked) {
     return { status: 403, body: { error: "Signer wallet is not linked to a Magpie account" } };
   }

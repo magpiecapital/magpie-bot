@@ -135,10 +135,9 @@ export async function handleBackfillWalletLoans(req) {
   // can spray random pubkeys to learn the wallet↔Magpie-account
   // mapping (same fix pattern as sync-loan PR #52). Log internally
   // for ops visibility but stay opaque to the caller.
-  const { rows: [walletRow] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [walletStr],
-  );
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(walletStr);
+  const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!walletRow) {
     console.error(`[backfill] wallet ${walletStr.slice(0, 8)}... not linked — returning generic noop`);
     return {
