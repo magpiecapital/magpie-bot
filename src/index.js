@@ -159,6 +159,7 @@ import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
+import { startLimitCloseNearTriggerWatcher } from "./services/limit-close-near-trigger-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
@@ -810,6 +811,13 @@ bot.start({
     // orders are old AND trigger far from current price. One-time
     // nudge per order. See feedback_tg_changes_careful.
     setTimeout(() => startLimitCloseStalenessWatcher(), 90_000);
+    // Near-trigger nudge — every 5 min DMs users whose armed orders
+    // are within ~10% of firing. One-time per arm; reset on modify so
+    // a re-tuned trigger gets a fresh nudge if it lands in the band.
+    // Different cadence + audience than the staleness watcher:
+    // staleness = "forgotten old order", near-trigger = "imminent
+    // action heads-up". See feedback_tg_changes_careful.
+    setTimeout(() => startLimitCloseNearTriggerWatcher(), 95_000);
     // Impersonator watchdog — every 30 min retroactively scans the
     // last 24h of community joins against the CURRENT
     // IMPERSONATION_PATTERNS list. Catches impersonators who slipped
