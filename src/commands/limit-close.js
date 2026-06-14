@@ -957,6 +957,7 @@ export async function handleLimitOrders(ctx) {
             lc.trailing_distance_bps,
             lc.peak_price_micros::text AS peak_price_micros,
             COALESCE(lc.slice_pct, 10000) AS slice_pct,
+            lc.ladder_group_id,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
             m.symbol AS collateral_symbol,
@@ -1029,11 +1030,35 @@ export async function handleLimitOrders(ctx) {
     // tells the user this is one rung of a multi-target plan.
     const slicePct = Number(r.slice_pct) || 10000;
     const sliceBadge = slicePct < 10000 ? ` · slice ${(slicePct / 100).toFixed(slicePct % 100 === 0 ? 0 : 1)}%` : "";
+    // Ladder badge — when the row belongs to a ladder_group_id, surface a
+    // short 4-char prefix so the user can visually tie sibling legs
+    // together. Same prefix appears on every leg of the same ladder.
+    const ladderBadge = r.ladder_group_id ? ` · ladder ${r.ladder_group_id.slice(0, 4)}` : "";
     lines.push(
       `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
-      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}${sliceBadge}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}${sliceBadge}${ladderBadge}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
       "",
     );
+  }
+
+  // Ladder summary — for any ladder_group_id with multiple legs, add a
+  // one-line "Ladder X: total Y% across N legs" so the user can see the
+  // aggregate at a glance. Sorted by group so legs of the same ladder
+  // appear consecutive in the message.
+  const groups = new Map();
+  for (const r of rows) {
+    if (!r.ladder_group_id) continue;
+    const g = groups.get(r.ladder_group_id) || { count: 0, totalSlice: 0, sym: r.collateral_symbol || "?" };
+    g.count++;
+    g.totalSlice += Number(r.slice_pct) / 100;
+    groups.set(r.ladder_group_id, g);
+  }
+  if (groups.size > 0) {
+    lines.push("_Ladders armed:_");
+    for (const [gid, g] of groups) {
+      lines.push(`  ${gid.slice(0, 4)}  ${g.sym}  ${g.count} legs  ${g.totalSlice.toFixed(0)}% total`);
+    }
+    lines.push("");
   }
 
   // One inline cancel button per order — keeps the keyboard compact
