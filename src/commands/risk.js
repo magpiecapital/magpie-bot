@@ -35,14 +35,19 @@ export async function handleRisk(ctx) {
   }
 
   try {
-    // Find mint by symbol
-    const { rows: [mint] } = await query(
-      `SELECT mint, symbol FROM supported_mints WHERE UPPER(symbol) = $1 AND enabled = true`,
-      [symbol],
-    );
-    if (!mint) {
+    // Find mint by symbol via the safe resolver — refuses to silently
+    // pick when multiple enabled tokens share the same ticker (e.g. a
+    // memecoin and a tokenized stock with the same symbol). Operator-
+    // demanded class-of-vulnerability defense, 2026-06-14.
+    const { resolveSymbol, formatAmbiguousMessage } = await import("../services/safe-symbol-lookup.js");
+    const resolution = await resolveSymbol(symbol);
+    if (resolution.status === "not_found") {
       return ctx.reply(`Token "${symbol}" not found in supported mints. Use /supported to see all.`);
     }
+    if (resolution.status === "ambiguous") {
+      return ctx.reply(formatAmbiguousMessage(symbol, resolution.candidates));
+    }
+    const mint = resolution.mint;
 
     const profile = await getTokenRisk(mint.mint);
     if (!profile) {

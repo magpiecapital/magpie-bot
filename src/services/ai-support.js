@@ -2522,10 +2522,27 @@ const TOOL_HANDLERS = {
     // command (src/services/loan-tier-resolver.js).
     const trimmed = String(token || "").trim().replace(/^\$/, "");
     const isMintLike = trimmed.length >= 32;
-    const lookup = isMintLike
-      ? await query(`SELECT mint, symbol, decimals, enabled, category FROM supported_mints WHERE mint = $1 LIMIT 1`, [trimmed])
-      : await query(`SELECT mint, symbol, decimals, enabled, category FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [trimmed]);
-    const mintRow = lookup.rows[0];
+    let mintRow;
+    if (isMintLike) {
+      const lookup = await query(`SELECT mint, symbol, decimals, enabled, category FROM supported_mints WHERE mint = $1 LIMIT 1`, [trimmed]);
+      mintRow = lookup.rows[0];
+    } else {
+      // Symbol-based resolution goes through the safe resolver. If
+      // multiple enabled tokens share the same ticker (a memecoin and
+      // a tokenized stock both named "SPCX" for instance), Pip must
+      // refuse to pick and ask the user for the explicit mint.
+      const { resolveSymbol, formatAmbiguousMessage } = await import("./safe-symbol-lookup.js");
+      const resolution = await resolveSymbol(trimmed);
+      if (resolution.status === "ambiguous") {
+        return toolError(
+          "symbol_ambiguous",
+          null,
+          formatAmbiguousMessage(trimmed, resolution.candidates) +
+            "\n\nTell the user the ticker matches multiple enabled tokens — they need to give the full mint pubkey of the one they want to borrow against (or pick from their dashboard, which is mint-keyed).",
+        );
+      }
+      mintRow = resolution.mint;
+    }
     if (!mintRow) return toolError("token_not_supported", null, `${trimmed} isn't a supported collateral. Tell the user to check /tokens for the list.`);
     if (!mintRow.enabled) return toolError("token_disabled", null, `${mintRow.symbol} is currently disabled as collateral. Tell the user — they should pick a different token or wait until it's re-enabled.`);
 
@@ -3729,17 +3746,31 @@ const TOOL_HANDLERS = {
   check_my_token_balance: async ({ token }, { userId, signerPubkey }) => {
     const pubkey = signerPubkey || await getUserWallet(userId);
     if (!pubkey) return toolError("no_wallet", null, HINT_NO_WALLET);
-    // Resolve token (symbol or mint) to a real mint
+    // Resolve token (symbol or mint) to a real mint via the safe
+    // resolver — refuses to silently pick when multiple enabled
+    // tokens share the same ticker.
     let mintRow;
     try {
       const isMintLike = typeof token === "string" && token.length >= 32;
-      const lookup = isMintLike
-        ? await query(`SELECT mint, symbol, decimals FROM supported_mints WHERE mint = $1 LIMIT 1`, [token])
-        : await query(`SELECT mint, symbol, decimals FROM supported_mints WHERE UPPER(symbol) = UPPER($1) LIMIT 1`, [token]);
-      mintRow = lookup.rows[0];
-      // Fall back to using the raw input as mint even if not in supported_mints
-      // (e.g., user asking about a token they hold but isn't approved collateral)
-      if (!mintRow && isMintLike) mintRow = { mint: token, symbol: null, decimals: null };
+      if (isMintLike) {
+        const lookup = await query(`SELECT mint, symbol, decimals FROM supported_mints WHERE mint = $1 LIMIT 1`, [token]);
+        mintRow = lookup.rows[0];
+        // Fall back to using the raw input as mint even if not in supported_mints
+        // (e.g., user asking about a token they hold but isn't approved collateral)
+        if (!mintRow) mintRow = { mint: token, symbol: null, decimals: null };
+      } else {
+        const { resolveSymbol, formatAmbiguousMessage } = await import("./safe-symbol-lookup.js");
+        const resolution = await resolveSymbol(token);
+        if (resolution.status === "ambiguous") {
+          return toolError(
+            "symbol_ambiguous",
+            null,
+            formatAmbiguousMessage(token, resolution.candidates) +
+              "\n\nTell the user the ticker matches multiple enabled tokens and ask which mint they mean.",
+          );
+        }
+        mintRow = resolution.mint;
+      }
     } catch {
       return toolError("lookup_failed", null, "DB lookup for the mint failed; retry or escalate.");
     }
