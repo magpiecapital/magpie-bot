@@ -154,6 +154,30 @@ function renderLimitCloseActionRequired(p) {
   ].filter(Boolean).join("\n");
 }
 
+// Transparency DM emitted by the engine the FIRST time it auto-escalates
+// slippage on an order. Users would otherwise see nothing happen between
+// trigger-hit and final fire/fail — this confirms the engine is actively
+// working and shows the new slippage so they can sanity-check it against
+// their cap. Subsequent escalations are silent (one DM per order).
+function renderLimitCloseRetrying(p) {
+  const prevPct = (Number(p.previous_slippage_bps) / 100).toFixed(2);
+  const newPct = (Number(p.new_slippage_bps) / 100).toFixed(2);
+  const capPct = p.max_slippage_bps_cap != null
+    ? (Number(p.max_slippage_bps_cap) / 100).toFixed(2)
+    : null;
+  return [
+    `*Working on your limit-close — order #${p.order_id}*`,
+    "",
+    `Your trigger hit, but the first execution would have exceeded the slippage allowance.`,
+    "",
+    `*Slippage:* ${prevPct}% → ${newPct}%${capPct ? ` _(cap ${capPct}%)_` : ""}`,
+    "",
+    `The engine retries automatically every ~30 seconds and steps the slippage up until it fills or hits your cap. No action needed — we'll DM you with the receipt when it lands.`,
+    "",
+    `_If price drops back below your trigger before we fill, the order stays armed and waits._`,
+  ].join("\n");
+}
+
 function renderLimitCloseCancelled(p) {
   const agentLine = agentAttribution(p);
   return [
@@ -224,6 +248,7 @@ const RENDERERS = {
   limit_close_failed:          renderLimitCloseFailed,
   limit_close_cancelled:       renderLimitCloseCancelled,
   limit_close_action_required: renderLimitCloseActionRequired,
+  limit_close_retrying:        renderLimitCloseRetrying,
   limit_close_intervention: renderLimitCloseIntervention,
   limit_close_staleness_nudge: renderLimitCloseStalenessNudge,
   limit_close_near_trigger:    renderLimitCloseNearTrigger,
@@ -310,6 +335,30 @@ async function tick(bot) {
               const kb = new InlineKeyboard()
                 .text("Keep active", `lcstale:keep:${row.payload.order_id}`)
                 .text("Cancel order", `lcstale:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_retrying") {
+              // Lets the user bail mid-retry if they no longer want the
+              // engine to keep escalating. Cancel is hard-cancel — order
+              // moves to status='cancelled'. The callback handler is in
+              // src/index.js under bot.callbackQuery("lcret:cancel:...").
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard()
+                .text("Cancel this order", `lcret:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_fired") {
+              // Receipt-confirmation keyboard. Solscan links are already
+              // inline in the body, but tap-once buttons are friendlier
+              // for verifying proceeds on phones. Dashboard button takes
+              // user to past-loans where they can see the full receipt.
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard();
+              if (row.payload?.tx_swap) {
+                kb.url("View sale tx", `https://solscan.io/tx/${row.payload.tx_swap}`);
+              }
+              if (row.payload?.tx_repay) {
+                kb.url("View repay tx", `https://solscan.io/tx/${row.payload.tx_repay}`);
+              }
+              kb.row().url("Open dashboard", "https://www.magpie.capital/dashboard");
               extra = { reply_markup: kb };
             }
             await bot.api.sendMessage(Number(u.telegram_id), text, {
