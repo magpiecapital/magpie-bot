@@ -178,20 +178,25 @@ export async function armOrder({
   if (!VALID_DESTINATIONS.has(sellDestination)) {
     return { ok: false, error: "invalid_sell_destination" };
   }
-  // ── Slice (ladder) validation ────────────────────────────────
+  // ── Slice (ladder scaffolding) validation ────────────────────
   if (!Number.isInteger(slicePct) || slicePct <= 0 || slicePct > 10000) {
     return { ok: false, error: "invalid_slice_pct", detail: { allowed_range_bps: [1, 10000] } };
   }
-  // Engine-side partial-fill ships separately. Until then, refuse any
-  // slice < 100% so the bot never accepts a ladder it can't honor.
-  // Operator unblocks by setting LIMIT_CLOSE_LADDER_ENABLED=true once
-  // the magpie-limitclose partial_repay PR has rolled out.
+  // Migration 064 keeps slice_pct as scaffolding: the column exists but
+  // every armed leg is implicitly full-close (slice = 10000) until a
+  // future on-chain instruction supports fractional collateral release.
+  // Today's on-chain partial_repay only reduces debt — it doesn't
+  // release fractional collateral — so a slice<100% arm can't be
+  // honored end-to-end. Refuse it explicitly so users never see a
+  // misleading "armed" status on something the engine can't fire as
+  // promised. The env flag is here for the day the partial-close
+  // instruction lands; flipping it to true is part of that rollout.
   const LADDER_ENABLED = process.env.LIMIT_CLOSE_LADDER_ENABLED === "true";
   if (slicePct < 10000 && !LADDER_ENABLED) {
     return {
       ok: false,
-      error: "ladder_not_yet_enabled",
-      detail: "Partial-slice TP/SL is rolling out — for now, slice_pct must be 100% (10000 bps). Engine support ships next.",
+      error: "fractional_slice_not_supported_today",
+      detail: "Today's on-chain protocol only supports full close per leg. For now, every TP/SL leg is implicitly 100%. Multi-target arming at different prices IS supported — arm a TP at 1.5x AND another at 2x; first to trigger fires, the other auto-cancels.",
     };
   }
   // Trailing validation. Bounded same as the migration's CHECK constraint.
@@ -560,17 +565,11 @@ export async function armOrder({
            : `armed via ${source}; ${triggerDirection === "below" ? (trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : "STOP-LOSS") : "TP"}${slicePct < 10000 ? ` slice=${slicePct/100}%` : ""}`)],
     );
   } catch (err) {
-    // Slice-sum trigger (migration 064): TP/SL ladder exceeds 100%.
-    // Surface as a structured error so UI can show the over-allocation.
-    if (/TP\/SL ladder exceeds 100/i.test(err.message || "")) {
-      return {
-        ok: false,
-        error: "ladder_sum_exceeds_100",
-        detail: err.message?.slice(0, 240),
-      };
-    }
-    // (Legacy migration 047 UNIQUE is dropped by 064, but tolerate
-    // any other DB-level duplicate signal in case rollouts overlap.)
+    // Migration 047's per-direction UNIQUE is dropped by 064 so multi-
+    // target arming is allowed. Tolerate the duplicate-key signal in
+    // case a stale replica is still using the pre-064 schema during
+    // rollout. The 064 deploy is single-step (no overlap window
+    // expected) so this branch should never fire in practice.
     if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
       return {
         ok: false,
