@@ -634,6 +634,204 @@ export async function handleTrailingStop(ctx) {
   ].join("\n"), { parse_mode: "Markdown" });
 }
 
+/* ─── /bracket ─────────────────────────────────────────────────── */
+//
+// One-shot TP + SL pair on the same loan. Schema (migration 047) and
+// engine (execution.js sibling-cancel) already allow this — /bracket
+// is just the UX surface that arms BOTH legs atomically from a single
+// command, with rollback if leg 2 fails so the user never ends up in
+// a half-armed state.
+//
+// Forms accepted:
+//   /bracket 1234 tp=2x sl=0.7x
+//   /bracket 1234 tp=$0.005 sl=$0.001 slip=3% dest=usdc
+//   /bracket 1234 tp=$150m sl=$50m
+//
+// Mixed targets are fine — tp can be a multiplier while sl is an
+// explicit price. The "first to fire wins; sibling auto-cancels" rule
+// is documented in the confirmation reply.
+export async function handleBracket(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const text = (ctx.message?.text || "").trim();
+  const m = text.match(/^\/\S+\s+(.+)$/);
+  if (!m) {
+    return ctx.reply(
+      "*Usage*\n\n" +
+      "`/bracket <loan_id> tp=<target> sl=<floor> [slip=2% dest=sol]`\n\n" +
+      "Examples:\n" +
+      "`/bracket 1234 tp=2x sl=0.7x`\n" +
+      "`/bracket 1234 tp=$0.005 sl=$0.001 slip=3%`\n" +
+      "`/bracket 1234 tp=$150m sl=$50m dest=usdc`\n\n" +
+      "Arms BOTH a take-profit and stop-loss. First to fire closes the loan; the other auto-cancels.",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const rest = m[1].trim().split(/\s+/);
+  const loan_id = rest[0];
+  if (!/^\d+$/.test(loan_id)) {
+    return ctx.reply("`<loan_id>` must be a positive integer. Try `/positions` to see your loans.", { parse_mode: "Markdown" });
+  }
+
+  // Parse the kv args. tp and sl can each be:
+  //   multiplier: "2x", "0.7x"
+  //   USD price:  "$0.005", "0.005"
+  //   MC:         "$150m", "50M"
+  function parseLeg(raw) {
+    const v = raw.toLowerCase();
+    // multiplier "<N>x"
+    const mMul = v.match(/^([0-9]+(?:\.[0-9]+)?)x$/);
+    if (mMul) return { kind: "multiplier", value: Number(mMul[1]) };
+    // market cap "<N>[kmb]"
+    const mMc = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)([kmb])$/);
+    if (mMc) {
+      const mult = mMc[2] === "k" ? 1e3 : mMc[2] === "m" ? 1e6 : 1e9;
+      return { kind: "mc_usd", value: Number(mMc[1]) * mult };
+    }
+    // USD price (bare or $-prefixed)
+    const mPrice = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)$/);
+    if (mPrice) return { kind: "price_usd", value: Number(mPrice[1]) };
+    return null;
+  }
+
+  let tpRaw = null;
+  let slRaw = null;
+  let slippage_bps = 200;
+  let sell_destination = "sol";
+  for (const tok of rest.slice(1)) {
+    const kv = tok.match(/^([a-z_]+)=(.+)$/i);
+    if (!kv) continue;
+    const k = kv[1].toLowerCase();
+    const v = kv[2];
+    if (k === "tp") tpRaw = v;
+    else if (k === "sl") slRaw = v;
+    else if (k === "slip") {
+      const sm = v.match(/^(\d+(?:\.\d+)?)(%|bps)?$/i);
+      if (!sm) return ctx.reply(`\`slip=${v}\` couldn't be parsed.`, { parse_mode: "Markdown" });
+      const unit = (sm[2] || "%").toLowerCase();
+      const bps = unit === "bps" ? Math.round(Number(sm[1])) : Math.round(Number(sm[1]) * 100);
+      if (bps < 10 || bps > 2500) {
+        return ctx.reply("`slip=` must be in 0.1%-25% (10-2500 bps).", { parse_mode: "Markdown" });
+      }
+      slippage_bps = bps;
+    } else if (k === "dest") {
+      const dv = v.toLowerCase();
+      if (dv !== "sol" && dv !== "usdc") return ctx.reply("`dest=` must be sol or usdc.", { parse_mode: "Markdown" });
+      sell_destination = dv;
+    }
+  }
+  if (!tpRaw || !slRaw) {
+    return ctx.reply("Both `tp=` and `sl=` are required. Try `/bracket 1234 tp=2x sl=0.7x`.", { parse_mode: "Markdown" });
+  }
+  const tp = parseLeg(tpRaw);
+  const sl = parseLeg(slRaw);
+  if (!tp) return ctx.reply(`Couldn't parse \`tp=${tpRaw}\`. Try \`2x\`, \`$0.005\`, or \`$150m\`.`, { parse_mode: "Markdown" });
+  if (!sl) return ctx.reply(`Couldn't parse \`sl=${slRaw}\`. Try \`0.7x\`, \`$0.001\`, or \`$50m\`.`, { parse_mode: "Markdown" });
+  if (tp.kind === "multiplier" && tp.value <= 1) {
+    return ctx.reply("`tp=` multiplier must be > 1 (e.g. `2x`). For downside, use `sl=`.", { parse_mode: "Markdown" });
+  }
+  if (sl.kind === "multiplier" && sl.value >= 1) {
+    return ctx.reply("`sl=` multiplier must be < 1 (e.g. `0.7x` = 70% of current). For upside, use `tp=`.", { parse_mode: "Markdown" });
+  }
+
+  const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // Resolve multipliers to concrete trigger values. Two oracle reads
+  // (one per leg) — accepts the small cost for clearer error surface
+  // and to avoid passing rawLevel through arm-core (which would push
+  // the resolution into the inner critical path).
+  const { rows: [loanForMint] } = await query(
+    `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id = $2`,
+    [user.id, loan_id],
+  );
+  if (!loanForMint) {
+    return ctx.reply(`Loan #${loan_id} not found in your account.`);
+  }
+
+  async function resolveLeg(leg, allowBelowOne) {
+    if (leg.kind === "multiplier") {
+      const r = await resolveMultiplierToPrice(loanForMint.collateral_mint, leg.value, { allowBelowOne });
+      if (!r.ok) return r;
+      return { ok: true, triggerKind: "price_usd", triggerValueMicro: r.triggerValueMicro.toString(), currentUsd: r.currentUsd, resolvedUsd: r.targetUsd };
+    }
+    if (leg.kind === "price_usd") {
+      return { ok: true, triggerKind: "price_usd", triggerValueMicro: BigInt(Math.round(leg.value * 1e6)).toString(), resolvedUsd: leg.value };
+    }
+    if (leg.kind === "mc_usd") {
+      return { ok: true, triggerKind: "mc_usd", triggerValueMicro: BigInt(Math.round(leg.value * 1e6)).toString(), resolvedMc: leg.value };
+    }
+    return { ok: false, error: "Unhandled leg kind." };
+  }
+
+  const tpResolved = await resolveLeg(tp, false);
+  if (!tpResolved.ok) return ctx.reply(`TP leg: ${tpResolved.error}`, { parse_mode: "Markdown" });
+  const slResolved = await resolveLeg(sl, true);
+  if (!slResolved.ok) return ctx.reply(`SL leg: ${slResolved.error}`, { parse_mode: "Markdown" });
+
+  // Arm leg 1 (TP). If this fails for ANY reason — duplicate-direction
+  // index hit, oracle disagreement, etc. — bail before touching SL.
+  const tpArm = await armOrder({
+    userId: user.id,
+    source: "tg",
+    loanIdChain: String(loan_id),
+    triggerKind: tpResolved.triggerKind,
+    triggerValueMicro: tpResolved.triggerValueMicro,
+    triggerDirection: "above",
+    slippageBps: slippage_bps,
+    sellDestination: sell_destination,
+  });
+  if (!tpArm.ok) {
+    return ctx.reply(`Couldn't arm TP leg: \`${tpArm.error}\`. Bracket NOT armed.`, { parse_mode: "Markdown" });
+  }
+
+  // Arm leg 2 (SL). If this fails, roll back TP via cancelOrder so the
+  // user never ends up with a half-armed bracket.
+  const slArm = await armOrder({
+    userId: user.id,
+    source: "tg",
+    loanIdChain: String(loan_id),
+    triggerKind: slResolved.triggerKind,
+    triggerValueMicro: slResolved.triggerValueMicro,
+    triggerDirection: "below",
+    slippageBps: slippage_bps,
+    sellDestination: sell_destination,
+  });
+  if (!slArm.ok) {
+    const { cancelOrder } = await import("../services/limit-close-arm-core.js");
+    try {
+      await cancelOrder({ orderId: tpArm.orderId, userId: user.id, reason: "bracket_partial_rollback" });
+    } catch (err) {
+      console.warn(`[bracket] rollback of TP ${tpArm.orderId} failed:`, err.message?.slice(0, 100));
+    }
+    return ctx.reply(
+      `Couldn't arm SL leg: \`${slArm.error}\`. TP leg #${tpArm.orderId} was rolled back so you're not half-armed.`,
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+  const tpHuman = tp.kind === "multiplier"
+    ? `${tp.value}× ($${fmt(tpResolved.resolvedUsd)})`
+    : tp.kind === "mc_usd"
+      ? `MC $${(tpResolved.resolvedMc / 1e6).toFixed(1)}M`
+      : `$${fmt(tpResolved.resolvedUsd)}`;
+  const slHuman = sl.kind === "multiplier"
+    ? `${sl.value}× ($${fmt(slResolved.resolvedUsd)})`
+    : sl.kind === "mc_usd"
+      ? `MC $${(slResolved.resolvedMc / 1e6).toFixed(1)}M`
+      : `$${fmt(slResolved.resolvedUsd)}`;
+  return ctx.reply([
+    `*Bracket armed* on loan #${loan_id}`,
+    "",
+    `TP: ${tpHuman} · order #${tpArm.orderId}`,
+    `SL: ${slHuman} · order #${slArm.orderId}`,
+    `Slippage: ${(slippage_bps / 100).toFixed(2)}% · proceeds → ${sell_destination.toUpperCase()}`,
+    "",
+    `First leg to fire closes the loan and auto-cancels the other.`,
+    `\`/limitorders\` to view, \`/cancellimitorder <id>\` to cancel either leg.`,
+  ].join("\n"), { parse_mode: "Markdown" });
+}
+
 /* ─── /limitorders ─────────────────────────────────────────────── */
 
 // Age tag: "3d ago" / "5h ago" / "12m ago"
