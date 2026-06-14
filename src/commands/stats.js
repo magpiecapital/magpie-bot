@@ -208,6 +208,34 @@ export async function handleStats(ctx) {
       }
     } catch { /* migration 059 not applied yet — degrade silently */ }
 
+    // ── Auto-sell (limit-close) fee rollup ────────────────────────
+    // The 1% protocol fee on every successful auto-sell fire accrues
+    // through limit-close-fee-accrual-watcher.js (same 70/10/10/10
+    // split as borrow origination). This rollup makes that revenue
+    // line visible in /stats — previously it was correctly distributed
+    // to holder + LP + reserve + referrer pools but invisible as a
+    // line item. Degrades silently if the table is missing.
+    let lcFeesLifetime = 0n, lcFeesLast24h = 0n;
+    let lcFiresLifetime = 0, lcFiresLast24h = 0;
+    try {
+      const { rows: [agg] } = await query(
+        `SELECT
+           COALESCE(SUM(protocol_fee_lamports::numeric)
+             FILTER (WHERE status = 'fired'), 0)::text AS lifetime,
+           COALESCE(SUM(protocol_fee_lamports::numeric)
+             FILTER (WHERE status = 'fired' AND fired_at > NOW() - INTERVAL '24 hours'), 0)::text AS last24h,
+           COUNT(*) FILTER (WHERE status = 'fired')::int AS fires_lifetime,
+           COUNT(*) FILTER (WHERE status = 'fired' AND fired_at > NOW() - INTERVAL '24 hours')::int AS fires_24h
+         FROM limit_close_orders`,
+      );
+      if (agg) {
+        lcFeesLifetime = BigInt(agg.lifetime || "0");
+        lcFeesLast24h = BigInt(agg.last24h || "0");
+        lcFiresLifetime = Number(agg.fires_lifetime || 0);
+        lcFiresLast24h = Number(agg.fires_24h || 0);
+      }
+    } catch { /* limit_close_orders table absent — degrade silently */ }
+
     // $MAGPIE BURNED — read from the magpie_burns ledger so the figure
     // sums every burn path (default-driven, manual operator burns, future
     // buybacks). Single source of truth shared with the site /api/v1/stats
@@ -290,6 +318,22 @@ export async function handleStats(ctx) {
               ? [row("Pending distribute", `${fmtSol(defaultsAwaitingDistribution.toString())} SOL`)] : []),
             ...(magpieBurnPendingCount > 0 || magpieBurnedCount > 0
               ? [row("$MAGPIE burns", `${magpieBurnedCount} done / ${magpieBurnPendingCount} pending`)] : []),
+          ]
+        : []),
+      // ── AUTO-SELL FEES (limit-close fires) ─────────────────────
+      // Surfaces the 1% protocol fee revenue stream from successful
+      // auto-sells. This is real revenue that flows into the same
+      // 70/10/10/10 split as borrow origination — making it visible
+      // here closes the transparency gap the operator flagged.
+      // Renders only once a single fire has landed.
+      ...(lcFiresLifetime > 0
+        ? [
+            ``,
+            `AUTO-SELLS (1% fee → rewards)`,
+            row("Lifetime fires", String(lcFiresLifetime)),
+            row("Last 24h fires", String(lcFiresLast24h)),
+            row("Lifetime fees", `${fmtSol(lcFeesLifetime.toString())} SOL`),
+            row("Last 24h fees", `${fmtSol(lcFeesLast24h.toString())} SOL`),
           ]
         : []),
       // $MAGPIE BURNED — supply contraction headline. Renders whenever
