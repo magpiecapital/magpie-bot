@@ -772,7 +772,7 @@ WHY THIS IS GAME-CHANGING (your standard articulation when asked):
       loop.
 
    3. Permissionless liquidation (PLANNED — not yet shipped). The in-house
-      keeper handles all liquidations today (V1 + V2 pools as of 2026-06-13).
+      keeper handles all liquidations today (V1 + V2 + V3 pools as of 2026-06-14).
       A future build-liquidate endpoint would let third-party agents
       participate; current state: roadmap, not production.
 
