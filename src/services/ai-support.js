@@ -730,9 +730,9 @@ The endpoint surface (live on x402.magpie.capital + magpie.capital/x402):
   • POST /api/v1/agent/build-borrow     — immediate borrow tx builder
   • POST /api/v1/agent/build-repay      — repay tx builder
   • POST /api/v1/agent/build-extend|topup|partial-repay
-  • POST /api/v1/agent/build-deposit    — LP deposit (agent as lender)
-  • POST /api/v1/agent/build-withdraw   — LP withdraw (agent as lender)
-  • POST /api/v1/agent/build-liquidate  — liquidate past-due loan + keeper bounty
+  • (planned) /api/v1/agent/build-deposit     — LP deposit, not yet shipped
+  • (planned) /api/v1/agent/build-withdraw    — LP withdraw, not yet shipped
+  • (planned) /api/v1/agent/build-liquidate   — permissionless liquidation, not yet shipped (the in-house keeper covers liquidations today)
   • GET  /api/v1/agent/credit-attest    — ed25519-signed credit score
   • GET  /api/v1/agent/token-risk       — per-token risk profile for collateral selection
   • GET  /api/v1/agent/lp-state         — depositor position + pool context (free)
@@ -768,11 +768,10 @@ WHY THIS IS GAME-CHANGING (your standard articulation when asked):
       reference yield-bot in /agents/yield-bot demonstrates the full
       loop.
 
-   3. Permissionless liquidation (shipped June 10). build-liquidate
-      constructs an unsigned liquidate_loan tx for any past-due loan;
-      the keeper receives the bounty share of seized collateral.
-      Closes the loop for liquidation-bot agents that used to have
-      to roll their own Anchor client.
+   3. Permissionless liquidation (PLANNED — not yet shipped). The in-house
+      keeper handles all liquidations today (V1 + V2 pools as of 2026-06-13).
+      A future build-liquidate endpoint would let third-party agents
+      participate; current state: roadmap, not production.
 
    4. Conditional borrows with optional webhooks. Agents post an intent
       — 'when \$TOKEN trades above \$0.50, fire a borrow against 10000
@@ -812,9 +811,7 @@ PRICING (public):
   • /agent/intent (conditional borrow)  — 0.01 SOL per intent
   • /agent/build-borrow                 — 0.005 SOL
   • /agent/build-repay/extend/topup/pr  — 0.002 SOL each
-  • /agent/build-deposit (LP)           — 0.002 SOL
-  • /agent/build-withdraw (LP)          — 0.002 SOL
-  • /agent/build-liquidate              — 0.003 SOL
+  • (planned — not yet live: build-deposit / build-withdraw / build-liquidate)
   • /agent/credit-attest                — 0.0005 SOL
   • /agent/token-risk                   — 0.001 SOL
   • /credit-score                       — 0.001 SOL
