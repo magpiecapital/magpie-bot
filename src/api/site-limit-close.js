@@ -292,7 +292,9 @@ export async function handleSiteLimitCloseList(req, url) {
               slippage_bps, sell_destination, status,
               armed_at, expires_at,
               max_slippage_bps_cap, auto_escalate_slippage,
-              source, source_agent_pubkey
+              source, source_agent_pubkey,
+              trailing_distance_bps,
+              peak_price_micros::text AS peak_price_micros
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
           AND status IN ('armed','firing','twap_in_progress','awaiting_user')
