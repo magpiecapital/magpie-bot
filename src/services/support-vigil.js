@@ -147,8 +147,35 @@ async function tick(bot) {
 
     let sent = 0;
     let closed = 0;
+    let unreachable = 0;
     for (const r of rows) {
       const ageHours = Number(r.age_since_reply_secs) / 3600;
+      // 2026-06-13: handle "unreachable" tickets — telegram_id missing
+      // or stored as a negative chat ID (the site-originated pattern
+      // where the user came in via a group context, not a private DM).
+      // Telegram user IDs are always positive 64-bit; negative IDs are
+      // chat IDs the bot can't reliably DM into. Without this branch,
+      // these tickets sit in awaiting_user forever — operator gets
+      // increasingly stale self-monitor warnings + Pip never reaches
+      // the user. Auto-close at 24h with an explanation so the
+      // ticket flow can move on; user can /support again from a
+      // TG-linked account if they actually need more help.
+      const tgid = r.telegram_id != null ? Number(r.telegram_id) : null;
+      const isReachable = Number.isFinite(tgid) && tgid > 0;
+      if (!isReachable && ageHours >= 24) {
+        await query(
+          `UPDATE support_tickets
+              SET status = 'closed',
+                  closed_at = NOW(),
+                  admin_reply = COALESCE(admin_reply, '') ||
+                    E'\n[vigil] auto-closed: site-originated ticket with no valid TG DM path back to user (telegram_id=' || $2 || ' is not a private chat). Initial Pip auto-reply was the complete response; user can /support from a TG-linked account if they need more.'
+            WHERE id = $1
+              AND closed_at IS NULL`,
+          [r.id, String(r.telegram_id)],
+        );
+        unreachable++;
+        continue;
+      }
       // Auto-close path FIRST (covers tickets that already received
       // their 2 followups and still haven't been acknowledged).
       if (ageHours >= AUTO_CLOSE_HOURS) {
@@ -168,8 +195,8 @@ async function tick(bot) {
       const res = await sendFollowup(bot, r, tier);
       if (res.ok) sent++;
     }
-    if (sent > 0 || closed > 0) {
-      console.log(`[support-vigil] tick sent=${sent} closed=${closed} scanned=${rows.length}`);
+    if (sent > 0 || closed > 0 || unreachable > 0) {
+      console.log(`[support-vigil] tick sent=${sent} closed=${closed} unreachable=${unreachable} scanned=${rows.length}`);
     }
   } catch (err) {
     console.error("[support-vigil] tick threw:", err.message);

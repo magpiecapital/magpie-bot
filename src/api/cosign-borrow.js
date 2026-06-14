@@ -427,6 +427,42 @@ export async function handleCosignBorrow(req) {
               body: { error: "Unsupported collateral mint", detail: `mint ${collateralMintStr} not in supported_mints` },
             };
           }
+          // ── RWA/program routing enforcement (2026-06-13) ───────────
+          // Defense-in-depth against stale client bundles. The site's
+          // buildBorrowTransaction picks V1 or V2 based on the client-
+          // side category lookup. A user with a cached old JS bundle
+          // (especially in mobile webview wallets like Phantom mobile)
+          // may construct a tx that targets V1 program against an RWA
+          // mint — V1 then applies its memecoin 20% LTV ladder and
+          // delivers ~29% of what the dashboard advertised.
+          //
+          // PRs #58, #61, #63 fix the client-side flow but cannot help
+          // a user whose browser is serving cached JS. This server-side
+          // refusal is the structural guarantee: even with stale client
+          // code, a wrong-program borrow CANNOT be signed by the lender.
+          // The user sees a clear error and is forced to refresh.
+          const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
+          const ixProgramId = magpieIx.programId;
+          if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
+            return {
+              status: 400,
+              body: {
+                error: "wrong_program_for_collateral",
+                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V2 RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
+              },
+            };
+          }
+          // Also refuse if a memecoin tries to borrow against V2 (the
+          // symmetric mistake — V2 is RWA-only, fee economics differ).
+          if (!isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID)) {
+            return {
+              status: 400,
+              body: {
+                error: "wrong_program_for_collateral",
+                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets V2.`,
+              },
+            };
+          }
           // ── LTV ladder resolution (category-aware) ─────────────────
           // 2026-06-13 root cause: this endpoint previously hardcoded the
           // memecoin ladder `{0:30, 1:25, 2:20}` for every borrow, regardless
