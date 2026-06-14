@@ -164,6 +164,7 @@ import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
+import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -837,6 +838,11 @@ bot.start({
     // finding — protocol takes account-creation rent out of loan
     // proceeds without reflecting it in loan_amount_lamports).
     setTimeout(() => startLoanReceivedWatchdog(bot), 130_000);
+    // First-V2-fire watcher — one-shot celebratory DM when the very
+    // first RWA limit-close fires through V2. End-to-end RWA
+    // limit-close shipped 2026-06-13; this watcher closes the loop
+    // by announcing when production validates it.
+    setTimeout(() => startFirstV2FireWatcher(bot), 145_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
