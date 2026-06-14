@@ -176,6 +176,7 @@ import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
+import { startWalletAttributionSentinel } from "./services/wallet-attribution-sentinel.js";
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
 import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
@@ -900,6 +901,11 @@ bot.start({
     // limit_close_orders row is missing engine_program_id. Closes the
     // silent-wrong-pool-fire failure mode flagged in the V3 audit.
     setTimeout(() => startLimitCloseEngineProgramIdSentinel(bot), 120_000);
+    // Wallet-attribution sentinel — DMs admin if any active/overdue loan
+    // is attributed to the wrong user_id (ghost site_native instead of the
+    // canonical TG-linked user). Closes the failure-mode behind PR #231
+    // + #232 — operator hit it on V3 SPCX loan id=720 not visible in /repay.
+    setTimeout(() => startWalletAttributionSentinel(bot), 125_000);
     // Loan actual-received watchdog — backfills + verifies the
     // on-chain SOL delta per borrow row. Catches the class of bug
     // where the dashboard shows ~$1 more "received" than the
