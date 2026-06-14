@@ -136,6 +136,39 @@ function loadLenderKeypair() {
  * to call from inside the loan-recording try/catch (errors don't
  * propagate up to the user-facing flow).
  */
+/**
+ * Credit a pre-computed lamport amount directly to the holder pool.
+ *
+ * Unlike accrueToHolderPool which interprets its input as a loan-fee
+ * and applies the live bps fraction, this is for callers that have
+ * already done the fraction math and want the EXACT amount credited.
+ *
+ * Used by the Phase 2 liquidation-distribution-watcher to route the
+ * pre-computed holder share of a defaulted-loan's net profit (which
+ * may be 70% of the profit, or 80% when the borrower has no referrer
+ * and the referrer slice rolls back to holders).
+ *
+ * Idempotency must be enforced by the caller — this primitive just
+ * does the UPDATE.
+ */
+export async function creditHolderPoolDirect(lamports) {
+  const amt = BigInt(lamports);
+  if (amt <= 0n) return null;
+  try {
+    await query(
+      `UPDATE magpie_holder_pool
+          SET accrued_lamports = accrued_lamports + $1::numeric,
+              updated_at = NOW()
+        WHERE id = 1`,
+      [amt.toString()],
+    );
+    return amt;
+  } catch (err) {
+    console.error("[holder-rewards] direct credit failed:", err.message);
+    return null;
+  }
+}
+
 export async function accrueToHolderPool(feeLamports) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;

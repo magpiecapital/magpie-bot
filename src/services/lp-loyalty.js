@@ -100,6 +100,31 @@ export async function accrueToLpLoyaltyPool(feeLamports) {
 }
 
 /**
+ * Credit a pre-computed lamport amount directly to the LP loyalty
+ * pool. Mirror of magpie-holder-rewards.creditHolderPoolDirect — for
+ * callers (like the Phase 2 liquidation-distribution-watcher) that
+ * already computed the exact share and don't want fee*bps math
+ * applied again. Idempotency is the caller's job.
+ */
+export async function creditLpLoyaltyPoolDirect(lamports) {
+  const amt = BigInt(lamports);
+  if (amt <= 0n) return null;
+  try {
+    await query(
+      `UPDATE lp_loyalty_pool
+          SET accrued_lamports = accrued_lamports + $1::numeric,
+              updated_at = NOW()
+        WHERE id = 1`,
+      [amt.toString()],
+    );
+    return amt;
+  } catch (err) {
+    console.error("[lp-loyalty] direct credit failed:", err.message);
+    return null;
+  }
+}
+
+/**
  * Read current accrued pool size + scheduling state. Operator-private —
  * never expose next_distribution_at via public APIs (same anti-dump
  * pattern as $MAGPIE holders).
