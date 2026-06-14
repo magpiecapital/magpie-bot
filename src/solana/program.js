@@ -198,5 +198,18 @@ export function getProgramForSigner(signerKeypair, programId = PROGRAM_ID) {
   const provider = new AnchorProvider(connection, new Wallet(signerKeypair), {
     commitment: "confirmed",
   });
-  return new Program({ ...idl, address: programId.toBase58() }, provider);
+  // Pick the matching IDL per programId. V3's request_and_fund_loan has
+  // ONE EXTRA u8 arg vs V1/V2 (category byte). If we build the program
+  // object with V1 IDL but target V3, the borrow flow's 5-arg call
+  // throws "provided too many arguments ... expecting:
+  // collateralAmount,loanOption,collateralValue,loanId" — caught
+  // 2026-06-14 on the SPCX TG borrow path. Mirrors the same IDL
+  // selection getReadOnlyProgram does above.
+  let useIdl = idl;
+  if (PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3)) {
+    useIdl = getV3Idl();
+  } else if (PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2)) {
+    useIdl = getV2Idl();
+  }
+  return new Program({ ...useIdl, address: programId.toBase58() }, provider);
 }
