@@ -1832,6 +1832,7 @@ Mandatory tool triggers — pattern → tool:
 - User says "show my take profits", "what limits do I have armed", "any take-profits set" → \`list_my_take_profits\`. After the call, summarize concisely: count + each one's collateral, target, slippage. If empty, suggest setting one with \`propose_take_profit\`.
 - User says "why did my take profit fire at X%", "what happened with my limit order", "why was the slippage so high", "explain my last take-profit", "did my TP partial fill" → \`explain_my_take_profit\`. Pass order_id when the user names one (e.g. "order #1842"); omit otherwise to default to the most recent. After the call, narrate the lifecycle in 2-3 sentences using the timeline_notes verbatim — never add or guess details. If outcome is non-null, report proceeds_sol and net_to_user_sol from the result. If it's still in flight (status armed / firing / twap_in_progress / awaiting_user), describe current state and what the engine is currently doing. NEVER speculate about token-specific reasons; the tool result is the truth.
 - User says "what would I net at 2x", "how much SOL if I set a 3x take-profit", "if I locked in at 1.5x what do I get", "is it worth arming a TP at X" → \`simulate_take_profit\` with their loan_id + multiplier. After the call, report net_to_user_sol as the headline ("you'd net ~X SOL after fees and slippage"). Always include the caveat from result.note about prices changing. Surface result.arm_hint as a one-tap command if the projection looks good. If error is present, narrate the error.note verbatim.
+- User says "what would I get with a trailing 10%", "how much SOL if I trail 15%", "is a trailing stop worth it on my loan", "should I trail 5% or 10%" → \`simulate_trailing_stop\` with their loan_id + distance_pct. Report net_to_user_sol as headline ("you'd net ~X SOL if the floor fires today"). ALWAYS narrate result.note verbatim — the worst-case framing matters because users tend to anchor on the current price. Surface result.arm_hint as a one-tap command.
 - ALL loan actions execute in this chat via cards. NEVER tell the user to run any of these commands in Telegram.
 - User asks "what's $X at", "price of Y", "how much is Z worth in SOL" → \`get_token_price\`
 - User asks about "auto-protect", "anti-liquidation", "auto-repay if my loan drops" → tell them about /autoprotect (opt-in, monitors every 90s, auto-partial-repays from idle SOL when health < 1.30x, capped at 1 SOL/action and 3 actions/loan/24h)
@@ -2129,6 +2130,18 @@ const TOOLS = [
         multiplier: { type: "number", description: "The target multiplier vs the current collateral USD price. 2 = sell at 2x current, 1.5 = sell at 1.5x current, etc. Must be > 1." },
       },
       required: ["loan_id", "multiplier"],
+    },
+  },
+  {
+    name: "simulate_trailing_stop",
+    description: "PROJECT what the user would NET if they armed a trailing stop at a given distance on an active loan and the initial floor fired today (worst case — price never makes a new high). Reads the loan's current collateral USD value and computes (proceeds_at_initial_floor - loan_owed - 1% protocol fee - 2% slippage_buffer) in SOL. Use when user asks 'what would I get with a trailing 10%', 'how much SOL if I set a trailing 15%', 'is a trailing stop worth it on my loan'. Loan MUST belong to the current user.",
+    input_schema: {
+      type: "object",
+      properties: {
+        loan_id: { type: "string", description: "The chain loan_id (long number from /loans). The loan must be active and owned by the current user." },
+        distance_pct: { type: "number", description: "The trailing distance as a percent (10 = 10%). Range 0.5..50." },
+      },
+      required: ["loan_id", "distance_pct"],
     },
   },
   {
@@ -3149,6 +3162,73 @@ const TOOL_HANDLERS = {
       arm_hint: `/takeprofit ${loan.loan_id_chain} at ${mult}x`,
     };
   },
+  // Projects what the user would NET in SOL if a trailing-stop's initial
+  // floor fires today. Mirrors simulate_take_profit's structure: gross at
+  // floor minus owed minus 1% protocol fee minus a conservative 2% slip
+  // buffer. Pip narrates the headline net_to_user_sol so users can decide
+  // whether to arm before paying gas.
+  simulate_trailing_stop: async ({ loan_id, distance_pct }, { userId }) => {
+    const distPct = Number(distance_pct);
+    if (!Number.isFinite(distPct) || distPct < 0.5 || distPct > 50) {
+      return { error: "invalid_distance", note: "Trailing distance must be 0.5%–50%." };
+    }
+    const loanIdStr = String(loan_id).trim();
+    if (!/^\d+$/.test(loanIdStr)) {
+      return { error: "invalid_loan_id" };
+    }
+    const { rows: [loan] } = await query(
+      `SELECT l.id, l.user_id, l.loan_id::text AS loan_id_chain, l.collateral_mint,
+              l.collateral_amount::text AS collateral_amount_raw,
+              l.original_loan_amount_lamports::text AS owed_lamports,
+              l.status, sm.symbol AS collateral_symbol, sm.decimals
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.user_id = $1 AND l.loan_id = $2`,
+      [userId, loanIdStr],
+    );
+    if (!loan) return { error: "loan_not_found", note: "No loan with that id belongs to this user." };
+    if (loan.status !== "active") return { error: "loan_not_active", status: loan.status };
+
+    const { getPriceInUsdCrossSourced } = await import("./price.js");
+    const currentUsdPerToken = await getPriceInUsdCrossSourced(loan.collateral_mint);
+    if (!currentUsdPerToken || currentUsdPerToken <= 0) {
+      return { error: "price_unavailable", note: "Can't fetch current USD price right now — try again in a moment." };
+    }
+    const solUsd = await getPriceInUsdCrossSourced("So11111111111111111111111111111111111111112");
+    if (!solUsd || solUsd <= 0) {
+      return { error: "sol_price_unavailable" };
+    }
+    const decimals = loan.decimals ?? 9;
+    const collateralWhole = Number(loan.collateral_amount_raw) / 10 ** decimals;
+    // Initial floor = current × (1 - distance). Projects the WORST case
+    // for arming today: price never goes higher and immediately retraces.
+    // If price rises before the fire, the actual floor (and net) goes up
+    // with it — we surface this in the note.
+    const initialFloorUsd = currentUsdPerToken * (1 - distPct / 100);
+    const grossUsdAtFloor = collateralWhole * initialFloorUsd;
+    const grossSolAtFloor = grossUsdAtFloor / solUsd;
+    const owedSol = Number(loan.owed_lamports) / 1e9;
+    const protocolFeeSol = grossSolAtFloor * 0.01;
+    const slippageBufferSol = grossSolAtFloor * 0.02;
+    const netToUserSol = grossSolAtFloor - owedSol - protocolFeeSol - slippageBufferSol;
+
+    return {
+      loan_id_chain: loan.loan_id_chain,
+      collateral_symbol: loan.collateral_symbol || null,
+      distance_pct: distPct,
+      current_usd_per_token: currentUsdPerToken,
+      initial_floor_usd_per_token: initialFloorUsd,
+      collateral_amount: collateralWhole,
+      gross_proceeds_sol_at_initial_floor: Number(grossSolAtFloor.toFixed(4)),
+      loan_owed_sol: Number(owedSol.toFixed(4)),
+      protocol_fee_sol: Number(protocolFeeSol.toFixed(4)),
+      slippage_buffer_sol_2pct: Number(slippageBufferSol.toFixed(4)),
+      net_to_user_sol: Number(netToUserSol.toFixed(4)),
+      note: "Projects the WORST case — if price never makes a new high and immediately retraces. If price rises first, the floor rises with it and your net goes up.",
+      arm_hint: `/trailingstop ${loan.loan_id_chain} ${distPct}%`,
+    };
+  },
+
   list_my_take_profits: async (_args, { userId }) => {
     const { rows } = await query(
       `SELECT lco.id, lco.trigger_kind, lco.trigger_value_micro::text AS trigger_value_micro,
