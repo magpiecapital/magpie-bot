@@ -33,6 +33,7 @@ import {
   getProgramForSigner,
   PROGRAM_ID,
   PROGRAM_ID_V2,
+  PROGRAM_ID_V3,
 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { readFileSync } from "node:fs";
@@ -238,6 +239,13 @@ export async function startKeeper() {
       label: "V2 (RWA)",
       programId: PROGRAM_ID_V2,
       program: getProgramForSigner(keeper, PROGRAM_ID_V2),
+    });
+  }
+  if (PROGRAM_ID_V3) {
+    programConfigs.push({
+      label: "V3",
+      programId: PROGRAM_ID_V3,
+      program: getProgramForSigner(keeper, PROGRAM_ID_V3),
     });
   }
 
