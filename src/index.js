@@ -172,6 +172,7 @@ import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
 import { startLimitCloseNearTriggerWatcher } from "./services/limit-close-near-trigger-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
+import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
@@ -500,6 +501,7 @@ registerMyTicketsCallbacks(bot);
 // the runtime startup section.
 registerSupportVigilCallbacks(bot);
 registerLcStalenessCallbacks(bot);
+registerLcRetryingCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);

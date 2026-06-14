@@ -13,6 +13,7 @@ import { renderRiskBlock } from "../services/token-risk-preview.js";
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
+import { parseStrike } from "../lib/strike-price-parser.js";
 
 // Tier schedule is category-aware as of 2026-06-12 migration 040.
 // Memecoins use the legacy 30/25/20 LTV ladder; RWA collateral
@@ -26,6 +27,66 @@ import { getEligibleTiers, getTierByOption, MEMECOIN_TIERS as LTV_TIERS } from "
 
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
 const pending = new Map();
+
+// Pre-borrow ladder presets. Slice values in basis points sum to 10000 per preset.
+// Multipliers are anchors off the borrow-time spot price; resolveMultiplierToPrice
+// converts each to a triggerValueMicro at arm time so legs share a price basis.
+const LADDER_PRESETS = {
+  tp: {
+    conservative: {
+      label: "Conservative — 1.5x / 2x / 3x",
+      legs: [
+        { multiplier: 1.5, sliceBps: 7000 },
+        { multiplier: 2.0, sliceBps: 2000 },
+        { multiplier: 3.0, sliceBps: 1000 },
+      ],
+    },
+    balanced: {
+      label: "Balanced — 1.5x / 2.5x / 4x",
+      legs: [
+        { multiplier: 1.5, sliceBps: 5000 },
+        { multiplier: 2.5, sliceBps: 3000 },
+        { multiplier: 4.0, sliceBps: 2000 },
+      ],
+    },
+    aggressive: {
+      label: "Aggressive — 2x / 3x / 5x / 10x / 20x",
+      legs: [
+        { multiplier: 2.0, sliceBps: 3000 },
+        { multiplier: 3.0, sliceBps: 3000 },
+        { multiplier: 5.0, sliceBps: 2000 },
+        { multiplier: 10.0, sliceBps: 1000 },
+        { multiplier: 20.0, sliceBps: 1000 },
+      ],
+    },
+  },
+  sl: {
+    conservative: {
+      label: "Conservative — 0.85x / 0.7x / 0.5x",
+      legs: [
+        { multiplier: 0.85, sliceBps: 3000 },
+        { multiplier: 0.70, sliceBps: 4000 },
+        { multiplier: 0.50, sliceBps: 3000 },
+      ],
+    },
+    balanced: {
+      label: "Balanced — 0.8x / 0.65x / 0.5x",
+      legs: [
+        { multiplier: 0.80, sliceBps: 5000 },
+        { multiplier: 0.65, sliceBps: 3000 },
+        { multiplier: 0.50, sliceBps: 2000 },
+      ],
+    },
+    aggressive: {
+      label: "Aggressive — 0.9x / 0.75x / 0.6x",
+      legs: [
+        { multiplier: 0.90, sliceBps: 7000 },
+        { multiplier: 0.75, sliceBps: 2000 },
+        { multiplier: 0.60, sliceBps: 1000 },
+      ],
+    },
+  },
+};
 
 /**
  * Clear any in-progress borrow state for a chat. Used by sibling commands
@@ -42,6 +103,106 @@ const MAX_SLIPPAGE_PCT = 2; // reject if price moved >2% since quote
 
 function fmtSol(lamports) {
   return (Number(lamports) / 1e9).toFixed(4);
+}
+
+// Arms the user's pre-selected exits immediately after a successful loan
+// record. Always returns an array of leg-level outcomes so the funded-loan
+// card can show exactly which legs landed and which need a manual retry.
+// Errors on individual legs are non-fatal — they surface as failed legs
+// rather than aborting the whole flow.
+async function armConfiguredExits({ userId, loanIdChain, collateralMint, exits }) {
+  if (!exits || exits.type === "skip") return [];
+
+  const armSingle = async ({ label, direction, multiplier, parsedStrike, sliceBps }) => {
+    let triggerKind, triggerValueMicro;
+    if (parsedStrike) {
+      triggerKind = parsedStrike.kind;
+      triggerValueMicro = parsedStrike.valueMicro.toString();
+    } else {
+      const resolved = await resolveMultiplierToPrice(
+        collateralMint,
+        multiplier,
+        { allowBelowOne: direction === "below" },
+      );
+      if (!resolved.ok) return { ok: false, label, error: resolved.error || "resolve_failed" };
+      triggerKind = "price_usd";
+      triggerValueMicro = resolved.triggerValueMicro.toString();
+    }
+    const slippageBps = direction === "below" ? 300 : 200;
+    const armed = await armOrder({
+      userId,
+      source: "tg",
+      loanIdChain,
+      triggerKind,
+      triggerValueMicro,
+      triggerDirection: direction,
+      slippageBps,
+      sellDestination: "sol",
+      slicePct: sliceBps && sliceBps < 10000 ? sliceBps : undefined,
+    });
+    return armed.ok
+      ? { ok: true, label, orderId: armed.orderId }
+      : { ok: false, label, error: armed.error };
+  };
+
+  switch (exits.type) {
+    case "tp_default":
+      return [await armSingle({ label: "TP @ 2x", direction: "above", multiplier: 2 })];
+    case "sl_default":
+      return [await armSingle({ label: "SL @ 0.7x", direction: "below", multiplier: 0.7 })];
+    case "bracket": {
+      const tp = await armSingle({ label: "TP @ 2x", direction: "above", multiplier: 2 });
+      // Only attempt SL if TP succeeded — otherwise user gets confusing
+      // half-bracket. The TP-only case still leaves the post-borrow SL
+      // button tappable.
+      if (!tp.ok) return [tp];
+      const sl = await armSingle({ label: "SL @ 0.7x", direction: "below", multiplier: 0.7 });
+      return [tp, sl];
+    }
+    case "custom_tp":
+      return [await armSingle({
+        label: `TP @ ${exits.parsedStrike.normalizedDisplay}`,
+        direction: "above",
+        parsedStrike: exits.parsedStrike,
+      })];
+    case "custom_sl":
+      return [await armSingle({
+        label: `SL @ ${exits.parsedStrike.normalizedDisplay}`,
+        direction: "below",
+        parsedStrike: exits.parsedStrike,
+      })];
+    case "tp_ladder":
+    case "sl_ladder": {
+      const direction = exits.type === "tp_ladder" ? "above" : "below";
+      const sidePrefix = direction === "above" ? "TP" : "SL";
+      const results = [];
+      for (const leg of exits.preset.legs) {
+        const r = await armSingle({
+          label: `${sidePrefix} ${leg.multiplier}x (${(leg.sliceBps / 100).toFixed(0)}%)`,
+          direction,
+          multiplier: leg.multiplier,
+          sliceBps: leg.sliceBps,
+        });
+        results.push(r);
+        // Stop the cascade on a hard failure to avoid partial-ladder
+        // confusion; user can retry the remaining legs manually.
+        if (!r.ok) break;
+      }
+      return results;
+    }
+    default:
+      return [];
+  }
+}
+
+function renderExitsSummary(armResults) {
+  if (!armResults || armResults.length === 0) return null;
+  const lines = armResults.map((r) =>
+    r.ok
+      ? `• ${r.label} — armed #${r.orderId}`
+      : `• ${r.label} — failed (${r.error || "unknown"})`,
+  );
+  return ["*Exits:*", ...lines].join("\n");
 }
 
 function isQuoteExpired(state) {
@@ -175,6 +336,47 @@ export function registerBorrowCallbacks(bot) {
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
+  });
+
+  // Middleware to catch custom strike input for the pre-borrow exits step.
+  // Parses the free-text trigger via the shared strike parser and proceeds
+  // directly to executeBorrowWithExits with the parsed result stamped into
+  // state.exits.
+  bot.on("message:text", async (ctx, next) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) return next();
+    if (state.stage !== "await_custom_tp_input" && state.stage !== "await_custom_sl_input") {
+      return next();
+    }
+    const isTp = state.stage === "await_custom_tp_input";
+    // If the user typed a bare number with no kind, treat it as a
+    // multiplier — that's the most common borrow-time intent ("5" → 5x).
+    // The parser only handles multipliers explicitly (e.g. "2x"), so we
+    // append "x" client-side when the raw input is just digits.
+    const raw = ctx.message.text.trim();
+    const normalized = /^[\d]+(\.\d+)?$/.test(raw) ? `${raw}x` : raw;
+    const parsed = parseStrike(normalized, {
+      directionHint: isTp ? "above" : "below",
+    });
+    if (!parsed.ok) {
+      return ctx.reply(
+        `Couldn't read that strike: ${parsed.error || "unknown"}. Try \`5x\`, \`$0.02\`, or \`30m mc\`.`,
+        { parse_mode: "Markdown" },
+      );
+    }
+    // Sanity: TP must be above 1x territory, SL must be below.
+    if (parsed.impliedDirection && parsed.impliedDirection !== (isTp ? "above" : "below")) {
+      return ctx.reply(
+        isTp
+          ? "That looks like a stop-loss target. For TP, use a multiplier above 1× (e.g. `2x`) or a price above current."
+          : "That looks like a take-profit target. For SL, use a multiplier below 1× (e.g. `0.7x`) or a price below current.",
+        { parse_mode: "Markdown" },
+      );
+    }
+    state.exits = { type: isTp ? "custom_tp" : "custom_sl", parsedStrike: parsed };
+    state.stage = "executing";
+    pending.set(ctx.chat.id, state);
+    await executeBorrowWithExits(ctx, state);
   });
 
   // Middleware to catch custom percentage input.
@@ -339,21 +541,66 @@ export function registerBorrowCallbacks(bot) {
     );
   });
 
-  bot.callbackQuery(/^borrow:tier:(\d+)$/, async (ctx) => {
-    const option = Number(ctx.match[1]);
-    const state = pending.get(ctx.chat.id);
-    // Resolve from the same tier set the user picked from — by category.
-    const tier = await getTierByOption({ category: state?.selected?.category, option });
-    if (!state || !tier) {
-      await ctx.answerCallbackQuery("Session expired");
-      return;
-    }
+  // Renders the exits picker AFTER a tier is selected. User can pre-arm
+  // TP / SL / Bracket / Custom strike / Ladder before the loan executes —
+  // exits land in the same transaction window as the borrow so the user
+  // walks out with both the loan and the strategy in one wizard.
+  async function showExitsMenu(ctx, state) {
+    state.stage = "await_exits";
+    pending.set(ctx.chat.id, state);
+    const symbol = state.selected.symbol;
+    const kb = new InlineKeyboard()
+      .text("TP @ 2x", "borrow:exits:tp").text("SL @ 0.7x", "borrow:exits:sl").row()
+      .text("Bracket (TP + SL)", "borrow:exits:bracket").row()
+      .text("Custom TP", "borrow:exits:custom_tp").text("Custom SL", "borrow:exits:custom_sl").row()
+      .text("TP Ladder", "borrow:exits:ladder_tp").text("SL Ladder", "borrow:exits:ladder_sl").row()
+      .text("Skip — set later", "borrow:exits:skip").row()
+      .text("← Change tier", "borrow:exits:retier").text("✕ Cancel", "borrow:cancel");
+    await ctx.editMessageText(
+      [
+        `*Set your exit strategy for ${symbol}*`,
+        "",
+        "Pre-arm now and your exits fire the moment your trigger hits — no need to come back and set them after.",
+        "",
+        "• *TP / SL* — one-tap at 2x / 0.7x",
+        "• *Bracket* — both legs at once",
+        "• *Custom* — type your own strike (e.g. `5x`, `$0.02`, `30m mc`)",
+        "• *Ladder* — sell in tranches across multiple targets",
+        "• *Skip* — execute the borrow only; set exits later via /takeprofit /stoploss",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  }
+
+  // Shared execution helper: runs all the safety checks (quote expiry,
+  // slippage, limits, ban, anti-exploit, price-feed attest), submits the
+  // borrow on-chain, records it, and auto-arms whatever exits the user
+  // pre-selected before rendering the funded-loan card.
+  async function executeBorrowWithExits(ctx, state) {
+    const tier = state.tier;
+    const option = state.tierOption;
+
+    // Status renderer that handles both callback contexts (edit the
+    // existing message) and text-handler contexts (no callback message
+    // to edit — reply once, then edit that reply by id thereafter).
+    const isCallbackCtx = !!ctx.callbackQuery;
+    let statusMsgId = null;
+    const say = async (text, opts = {}) => {
+      if (isCallbackCtx) {
+        return ctx.editMessageText(text, opts);
+      }
+      if (statusMsgId) {
+        return ctx.api.editMessageText(ctx.chat.id, statusMsgId, text, opts);
+      }
+      const sent = await ctx.reply(text, opts);
+      statusMsgId = sent.message_id;
+      return sent;
+    };
 
     // ── Quote expiry check ──
     if (isQuoteExpired(state)) {
       pending.delete(ctx.chat.id);
-      await ctx.answerCallbackQuery("Quote expired");
-      await ctx.editMessageText(
+      await say(
         "⏱ *Quote expired* — prices may have changed.\n\nRun /borrow to get a fresh quote.",
         { parse_mode: "Markdown" },
       );
@@ -361,8 +608,7 @@ export function registerBorrowCallbacks(bot) {
     }
 
     // ── Price slippage guard — re-fetch and compare ──
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText("⏳ Verifying price...");
+    await say("⏳ Verifying price...");
 
     let currentValueLamports;
     try {
@@ -374,7 +620,7 @@ export function registerBorrowCallbacks(bot) {
     } catch (err) {
       console.error("Price re-fetch failed:", err);
       pending.delete(ctx.chat.id);
-      await ctx.editMessageText(
+      await say(
         "❌ Could not verify current price. Run /borrow to try again.",
       );
       return;
@@ -386,7 +632,7 @@ export function registerBorrowCallbacks(bot) {
     if (priceDrift > MAX_SLIPPAGE_PCT) {
       pending.delete(ctx.chat.id);
       const direction = currentValueLamports < quotedValue ? "dropped" : "increased";
-      await ctx.editMessageText(
+      await say(
         [
           `⚠️ *Price moved ${priceDrift.toFixed(1)}%* since your quote (${direction}).`,
           "",
@@ -408,7 +654,7 @@ export function registerBorrowCallbacks(bot) {
     const limitCheck = await checkLoanLimits(state.userId, loanAmountCheck);
     if (!limitCheck.allowed) {
       pending.delete(ctx.chat.id);
-      await ctx.editMessageText(
+      await say(
         `⚠️ *Loan limit reached*\n\n${limitCheck.reason}\n\nTier: *${limitCheck.tier}*\nRun /borrow to try a smaller amount.`,
         { parse_mode: "Markdown" },
       );
@@ -425,7 +671,7 @@ export function registerBorrowCallbacks(bot) {
     });
     if (banResult?.blocked) {
       pending.delete(ctx.chat.id);
-      await ctx.editMessageText(
+      await say(
         "⚠️ This account is restricted from opening new loans.\n\nIf you believe this is a mistake, contact support.",
       );
       return;
@@ -444,13 +690,13 @@ export function registerBorrowCallbacks(bot) {
     });
     if (exploitCheck?.blocked) {
       pending.delete(ctx.chat.id);
-      await ctx.editMessageText(`⚠️ *Borrow refused*\n\n${exploitCheck.message}`, {
+      await say(`⚠️ *Borrow refused*\n\n${exploitCheck.message}`, {
         parse_mode: "Markdown",
       });
       return;
     }
 
-    await ctx.editMessageText("⏳ Submitting on-chain...");
+    await say("⏳ Submitting on-chain...");
 
     // Just-in-time price feed refresh — but only if the on-chain feed is
     // actually stale. Contract requires <120s; we use a 60s threshold to
@@ -470,7 +716,7 @@ export function registerBorrowCallbacks(bot) {
             await attestPrice(state.selected.mint, state.selected.decimals);
           } catch (initErr) {
             pending.delete(ctx.chat.id);
-            await ctx.editMessageText(
+            await say(
               `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
             );
             return;
@@ -484,14 +730,14 @@ export function registerBorrowCallbacks(bot) {
             // Close enough — proceed with the borrow anyway.
           } else {
             pending.delete(ctx.chat.id);
-            await ctx.editMessageText(
+            await say(
               `⚠️ Solana network is congested right now and our price refresh tx didn't confirm.\n\nGive it a minute and try /borrow again — it usually clears quickly.`,
             );
             return;
           }
         } else {
           pending.delete(ctx.chat.id);
-          await ctx.editMessageText(
+          await say(
             `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
           );
           return;
@@ -528,18 +774,34 @@ export function registerBorrowCallbacks(bot) {
       });
       await incrementBorrowed(state.userId, loanAmountPreFee);
 
+      // Auto-arm pre-selected exits BEFORE rendering the card so the
+      // user sees confirmation in the same message. Failures are
+      // surfaced per-leg without aborting the borrow.
+      const exitArmResults = await armConfiguredExits({
+        userId: state.userId,
+        loanIdChain: result.loanId,
+        collateralMint: state.selected.mint,
+        exits: state.exits,
+      }).catch((err) => {
+        console.warn("[borrow] armConfiguredExits threw:", err.message);
+        return [{ ok: false, label: "Auto-arm", error: "internal_error" }];
+      });
+      const exitsSummary = renderExitsSummary(exitArmResults);
+      const allLegsArmed = exitArmResults.length > 0 && exitArmResults.every((r) => r.ok);
+
       pending.delete(ctx.chat.id);
 
-      // Build inline keyboard for the funded-loan card. Two rows:
-      //   1. One-tap protection — Arm TP / SL at smart defaults.
-      //      Mirrors the site's post-borrow protection card (PR #71).
-      //      Wires to the borrow:protect:tp / sl callbacks below.
-      //   2. Share buttons — every funded loan is a marketing moment.
-      let kb = new InlineKeyboard()
-        .text("TP @ 2x", `borrow:protect:tp:${result.loanId}`)
-        .text("SL @ 0.7x", `borrow:protect:sl:${result.loanId}`)
-        .text("Bracket (both)", `borrow:protect:bracket:${result.loanId}`)
-        .row();
+      // Build inline keyboard. Hide the one-tap TP/SL/Bracket row if
+      // every pre-selected exit already armed — otherwise leave it so
+      // the user can add or retry protection.
+      let kb = new InlineKeyboard();
+      if (!allLegsArmed) {
+        kb = kb
+          .text("TP @ 2x", `borrow:protect:tp:${result.loanId}`)
+          .text("SL @ 0.7x", `borrow:protect:sl:${result.loanId}`)
+          .text("Bracket (both)", `borrow:protect:bracket:${result.loanId}`)
+          .row();
+      }
       try {
         const { getOrCreateCode } = await import("../services/referrals.js");
         const { shareBorrow } = await import("../services/share-moments.js");
@@ -556,7 +818,7 @@ export function registerBorrowCallbacks(bot) {
           .url("📨 Tell a friend", card.telegramShareUrl);
       } catch { /* share row non-critical */ }
 
-      await ctx.editMessageText(
+      await say(
         [
           "✅ *Loan funded*",
           "",
@@ -565,27 +827,221 @@ export function registerBorrowCallbacks(bot) {
           `Term: ${tier.days} days at ${tier.ltv}% LTV`,
           "",
           `[View tx](https://solscan.io/tx/${result.signature})`,
+          exitsSummary ? "" : null,
+          exitsSummary,
           "",
-          // Surface protection options — TP locks in upside, SL caps
-          // downside. Either button below arms the corresponding order
-          // at a sensible default; for custom triggers, the
-          // /takeprofit and /stoploss commands accept full multipliers
-          // and USD targets.
-          "🛡 *Protect this loan?* Tap a button below or use",
-          `\`/takeprofit ${result.loanId} at 2x\` · \`/stoploss ${result.loanId} at 0.7x\``,
-          "",
-          "/positions to check status · /share to flex on the timeline",
-        ].join("\n"),
+          // If exits already armed, skip the "protect this loan?" pitch.
+          allLegsArmed
+            ? "/positions to check status · /limitorders to manage exits"
+            : "🛡 *Protect this loan?* Tap a button above or use",
+          allLegsArmed
+            ? null
+            : `\`/takeprofit ${result.loanId} at 2x\` · \`/stoploss ${result.loanId} at 0.7x\``,
+          allLegsArmed ? null : "",
+          allLegsArmed ? null : "/positions to check status · /share to flex on the timeline",
+        ].filter((l) => l != null).join("\n"),
         { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: kb },
       );
     } catch (err) {
       console.error("Borrow failed:", err);
       const friendly = translateTxError(err, { flow: "borrow" });
-      await ctx.editMessageText(friendly, {
+      await say(friendly, {
         parse_mode: "Markdown",
         reply_markup: errorActionKeyboard({ flow: "borrow", errorKind: "tx_error" }),
       });
     }
+  }
+
+  // ── New tier callback — stores selection, opens the exits picker ──
+  bot.callbackQuery(/^borrow:tier:(\d+)$/, async (ctx) => {
+    const option = Number(ctx.match[1]);
+    const state = pending.get(ctx.chat.id);
+    const tier = await getTierByOption({ category: state?.selected?.category, option });
+    if (!state || !tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    if (isQuoteExpired(state)) {
+      pending.delete(ctx.chat.id);
+      await ctx.answerCallbackQuery("Quote expired");
+      await ctx.editMessageText(
+        "⏱ *Quote expired* — prices may have changed.\n\nRun /borrow to get a fresh quote.",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+    state.tier = tier;
+    state.tierOption = option;
+    await ctx.answerCallbackQuery();
+    await showExitsMenu(ctx, state);
+  });
+
+  // ── Exits picker callbacks ─────────────────────────────────────
+  // One-tap presets and skip route straight to execution. Custom
+  // strike and ladder routes the user through a sub-step first.
+  const oneTapExits = {
+    tp: { type: "tp_default" },
+    sl: { type: "sl_default" },
+    bracket: { type: "bracket" },
+    skip: { type: "skip" },
+  };
+  bot.callbackQuery(/^borrow:exits:(tp|sl|bracket|skip)$/, async (ctx) => {
+    const choice = ctx.match[1];
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.exits = oneTapExits[choice];
+    await ctx.answerCallbackQuery();
+    await executeBorrowWithExits(ctx, state);
+  });
+
+  bot.callbackQuery(/^borrow:exits:(custom_tp|custom_sl)$/, async (ctx) => {
+    const kind = ctx.match[1];
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.stage = kind === "custom_tp" ? "await_custom_tp_input" : "await_custom_sl_input";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    const side = kind === "custom_tp" ? "take-profit" : "stop-loss";
+    await ctx.editMessageText(
+      [
+        `*Custom ${side} strike for ${state.selected.symbol}*`,
+        "",
+        "Type your trigger. Anything works:",
+        "• `5x` — 5× current price",
+        "• `$0.02` — exact USD price",
+        "• `30m mc` — market cap",
+        "• `0.0025 sol` — SOL-denominated",
+        kind === "custom_sl" ? "• `0.7x` or `-30%` — for stop-loss" : "• `+50%` — % gain",
+        "",
+        "Or tap *Back* to pick a different option.",
+      ].join("\n"),
+      {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard().text("← Back", "borrow:exits:back"),
+      },
+    );
+  });
+
+  bot.callbackQuery(/^borrow:exits:(ladder_tp|ladder_sl)$/, async (ctx) => {
+    const kind = ctx.match[1]; // ladder_tp | ladder_sl
+    const side = kind === "ladder_tp" ? "tp" : "sl";
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    const presets = LADDER_PRESETS[side];
+    const kb = new InlineKeyboard()
+      .text(presets.conservative.label, `borrow:exits:${kind}:conservative`).row()
+      .text(presets.balanced.label, `borrow:exits:${kind}:balanced`).row()
+      .text(presets.aggressive.label, `borrow:exits:${kind}:aggressive`).row()
+      .text("← Back", "borrow:exits:back");
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `*${side === "tp" ? "Take-profit" : "Stop-loss"} ladder for ${state.selected.symbol}*`,
+        "",
+        "Each leg sells a slice at its own trigger. Heads up: every leg",
+        "pays the same origination fee on its re-borrow, so 3-leg ladders",
+        "cost ~3× more in fees than a single exit.",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  });
+
+  bot.callbackQuery(/^borrow:exits:(ladder_tp|ladder_sl):(conservative|balanced|aggressive)$/, async (ctx) => {
+    const kind = ctx.match[1];
+    const presetName = ctx.match[2];
+    const side = kind === "ladder_tp" ? "tp" : "sl";
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.exits = {
+      type: side === "tp" ? "tp_ladder" : "sl_ladder",
+      preset: LADDER_PRESETS[side][presetName],
+    };
+    await ctx.answerCallbackQuery();
+    await executeBorrowWithExits(ctx, state);
+  });
+
+  bot.callbackQuery("borrow:exits:back", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await showExitsMenu(ctx, state);
+  });
+
+  // Lets user back up from the exits menu to re-pick the tier. We re-
+  // run the tier-selection screen by re-quoting current collateral
+  // value (the cached quote may already be stale at this point — the
+  // user has been sitting in the exits menu for some seconds).
+  bot.callbackQuery("borrow:exits:retier", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    // Clear tier + exits so the user gets a fresh tier picker.
+    delete state.tier;
+    delete state.tierOption;
+    delete state.exits;
+    delete state.stage;
+    pending.set(ctx.chat.id, state);
+    let valueLamports;
+    try {
+      valueLamports = await collateralValueLamports(
+        state.selected.mint,
+        state.collateralRaw,
+        state.selected.decimals,
+      );
+    } catch (err) {
+      console.warn("[borrow:exits:retier] price re-fetch failed:", err.message);
+      await ctx.answerCallbackQuery("Couldn't refresh price. Run /borrow again.");
+      return;
+    }
+    state.collateralValueLamports = valueLamports;
+    state.quotedAt = Date.now();
+    pending.set(ctx.chat.id, state);
+    const tiers = await getEligibleTiers({ category: state.selected.category });
+    const kb = new InlineKeyboard();
+    const tierLines = tiers.map((t) => {
+      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
+      const fee = loanSol * (t.feeBps / 10_000);
+      const receive = loanSol - fee;
+      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
+      const shortName = shortMatch ? shortMatch[1] : t.label;
+      kb.text(
+        `${shortName} — ${receive.toFixed(4)} SOL`,
+        `borrow:tier:${t.option}`,
+      ).row();
+      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
+    });
+    kb.text("✕ Cancel", "borrow:cancel");
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
+        `*Value:* ${fmtSol(valueLamports)} SOL`,
+        "",
+        "*Choose a loan tier:*",
+        ...tierLines,
+        "",
+        "_Amount shown is what you receive after the tier fee._",
+        "⏱ _This quote expires in 60 seconds._",
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
   });
 
   // ── Post-borrow protection callbacks ───────────────────────────
