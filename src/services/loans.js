@@ -24,6 +24,7 @@ import { connection } from "../solana/connection.js";
 import {
   getProgramForSigner,
   PROGRAM_ID,
+  PROGRAM_ID_V4,
   chooseProgramIdForCategory,
   chooseProgramId,
   assertProgramMatchesCategory,
