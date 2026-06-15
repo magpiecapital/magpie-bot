@@ -1,0 +1,24 @@
+[package]
+name = "magpie-lending-v4"
+version = "0.1.0"
+description = "Magpie lending v4 — adds in-vault auto-sell conversion. New convert_collateral_slice instruction lets the engine swap a slice of SPL collateral to SOL via Jupiter CPI, store the SOL in the loan vault, and keep the loan ACTIVE. repay_loan + liquidate_loan now return a mix of remaining SPL + accumulated SOL. Replaces the limit-close re-borrow orchestration in v1/v2/v3; ladders no longer pay per-leg origination. v1/v2/v3 programs continue serving existing loans untouched; v4 is a parallel deploy that supersedes them for new borrows only."
+edition = "2021"
+rust-version = "1.79"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "magpie_lending_v4"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl = "0.32.1"
+</content>
+</invoke>
