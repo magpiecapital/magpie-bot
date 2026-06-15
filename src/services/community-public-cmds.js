@@ -1393,6 +1393,49 @@ const COMMUNITY_CMD_HANDLERS = {
 
 export async function maybeHandlePublicCommand(ctx, msg) {
   const text = (msg?.text || "").trim();
+
+  // Bareword keyword triggers — operator-mandated 2026-06-15 after
+  // @magical_mutes213 typed "CA" in @magpietalk and Pip didn't reply.
+  // Strict whitelist: must be an EXACT match against the lowercased
+  // trimmed message (with optional trailing ?) so we never fire on
+  // mid-sentence noise like "I lost my CA in a dream last night".
+  //
+  // Throttled per (chat, keyword) so a CA-flood doesn't spam the
+  // group. The LLM Q&A path still runs for anything not in the
+  // whitelist (operator: future operator-flagged keywords go here
+  // without waiting for permission).
+  const lower = text.toLowerCase().replace(/[?!.]+$/, "").trim();
+  const BAREWORD_MAP = {
+    "ca": "ca",
+    "contract": "ca",
+    "contract address": "ca",
+    "address": "ca",
+    "what is the ca": "ca",
+    "whats the ca": "ca",
+    "what's the ca": "ca",
+  };
+  const barewordCmd = BAREWORD_MAP[lower];
+  if (barewordCmd) {
+    const throttleKey = `${ctx.chat.id}:bareword:${barewordCmd}`;
+    if (!isBarewordThrottled(throttleKey)) {
+      const fn = COMMUNITY_CMD_HANDLERS[barewordCmd];
+      if (fn) {
+        try {
+          await fn(ctx);
+          markBarewordSent(throttleKey);
+        } catch (err) {
+          console.warn(`[community-public-cmds] bareword "${lower}" → ${barewordCmd} failed:`, err.message);
+        }
+        return true;
+      }
+    } else {
+      // Throttled — silently skip. Pip's LLM path won't fire either
+      // since we return true. Re-firing within 5 minutes risks spam
+      // during a CA-flood.
+      return true;
+    }
+  }
+
   if (!text.startsWith("/")) return false;
   const m = text.match(/^\/([a-z_]+)(?:@\w+)?(?:\s|$)/i);
   if (!m) return false;
@@ -1405,6 +1448,19 @@ export async function maybeHandlePublicCommand(ctx, msg) {
     console.warn(`[community-public-cmds] /${cmd} failed:`, err.message);
   }
   return true;
+}
+
+// In-memory throttle for bareword triggers. 5-minute window per
+// (chat, keyword). Memory-bounded by the set of active chats × the
+// set of bareword keys; trivially small.
+const BAREWORD_THROTTLE_MS = 5 * 60 * 1000;
+const _barewordLastSent = new Map();
+function isBarewordThrottled(key) {
+  const t = _barewordLastSent.get(key);
+  return t != null && Date.now() - t < BAREWORD_THROTTLE_MS;
+}
+function markBarewordSent(key) {
+  _barewordLastSent.set(key, Date.now());
 }
 
 /* ─────────────────────────── UTILS ─────────────────────────── */
