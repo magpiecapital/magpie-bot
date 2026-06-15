@@ -35,7 +35,7 @@ import { query } from "../db/pool.js";
 
 const WATCHER_INTERVAL_MS = Number(process.env.FIRST_V4_FIRE_INTERVAL_MS) || 5 * 60_000;
 const FIRST_RUN_DELAY_MS = Number(process.env.FIRST_V4_FIRE_FIRST_DELAY_MS) || 2 * 60_000;
-const V4_PROGRAM_ID = process.env.process.env.PROGRAM_ID_V4 || null;
+const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4 || null;
 
 let _timer = null;
 let _successDisabled = false;
