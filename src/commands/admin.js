@@ -61,6 +61,145 @@ export async function handleResume(ctx) {
   await ctx.reply("▶️ Borrowing resumed.");
 }
 
+/**
+ * /v4-status — V4-only health snapshot for the operator.
+ *
+ * Surfaces at a glance:
+ *   - On-chain pool TVL (total deposits, total borrowed, available)
+ *   - Active V4 loans count + total SOL owed
+ *   - Total accumulated vault SOL across all V4 loans (the spread sitting
+ *     inside loans waiting to be claimed at repay)
+ *   - Engine fire history: total fires, success rate, last fire
+ *   - First-V4-fire milestone state (celebrated yet? failure yet?)
+ *
+ * No on-chain writes; pure read. Safe to spam.
+ */
+export async function handleV4Status(ctx) {
+  if (!(await requireAdmin(ctx, "v4-status"))) return;
+
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4) {
+    return ctx.reply("V4 not configured (PROGRAM_ID_V4 env unset). Nothing to report.");
+  }
+
+  try {
+    const [poolSnap, dbLoans, dbFires, milestones] = await Promise.all([
+      (async () => {
+        // Inline pool snapshot — keeps this command self-contained.
+        // Mirrors fetchPoolSnapshot in commands/stats.js for V4.
+        try {
+          const { getReadOnlyProgram } = await import("../solana/program.js");
+          const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
+          const { connection } = await import("../solana/connection.js");
+          const { PublicKey } = await import("@solana/web3.js");
+          const program = getReadOnlyProgram(PROGRAM_ID_V4);
+          const lenderPubkey = new PublicKey(process.env.LENDER_PUBKEY);
+          const [poolPda] = lendingPoolPda(lenderPubkey, PROGRAM_ID_V4);
+          const pool = await program.account.lendingPool.fetch(poolPda);
+          const [vaultPda] = loanTokenVaultPda(poolPda, PROGRAM_ID_V4);
+          const vault = await connection.getTokenAccountBalance(vaultPda).catch(() => null);
+          const totalDeposits = BigInt(pool.totalDeposits.toString());
+          const totalBorrowed = BigInt(pool.totalBorrowed.toString());
+          const availableLiquidity = vault?.value?.amount
+            ? BigInt(vault.value.amount)
+            : (totalDeposits - totalBorrowed);
+          const utilizationRate = totalDeposits > 0n
+            ? Number(totalBorrowed) / Number(totalDeposits)
+            : 0;
+          return {
+            totalDeposits: totalDeposits.toString(),
+            totalBorrowed: totalBorrowed.toString(),
+            availableLiquidity: availableLiquidity.toString(),
+            utilizationRate,
+            paused: !!pool.paused,
+          };
+        } catch (err) {
+          return { error: err.message?.slice(0, 100) };
+        }
+      })(),
+      query(
+        `SELECT
+           COUNT(*)::int AS active_count,
+           COALESCE(SUM(original_loan_amount_lamports), 0)::text AS total_owed_lamports,
+           COALESCE(SUM(sol_proceeds_amount), 0)::text AS total_vault_lamports,
+           COUNT(*) FILTER (WHERE auto_sells_fired > 0)::int AS with_fires
+         FROM loans
+         WHERE program_id = $1
+           AND status = 'active'`,
+        [PROGRAM_ID_V4.toBase58()],
+      ),
+      query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'fired')::int AS fired,
+           COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+           COUNT(*) FILTER (WHERE status = 'armed')::int AS armed,
+           MAX(fired_at) AS last_fired_at,
+           COALESCE(SUM(proceeds_lamports) FILTER (WHERE status = 'fired'), 0)::text AS total_proceeds
+         FROM limit_close_orders
+         WHERE engine_program_id = $1`,
+        [PROGRAM_ID_V4.toBase58()],
+      ),
+      query(
+        `SELECT milestone_key, notified_at, reference_id
+           FROM engine_milestone_flags
+          WHERE milestone_key IN ('first_v4_fire', 'first_v4_fire_failure')`,
+      ),
+    ]);
+
+    const fmtSol = (lamportsStr) => (Number(lamportsStr) / 1e9).toFixed(4);
+    const loansRow = dbLoans.rows[0];
+    const firesRow = dbFires.rows[0];
+    const successPct = (firesRow.fired + firesRow.failed) > 0
+      ? ((firesRow.fired * 100) / (firesRow.fired + firesRow.failed)).toFixed(1)
+      : "n/a";
+    const firstFire = milestones.rows.find((r) => r.milestone_key === "first_v4_fire");
+    const firstFail = milestones.rows.find((r) => r.milestone_key === "first_v4_fire_failure");
+
+    const lines = [
+      "*V4 status*",
+      "",
+      `Program: \`${PROGRAM_ID_V4.toBase58().slice(0, 16)}…\``,
+      "",
+      "*Pool (on-chain):*",
+      poolSnap.error
+        ? `  read error: ${poolSnap.error}`
+        : [
+            `  total deposits:  \`${fmtSol(poolSnap.totalDeposits)} SOL\``,
+            `  total borrowed:  \`${fmtSol(poolSnap.totalBorrowed)} SOL\``,
+            `  available liq:   \`${fmtSol(poolSnap.availableLiquidity)} SOL\``,
+            `  utilization:     \`${(poolSnap.utilizationRate * 100).toFixed(1)}%\``,
+            poolSnap.paused ? `  *PAUSED*` : null,
+          ].filter(Boolean).join("\n"),
+      "",
+      "*Active V4 loans (DB):*",
+      `  count:           ${loansRow.active_count}`,
+      `  total owed:      \`${fmtSol(loansRow.total_owed_lamports)} SOL\``,
+      `  vault accrued:   \`${fmtSol(loansRow.total_vault_lamports)} SOL\``,
+      `  with auto-sells fired: ${loansRow.with_fires}`,
+      "",
+      "*Limit-close orders (V4):*",
+      `  armed:    ${firesRow.armed}`,
+      `  fired:    ${firesRow.fired}`,
+      `  failed:   ${firesRow.failed}`,
+      `  success%: ${successPct}`,
+      `  total proceeds (lifetime): \`${fmtSol(firesRow.total_proceeds)} SOL\``,
+      firesRow.last_fired_at
+        ? `  last fired: \`${new Date(firesRow.last_fired_at).toISOString().slice(0, 19)}Z\``
+        : `  last fired: never`,
+      "",
+      "*Milestones:*",
+      `  first_v4_fire:         ${firstFire?.notified_at ? "CELEBRATED " + new Date(firstFire.notified_at).toISOString().slice(0, 19) + "Z" : "pending"}`,
+      `  first_v4_fire_failure: ${firstFail?.notified_at ? "ALERTED " + new Date(firstFail.notified_at).toISOString().slice(0, 19) + "Z" : "none yet"}`,
+    ].filter(Boolean);
+
+    await logAdminCommand(ctx, "v4-status", { outcome: "success" });
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    await logAdminCommand(ctx, "v4-status", { outcome: "error", error: err.message });
+    await ctx.reply(`v4-status read failed: ${err.message?.slice(0, 200)}`);
+  }
+}
+
 export async function handleAdminStatus(ctx) {
   if (!(await requireAdmin(ctx, "admin"))) return;
   const { getGlobalSiteState } = await import("../services/site-global.js");
