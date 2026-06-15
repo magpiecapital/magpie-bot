@@ -1,0 +1,39 @@
+-- 069_drop_orphan_cap_in_range_constraint.sql
+--
+-- BACKGROUND
+-- ──────────────────────────────────────────────────────────────────
+-- Migration 027 added a CHECK constraint named
+--     limit_close_orders_cap_in_range
+-- capping max_slippage_bps_cap at 1000 bps (10%).
+--
+-- Migration 031 was supposed to widen that ceiling to 5000 bps (50%)
+-- so V3 RWA + V4 thin tokens could pass the thin-token slippage bump.
+-- But 031's DROP/ADD pair targeted a DIFFERENT name —
+--     limit_close_orders_max_slippage_cap_in_range
+-- — because of a copy-paste typo in the constraint name. So the OLD
+-- 10% constraint was never dropped. Both constraints have been live
+-- since 2026-04, and the stricter (10%) one silently blocks every
+-- insert whose cap exceeds 1000 bps.
+--
+-- IMPACT
+-- ──────────────────────────────────────────────────────────────────
+-- This is the actual reason the operator's 2026-06-15 V4 $TROLL
+-- ladder failed with `insert_failed`. arm-core computes a thin-token
+-- cap that lands in the 10–50% range. The new constraint accepted
+-- it; the orphaned old one rejected it.
+--
+-- FIX
+-- ──────────────────────────────────────────────────────────────────
+-- Drop the orphaned `limit_close_orders_cap_in_range` constraint.
+-- The wider replacement `limit_close_orders_max_slippage_cap_in_range`
+-- (5000 bps ceiling) from 031 remains in place and is sufficient.
+--
+-- This is a pure constraint removal — no row touched, no data lost,
+-- no existing behavior changes for any row already under the wider
+-- 50% ceiling.
+--
+-- Idempotent: IF EXISTS guard so re-running on a DB where the
+-- constraint was already dropped is a no-op.
+
+ALTER TABLE limit_close_orders
+  DROP CONSTRAINT IF EXISTS limit_close_orders_cap_in_range;
