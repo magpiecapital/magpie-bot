@@ -862,12 +862,20 @@ export function registerBorrowCallbacks(bot) {
     // tell the user it failed — even if the post-tx rendering breaks.
     let result;
     try {
+      // V4-exclusive routing (2026-06-15): if the user selected ANY
+      // exit type in the wizard (not 'skip'), this borrow lands on V4
+      // because V4 is the only pool whose engine fire path keeps the
+      // loan ACTIVE and accumulates SOL in the per-loan vault. Plain
+      // borrows (state.exits.type === 'skip' or no exits) take the
+      // legacy V1/V2/V3 category routing.
+      const hasExitArming = !!(state.exits && state.exits.type && state.exits.type !== "skip");
       result = await executeBorrow({
         userId: state.userId,
         collateralMint: state.selected.mint,
         collateralAmountRaw: state.collateralRaw,
         collateralValueLamports: currentValueLamports,
         loanOption: option,
+        hasExitArming,
       });
     } catch (err) {
       console.error("Borrow failed (pre-tx or tx submission):", err);

@@ -25,6 +25,7 @@ import {
   getProgramForSigner,
   PROGRAM_ID,
   chooseProgramIdForCategory,
+  chooseProgramId,
   assertProgramMatchesCategory,
   chooseProgramIdForLoan,
 } from "../solana/program.js";
@@ -158,6 +159,13 @@ export async function executeBorrow({
   collateralAmountRaw,
   collateralValueLamports,
   loanOption,
+  // V4-exclusive routing (2026-06-15): when the borrow is part of a
+  // flow that ALSO arms an exit (TP/SL/trailing/bracket/ladder), set
+  // this flag so the borrow lands on V4. V4 is the only pool whose
+  // engine fire path keeps the loan ACTIVE and accumulates SOL in the
+  // per-loan vault. Plain borrows (no exit) keep the legacy V1/V2/V3
+  // category-based routing.
+  hasExitArming = false,
 }) {
   // Look up the collateral's category to decide which lending program to use.
   // RWAs (stocks/ETFs/metals) route to v2 (newer anchor-spl with Token-2022
@@ -168,7 +176,8 @@ export async function executeBorrow({
     [collateralMint],
   );
   const category = catRows[0]?.category ?? "memecoin";
-  const programId = chooseProgramIdForCategory(category);
+  // Exit-armed borrows force V4. Plain borrows take the category path.
+  const programId = chooseProgramId(category, { hasExitArming });
   // Hard safety stop — refuse to open a loan if the program/category
   // pairing is wrong. The v2 pool must NEVER hold memecoin collateral,
   // and v1 must never hold RWA. Throws if violated; caller surfaces
