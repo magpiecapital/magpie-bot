@@ -1065,13 +1065,21 @@ export function registerBorrowCallbacks(bot) {
     }
 
     // Notify operator if anything went sideways after on-chain success.
+    // Include per-leg error codes so the operator gets full diagnostic
+    // info instead of just "exit arm failed". This is how we'll pinpoint
+    // root causes like the operator's 2026-06-15 insert_failed leg
+    // without having to dig through Railway logs.
     if (!renderedOk || recordLoanFailed || anyExitFailed) {
       try {
         const { notifyAdmin, getNotifyBot } = await import("../services/admin-notify.js");
+        const failedLegs = exitArmResults
+          .filter((r) => !r.ok)
+          .map((r) => `${r.label}: ${r.error || "unknown"}`)
+          .join(" | ");
         const issues = [
           recordLoanFailed ? "recordLoan failed" : null,
           !renderedOk ? "card render failed" : null,
-          anyExitFailed ? "exit arm failed" : null,
+          anyExitFailed ? `exit arm failed [${failedLegs}]` : null,
         ].filter(Boolean).join(", ");
         const adminBot = getNotifyBot();
         if (adminBot) {
