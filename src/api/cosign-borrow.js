@@ -603,8 +603,17 @@ export async function handleCosignBorrow(req) {
           // moment. Operator-stated mandate 2026-06-13: protocol must
           // operate at the highest level; momentary oracle blips can't
           // block borrows.
-          const PRICE_RETRY_DELAYS_MS = [0, 800, 2200];
-          const STALE_SNAPSHOT_MAX_AGE_MS = 3 * 60_000; // 3 min — snapshotter runs every ~2 min
+          // Operator hit "Price oracle briefly unavailable" on hard-refresh
+          // V1 borrows 2026-06-15 PM despite the existing 3-retry +
+          // 3-min-snapshot fallback. Widen both: 5 retries instead of 3
+          // (covers longer rate-limit windows from Jupiter/DexScreener)
+          // and the snapshot cap goes 3min→15min so a delayed snapshotter
+          // run doesn't manifest as a borrow rejection. The cap is still
+          // far below any pump-and-front-run window — the LTV math and
+          // the pre-existing fresh-pump gates downstream protect against
+          // adversarial mispricing even on a 15-min-old snapshot.
+          const PRICE_RETRY_DELAYS_MS = [0, 500, 1200, 2500, 4500];
+          const STALE_SNAPSHOT_MAX_AGE_MS = 15 * 60_000; // 15 min — was 3
           let valueLamports;
           let lastErr;
           for (const delayMs of PRICE_RETRY_DELAYS_MS) {

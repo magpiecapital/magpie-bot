@@ -202,7 +202,7 @@ export async function executeBorrow({
   const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
   const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
 
-  const collateralTokenProgram = await getMintTokenProgram(collateralMint);
+  // collateralTokenProgram already resolved above for the Token-2022 gate.
   const loanTokenProgram = TOKEN_PROGRAM_ID; // wSOL is classic SPL
 
   const loanId = new BN(Date.now());
@@ -462,24 +462,43 @@ export async function executeRepay({ userId, loanDbRow }) {
     };
   }
 
-  const sig = await program.methods
-    .repayLoan()
-    .accounts({
-      pool: lendingPool,
-      loanTokenVault,
-      loan: loanPdaPk,
-      collateralMint: collateralMintPk,
-      collateralVault,
-      borrowerCollateralAccount: borrowerCollateralAta,
-      borrowerLoanTokenAccount: borrowerWsolAta,
-      borrower: borrower.publicKey,
-      tokenProgram: collateralTokenProgram,
-      loanTokenProgram,
-      ...v4ExtraAccounts,
-    })
-    .preInstructions(preIxs)
-    .postInstructions(postIxs)
-    .rpc({ commitment: "confirmed" });
+  const buildRepayMethod = () =>
+    program.methods
+      .repayLoan()
+      .accounts({
+        pool: lendingPool,
+        loanTokenVault,
+        loan: loanPdaPk,
+        collateralMint: collateralMintPk,
+        collateralVault,
+        borrowerCollateralAccount: borrowerCollateralAta,
+        borrowerLoanTokenAccount: borrowerWsolAta,
+        borrower: borrower.publicKey,
+        tokenProgram: collateralTokenProgram,
+        loanTokenProgram,
+        ...v4ExtraAccounts,
+      })
+      .preInstructions(preIxs)
+      .postInstructions(postIxs);
+
+  // Pre-flight simulate before the user's wallet pays fees. Operator-mandated
+  // 2026-06-15 "Repay must never simulate-fail" — catches Token-2022
+  // account-mismatch + missing-account class of bugs at the bot layer so
+  // the user sees a clean error instead of a confirmed-failure tx on chain.
+  // Symmetric across V1/V2/V3/V4 per the world-class engineering standard.
+  try {
+    await buildRepayMethod().simulate({ commitment: "confirmed" });
+  } catch (simErr) {
+    const annotated = new Error(
+      `[repay] pre-flight simulation failed before send: ${simErr?.message || simErr}`,
+    );
+    annotated.simulationError = simErr;
+    annotated.logs = simErr?.simulationResponse?.logs || simErr?.logs || [];
+    annotated.programErrorStack = simErr?.programErrorStack;
+    throw annotated;
+  }
+
+  const sig = await buildRepayMethod().rpc({ commitment: "confirmed" });
 
   return { signature: sig };
 }
