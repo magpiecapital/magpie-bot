@@ -551,7 +551,16 @@
         },
         {
           "name": "fee_wallet_token_account",
-          "writable": true
+          "docs": [
+            "Wave 5 C4 (2026-06-15): hardcoded `address` constraint closes",
+            "the audit finding — without it a borrower extending their V4",
+            "loan could pass own wSOL ATA and keep the 1% extension fee.",
+            "Now restricted to the canonical Magpie fee wallet only.",
+            "(Wave 3 added this to RequestLoan + ConvertCollateralSlice but",
+            "MISSED ExtendLoan — caught in the post-Wave-4 final audit.)"
+          ],
+          "writable": true,
+          "address": "3wk75XDABdEEec28c9ES6KdH2V9zh8h76Q8oTitEe4TE"
         },
         {
           "name": "borrower",
@@ -836,8 +845,9 @@
           "docs": [
             "v4 — sol_proceeds_vault holding accumulated SOL from auto-sells.",
             "Same seeds + authority pattern as the SPL collateral vault.",
-            "Always passed in even if no auto-sells fired (zero-balance is fine);",
-            "keeps account ordering stable."
+            "Wave 5 C1 (2026-06-15): `init_if_needed` so V4 loans whose",
+            "auto-sell never fired can still be liquidated. Keeper pays the",
+            "small ATA rent (~0.002 SOL); recovered on the close path."
           ],
           "writable": true,
           "pda": {
@@ -889,11 +899,28 @@
           "signer": true
         },
         {
+          "name": "wsol_mint",
+          "docs": [
+            "wSOL mint — needed by the `init_if_needed` on sol_proceeds_vault."
+          ]
+        },
+        {
           "name": "token_program"
         },
         {
           "name": "loan_token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "docs": [
+            "Wave 5 C1 — required by init_if_needed on sol_proceeds_vault."
+          ],
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
         }
       ],
       "args": []
@@ -1107,7 +1134,17 @@
             "lazily on first convert_collateral_slice; here in repay it gets",
             "drained back to the borrower along with any remaining SPL.",
             "Authority = collateral_vault PDA (same seeds as the SPL vault),",
-            "so the program can sign for withdrawals using vault_seeds."
+            "so the program can sign for withdrawals using vault_seeds.",
+            "",
+            "Wave 5 C1 (2026-06-15): `init_if_needed` so V4 loans whose",
+            "auto-sell never fired (price never hit trigger) can still be",
+            "repaid. Without this, every never-fired V4 loan is unrepayable",
+            "— sol_proceeds_vault is only init'd lazily inside",
+            "convert_collateral_slice, so a loan that didn't auto-sell has",
+            "no vault account and Anchor fails with AccountNotInitialized",
+            "(3012) at repay time. wsol_mint param added below for the init.",
+            "Borrower pays the small ATA rent (~0.002 SOL); on close path",
+            "the rent is recovered."
           ],
           "writable": true,
           "pda": {
@@ -1137,11 +1174,30 @@
           }
         },
         {
+          "name": "wsol_mint",
+          "docs": [
+            "wSOL mint (canonical pubkey So11111…). Used to gate the",
+            "init_if_needed on sol_proceeds_vault. Read-only."
+          ]
+        },
+        {
           "name": "token_program"
         },
         {
           "name": "loan_token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program",
+          "docs": [
+            "Wave 5 C1 — needed because init_if_needed allocates a new",
+            "account, which requires the system_program to be passed."
+          ],
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "rent",
+          "address": "SysvarRent111111111111111111111111111111111"
         }
       ],
       "args": []
