@@ -2039,7 +2039,11 @@ async function router(req, res) {
         };
     }
   } catch (err) {
-    console.error(`[api] Error on ${path}:`, err.message);
+    // Log the FULL stack so we can debug 500s without re-instrumenting
+    // every code path. message-only logging burned an investigation
+    // on 2026-06-15 (trailing-SL arm 500: needed the stack to see the
+    // throw was inside getPriceInUsdCrossSourced).
+    console.error(`[api] Error on ${path}:`, err?.stack || err?.message || err);
     result = { status: 500, body: { error: "Internal server error" } };
   }
 
