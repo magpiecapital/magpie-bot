@@ -800,6 +800,33 @@ export async function markLoanRepaid(loanDbId, txSignature) {
 export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }) {
   const programId = chooseProgramIdForLoan(loanDbRow);
 
+  // V4 Wave 5 H2 (2026-06-15): refuse add_collateral on V4 loans that have
+  // an armed limit_close_order. V4's convert_collateral_slice slice math
+  // is `loan.collateral_amount × slice_bps / 10000` ON-CHAIN. Adding more
+  // collateral mid-ladder grows the base, so subsequent fires sell larger
+  // slices than the user expected at arm time AND than the engine quoted
+  // (engine snapshots are off-by-one from on-chain reality). Cleanest
+  // mitigation: block topup while the order is armed. User can cancel
+  // the order, topup, then re-arm — explicit and predictable.
+  const v4ProgramIdStr = process.env.PROGRAM_ID_V4 || null;
+  const isV4Loan = v4ProgramIdStr && programId.toBase58() === v4ProgramIdStr;
+  if (isV4Loan) {
+    const { rows: [armed] } = await query(
+      `SELECT id FROM limit_close_orders
+        WHERE loan_id = $1
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user')
+        LIMIT 1`,
+      [loanDbRow.id],
+    );
+    if (armed) {
+      const err = new Error(
+        "add_collateral blocked: V4 loan has an armed auto-sell. Cancel the order with /cancellimitorder, then /topup.",
+      );
+      err.code = "v4_topup_blocked_armed_order";
+      throw err;
+    }
+  }
+
   const borrower = await loadKeypair(userId);
   const program = getProgramForSigner(borrower, programId);
 
