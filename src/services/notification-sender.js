@@ -96,6 +96,100 @@ function renderLimitCloseArmed(p) {
 }
 
 /**
+ * Arm-attempt failure DM. Fired by limit-close-arm-core's wrapper on
+ * EVERY failed armOrder() call, regardless of source (site / tg /
+ * agent_x402). Forcing function: operator's 2026-06-15 V4 SPCX ladder
+ * incident — the user thought they armed a ladder, the strike was
+ * hit, no fire happened, no signal anywhere on the dashboard. Now
+ * they get the truth in their DMs within seconds.
+ */
+function renderLimitCloseArmFailed(p) {
+  // Human-readable explanation for known error codes. Falls back to
+  // the raw error_code + detail so we never silently drop info.
+  const why = humanizeArmFailure(p.error_code, p.error_detail);
+
+  // Format the target the user tried to arm, when we have enough to
+  // reconstruct it. Otherwise a generic "your auto-sell".
+  const target = formatAttemptedTarget(p);
+
+  const dirLabel = p.direction === "below" ? "stop-loss" : "take-profit";
+  const sliceTxt = p.slice_pct && p.slice_pct < 10000
+    ? ` (${(p.slice_pct / 100).toFixed(0)}% slice)`
+    : "";
+
+  return [
+    `*Auto-sell didn't arm*`,
+    ``,
+    `What you tried to set: ${target}${sliceTxt} — ${dirLabel}`,
+    p.loan_id_chain ? `Loan: #${p.loan_id_chain}` : null,
+    ``,
+    `Why it failed: ${why}`,
+    ``,
+    `Nothing is armed on the chain. Tap "Try again" in the dashboard or DM me ("/help") if you'd like a walk-through.`,
+  ].filter((s) => s !== null).join("\n");
+}
+
+function formatAttemptedTarget(p) {
+  if (!p.trigger_kind || p.trigger_value_micro == null) return "your auto-sell";
+  const n = Number(p.trigger_value_micro);
+  if (!Number.isFinite(n)) return "your auto-sell";
+  if (p.trigger_kind === "mc_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1e9) return `$${(usd / 1e9).toFixed(2)}B mc`;
+    if (usd >= 1e6) return `$${(usd / 1e6).toFixed(2)}M mc`;
+    if (usd >= 1e3) return `$${(usd / 1e3).toFixed(2)}K mc`;
+    return `$${usd.toFixed(2)} mc`;
+  }
+  if (p.trigger_kind === "price_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1) return `$${usd.toFixed(2)}`;
+    if (usd >= 0.01) return `$${usd.toFixed(4)}`;
+    return `$${usd.toFixed(8)}`;
+  }
+  return `${(n / 1e9).toFixed(6)} SOL`;
+}
+
+function humanizeArmFailure(code, detail) {
+  switch (code) {
+    case "loan_not_found_for_user":
+      return "We couldn't find that loan on your account. If you just borrowed, give it ~5 seconds and try again — the loan may not have propagated yet.";
+    case "loan_not_active":
+      return "That loan isn't active anymore. It may have been repaid or liquidated.";
+    case "loan_below_minimum_size":
+      return "Loans under 1 SOL aren't eligible for auto-sells right now.";
+    case "collateral_not_enabled":
+      return "This collateral token is currently disabled for new auto-sells. Ping @MagpieLoans if you think this is a mistake.";
+    case "take_profit_already_armed":
+    case "stop_loss_already_armed":
+    case "loan_already_has_active_order":
+      return "You already have an active auto-sell on this loan in this direction. Cancel the existing one first if you want to change it.";
+    case "trigger_would_fire_immediately":
+      return "Your target is on the wrong side of the current price — it would fire as soon as it armed. Pick a target above the current price for take-profit (or below it for stop-loss).";
+    case "user_concurrency_cap_reached":
+      return "You've hit the per-user cap of 10 active auto-sells. Cancel an existing one and try again.";
+    case "invalid_slippage_bps":
+      return "The slippage allowance was outside the protocol bounds.";
+    case "invalid_slice_pct":
+      return "Ladder slice has to add up correctly — each leg between 0.01% and 100%, total ≤ 100%.";
+    case "invalid_trigger_value":
+    case "trigger_value_out_of_range":
+      return "The price target looked malformed. Try entering it as a USD value (e.g. \"180\") or a market-cap (\"145M mc\").";
+    case "invalid_trailing_distance_bps":
+      return "Trailing distance must be between 0.5% and 50%.";
+    case "trailing_only_valid_on_stop_loss":
+      return "Trailing distance only applies to stop-loss orders, not take-profit.";
+    case "insert_failed":
+      return `The database refused the order at the last step. Detail: ${detail || "(none provided)"}`;
+    case "exception":
+      return `An unexpected error happened on the server. Detail: ${detail || "(none provided)"}`;
+    default:
+      return code
+        ? `${code}${detail ? ` — ${detail}` : ""}`
+        : "Unknown failure (we logged it).";
+  }
+}
+
+/**
  * V4 fire DM — fundamentally different message from legacy fire.
  *
  * Legacy V1/V3 fire: engine repaid loan + sold collateral + sent SOL to
@@ -360,6 +454,7 @@ function renderEnginePreflightFailed(p) {
 
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
+  limit_close_arm_failed:   renderLimitCloseArmFailed,
   limit_close_fired:           renderLimitCloseFired,
   limit_close_v4_fired:        renderLimitCloseV4Fired,
   limit_close_failed:          renderLimitCloseFailed,
