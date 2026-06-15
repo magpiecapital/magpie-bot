@@ -9,13 +9,20 @@ import { InlineKeyboard } from "grammy";
 
 export async function handleWhatsNew(ctx) {
   const kb = new InlineKeyboard()
-    .url("📊 Open dashboard", "https://magpie.capital/dashboard")
+    .url("Open dashboard", "https://magpie.capital/dashboard")
     .row()
-    .text("🔐 My security", "me:security");
+    .text("My security", "me:security");
 
   await ctx.reply(
     [
-      "✨ *What's new on Magpie*",
+      "*What's new on Magpie*",
+      "",
+      "*V4 in-vault auto-sells (LIVE 2026-06-15):*",
+      "• When you borrow + attach an auto-sell (TP / SL / bracket / ladder), the loan now goes to V4 — a new pool built for exits.",
+      "• Each leg sells its slice ON-CHAIN and the SOL accumulates INSIDE your loan vault. The loan stays *Active*; nothing hits your wallet at fire time.",
+      "• When YOU decide to close, /repay returns BOTH any remaining collateral AND the vault SOL in the same tx.",
+      "• V4 ladders cost a flat 1% per leg — no per-leg origination fee (legacy V1/V3 ladders cost up to 5% × N).",
+      "• Heads up: V4 repay needs the owed amount in liquid SOL in your wallet. Vault SOL flows back at repay but doesn't pre-pay the loan.",
       "",
       "*Site (magpie.capital/dashboard) now does everything this bot does:*",
       "• Borrow / repay / extend / topup — all via Phantom",
