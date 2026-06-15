@@ -121,32 +121,66 @@ export function isRwaCategory(category) {
 }
 
 /**
- * Pick the program ID for a NEW borrow against the given collateral category.
+ * Pick the program ID for a NEW borrow.
  *
+ * **V4-exclusive exits model (2026-06-15):** if the user is arming any
+ * exit (TP / SL / trailing / bracket / ladder) as part of the borrow
+ * flow, the loan MUST go to V4 — that's the only pool whose engine fire
+ * path keeps the loan ACTIVE and accumulates SOL inside the per-loan
+ * vault via convert_collateral_slice. V1/V2/V3 cannot service exits
+ * going forward.
+ *
+ * If no exit is being armed, regular category routing applies:
  *   RWA (stock/etf/metal) → v3 (if configured AND ROUTE_RWA_TO_V3=true)
  *                          otherwise v2 (if configured), otherwise v1
  *   memecoin (default)    → v3 (if configured AND ROUTE_MEMECOINS_TO_V3=true)
  *                          otherwise v1
  *
- * Existing loans repay against THEIR original program (loans.program_id);
- * this routing only governs NEW borrows. Operator flips routing flags
- * one category at a time so the V3 rollout is staged.
+ *   chooseProgramId(category)                          — plain borrow
+ *   chooseProgramId(category, { hasExitArming: true }) — exit-armed borrow
  *
- * Fail-safe: when in doubt, return v1, which is the deployed-and-tested
- * program. The env-gating means v3 only activates when the operator
- * explicitly confirms deploy + readiness.
+ * Existing loans repay against THEIR original program (loans.program_id);
+ * this routing only governs NEW borrows.
+ *
+ * Throws when hasExitArming=true but PROGRAM_ID_V4 isn't deployed — the
+ * caller MUST refuse the borrow up the stack and tell the user exits
+ * aren't available right now. Silently falling back to V1/V3 would
+ * promise the user an in-vault exit and not deliver it.
+ *
+ * Fail-safe for the no-exit path: when in doubt, return v1.
  */
-export function chooseProgramIdForCategory(category) {
+export function chooseProgramId(category, opts = {}) {
+  const { hasExitArming = false } = opts;
+  if (hasExitArming) {
+    if (!PROGRAM_ID_V4) {
+      throw new Error(
+        "EXIT_ARMING_REQUIRES_V4: exit-armed borrow requested but PROGRAM_ID_V4 is not configured. " +
+        "Either complete the V4 deploy / env setup, or build a plain borrow without an exit.",
+      );
+    }
+    return PROGRAM_ID_V4;
+  }
   if (RWA_CATEGORIES.has(category)) {
-    if (PROGRAM_ID_V4 && ROUTE_RWA_TO_V4) return PROGRAM_ID_V4;
     if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
     if (PROGRAM_ID_V2) return PROGRAM_ID_V2;
     return PROGRAM_ID;
   }
   // Non-RWA path
-  if (PROGRAM_ID_V4 && ROUTE_MEMECOINS_TO_V4) return PROGRAM_ID_V4;
   if (PROGRAM_ID_V3 && ROUTE_MEMECOINS_TO_V3) return PROGRAM_ID_V3;
   return PROGRAM_ID;
+}
+
+/**
+ * Backwards-compatible shim — pre-2026-06-15 callers that don't know
+ * about exit arming still call this. They get the plain-borrow routing,
+ * which is correct because if the caller didn't pass `hasExitArming`,
+ * they aren't in an exit-arming flow.
+ *
+ * New callers should use chooseProgramId(category, { hasExitArming })
+ * directly so the exit-aware routing engages.
+ */
+export function chooseProgramIdForCategory(category) {
+  return chooseProgramId(category, { hasExitArming: false });
 }
 
 /**
@@ -161,7 +195,8 @@ export function assertProgramMatchesCategory(programId, category) {
   const isRwa = RWA_CATEGORIES.has(category);
   const routesToV2 = PROGRAM_ID_V2 && programId.equals(PROGRAM_ID_V2);
   const routesToV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
-  const routesToV1 = !routesToV2 && !routesToV3; // default
+  const routesToV4 = PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+  const routesToV1 = !routesToV2 && !routesToV3 && !routesToV4; // default
 
   // Pool semantics as of 2026-06-13 (V3 launch):
   //   V1: memecoin-only (legacy memecoin lending)
@@ -194,6 +229,8 @@ export function assertProgramMatchesCategory(programId, category) {
   }
   // V3 + RWA: VALID — V3 has the new RWA ladder.
   // V3 + memecoin: VALID — V3 dual-tier supports memecoin too.
+  // V4 + RWA: VALID — V4 dual-tier with in-vault auto-sell.
+  // V4 + memecoin: VALID — V4 dual-tier with in-vault auto-sell.
   // V1 + memecoin: VALID — default path.
   // V2 + RWA: VALID — legacy RWA pool.
 }
