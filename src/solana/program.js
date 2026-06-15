@@ -150,36 +150,8 @@ export function isRwaCategory(category) {
  * Fail-safe for the no-exit path: when in doubt, return v1.
  */
 export function chooseProgramId(category, opts = {}) {
-  const { hasExitArming = false, isToken2022 = false } = opts;
+  const { hasExitArming = false } = opts;
   if (hasExitArming) {
-    // 2026-06-15: Token-2022 collateral (SPCX and other RWA tokenized
-    // stocks/ETFs/metals built on Token-2022) does NOT repay cleanly
-    // against the currently-deployed V4 program — simulation reverts
-    // with `incorrect program id for instruction` at the RepayLoan
-    // CPI when V4 initializes sol_proceeds_vault. Operator hit it on
-    // loan id=763 (SPCX, V4). Per the operator-mandated
-    // never-affect-existing-loans rule, V4 is NOT being redeployed.
-    //
-    // Stop the bleeding for NEW borrows: route Token-2022 + exit-armed
-    // borrows to V3, which has been repaying SPCX cleanly all along.
-    // V3 uses the legacy fire-and-close exit model (fire = repay loan
-    // + sell + send SOL to wallet) instead of V4's in-vault model —
-    // semantically different but functional. Better than silently
-    // failing at repay time.
-    //
-    // Classic SPL collateral (memecoins) with exit arming keeps the V4
-    // in-vault routing — no Token-2022 bug, no behavior change.
-    if (isToken2022) {
-      if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
-      // Defense-in-depth: if V3 isn't configured, refuse the borrow
-      // rather than fall through to V4 (which would silently fail
-      // at repay time).
-      throw new Error(
-        "EXIT_ARMING_REQUIRES_V3_FOR_TOKEN2022: Token-2022 collateral with " +
-        "exit arming requires PROGRAM_ID_V3 + ROUTE_RWA_TO_V3=true. " +
-        "Currently misconfigured.",
-      );
-    }
     if (!PROGRAM_ID_V4) {
       throw new Error(
         "EXIT_ARMING_REQUIRES_V4: exit-armed borrow requested but PROGRAM_ID_V4 is not configured. " +

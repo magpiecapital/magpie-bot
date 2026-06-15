@@ -177,17 +177,8 @@ export async function executeBorrow({
     [collateralMint],
   );
   const category = catRows[0]?.category ?? "memecoin";
-  // Determine whether the collateral mint is Token-2022. SPCX-class
-  // (tokenized stocks/ETFs/metals) live on Token-2022; classic SPL
-  // memecoins use the legacy Token program. Token-2022 + exit arming
-  // currently fails V4 repay simulation (sol_proceeds_vault init
-  // bug — operator loan 763, 2026-06-15) so we route Token-2022 +
-  // exit-armed borrows to V3 instead. Memecoin (classic SPL) + exit
-  // continues to V4.
-  const collateralTokenProgram = await getMintTokenProgram(collateralMint);
-  const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
-  const isToken2022 = collateralTokenProgram.equals(TOKEN_2022_PROGRAM_ID);
-  const programId = chooseProgramId(category, { hasExitArming, isToken2022 });
+  // Exit-armed borrows force V4. Plain borrows take the category path.
+  const programId = chooseProgramId(category, { hasExitArming });
   // Hard safety stop — refuse to open a loan if the program/category
   // pairing is wrong. The v2 pool must NEVER hold memecoin collateral,
   // and v1 must never hold RWA. Throws if violated; caller surfaces
