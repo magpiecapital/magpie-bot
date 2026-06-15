@@ -32,7 +32,7 @@ jobs:
       packages: none
       pull-requests: none
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Shallow clone is plenty — we're parsing files, not history.
           fetch-depth: 1
