@@ -1,6 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
-import { PROGRAM_ID, PROGRAM_ID_V3 } from "./program.js";
+import { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4 } from "./program.js";
 
 // All PDA derivations accept an optional `programId` so v1 and v2 callers
 // can share these functions. Defaulting to v1's PROGRAM_ID keeps every
@@ -44,8 +44,14 @@ export function priceFeedPda(mintPubkey, poolPubkey, programId = PROGRAM_ID) {
   // borrow simulation in Phantom shows StalePriceAttestation.
   // Detected 2026-06-14 when V3 RWA borrows started failing for every
   // Xs-prefixed xStocks mint immediately after V3 routing went live.
+  //
+  // V4 (2026-06-15) inherits the "price_v3" seed name — same TWAP
+  // PriceHistory layout, just a different program ID. Falling through
+  // to the "price" default surfaces as "Account state mismatch" on
+  // every V4 borrow (same audit bug class as the V3 launch day).
   const isV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
-  const seedPrefix = isV3 ? "price_v3" : "price";
+  const isV4 = PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+  const seedPrefix = (isV3 || isV4) ? "price_v3" : "price";
   return PublicKey.findProgramAddressSync(
     [Buffer.from(seedPrefix), mintPubkey.toBuffer(), poolPubkey.toBuffer()],
     programId,

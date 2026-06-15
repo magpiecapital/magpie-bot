@@ -754,14 +754,21 @@ export async function handleCosignBorrow(req) {
         const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } =
           await import("../services/price-attestor.js");
         const FRESH_THRESHOLD_SEC = 60;
-        const age = await getPriceFeedAgeSeconds(mintStr);
+        // V4-aware JIT attestation (2026-06-15): use the borrow tx's
+        // own programId so V4 borrows attest V4's PriceHistory PDA
+        // (not the category-default V1/V3). Without this, V4 borrows
+        // surface as "Account state mismatch" because V4's price_feed
+        // PDA was never initialized — bot's category routing never
+        // reaches V4.
+        const borrowProgramId = magpieIxForAttest.programId;
+        const age = await getPriceFeedAgeSeconds(mintStr, borrowProgramId);
         if (age === null || age > FRESH_THRESHOLD_SEC) {
           try {
-            await attestPrice(mintStr, Number(mintRow.decimals));
+            await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
           } catch (attestErr) {
             if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-              await initializePriceFeed(mintStr);
-              await attestPrice(mintStr, Number(mintRow.decimals));
+              await initializePriceFeed(mintStr, borrowProgramId);
+              await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
             } else {
               throw attestErr;
             }
