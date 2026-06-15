@@ -238,8 +238,14 @@ export async function buildBorrowTx({
   try {
     programId = chooseProgramId(mintRow.category, { hasExitArming, isToken2022 });
   } catch (err) {
-    // Distinguish the deliberate Token-2022 block (422 — caller should
-    // retry without the exit, not later) from v4-not-deployed (503).
+    // Distinguish the THREE block paths so callers can retry intelligently:
+    //   - V4_BORROWS_PAUSED (503 — retry later, will lift after V4 patch)
+    //   - TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED (422 — retry WITHOUT exit
+    //     or pick a different collateral, will lift after V4 patch)
+    //   - generic V4 not configured (503 — operational issue)
+    if (err.message?.startsWith("V4_BORROWS_PAUSED")) {
+      return { blocked: true, status: 503, body: { error: "v4_borrows_paused", detail: err.message } };
+    }
     if (err.message?.startsWith("TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED")) {
       return { blocked: true, status: 422, body: { error: "token2022_exit_blocked", detail: err.message } };
     }
