@@ -122,6 +122,15 @@ function renderAlertText(loan, tier, appreciationPct, currentValueUsd, collatera
 }
 
 async function processLoan(loan) {
+  // V4-exclusive: under V4_EXIT_EXCLUSIVE_ENFORCE, only loans on V4 can
+  // be armed with TP. Nudging a V1/V3 borrower to /takeprofit would
+  // dead-end at exits_require_v4_loan, so skip the DM entirely.
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+  const canArmExits =
+    (!!v4ProgramId && loan.program_id === v4ProgramId) || !v4Enforced;
+  if (!canArmExits) return { skipped: "loan_not_v4_eligible" };
+
   const apprec = await computeAppreciation(loan);
   if (!apprec) return { skipped: "no_price_or_ltv" };
   if (apprec.pct < TIERS[0].threshold_pct) {
@@ -200,6 +209,7 @@ export async function tick() {
     const { rows: loans } = await query(
       `SELECT l.id, l.user_id, l.loan_id::text AS loan_id_chain,
               l.collateral_mint, l.collateral_amount, l.ltv_percentage,
+              l.program_id,
               l.original_loan_amount_lamports::text AS original_loan_amount_lamports,
               sm.decimals, sm.symbol AS collateral_symbol
          FROM loans l

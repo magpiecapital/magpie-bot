@@ -953,11 +953,21 @@ export function registerBorrowCallbacks(bot) {
 
     pending.delete(ctx.chat.id);
 
-    // Build inline keyboard. Always include the protect buttons when
-    // an exit failed or wasn't requested — gives the user a one-tap
-    // recovery path.
+    // V4-exclusive guard: when V4_EXIT_EXCLUSIVE_ENFORCE is on, only loans
+    // that landed on V4 can be armed with exits. Showing protect buttons
+    // or "/takeprofit ..." hints on a V1/V3 loan would just route the user
+    // into an exits_require_v4_loan refusal (see limit-close-arm-core.js).
+    // So gate post-borrow exit prompts on the actual program the loan
+    // landed on, not on whether arming was requested.
+    const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+    const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+    const isV4Loan = !!v4ProgramId && result.programId === v4ProgramId;
+    const canArmExits = isV4Loan || !v4Enforced;
+
+    // Build inline keyboard. Show protect buttons only when (a) some leg
+    // didn't arm AND (b) the loan is actually arm-eligible.
     let kb = new InlineKeyboard();
-    if (!allLegsArmed) {
+    if (!allLegsArmed && canArmExits) {
       kb = kb
         .text("Sell at 2x (lock profit)", `borrow:protect:tp:${result.loanId}`).row()
         .text("Sell at 0.7x (cap loss)", `borrow:protect:sl:${result.loanId}`).row()
@@ -1003,15 +1013,17 @@ export function registerBorrowCallbacks(bot) {
       "",
       allLegsArmed
         ? "/positions to check status · /limitorders to manage auto-sells"
-        : "*Want to set an auto-sell?* Tap a button above, or type:",
-      allLegsArmed
+        : canArmExits
+          ? "*Want to set an auto-sell?* Tap a button above, or type:"
+          : "/positions to check status · /share to flex on the timeline",
+      allLegsArmed || !canArmExits
         ? null
         : `\`/takeprofit ${result.loanId} at 2x\` (sell when up 2x)`,
-      allLegsArmed
+      allLegsArmed || !canArmExits
         ? null
         : `\`/stoploss ${result.loanId} at 0.7x\` (sell if down 30%)`,
-      allLegsArmed ? null : "",
-      allLegsArmed ? null : "/positions to check status · /share to flex on the timeline",
+      allLegsArmed || !canArmExits ? null : "",
+      allLegsArmed || !canArmExits ? null : "/positions to check status · /share to flex on the timeline",
     ].filter((l) => l != null);
 
     const plainTextLines = [
@@ -1031,7 +1043,9 @@ export function registerBorrowCallbacks(bot) {
       "",
       allLegsArmed
         ? "Run /positions to check status, /limitorders to manage auto-sells."
-        : "Tap a button below to set up auto-sells, or use /takeprofit and /stoploss.",
+        : canArmExits
+          ? "Tap a button below to set up auto-sells, or use /takeprofit and /stoploss."
+          : "Run /positions to check status.",
     ].filter((l) => l != null);
 
     let renderedOk = false;
@@ -1160,7 +1174,7 @@ export function registerBorrowCallbacks(bot) {
         "",
         `Tier: ${tier.days} days at ${tier.ltv}% LTV`,
         "",
-        "Want to set up an auto-sell now? (Optional — you can always set one up later from the funded-loan screen or /takeprofit.)",
+        "Want to set up an auto-sell now? Loans with auto-sells route to a different pool — they can't be added after the fact. (You can always /borrow again later to open a fresh loan with one.)",
       ].join("\n"),
       {
         parse_mode: "Markdown",
