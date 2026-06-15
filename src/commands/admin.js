@@ -1005,13 +1005,19 @@ export async function handleFundPool(ctx) {
       "• `/fundpool 5` → 5 SOL into memecoin pool (v1)\n" +
       "• `/fundpool max v2` → all lender SOL (minus 0.2 reserve) into RWA pool\n" +
       "• `/fundpool 50% v2` → half of lender SOL into RWA pool\n" +
-      "• `/fundpool 2 v3` → 2 SOL into v3 pool (requires PROGRAM_ID_V3 env)",
+      "• `/fundpool 2 v3` → 2 SOL into v3 pool (requires PROGRAM_ID_V3 env)\n" +
+      "• `/fundpool 5 v4` → 5 SOL into v4 pool (requires PROGRAM_ID_V4 env)",
       { parse_mode: "Markdown" },
     );
   }
   const isV2 = ["v2", "v2b", "rwa", "rwas", "stocks"].includes(poolArg);
   const isV3 = ["v3"].includes(poolArg);
-  const poolLabel = isV3 ? "v3 pool" : (isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)");
+  const isV4 = ["v4", "exits", "exit", "limit", "limits"].includes(poolArg);
+  const poolLabel = isV4
+    ? "v4 pool (exits)"
+    : isV3
+      ? "v3 pool"
+      : isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)";
 
   try {
     const { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
@@ -1041,19 +1047,26 @@ export async function handleFundPool(ctx) {
     }
 
     const { connection } = await import("../solana/connection.js");
-    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } = await import("../solana/program.js");
+    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
     const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
     const { parseAmountInput, clampToMax } = await import("../lib/amount-input.js");
 
-    // Route to v1 / v2b / v3 based on the pool arg. If v2 or v3 was
+    // Route to v1 / v2b / v3 / v4 based on the pool arg. If v2/v3/v4 was
     // requested but their PROGRAM_ID env isn't configured, fail clearly.
     if (isV2 && !PROGRAM_ID_V2) {
-      return ctx.reply("❌ v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
+      return ctx.reply("v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
     }
     if (isV3 && !PROGRAM_ID_V3) {
-      return ctx.reply("❌ v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
+      return ctx.reply("v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
     }
-    const programId = isV3 ? PROGRAM_ID_V3 : (isV2 ? PROGRAM_ID_V2 : PROGRAM_ID);
+    if (isV4 && !PROGRAM_ID_V4) {
+      return ctx.reply("v4 pool requested but `PROGRAM_ID_V4` env not set. Set `PROGRAM_ID_V4=HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo` on Railway and redeploy.");
+    }
+    const programId = isV4
+      ? PROGRAM_ID_V4
+      : isV3
+        ? PROGRAM_ID_V3
+        : isV2 ? PROGRAM_ID_V2 : PROGRAM_ID;
     const program = getProgramForSigner(lender, programId);
 
     // Read actual on-chain balance, parse input against it (handles "max"/"50%"
