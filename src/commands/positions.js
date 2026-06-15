@@ -9,6 +9,7 @@ import {
   countDueWithin,
   formatTimeToDue,
   formatHealthLabel,
+  hasV4MixedCollateral,
 } from "../services/loan-display.js";
 
 async function enrichWithHealth(loan, owedLamports) {
@@ -18,11 +19,23 @@ async function enrichWithHealth(loan, owedLamports) {
       [loan.collateral_mint],
     );
     if (!rows[0]) return null;
-    const currentLamports = await collateralValueLamports(
+    // V4 mixed loans: SPL side is the REMAINING balance (current_collateral_amount),
+    // not the original. After auto_sells fire, the original collateral_amount
+    // overstates the actual SPL still in vault by the converted slices.
+    const splAmountForValue = hasV4MixedCollateral(loan)
+      ? (loan.current_collateral_amount ?? loan.collateral_amount)
+      : loan.collateral_amount;
+    const splLamports = await collateralValueLamports(
       loan.collateral_mint,
-      loan.collateral_amount,
+      splAmountForValue,
       rows[0].decimals,
     );
+    // Add vault SOL to the collateral value — those proceeds are
+    // already SOL, so they're worth lamports 1:1 toward repayment. For
+    // V1/V2/V3 sol_proceeds_amount is always 0 (the column was added
+    // by migration 066 with that default).
+    const vaultSolLamports = Number(loan.sol_proceeds_amount ?? 0);
+    const currentLamports = Number(splLamports) + vaultSolLamports;
     const owed = Number(owedLamports ?? loan.original_loan_amount_lamports);
     const ratio = owed > 0 ? currentLamports / owed : 0;
     return { currentLamports, ratio, decimals: rows[0].decimals };
