@@ -466,66 +466,60 @@ export async function handleCosignBorrow(req) {
           // The user sees a clear error and is forced to refresh.
           const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
           const ixProgramId = magpieIx.programId;
-          // Expected RWA target depends on the live routing flags. V4
-          // supersedes V3 supersedes V2; only the highest-version flag
-          // that's both configured AND flipped takes precedence.
-          let expectedRwaProgram = V2_PROGRAM_ID;
-          let expectedRwaLabel = "V2";
-          if (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) {
-            expectedRwaProgram = V3_PROGRAM_ID;
-            expectedRwaLabel = "V3";
-          }
-          if (V4_PROGRAM_ID && ROUTE_RWA_TO_V4) {
-            expectedRwaProgram = V4_PROGRAM_ID;
-            expectedRwaLabel = "V4";
-          }
-          if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
-            return {
-              status: 400,
-              body: {
-                error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
-              },
-            };
-          }
-          // When V3 is the live RWA target, RWA mints must NOT route to V2
-          // (the legacy RWA pool). Surfaces cache-stale clients that still
-          // pick V2 after the operator flipped the routing flag.
-          if (isRwaMint && expectedRwaProgram && !ixProgramId.equals(expectedRwaProgram)) {
-            return {
-              status: 400,
-              body: {
-                error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again.`,
-              },
-            };
-          }
-          // Memecoin routing mirror. V2 is RWA-only (legacy). V3 is
-          // dual-tier so memecoin → V3 is FINE iff ROUTE_MEMECOINS_TO_V3
-          // is on. V4 is dual-tier too so memecoin → V4 is FINE iff
-          // ROUTE_MEMECOINS_TO_V4 is on. Anything else routing a meme
-          // to an RWA-only pool is the symmetric mistake we refuse.
-          const memeOnV2 = !isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID);
-          const memeOnV3WhenDisabled =
-            !isRwaMint &&
-            V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) &&
-            process.env.ROUTE_MEMECOINS_TO_V3 !== "true";
-          const memeOnV4WhenDisabled =
-            !isRwaMint &&
-            V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID) &&
-            process.env.ROUTE_MEMECOINS_TO_V4 !== "true";
-          const memeOnRwaPool = memeOnV2 || memeOnV3WhenDisabled || memeOnV4WhenDisabled;
-          if (memeOnRwaPool) {
-            const targetedLabel = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID)
-              ? "V4"
-              : V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
-            return {
-              status: 400,
-              body: {
-                error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets ${targetedLabel}.`,
-              },
-            };
+          // V4-exclusive routing (2026-06-15): V4 is the only pool that
+          // services exit-armed borrows, regardless of category. Routing
+          // is exit-arming-driven, not category/flag-driven. So a borrow
+          // tx targeting V4 is valid for ANY category (memecoin OR RWA) —
+          // skip the category gate when the tx is V4. The arm-side gate
+          // (limit-close-arm-core's exits_require_v4_loan refusal) is
+          // what enforces "V4 loans are the only ones that can host
+          // exits"; this endpoint just signs the borrow.
+          const isV4Borrow = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID);
+          if (!isV4Borrow) {
+            // V1/V2/V3 category gates — plain borrows still follow category routing.
+            let expectedRwaProgram = V2_PROGRAM_ID;
+            let expectedRwaLabel = "V2";
+            if (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) {
+              expectedRwaProgram = V3_PROGRAM_ID;
+              expectedRwaLabel = "V3";
+            }
+            if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
+                },
+              };
+            }
+            if (isRwaMint && expectedRwaProgram && !ixProgramId.equals(expectedRwaProgram)) {
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again.`,
+                },
+              };
+            }
+            // Memecoin routing mirror. V2 is RWA-only (legacy). V3 is
+            // dual-tier so memecoin → V3 is FINE iff ROUTE_MEMECOINS_TO_V3
+            // is on. V4 is now exit-armed-only and handled above.
+            const memeOnV2 = !isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID);
+            const memeOnV3WhenDisabled =
+              !isRwaMint &&
+              V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) &&
+              process.env.ROUTE_MEMECOINS_TO_V3 !== "true";
+            const memeOnRwaPool = memeOnV2 || memeOnV3WhenDisabled;
+            if (memeOnRwaPool) {
+              const targetedLabel = V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets ${targetedLabel}.`,
+                },
+              };
+            }
           }
 
           // ── V4 canary borrow cap ──────────────────────────────────

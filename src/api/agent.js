@@ -63,6 +63,7 @@ import {
   PROGRAM_ID_V3,
   PROGRAM_ID_V4,
   chooseProgramIdForCategory,
+  chooseProgramId,
   assertProgramMatchesCategory,
   getProgramForSigner,
 } from "../solana/program.js";
@@ -167,6 +168,13 @@ export async function buildBorrowTx({
   tier,                  // 0 | 1 | 2
   userId,                // already resolved
   mintRow,               // already resolved from supported_mints
+  // V4-exclusive routing (2026-06-15): agents that ALSO plan to arm
+  // an exit (TP / SL / trailing / bracket / ladder) immediately after
+  // funding the loan should pass hasExitArming=true so the borrow
+  // lands on V4. Plain borrows (no exit) take the legacy V1/V2/V3
+  // category routing. Default false to preserve the pre-V4
+  // contract — callers must explicitly opt in to V4 routing.
+  hasExitArming = false,
 }) {
   // Category-aware tier resolution. RWA mints get the higher-LTV
   // schedule out of rwa_loan_tiers; memecoin falls back to TIERS.
@@ -219,7 +227,13 @@ export async function buildBorrowTx({
     };
   }
 
-  const programId = chooseProgramIdForCategory(mintRow.category);
+  // Exit-armed borrows force V4; plain borrows take the category path.
+  let programId;
+  try {
+    programId = chooseProgramId(mintRow.category, { hasExitArming });
+  } catch (err) {
+    return { blocked: true, status: 503, body: { error: "v4_not_available", detail: err.message } };
+  }
   try {
     assertProgramMatchesCategory(programId, mintRow.category);
   } catch (err) {
@@ -423,7 +437,7 @@ export async function handleAgentBuildBorrow(req) {
   }
 
   // ── Validation ──
-  const { borrower_wallet, collateral_mint, collateral_amount, tier } = body ?? {};
+  const { borrower_wallet, collateral_mint, collateral_amount, tier, has_exit_arming } = body ?? {};
   if (!borrower_wallet || !collateral_mint || !collateral_amount || tier == null) {
     return {
       status: 400,
@@ -477,6 +491,7 @@ export async function handleAgentBuildBorrow(req) {
     tier: Number(tier),
     userId,
     mintRow: mint,
+    hasExitArming: has_exit_arming === true,
   });
   if (built.blocked) {
     return { status: built.status, body: built.body };
