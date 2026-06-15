@@ -286,16 +286,43 @@ async function armOrderImpl({
   }
 
   // ── Loan ownership + state ──────────────────────────────────
-  const { rows: [loan] } = await query(
-    `SELECT id, loan_id::text AS loan_id, status,
-            original_loan_amount_lamports::text AS owed,
-            collateral_mint, collateral_amount::text AS coll_amount,
-            collateral_amount::text AS collateral_amount_raw,
-            borrower_wallet, user_id, program_id
-       FROM loans
-      WHERE user_id = $1 AND loan_id = $2`,
-    [userId, loanIdChain],
-  );
+  // Server-side race-tolerant lookup. The pre-borrow ladder path on
+  // the site fires the auto-arm immediately after the borrow tx
+  // confirms — sometimes a few hundred ms before the loan row has
+  // propagated to the loans table (cosign-borrow records inline but
+  // sync-loan is fire-and-forget). The old behaviour was to return
+  // loan_not_found_for_user immediately and rely on the FRONT-END to
+  // retry, but every retry requires a fresh wallet signature — if the
+  // user looks away from the popup, the retries never happen and the
+  // ladder silently dies. Operator hit this on 2026-06-15 with a V4
+  // $TROLL ladder: single audit row, loan_not_found_for_user, ladder
+  // never armed.
+  //
+  // Fix: poll internally for up to ~6 seconds before giving up.
+  // Same envelope, same nonce, no extra wallet prompts. The loan
+  // reliably lands within 1-3s in practice; the longer window covers
+  // RPC blips.
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const LOAN_LOOKUP_INTERVAL_MS = 400;
+  let loan = null;
+  for (;;) {
+    const { rows } = await query(
+      `SELECT id, loan_id::text AS loan_id, status,
+              original_loan_amount_lamports::text AS owed,
+              collateral_mint, collateral_amount::text AS coll_amount,
+              collateral_amount::text AS collateral_amount_raw,
+              borrower_wallet, user_id, program_id
+         FROM loans
+        WHERE user_id = $1 AND loan_id = $2`,
+      [userId, loanIdChain],
+    );
+    if (rows.length > 0) {
+      loan = rows[0];
+      break;
+    }
+    if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
+    await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
+  }
   if (!loan) return { ok: false, error: "loan_not_found_for_user" };
   if (loan.status !== "active") {
     return { ok: false, error: "loan_not_active", detail: loan.status };
