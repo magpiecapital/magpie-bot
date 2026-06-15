@@ -20,6 +20,8 @@ import {
   Keypair,
   Transaction,
   ComputeBudgetProgram,
+  SystemProgram,
+  SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -169,11 +171,19 @@ async function liquidateLoan(program, keeper, loan, pool) {
     const authorityWsolAta = getAssociatedTokenAddressSync(
       NATIVE_MINT, pool.authority, false, TOKEN_PROGRAM_ID,
     );
+    // V4 Wave 5 C1 (2026-06-15): liquidate_loan now also needs
+    // wsol_mint + system_program + rent because sol_proceeds_vault
+    // is `init_if_needed` (so V4 loans whose auto-sell never fired
+    // can still be liquidated — Anchor needs system_program to
+    // allocate, rent to size it).
     v4ExtraAccounts = {
       solProceedsVault: solProceedsVaultPda,
       keeperLoanTokenAccount: keeperWsolAta,
       authorityLoanTokenAccount: authorityWsolAta,
       loanTokenProgram: TOKEN_PROGRAM_ID,
+      wsolMint: NATIVE_MINT,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
     };
     // Create the wSOL ATAs idempotently — keeper pays.
     preIxs.push(
