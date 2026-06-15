@@ -700,7 +700,9 @@ export async function recordLoan({
     console.error("[loans] referral accrual on borrow failed (continuing):", err.message);
   }
 
-  // $MAGPIE holder pool accrual (10% of fee)
+  // $MAGPIE holder pool accrual — 70% of fee post-MGP-001 (the bps is
+  // read from governance_config at accrual time; comment kept current
+  // so future readers don't think this is the legacy 10% share).
   try {
     const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
     if (feeLamports > 0n) {
