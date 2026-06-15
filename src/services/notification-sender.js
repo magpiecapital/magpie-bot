@@ -250,15 +250,32 @@ function renderLimitCloseStalenessNudge(p) {
 function renderLimitCloseNearTrigger(p) {
   const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
   const moveDir  = p.trigger_direction === "below" ? "drops" : "moves up";
-  return [
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const isV4 = !!v4ProgramId && p.engine_program_id === v4ProgramId;
+  const owedSol = p.owed_lamports
+    ? (Number(p.owed_lamports) / 1e9).toFixed(3)
+    : null;
+  const fireAction = isV4
+    ? "the engine will sell that slice on-chain and accumulate the SOL inside your loan"
+    : "the engine will repay the loan and sell your collateral";
+  const lines = [
     `*Your ${dirLabel} is close to firing*`,
     "",
-    `${p.collateral_symbol} is within ~${p.distance_pct}% of your trigger on order #${p.order_id}. If price ${moveDir} a touch more, the engine will repay the loan and sell automatically.`,
+    `${p.collateral_symbol} is within ~${p.distance_pct}% of your trigger on order #${p.order_id}. If price ${moveDir} a touch more, ${fireAction}.`,
+  ];
+  if (isV4 && owedSol) {
+    lines.push(
+      "",
+      `*Heads up:* this loan is on V4 (in-vault auto-sell). When you eventually decide to close, you'll need *~${owedSol} SOL liquid* in your wallet — the sell proceeds accumulate inside the loan and flow back to you at repay, but they don't pre-pay the loan itself.`,
+    );
+  }
+  lines.push(
     "",
     `If your plan changed, you can /modify ${p.order_id} (tighten or widen the trigger) or /cancel ${p.order_id} now. Otherwise sit tight — we've got it.`,
     "",
     `_One-time nudge per arm — you won't see this again until you re-arm or modify._`,
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 function renderEnginePreflightFailed(p) {

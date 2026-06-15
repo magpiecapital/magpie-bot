@@ -64,7 +64,9 @@ async function fetchCandidates() {
             COALESCE(o.trigger_direction, 'above') AS trigger_direction,
             o.armed_at, o.slippage_bps,
             o.sell_destination,
+            o.engine_program_id,
             l.collateral_mint, l.loan_id AS loan_id_chain,
+            l.original_loan_amount_lamports::text AS owed_lamports,
             m.symbol AS collateral_symbol,
             u.telegram_id, u.proactive_dms_disabled
        FROM limit_close_orders o
@@ -123,6 +125,12 @@ async function enqueueNudge(order, distancePct) {
       collateral_symbol: order.collateral_symbol || "your token",
       slippage_bps: order.slippage_bps,
       distance_pct: Math.round(distancePct * 10) / 10, // 1 decimal
+      // V4-aware DM text: the renderer swaps "auto-repay+sell" → "convert
+      // in-vault" wording AND appends a liquid-SOL reminder so the user
+      // can fund the eventual repay. Pass through the program id + the
+      // original owed amount; the renderer derives the message.
+      engine_program_id: order.engine_program_id || null,
+      owed_lamports: order.owed_lamports || null,
     })],
   );
 }
