@@ -319,9 +319,14 @@
         {
           "name": "fee_wallet",
           "docs": [
-            "Fee wallet (same wSOL ATA the borrow-side fee flows to)."
+            "Fee wallet (same wSOL ATA the borrow-side fee flows to).",
+            "Wave 3 (2026-06-15): hardcoded `address` constraint closes the",
+            "V4 audit finding that a compromised engine key could route the",
+            "1% protocol skim to any TokenAccount. Now restricted to the",
+            "canonical Magpie fee wallet only."
           ],
-          "writable": true
+          "writable": true,
+          "address": "3wk75XDABdEEec28c9ES6KdH2V9zh8h76Q8oTitEe4TE"
         },
         {
           "name": "wsol_mint",
@@ -1277,7 +1282,14 @@
         },
         {
           "name": "fee_wallet_token_account",
-          "writable": true
+          "docs": [
+            "Wave 3 (2026-06-15): hardcoded `address` constraint closes the",
+            "V4 audit finding that a borrower could pass their own wSOL ATA",
+            "here as fee_wallet and keep the 1% extension fee. Now restricted",
+            "to the canonical Magpie fee wallet only."
+          ],
+          "writable": true,
+          "address": "3wk75XDABdEEec28c9ES6KdH2V9zh8h76Q8oTitEe4TE"
         },
         {
           "name": "borrower",
@@ -1963,6 +1975,11 @@
       "code": 6026,
       "name": "EngineUnauthorized",
       "msg": "Only the designated engine authority can call convert_collateral_slice. Refusing."
+    },
+    {
+      "code": 6027,
+      "name": "InvalidFeeWallet",
+      "msg": "fee_wallet must equal MAGPIE_FEE_WALLET. The 1% protocol skim is hardcoded to the canonical Magpie fee wallet only."
     }
   ],
   "types": [
