@@ -51,6 +51,16 @@ export const V3_RWA_TIERS = [
   { option: 2, ltv: 70, days: 30, feeBps: 500, label: "70% LTV · 30d · 5% fee (RWA Standard V3)" },
 ];
 
+// V4 inherits V3's dual-tier ladder verbatim — V4 adds the in-vault
+// auto-sell capability without changing the tier economics. Keeping
+// these as separate exports (rather than aliasing V3_RWA_TIERS) so
+// labels can diverge later without affecting V3 borrowers.
+export const V4_RWA_TIERS = [
+  { option: 0, ltv: 50, days: 7,  feeBps: 250, label: "50% LTV · 7d · 2.5% fee (RWA Express V4)" },
+  { option: 1, ltv: 60, days: 15, feeBps: 350, label: "60% LTV · 15d · 3.5% fee (RWA Quick V4)" },
+  { option: 2, ltv: 70, days: 30, feeBps: 500, label: "70% LTV · 30d · 5% fee (RWA Standard V4)" },
+];
+
 // Categories that route to the RWA tier set. Source of truth for the
 // vocabulary lives in src/solana/program.js (RWA_CATEGORIES); we mirror
 // it here to avoid circular imports between solana + services layers.
@@ -64,6 +74,13 @@ function isRwaRoutingToV3() {
   return (
     !!process.env.PROGRAM_ID_V3 &&
     process.env.ROUTE_RWA_TO_V3 === "true"
+  );
+}
+
+function isRwaRoutingToV4() {
+  return (
+    !!process.env.PROGRAM_ID_V4 &&
+    process.env.ROUTE_RWA_TO_V4 === "true"
   );
 }
 
@@ -119,11 +136,15 @@ async function getRwaTiersFromDb() {
  */
 export async function getEligibleTiers({ category }) {
   if (category && RWA_CATEGORIES.has(category)) {
-    // When the env says RWA borrows now route to V3, return the
-    // V3-baked ladder so site + TG picker show the right options.
-    // V2-routed RWA still reads from the DB-tunable rwa_loan_tiers.
+    // Highest-version routing takes precedence:
+    //   V4 (if configured + ROUTE_RWA_TO_V4=true) → V4_RWA_TIERS
+    //   V3 (if configured + ROUTE_RWA_TO_V3=true) → V3_RWA_TIERS
+    //   else                                     → DB-tunable rwa_loan_tiers (V2)
     // Existing loans aren't affected — they keep their own program_id
     // and continue to repay/extend against whatever program issued them.
+    if (isRwaRoutingToV4()) {
+      return V4_RWA_TIERS;
+    }
     if (isRwaRoutingToV3()) {
       return V3_RWA_TIERS;
     }

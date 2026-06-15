@@ -61,6 +61,7 @@ import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
   chooseProgramIdForCategory,
   assertProgramMatchesCategory,
   getProgramForSigner,
@@ -266,13 +267,18 @@ export async function buildBorrowTx({
       ),
     ];
 
-    // V3 takes an extra `category` u8 arg; V1/V2 take 4. See
-    // src/services/loans.js for the symmetric branch on the TG borrow
-    // path. Without this, V3 borrows fail with InstructionDidNotDeserialize.
+    // V3 and V4 take an extra `category` u8 arg (5 args); V1/V2 take 4.
+    // V4 inherits V3's dual-tier instruction shape with the new in-vault
+    // auto-sell semantics layered on top. See src/services/loans.js for
+    // the symmetric branch on the TG borrow path. Without this, V3/V4
+    // borrows fail with InstructionDidNotDeserialize.
     const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
-    const isV3 = process.env.PROGRAM_ID_V3 && programId.toBase58() === process.env.PROGRAM_ID_V3;
+    const programIdB58 = programId.toBase58();
+    const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
+    const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+    const needsCategoryArg = isV3 || isV4;
     const categoryByte = RWA_CATEGORIES.has(mintRow.category) ? 1 : 0;
-    const ixArgs = isV3
+    const ixArgs = needsCategoryArg
       ? [new BN(collateralAmountRaw), Number(tier), new BN(collateralValLamports.toString()), loanId, categoryByte]
       : [new BN(collateralAmountRaw), Number(tier), new BN(collateralValLamports.toString()), loanId];
     const ix = await program.methods

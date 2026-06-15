@@ -35,6 +35,7 @@ import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import {
   markLoanRepaid,
@@ -164,7 +165,7 @@ export async function handleSyncLoan(req) {
       if (RETRY_DELAYS_MS[attempt] > 0) {
         await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
       }
-      for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean)) {
+      for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4].filter(Boolean)) {
         try {
           const prog = getReadOnlyProgram(candidate);
           onChainNew = await prog.account.loan.fetch(loanPk);

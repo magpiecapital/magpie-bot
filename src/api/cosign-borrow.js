@@ -65,6 +65,15 @@ const V3_PROGRAM_ID = process.env.PROGRAM_ID_V3
   : null;
 const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
 
+// V4 program — adds in-vault auto-sell. Once routing flips, the site builds
+// borrow txs targeting this program; including it here prevents the same
+// 403 cosign rejection class we hit on V3 launch day.
+const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4
+  ? new PublicKey(process.env.PROGRAM_ID_V4)
+  : null;
+const ROUTE_MEMECOINS_TO_V4 = process.env.ROUTE_MEMECOINS_TO_V4 === "true";
+const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
+
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
 // Strict allowlist of instruction discriminators we'll co-sign for the
@@ -96,6 +105,7 @@ const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
   V1_PROGRAM_ID.toBase58(),
   ...(V2_PROGRAM_ID ? [V2_PROGRAM_ID.toBase58()] : []),
   ...(V3_PROGRAM_ID ? [V3_PROGRAM_ID.toBase58()] : []),
+  ...(V4_PROGRAM_ID ? [V4_PROGRAM_ID.toBase58()] : []),
   "ComputeBudget111111111111111111111111111111",
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
@@ -145,6 +155,7 @@ function isMagpieProgram(programIdPk) {
   if (programIdPk.equals(V1_PROGRAM_ID)) return true;
   if (V2_PROGRAM_ID && programIdPk.equals(V2_PROGRAM_ID)) return true;
   if (V3_PROGRAM_ID && programIdPk.equals(V3_PROGRAM_ID)) return true;
+  if (V4_PROGRAM_ID && programIdPk.equals(V4_PROGRAM_ID)) return true;
   return false;
 }
 
@@ -455,13 +466,19 @@ export async function handleCosignBorrow(req) {
           // The user sees a clear error and is forced to refresh.
           const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
           const ixProgramId = magpieIx.programId;
-          // Expected RWA target depends on the live routing flag: when
-          // ROUTE_RWA_TO_V3 is on AND V3 is configured, RWA borrows must
-          // use V3; otherwise V2 (legacy) is the canonical RWA pool.
-          const expectedRwaProgram = (V3_PROGRAM_ID && ROUTE_RWA_TO_V3)
-            ? V3_PROGRAM_ID
-            : V2_PROGRAM_ID;
-          const expectedRwaLabel = (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) ? "V3" : "V2";
+          // Expected RWA target depends on the live routing flags. V4
+          // supersedes V3 supersedes V2; only the highest-version flag
+          // that's both configured AND flipped takes precedence.
+          let expectedRwaProgram = V2_PROGRAM_ID;
+          let expectedRwaLabel = "V2";
+          if (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) {
+            expectedRwaProgram = V3_PROGRAM_ID;
+            expectedRwaLabel = "V3";
+          }
+          if (V4_PROGRAM_ID && ROUTE_RWA_TO_V4) {
+            expectedRwaProgram = V4_PROGRAM_ID;
+            expectedRwaLabel = "V4";
+          }
           if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
             return {
               status: 400,
@@ -483,14 +500,25 @@ export async function handleCosignBorrow(req) {
               },
             };
           }
-          // Also refuse if a memecoin tries to borrow against V2 or V3 (the
-          // symmetric mistake — both are RWA-only, fee economics differ).
-          const memeOnRwaPool =
+          // Memecoin routing mirror. V2 is RWA-only (legacy). V3 is
+          // dual-tier so memecoin → V3 is FINE iff ROUTE_MEMECOINS_TO_V3
+          // is on. V4 is dual-tier too so memecoin → V4 is FINE iff
+          // ROUTE_MEMECOINS_TO_V4 is on. Anything else routing a meme
+          // to an RWA-only pool is the symmetric mistake we refuse.
+          const memeOnV2 = !isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID);
+          const memeOnV3WhenDisabled =
             !isRwaMint &&
-            ((V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID)) ||
-              (V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID)));
+            V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) &&
+            process.env.ROUTE_MEMECOINS_TO_V3 !== "true";
+          const memeOnV4WhenDisabled =
+            !isRwaMint &&
+            V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID) &&
+            process.env.ROUTE_MEMECOINS_TO_V4 !== "true";
+          const memeOnRwaPool = memeOnV2 || memeOnV3WhenDisabled || memeOnV4WhenDisabled;
           if (memeOnRwaPool) {
-            const targetedLabel = V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
+            const targetedLabel = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID)
+              ? "V4"
+              : V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
             return {
               status: 400,
               body: {
