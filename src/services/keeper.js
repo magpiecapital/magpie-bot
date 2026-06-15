@@ -143,6 +143,49 @@ async function liquidateLoan(program, keeper, loan, pool) {
     collateralTokenProgram,
   );
 
+  // V4-aware liquidation (2026-06-15): V4's liquidate_loan needs 4
+  // extra accounts to distribute the mixed collateral (SPL + accumulated
+  // SOL in sol_proceeds_vault). Without these, every V4 overdue loan
+  // fails with AccountNotEnoughKeys and stays uncollected.
+  const isV4 = PROGRAM_ID_V4 && program.programId.equals(PROGRAM_ID_V4);
+  let v4ExtraAccounts = {};
+  let preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+  ];
+  if (isV4) {
+    const { NATIVE_MINT } = await import("@solana/spl-token");
+    const { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction } =
+      await import("@solana/spl-token");
+    const [solProceedsVaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("sol-proceeds"), loanPubkey.toBuffer()],
+      program.programId,
+    );
+    // wSOL ATAs for keeper + authority. SOL pot bounty goes to keeper,
+    // residual to authority.
+    const keeperWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, keeper.publicKey, false, TOKEN_PROGRAM_ID,
+    );
+    const authorityWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, pool.authority, false, TOKEN_PROGRAM_ID,
+    );
+    v4ExtraAccounts = {
+      solProceedsVault: solProceedsVaultPda,
+      keeperLoanTokenAccount: keeperWsolAta,
+      authorityLoanTokenAccount: authorityWsolAta,
+      loanTokenProgram: TOKEN_PROGRAM_ID,
+    };
+    // Create the wSOL ATAs idempotently — keeper pays.
+    preIxs.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        keeper.publicKey, keeperWsolAta, keeper.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID,
+      ),
+      createAssociatedTokenAccountIdempotentInstruction(
+        keeper.publicKey, authorityWsolAta, pool.authority, NATIVE_MINT, TOKEN_PROGRAM_ID,
+      ),
+    );
+  }
+
   const tx = await program.methods
     .liquidateLoan()
     .accounts({
@@ -154,11 +197,9 @@ async function liquidateLoan(program, keeper, loan, pool) {
       authorityCollateralAccount: authorityCollateralAta.address,
       keeper: keeper.publicKey,
       tokenProgram: collateralTokenProgram,
+      ...v4ExtraAccounts,
     })
-    .preInstructions([
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-    ])
+    .preInstructions(preIxs)
     .rpc({ commitment: "confirmed" });
 
   return { success: true, txSig: tx };
