@@ -181,6 +181,7 @@ import { startWalletAttributionSentinel } from "./services/wallet-attribution-se
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
 import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
+import { startLimitCloseFirstV4FireWatcher } from "./services/limit-close-first-v4-fire-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -925,6 +926,10 @@ bot.start({
     // operator hears about a broken executeRepayLoanV3 path BEFORE more
     // orders pile up. Closes the V3-engine-readiness gap from the audit.
     setTimeout(() => startLimitCloseFirstV3FireWatcher(bot), 150_000);
+    // First-V4-fire watcher (2026-06-15) — V4 fires via convert_collateral_slice
+    // which is a brand-new path. Same celebrate/alert two-prong model
+    // as V3; closes the V4-engine-readiness gap from the Wave 4 audit.
+    setTimeout(() => startLimitCloseFirstV4FireWatcher(bot), 150_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
