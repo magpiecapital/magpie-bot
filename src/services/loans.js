@@ -433,6 +433,26 @@ export async function executeRepay({ userId, loanDbRow }) {
     ),
   ];
 
+  // V4 Wave 5 C1 (2026-06-15): V4's repayLoan now requires the
+  // sol_proceeds_vault + wsol_mint + system_program + rent accounts so
+  // it can `init_if_needed` the vault for loans whose auto-sell never
+  // fired. Without these the V4 repay tx fails AccountNotEnoughKeys.
+  // V1/V2/V3 paths unchanged.
+  const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+  let v4ExtraAccounts = {};
+  if (isV4) {
+    const [solProceedsVault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+      programId,
+    );
+    v4ExtraAccounts = {
+      solProceedsVault,
+      wsolMint: NATIVE_MINT,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    };
+  }
+
   const sig = await program.methods
     .repayLoan()
     .accounts({
@@ -446,6 +466,7 @@ export async function executeRepay({ userId, loanDbRow }) {
       borrower: borrower.publicKey,
       tokenProgram: collateralTokenProgram,
       loanTokenProgram,
+      ...v4ExtraAccounts,
     })
     .preInstructions(preIxs)
     .postInstructions(postIxs)
