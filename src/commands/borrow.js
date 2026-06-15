@@ -947,7 +947,10 @@ export function registerBorrowCallbacks(bot) {
       console.warn("[borrow] armConfiguredExits threw:", err.message);
       return [{ ok: false, label: "Auto-arm", error: "internal_error" }];
     });
-    const exitsSummary = renderExitsSummary(exitArmResults);
+    // exitsSummary used to be embedded in the borrow card — removed
+    // 2026-06-15 per operator's "bad look" feedback. The per-leg
+    // outcomes now ride on the limit_close_armed / limit_close_arm_failed
+    // DM pipeline (migration 068) instead.
     const allLegsArmed = exitArmResults.length > 0 && exitArmResults.every((r) => r.ok);
     const anyExitFailed = exitArmResults.some((r) => !r.ok);
 
@@ -1006,10 +1009,14 @@ export function registerBorrowCallbacks(bot) {
       `Term: ${tier.days} days at ${tier.ltv}% LTV`,
       "",
       `[View tx](https://solscan.io/tx/${result.signature})`,
-      exitsSummary ? "" : null,
-      exitsSummary,
-      anyExitFailed ? "" : null,
-      anyExitFailed ? "*One of your auto-sells didn't go through — tap a button below to set a default, or use /takeprofit / /stoploss to retry the exact target.*" : null,
+      // Per-leg arm results intentionally NOT shown on the borrow card —
+      // operator's 2026-06-15 directive: "I thought we GOT RID of that
+      // Profit Leg disclaimer at the bottom. It's a bad look." Failed
+      // legs are surfaced in their own `limit_close_arm_failed` DM via
+      // the audit pipeline (migration 068), and successful ones in the
+      // existing `limit_close_armed` DM — both arrive within seconds.
+      // The borrow card stays clean. Retry buttons below still appear
+      // when an exit didn't land, so users have a single-tap recovery.
       "",
       allLegsArmed
         ? "/positions to check status · /limitorders to manage auto-sells"
@@ -1035,11 +1042,7 @@ export function registerBorrowCallbacks(bot) {
       `Loan #${result.loanId}`,
       "",
       `Tx: https://solscan.io/tx/${result.signature}`,
-      exitsSummary ? "" : null,
-      // Strip markdown stars from the summary for the plain-text version.
-      exitsSummary ? exitsSummary.replace(/\*/g, "") : null,
-      anyExitFailed ? "" : null,
-      anyExitFailed ? "One of your auto-sells didn't go through — tap a button below to set a default, or use /takeprofit / /stoploss to retry the exact target." : null,
+      // Same omission as the Markdown card — leg results go via DM.
       "",
       allLegsArmed
         ? "Run /positions to check status, /limitorders to manage auto-sells."
