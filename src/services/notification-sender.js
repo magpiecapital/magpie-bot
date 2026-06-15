@@ -95,6 +95,55 @@ function renderLimitCloseArmed(p) {
   ].filter((s) => s !== null).join("\n");
 }
 
+/**
+ * V4 fire DM — fundamentally different message from legacy fire.
+ *
+ * Legacy V1/V3 fire: engine repaid loan + sold collateral + sent SOL to
+ * user wallet. Loan closed.
+ *
+ * V4 fire: engine converted slice_bps × original collateral in-vault.
+ * Loan STAYS ACTIVE. SOL accumulates in per-loan sol_proceeds_vault.
+ * User claims at repay (vault SOL + remaining SPL flow back atomically).
+ *
+ * Critical UX: don't tell the V4 user their loan closed. It didn't.
+ * Pip + dashboard + this DM all need to consistently teach the in-vault
+ * model.
+ */
+function renderLimitCloseV4Fired(p) {
+  const agentLine = agentAttribution(p);
+  const dirLabel = p.trigger_direction === "below"
+    ? "stop-loss"
+    : p.trigger_direction === "above"
+      ? "take-profit"
+      : "auto-sell";
+  const slicePct = p.slice_bps ? (p.slice_bps / 100).toFixed(0) : null;
+  const netSol = fmtSol(p.sol_received_net);
+  const feeSol = fmtSol(p.protocol_fee);
+  const cumSol = fmtSol(p.total_sol_proceeds);
+  const remainingSpl = p.remaining_collateral
+    ? `${p.remaining_collateral} raw (left in vault)`
+    : null;
+  const lines = [
+    `*${dirLabel.toUpperCase()} fired — V4 in-vault sale* (order #${p.order_id})`,
+    "",
+    slicePct
+      ? `Sold ${slicePct}% of original collateral. SOL deposited *inside your loan*, not your wallet.`
+      : `Slice sold. SOL deposited *inside your loan*, not your wallet.`,
+    "",
+    `*This leg:*  +${netSol} SOL (fee ${feeSol} · 1%)`,
+    `*Vault total (cumulative):*  ${cumSol} SOL`,
+    p.auto_sells_fired ? `*Auto-sells fired so far:*  ${p.auto_sells_fired}` : null,
+    p.tx_signature ? `[View tx](https://solscan.io/tx/${p.tx_signature})` : null,
+    "",
+    `Loan stays *Active* — you decide when to close. When you /repay, the vault SOL flows back to your wallet *along with* any remaining collateral, in the same tx.`,
+    "",
+    `_Heads up: V4 repay needs ~owed-amount liquid SOL in your wallet to fund the close. The vault SOL flows back in the same tx but doesn't pre-pay the loan._`,
+    agentLine ? "" : null,
+    agentLine,
+  ].filter((s) => s !== null);
+  return lines.join("\n");
+}
+
 function renderLimitCloseFired(p) {
   const agentLine = agentAttribution(p);
   // Headline switches by direction so the user immediately knows whether
@@ -299,6 +348,7 @@ function renderEnginePreflightFailed(p) {
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
   limit_close_fired:           renderLimitCloseFired,
+  limit_close_v4_fired:        renderLimitCloseV4Fired,
   limit_close_failed:          renderLimitCloseFailed,
   limit_close_cancelled:       renderLimitCloseCancelled,
   limit_close_action_required: renderLimitCloseActionRequired,
