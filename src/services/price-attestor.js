@@ -211,15 +211,38 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
  * keeps RPC cost in check.
  */
 async function fetchMintsToAttest() {
+  // 2026-06-15: V4 pre-warm requirement.
+  //
+  // The legacy attestor only kept feeds fresh for mints backing active
+  // loans + protected mints — everything else relied on JIT attest at
+  // borrow time. That model works for V1/V3 (single sample sufficient
+  // at borrow time) but BREAKS V4: V4's TWAP gate needs 8 samples
+  // accumulated over 5 minutes before the first borrow can land.
+  //
+  // For V4 to feel instant on ANY enabled mint, we keep the V4 feed
+  // continuously warm for every enabled mint. The legacy V1/V3 attest
+  // still gates on active-loan/protected — we don't want to burn
+  // attestation SOL on mints that won't be borrowed.
+  //
+  // Returns: { mint, decimals, needsLegacyAttest }
+  //   - needsLegacyAttest=true → write V1/V3 (category default) feed
+  //   - all rows → write V4 feed (caller iterates V4 inside its own
+  //                              gate based on PROGRAM_ID_V4 presence)
   const r = await query(
-    `SELECT DISTINCT sm.mint, sm.decimals
+    `SELECT sm.mint, sm.decimals,
+            (sm.protected = TRUE OR EXISTS(
+              SELECT 1 FROM loans l
+               WHERE l.collateral_mint = sm.mint
+                 AND l.status = 'active'
+            )) AS needs_legacy_attest
        FROM supported_mints sm
-       LEFT JOIN loans l
-              ON l.collateral_mint = sm.mint AND l.status = 'active'
-      WHERE sm.enabled = TRUE
-        AND (l.id IS NOT NULL OR sm.protected = TRUE)`,
+      WHERE sm.enabled = TRUE`,
   );
-  return r.rows.map((row) => ({ mint: row.mint, decimals: row.decimals }));
+  return r.rows.map((row) => ({
+    mint: row.mint,
+    decimals: row.decimals,
+    needsLegacyAttest: row.needs_legacy_attest,
+  }));
 }
 
 /**
@@ -234,6 +257,10 @@ export function startPriceAttestor(intervalMs = 30_000) {
 
   const lastPrices = new Map();
   const lastAttestAt = new Map();
+  // V4-specific tracking. Without separate timing, a legacy attest
+  // would refresh `lastAttestAt` and the V4 pre-warm would think the
+  // V4 feed is fresh too — leaving the V4 PDA stale.
+  const lastAttestAtV4 = new Map();
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
   // feed timestamp never crosses the contract's 120s staleness limit.
   const MAX_GAP_MS = 60_000;
@@ -280,7 +307,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
     }
 
     let initsThisTick = 0;
-    for (const { mint, decimals } of tokens) {
+    for (const { mint, decimals, needsLegacyAttest } of tokens) {
       const priceSol = priceMap.get(mint);
       if (!priceSol) continue; // no Jupiter coverage — skip silently
 
@@ -292,9 +319,11 @@ export function startPriceAttestor(intervalMs = 30_000) {
         // Skip ONLY if drift is small AND we attested recently enough
         // to keep the on-chain feed fresh.
         const drift = lastPrice > 0 ? Math.abs(priceLamports - lastPrice) / lastPrice : 1;
-        if (drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS) continue;
+        const driftSkip = drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS;
 
-        try {
+        // Legacy V1/V3 attest — only for mints that need it (active loan
+        // or protected). Skip otherwise to save SOL on tx fees.
+        if (needsLegacyAttest && !driftSkip) try {
           const result = await attestPrice(mint, decimals, priceSol);
           lastPrices.set(mint, priceLamports);
           lastAttestAt.set(mint, Date.now());
@@ -318,27 +347,34 @@ export function startPriceAttestor(intervalMs = 30_000) {
           }
         }
 
-        // 2026-06-15: V4 pre-warm. V4's price_feed PDA is distinct from
-        // V1/V3 (same "price_v3" seed but different program ID gives a
-        // different PDA). V4 borrows hit a TWAP gate requiring 5 min of
-        // continuous price history — first-time-on-V4 mints would fail
-        // with StalePriceAttestation or TwapInsufficientHistory unless
-        // we keep V4 feeds fresh continuously in parallel with the
-        // category default. Drip-feed inits use the same per-tick cap.
+        // 2026-06-15: V4 pre-warm — runs for EVERY enabled mint (not
+        // just active-loan ones). V4's price_feed PDA is distinct, V4
+        // borrows hit a TWAP gate requiring 5 min of continuous price
+        // history. Keeping every enabled mint's V4 feed fresh means
+        // any V4 borrow can land instantly without a JIT warmup wait.
+        //
+        // Cost-aware: only writes when sample is > 60s old, mirroring
+        // legacy MAX_GAP_MS. With ~50 enabled mints + 1 write/mint/min,
+        // that's ~1.4 SOL/day at current priority fees — acceptable for
+        // the UX win.
         try {
           const { PROGRAM_ID_V4 } = await import("../solana/program.js");
           if (PROGRAM_ID_V4) {
-            try {
-              await attestPrice(mint, decimals, priceSol, PROGRAM_ID_V4);
-            } catch (v4Err) {
-              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(v4Err.message || "")) {
-                if (initsThisTick < MAX_INITS_PER_TICK) {
-                  await initializePriceFeed(mint, PROGRAM_ID_V4);
-                  initsThisTick++;
-                  console.log(`[PriceAttestor] Auto-initialized V4 feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
+            const sinceV4 = Date.now() - (lastAttestAtV4.get(mint) || 0);
+            if (sinceV4 >= MAX_GAP_MS) {
+              try {
+                await attestPrice(mint, decimals, priceSol, PROGRAM_ID_V4);
+                lastAttestAtV4.set(mint, Date.now());
+              } catch (v4Err) {
+                if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(v4Err.message || "")) {
+                  if (initsThisTick < MAX_INITS_PER_TICK) {
+                    await initializePriceFeed(mint, PROGRAM_ID_V4);
+                    initsThisTick++;
+                    console.log(`[PriceAttestor] Auto-initialized V4 feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
+                  }
+                } else {
+                  console.warn(`[PriceAttestor] V4 attest failed for ${mint.slice(0, 8)}...: ${v4Err.message?.slice(0, 100)}`);
                 }
-              } else {
-                console.warn(`[PriceAttestor] V4 attest failed for ${mint.slice(0, 8)}...: ${v4Err.message?.slice(0, 100)}`);
               }
             }
           }
