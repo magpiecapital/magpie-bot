@@ -190,6 +190,28 @@ async function armConfiguredExits({ userId, loanIdChain, collateralMint, exits }
       }
       return results;
     }
+    case "custom_ladder": {
+      // User-built ladder. exits.legs is an array of
+      //   { parsedStrike, sliceBps, direction }
+      // Direction is uniform across legs (validated at submit time —
+      // mixed-direction ladders are rejected before this point). sidePrefix
+      // tracks the first leg's direction for label rendering.
+      const direction = exits.legs[0]?.direction || "above";
+      const sidePrefix = direction === "above" ? "Profit" : "Stop";
+      const results = [];
+      for (let i = 0; i < exits.legs.length; i++) {
+        const leg = exits.legs[i];
+        const r = await armSingle({
+          label: `${sidePrefix} step ${i + 1} @ ${leg.parsedStrike.normalizedDisplay} (${(leg.sliceBps / 100).toFixed(0)}%)`,
+          direction: leg.direction,
+          parsedStrike: leg.parsedStrike,
+          sliceBps: leg.sliceBps,
+        });
+        results.push(r);
+        if (!r.ok) break;
+      }
+      return results;
+    }
     default:
       return [];
   }
@@ -580,6 +602,7 @@ export function registerBorrowCallbacks(bot) {
       .text("Custom loss limit", "borrow:exits:custom_sl").row()
       .text("Profit ladder (stages up)", "borrow:exits:ladder_tp").row()
       .text("Loss ladder (stages down)", "borrow:exits:ladder_sl").row()
+      .text("Build my own ladder", "borrow:exits:custom_ladder").row()
       .text("Skip — set later", "borrow:exits:skip").row()
       .text("← Change tier", "borrow:exits:retier").text("✕ Cancel", "borrow:cancel");
     await ctx.editMessageText(
@@ -1125,6 +1148,182 @@ export function registerBorrowCallbacks(bot) {
     };
     await ctx.answerCallbackQuery();
     await executeBorrowWithExits(ctx, state);
+  });
+
+  // ── Custom ladder builder (TG version) ───────────────────────────
+  // Operator wants users to type their own multi-step ladder rather
+  // than picking from presets. Flow:
+  //   1. User taps "Build my own ladder" in the exits menu.
+  //   2. Bot prompts for a multi-line message: "<target> <slice%>"
+  //      per line, e.g.  17M 70  /  20M 20  /  25M 10
+  //   3. User sends one message. Bot parses, validates, shows a
+  //      confirmation card with the parsed ladder and Confirm /
+  //      Cancel buttons.
+  //   4. On Confirm we set state.exits.custom_ladder and proceed to
+  //      executeBorrowWithExits.
+  // Validation rejects: empty lines, unparseable strikes, slices not
+  // in (0,100], sum > 100, mixed direction (legs disagree on
+  // above/below).
+  bot.callbackQuery("borrow:exits:custom_ladder", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.stage = "await_custom_ladder_input";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      [
+        `*Build your own ladder for ${escapeMd(state.selected.symbol)}*`,
+        "",
+        "Type your ladder as one line per step. Each line is two parts: the price/MC target, then the % of your collateral to sell at that step.",
+        "",
+        "*Example for selling on the way up:*",
+        "```",
+        "17M 70",
+        "20M 20",
+        "25M 10",
+        "```",
+        "",
+        "*Example for selling on the way down:*",
+        "```",
+        "0.85x 30",
+        "0.7x 40",
+        "0.5x 30",
+        "```",
+        "",
+        "Up to 6 steps. Total sell % must be 100 or less. All steps must go the same direction (all up, or all down).",
+        "",
+        "Send your ladder in one message, or tap *Back* to pick a different option.",
+      ].join("\n"),
+      {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard().text("← Back", "borrow:exits:back"),
+      },
+    );
+  });
+
+  // Parses a multi-line ladder message. Returns { ok: true, legs }
+  // or { ok: false, error }.
+  function parseCustomLadderMessage(raw) {
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length === 0) {
+      return { ok: false, error: "no steps — type at least one line." };
+    }
+    if (lines.length > 6) {
+      return { ok: false, error: `up to 6 steps allowed (got ${lines.length}).` };
+    }
+    const legs = [];
+    let firstDirection = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Split into tokens; the LAST token is the slice%, everything
+      // before is the strike. Lets users write "17M MC 70%" or
+      // "17 million 70".
+      const tokens = line.split(/\s+/);
+      if (tokens.length < 2) {
+        return { ok: false, error: `step ${i + 1}: need both target and sell % (e.g. \`17M 70\`).` };
+      }
+      const sliceToken = tokens.pop().replace(/%$/, "");
+      const sliceNum = Number(sliceToken);
+      if (!Number.isFinite(sliceNum) || sliceNum <= 0 || sliceNum > 100) {
+        return { ok: false, error: `step ${i + 1}: sell % must be 1–100 (got "${sliceToken}").` };
+      }
+      const strikeText = tokens.join(" ");
+      const parsed = parseStrike(strikeText, {});
+      if (!parsed.ok) {
+        return { ok: false, error: `step ${i + 1}: couldn't read target "${strikeText}" — ${parsed.error || "try again"}.` };
+      }
+      const dir = parsed.impliedDirection || "above";
+      if (firstDirection === null) firstDirection = dir;
+      else if (dir !== firstDirection) {
+        return { ok: false, error: `step ${i + 1}: direction mismatch — all steps must go the same way (got "${dir}" after "${firstDirection}").` };
+      }
+      legs.push({
+        strikeText,
+        parsedStrike: parsed,
+        sliceBps: Math.round(sliceNum * 100),
+        direction: dir,
+      });
+    }
+    const totalSliceBps = legs.reduce((s, l) => s + l.sliceBps, 0);
+    if (totalSliceBps > 10000) {
+      return { ok: false, error: `total sell % is ${(totalSliceBps / 100).toFixed(0)}% — must be 100% or less.` };
+    }
+    return { ok: true, legs };
+  }
+
+  bot.on("message:text", async (ctx, next) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || state.stage !== "await_custom_ladder_input") return next();
+    const parsed = parseCustomLadderMessage(ctx.message.text);
+    if (!parsed.ok) {
+      return ctx.reply(
+        `Couldn't read that ladder: ${parsed.error}\n\nSend it again, or use /borrow to start over.`,
+        { parse_mode: "Markdown" },
+      );
+    }
+    // Stash the parsed ladder into pending state for the confirm
+    // callback. parsedStrike has BigInt fields which are fine for
+    // in-memory but won't survive process restart — that matches the
+    // rest of pending state's lifecycle (in-memory per chat).
+    state.pendingCustomLadder = parsed.legs;
+    state.stage = "await_custom_ladder_confirm";
+    pending.set(ctx.chat.id, state);
+    const sidePrefix = parsed.legs[0].direction === "above" ? "Profit" : "Stop";
+    const lines = parsed.legs.map((leg, i) =>
+      `Step ${i + 1}: ${escapeMd(leg.parsedStrike.normalizedDisplay)} → sell *${(leg.sliceBps / 100).toFixed(0)}%*`,
+    );
+    const totalPct = parsed.legs.reduce((s, l) => s + l.sliceBps, 0) / 100;
+    await ctx.reply(
+      [
+        `*${sidePrefix} ladder for ${escapeMd(state.selected.symbol)}*`,
+        "",
+        ...lines,
+        "",
+        `Total: *${totalPct.toFixed(0)}%* of your collateral.`,
+        "",
+        "Each step pays the protocol fee on its own re-borrow, so a 3-step ladder costs roughly 3× the fee of a single exit. Confirm to proceed.",
+      ].join("\n"),
+      {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text("✓ Use this ladder", "borrow:exits:custom_ladder:confirm")
+          .text("Edit", "borrow:exits:custom_ladder:redo")
+          .row()
+          .text("✕ Cancel", "borrow:cancel"),
+      },
+    );
+  });
+
+  bot.callbackQuery("borrow:exits:custom_ladder:confirm", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier || !state.pendingCustomLadder) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.exits = { type: "custom_ladder", legs: state.pendingCustomLadder };
+    delete state.pendingCustomLadder;
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await executeBorrowWithExits(ctx, state);
+  });
+
+  bot.callbackQuery("borrow:exits:custom_ladder:redo", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    delete state.pendingCustomLadder;
+    state.stage = "await_custom_ladder_input";
+    pending.set(ctx.chat.id, state);
+    await ctx.answerCallbackQuery();
+    await ctx.reply(
+      "Send your ladder again — one line per step, format `<target> <sell%>`.",
+      { parse_mode: "Markdown" },
+    );
   });
 
   bot.callbackQuery("borrow:exits:back", async (ctx) => {
