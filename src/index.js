@@ -112,6 +112,7 @@ import {
   handlePause,
   handleResume,
   handleAdminStatus,
+  handleV4Status,
   handleEnableMint,
   handleDisableMint,
   handleBroadcast,
@@ -182,6 +183,7 @@ import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js"
 import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
 import { startLimitCloseFirstV4FireWatcher } from "./services/limit-close-first-v4-fire-watcher.js";
+import { startV4FireFailureRateWatcher } from "./services/limit-close-v4-fire-failure-rate-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -273,6 +275,7 @@ bot.command("mydistributions", handleDistributions); // alias
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
+bot.command(["v4status", "v4-status", "v4"], handleV4Status);
 bot.command(["admincmds", "adminlog"], handleAdminCmds);
 // Limit-close engine observability (operator-facing). Read-only.
 {
@@ -930,6 +933,12 @@ bot.start({
     // which is a brand-new path. Same celebrate/alert two-prong model
     // as V3; closes the V4-engine-readiness gap from the Wave 4 audit.
     setTimeout(() => startLimitCloseFirstV4FireWatcher(bot), 150_000);
+    // V4 fire-failure RATE watcher — complements the first-fire one-shot
+    // by tracking ongoing failure rates per mint and engine-wide. Alerts
+    // when 3+ failures hit one mint or 5+ across all mints in a 1h window.
+    // First-fire watcher catches "V4 wired up?" — this one catches "V4
+    // is wired but something is silently failing repeatedly."
+    setTimeout(() => startV4FireFailureRateWatcher(bot), 180_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Conditional-borrow watcher — fires agent intents when their
