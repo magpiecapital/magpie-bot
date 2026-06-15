@@ -1,0 +1,41 @@
+name: Shared imports check
+
+# Catches the class of bug that took prod down on 2026-06-15: a bare
+# `PROGRAM_ID_V4` reference inside loans.js executeRepay() that wasn't
+# in the file's imports block. `node --check` doesn't catch it because
+# it only validates syntax — the missing binding throws ReferenceError
+# at runtime when the function body actually executes (i.e., when a
+# user hits /repay).
+#
+# This workflow runs a static check that scans for bare references to
+# PROGRAM_ID / PROGRAM_ID_V2 / V3 / V4 across src/ and ensures each
+# file that uses one also imports it from solana/program.js.
+#
+# Extend by editing TRACKED_SYMBOLS in the script.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shared-imports-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: none
+      actions: none
+      checks: none
+      deployments: none
+      packages: none
+      pull-requests: none
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: scripts/check-shared-imports.mjs
+        run: node scripts/check-shared-imports.mjs
