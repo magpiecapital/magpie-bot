@@ -227,18 +227,22 @@ export async function buildBorrowTx({
     };
   }
 
-  // Exit-armed borrows route by Token-2022 vs classic SPL:
-  //   - classic SPL (memecoins) + exit → V4 (in-vault model)
-  //   - Token-2022 (RWA tokens) + exit → V3 (legacy fire-and-close)
-  // V4 currently fails repay simulation for Token-2022 collateral
-  // (operator loan 763, 2026-06-15). Until V4 is patched non-
-  // invasively, Token-2022 + exit lives on V3.
+  // Exit-armed borrows force V4. Token-2022 + exits is BLOCKED until
+  // V4.x ships (operator-mandated V4 in-vault thesis 2026-06-15 PM —
+  // no V3 fallback because V3 uses the legacy fire-and-close model
+  // that the V4 thesis exists to replace). Plain borrows take the
+  // category path normally.
   const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
   const isToken2022 = mintRow.token_program === TOKEN_2022_PROGRAM_ID.toBase58();
   let programId;
   try {
     programId = chooseProgramId(mintRow.category, { hasExitArming, isToken2022 });
   } catch (err) {
+    // Distinguish the deliberate Token-2022 block (422 — caller should
+    // retry without the exit, not later) from v4-not-deployed (503).
+    if (err.message?.startsWith("TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED")) {
+      return { blocked: true, status: 422, body: { error: "token2022_exit_blocked", detail: err.message } };
+    }
     return { blocked: true, status: 503, body: { error: "v4_not_available", detail: err.message } };
   }
   try {
