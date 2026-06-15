@@ -190,6 +190,19 @@ function humanizeFailureReason(reason) {
       return "Some TWAP chunks filled, but the window expired before completing the rest. Check /positions for the partial state.";
     case "wallet_changed_during_twap":
       return "The wallet changed mid-TWAP. We stopped the slicing to protect remaining collateral.";
+    // V4-specific reasons (2026-06-15) — surface human copy instead of
+    // raw codes so V4 users aren't staring at v4_cross_source_*.
+    case "v4_quote_failed":
+      return "Jupiter routing for that slice failed — usually transient. We'll auto-retry on the next tick. No action needed.";
+    case "v4_cross_source_disagreement_at_fire_quote":
+      return "Two price sources disagreed at fire time, so we held off as a safety check. Likely a brief Jupiter routing imbalance. We'll re-check on the next tick.";
+    case "v4_cross_source_recheck_failed":
+      return "Couldn't get a clean cross-source price read at fire time. We're fail-closed on this — won't fire against a single source. Will retry shortly.";
+    case "v4_engine_program_id_mismatch":
+      return "The order's engine config doesn't match the loan's program — we refused to fire to avoid hitting the wrong pool. This needs operator review.";
+    case "v4_convert_failed":
+    case "v4_convert_failed_persistent":
+      return "The in-vault convert tx itself failed on-chain. Most often this is a slippage cap that's tighter than current market conditions. Widen the slippage or wait for a calmer window.";
     default:
       return null; // unknown — caller falls back to raw reason line
   }
