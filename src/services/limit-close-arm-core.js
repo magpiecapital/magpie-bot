@@ -251,6 +251,47 @@ export async function armOrder({
     return { ok: false, error: "loan_below_minimum_size" };
   }
 
+  // ── V4-exclusive exits gate (2026-06-15) ─────────────────────
+  // The operator design intent for V4: it is the ONLY pool whose
+  // engine fire path keeps the loan ACTIVE and accumulates SOL in the
+  // per-loan vault via convert_collateral_slice. V1/V2/V3 cannot
+  // service exits going forward — their fire path closes the loan
+  // and pays out immediately, which is the OLD model V4 supersedes.
+  //
+  // New arms against V1/V2/V3 loans are refused so users don't get
+  // a misleading "armed" status on a loan whose engine path doesn't
+  // match the in-vault model. They have to repay + re-borrow with
+  // the exit attached at borrow time so the new loan lands on V4.
+  //
+  // Existing V1/V2/V3 loans that ALREADY have armed orders keep
+  // firing through their legacy path — we don't break in-flight
+  // users mid-flight. This check only refuses NEW arms.
+  //
+  // V4_EXIT_EXCLUSIVE_ENFORCE env gates the rollout: set to "true"
+  // to enforce, anything else (or unset) keeps legacy arming. Lets
+  // the operator stage the cut-over without a code redeploy.
+  if (process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true") {
+    const v4ProgramIdStr = process.env.PROGRAM_ID_V4 ?? null;
+    if (!v4ProgramIdStr) {
+      // Defensive: enforce-on without V4 deployed would silently break
+      // every arm. Refuse with a clear message instead.
+      return {
+        ok: false,
+        error: "v4_not_configured",
+        detail: "V4_EXIT_EXCLUSIVE_ENFORCE is on but PROGRAM_ID_V4 isn't set on this host. Either deploy V4 first, or unset V4_EXIT_EXCLUSIVE_ENFORCE.",
+      };
+    }
+    if (loan.program_id && loan.program_id !== v4ProgramIdStr) {
+      return {
+        ok: false,
+        error: "exits_require_v4_loan",
+        detail:
+          "Exits live in V4 (in-vault auto-sell). This loan is on a legacy pool and can't be armed. " +
+          "To use an exit: /repay this loan, then re-open the borrow with the exit set at borrow time — the new loan lands on V4 automatically.",
+      };
+    }
+  }
+
   // ── Collateral allowlist ────────────────────────────────────
   const { rows: [mintRow] } = await query(
     `SELECT enabled, category, symbol, liquidity_usd FROM supported_mints WHERE mint = $1`,
