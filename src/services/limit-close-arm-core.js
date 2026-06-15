@@ -378,7 +378,25 @@ async function armOrderImpl({
         detail: "V4_EXIT_EXCLUSIVE_ENFORCE is on but PROGRAM_ID_V4 isn't set on this host. Either deploy V4 first, or unset V4_EXIT_EXCLUSIVE_ENFORCE.",
       };
     }
-    if (loan.program_id && loan.program_id !== v4ProgramIdStr) {
+    // 2026-06-15: Token-2022 collateral (SPCX etc.) fails V4 repay
+    // simulation due to a V4 program bug we can't redeploy around.
+    // Token-2022 + exit-armed borrows now route to V3 instead, so
+    // V3 loans with Token-2022 collateral MUST be allowed to arm.
+    // Detect by collateral_mint's token program owner.
+    let isToken2022 = false;
+    try {
+      const { getMintTokenProgram } = await import("./loans.js");
+      const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+      const mintProgram = await getMintTokenProgram(loan.collateral_mint);
+      isToken2022 = mintProgram.equals(TOKEN_2022_PROGRAM_ID);
+    } catch (err) {
+      console.warn("[arm-core] token-program check failed (defaulting to V4-only):", err.message);
+    }
+    if (
+      loan.program_id &&
+      loan.program_id !== v4ProgramIdStr &&
+      !isToken2022
+    ) {
       return {
         ok: false,
         error: "exits_require_v4_loan",

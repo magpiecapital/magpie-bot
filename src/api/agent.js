@@ -227,10 +227,17 @@ export async function buildBorrowTx({
     };
   }
 
-  // Exit-armed borrows force V4; plain borrows take the category path.
+  // Exit-armed borrows route by Token-2022 vs classic SPL:
+  //   - classic SPL (memecoins) + exit → V4 (in-vault model)
+  //   - Token-2022 (RWA tokens) + exit → V3 (legacy fire-and-close)
+  // V4 currently fails repay simulation for Token-2022 collateral
+  // (operator loan 763, 2026-06-15). Until V4 is patched non-
+  // invasively, Token-2022 + exit lives on V3.
+  const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+  const isToken2022 = mintRow.token_program === TOKEN_2022_PROGRAM_ID.toBase58();
   let programId;
   try {
-    programId = chooseProgramId(mintRow.category, { hasExitArming });
+    programId = chooseProgramId(mintRow.category, { hasExitArming, isToken2022 });
   } catch (err) {
     return { blocked: true, status: 503, body: { error: "v4_not_available", detail: err.message } };
   }

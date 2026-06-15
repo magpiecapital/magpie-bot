@@ -361,8 +361,32 @@ export async function handleSiteLimitCloseList(req, url) {
   // the ineligibility BEFORE the user signs an envelope that would
   // just bounce. Operator hit this on 2026-06-15 with $KINS and $PUMP
   // V1 loans that still showed the "Set upside auto-sell" CTA.
+  //
+  // 2026-06-15 PM: Token-2022 collateral exception. SPCX-class loans
+  // can't repay on V4 due to a program bug we can't redeploy around,
+  // so Token-2022 + exit-armed borrows route to V3. V3 loans with
+  // Token-2022 collateral must be ELIGIBLE for new arms here too.
   const v4EnforceOn = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
   const v4ProgramIdStr = process.env.PROGRAM_ID_V4 ?? null;
+  // Pre-fetch token-program for each collateral mint so the per-loan
+  // check below is sync-friendly. One query, multi-row, indexed.
+  const token2022ByMint = new Set();
+  if (v4EnforceOn && loans.length > 0) {
+    try {
+      const mints = [...new Set(loans.map((l) => l.collateral_mint).filter(Boolean))];
+      const { rows: mintRows } = await query(
+        `SELECT mint, token_program FROM supported_mints WHERE mint = ANY($1::text[])`,
+        [mints],
+      );
+      const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+      const t22 = TOKEN_2022_PROGRAM_ID.toBase58();
+      for (const r of mintRows) {
+        if (r.token_program === t22) token2022ByMint.add(r.mint);
+      }
+    } catch (err) {
+      console.warn("[site-limit-close] token-program lookup failed (defaulting to V4-only):", err.message);
+    }
+  }
 
   const annotated = loans.map((l) => {
     const baseReasons = [];
@@ -371,7 +395,17 @@ export async function handleSiteLimitCloseList(req, url) {
     // V4 enforcement: non-V4 loans can't take new exits. NOTE: this
     // intentionally does NOT touch already-armed orders — those keep
     // firing through their legacy path. Only blocks NEW arms.
-    if (v4EnforceOn && v4ProgramIdStr && l.program_id && l.program_id !== v4ProgramIdStr) {
+    //
+    // Exception: Token-2022 collateral routes to V3 (not V4) because
+    // of the V4 + sol_proceeds_vault init bug. V3 loans with
+    // Token-2022 collateral can be armed normally.
+    if (
+      v4EnforceOn &&
+      v4ProgramIdStr &&
+      l.program_id &&
+      l.program_id !== v4ProgramIdStr &&
+      !token2022ByMint.has(l.collateral_mint)
+    ) {
       baseReasons.push("exits_require_v4_loan");
     }
     // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible
