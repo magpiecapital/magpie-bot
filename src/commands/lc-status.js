@@ -135,7 +135,8 @@ async function showFired(ctx) {
     `SELECT lc.id, lc.loan_id, l.collateral_mint, sm.symbol,
             COALESCE(lc.trigger_direction, 'above') AS dir,
             lc.status, lc.fired_at, lc.tx_signature_repay, lc.tx_signature_swap,
-            lc.proceeds_lamports::text AS proceeds, lc.fee_lamports::text AS fee,
+            lc.proceeds_lamports::text AS proceeds,
+            (lc.proceeds_lamports - COALESCE(lc.net_to_user_lamports, lc.proceeds_lamports))::text AS fee,
             lc.source
        FROM limit_close_orders lc
        JOIN loans l ON l.id = lc.loan_id

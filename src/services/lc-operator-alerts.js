@@ -62,7 +62,12 @@ async function tick(bot) {
             COALESCE(lc.trigger_direction, 'above') AS dir,
             lc.status, lc.fired_at, lc.updated_at,
             lc.tx_signature_repay, lc.tx_signature_swap,
-            lc.proceeds_lamports::text AS proceeds, lc.fee_lamports::text AS fee,
+            lc.proceeds_lamports::text AS proceeds,
+            -- fee_lamports column doesn't exist on limit_close_orders.
+            -- Derive: fee = proceeds - net_to_user (1% protocol take).
+            -- NULL-safe via COALESCE so partial-fired rows without
+            -- net_to_user yet still report fee as NULL instead of NaN.
+            (lc.proceeds_lamports - COALESCE(lc.net_to_user_lamports, lc.proceeds_lamports))::text AS fee,
             lc.failure_reason, lc.failure_count,
             lc.source, lc.source_agent_pubkey
        FROM limit_close_orders lc
