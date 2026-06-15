@@ -813,18 +813,30 @@ export function registerBorrowCallbacks(bot) {
     // actually stale. Contract requires <120s; we use a 60s threshold to
     // leave headroom for the borrow tx to land before the contract clock
     // rejects it. Most repeat-borrows skip the attestation entirely.
+    //
+    // V4-aware (2026-06-15): exit-armed borrows land on V4 (regardless
+    // of category), so attest V4's PriceHistory PDA when the wizard
+    // selected any exit. Otherwise attest the category default (V1/V3).
+    // Without this, V4 borrows surface as "Account state mismatch"
+    // because V4's price_feed PDA was never initialized.
+    const hasExitArmingForAttest = !!(state.exits && state.exits.type && state.exits.type !== "skip");
+    let attestProgramId = null;
+    if (hasExitArmingForAttest) {
+      const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+      if (PROGRAM_ID_V4) attestProgramId = PROGRAM_ID_V4;
+    }
     const FRESH_THRESHOLD_SEC = 60;
-    const feedAge = await getPriceFeedAgeSeconds(state.selected.mint);
+    const feedAge = await getPriceFeedAgeSeconds(state.selected.mint, attestProgramId);
     const needsAttest = feedAge === null || feedAge > FRESH_THRESHOLD_SEC;
 
     if (needsAttest) {
       try {
-        await attestPrice(state.selected.mint, state.selected.decimals);
+        await attestPrice(state.selected.mint, state.selected.decimals, undefined, attestProgramId);
       } catch (attestErr) {
         if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
           try {
-            await initializePriceFeed(state.selected.mint);
-            await attestPrice(state.selected.mint, state.selected.decimals);
+            await initializePriceFeed(state.selected.mint, attestProgramId);
+            await attestPrice(state.selected.mint, state.selected.decimals, undefined, attestProgramId);
           } catch (initErr) {
             pending.delete(ctx.chat.id);
             await say(
@@ -836,7 +848,7 @@ export function registerBorrowCallbacks(bot) {
           // Solana congestion ate the attestation tx. Re-check the feed
           // age — if a previous attest got close enough to land, we may
           // already be within the contract's 120s window.
-          const recheckAge = await getPriceFeedAgeSeconds(state.selected.mint);
+          const recheckAge = await getPriceFeedAgeSeconds(state.selected.mint, attestProgramId);
           if (recheckAge !== null && recheckAge < 110) {
             // Close enough — proceed with the borrow anyway.
           } else {

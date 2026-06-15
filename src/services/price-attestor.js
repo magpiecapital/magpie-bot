@@ -81,19 +81,20 @@ function loadLenderKeypair() {
  * on the wire — which would cause this function to declare the feed
  * "fresh" even when V3's on-chain freshness window has expired.
  */
-export async function getPriceFeedAgeSeconds(mintStr) {
+export async function getPriceFeedAgeSeconds(mintStr, programIdOverride = null) {
   try {
     const mintPk = new PublicKey(mintStr);
     const category = await resolveCategory(mintStr);
-    const programId = chooseProgramIdForCategory(category);
+    const programId = programIdOverride || chooseProgramIdForCategory(category);
     const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
     const [priceFeed] = priceFeedPda(mintPk, pool, programId);
     const info = await connection.getAccountInfo(priceFeed);
     if (!info) return null;
-    const { PROGRAM_ID_V3 } = await import("../solana/program.js");
+    const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
     const isV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
+    const isV4 = PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
     let ts;
-    if (isV3) {
+    if (isV3 || isV4) {
       // PriceHistory layout — minimum is disc+mint+pool+authority+
       // head+count+padding = 104, plus at least one 16-byte sample.
       if (info.data.length < 120) return null;
@@ -120,10 +121,17 @@ export async function getPriceFeedAgeSeconds(mintStr) {
 /**
  * Initialize a price feed PDA for a given mint. Idempotent — returns
  * { alreadyExists: true } if the PDA is already on chain.
+ *
+ * `programIdOverride` (optional, 2026-06-15): bypass category routing
+ * and initialize a price feed against a specific program ID. Required
+ * for V4 — exit-armed borrows land on V4 regardless of category, so
+ * the V4 price_feed PDA must be initialized in PARALLEL with the
+ * category default. Without this V4 borrows fail with "Account state
+ * mismatch" at on-chain price validation.
  */
-export async function initializePriceFeed(mintStr) {
+export async function initializePriceFeed(mintStr, programIdOverride = null) {
   const category = await resolveCategory(mintStr);
-  const programId = chooseProgramIdForCategory(category);
+  const programId = programIdOverride || chooseProgramIdForCategory(category);
   const lender = loadLenderKeypair();
   const program = getProgramForSigner(lender, programId);
   const mintPk = new PublicKey(mintStr);
@@ -155,10 +163,14 @@ export async function initializePriceFeed(mintStr) {
  * If `priceSolOverride` is provided, uses it; otherwise fetches from Jupiter.
  * Callers attesting many tokens at once should batch-fetch via
  * getPricesInSolBatch and pass the per-mint price to avoid rate limits.
+ *
+ * `programIdOverride` (optional, 2026-06-15): bypass category routing
+ * and attest against a specific program. Needed for V4 — see
+ * initializePriceFeed for the rationale.
  */
-export async function attestPrice(mintStr, decimals, priceSolOverride) {
+export async function attestPrice(mintStr, decimals, priceSolOverride, programIdOverride = null) {
   const category = await resolveCategory(mintStr);
-  const programId = chooseProgramIdForCategory(category);
+  const programId = programIdOverride || chooseProgramIdForCategory(category);
   const lender = loadLenderKeypair();
   const program = getProgramForSigner(lender, programId);
   const mintPk = new PublicKey(mintStr);
