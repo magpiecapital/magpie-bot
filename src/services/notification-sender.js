@@ -464,6 +464,18 @@ async function tick(bot) {
               }
               kb.row().url("Open dashboard", "https://www.magpie.capital/dashboard");
               extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_v4_fired") {
+              // V4 fire — single tx (convert_collateral_slice). User's
+              // primary action is to either keep waiting (more legs may
+              // fire) or repay now to claim the vault SOL. Give them a
+              // tap to verify the tx + a path to the loan management UI.
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard();
+              if (row.payload?.tx_signature) {
+                kb.url("View tx", `https://solscan.io/tx/${row.payload.tx_signature}`);
+              }
+              kb.row().url("Open loan", "https://www.magpie.capital/dashboard");
+              extra = { reply_markup: kb };
             }
             await bot.api.sendMessage(Number(u.telegram_id), text, {
               parse_mode: "Markdown",
