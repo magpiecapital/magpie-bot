@@ -78,7 +78,24 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier, { all
     return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
   const { getPriceInUsdCrossSourced } = await import("./price.js");
-  const currentUsd = await getPriceInUsdCrossSourced(collateralMint);
+  // getPriceInUsdCrossSourced THROWS on cross-source disagreement,
+  // single-source-only responses, and total fetcher failures. The
+  // trailing-stop arm path (and any multiplier arm) calls this — if
+  // it throws and we don't catch, the route handler emits a generic
+  // 500 with no useful detail. Operator hit this on 2026-06-15
+  // trying to set a trailing SL while Jupiter was rate-limited.
+  // Catch the throw, return a structured ok:false so the caller can
+  // emit a 502 with the actual reason.
+  let currentUsd;
+  try {
+    currentUsd = await getPriceInUsdCrossSourced(collateralMint);
+  } catch (err) {
+    return {
+      ok: false,
+      error: "price_unavailable",
+      detail: (err?.message || String(err)).slice(0, 240),
+    };
+  }
   if (!currentUsd || currentUsd <= 0) {
     return { ok: false, error: "Couldn't fetch current USD price right now — try again or use an explicit price target." };
   }
