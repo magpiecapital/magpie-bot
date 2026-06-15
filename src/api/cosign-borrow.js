@@ -521,6 +521,43 @@ export async function handleCosignBorrow(req) {
               };
             }
           }
+
+          // ── V4 canary borrow cap ──────────────────────────────────
+          // During the V4 canary phase the operator funds the pool with
+          // a small amount (e.g., 1 SOL) and sets V4_BORROW_CAP_LAMPORTS
+          // as a belt-and-suspenders ceiling on top of pool liquidity.
+          // Once on-chain pool.totalBorrowed reaches the cap, the bot
+          // refuses to cosign additional V4 borrows. Removed (env unset)
+          // after the operator promotes V4 past canary.
+          if (V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID) && process.env.V4_BORROW_CAP_LAMPORTS) {
+            try {
+              const cap = BigInt(process.env.V4_BORROW_CAP_LAMPORTS);
+              const { getReadOnlyProgram } = await import("../solana/program.js");
+              const v4Program = getReadOnlyProgram(V4_PROGRAM_ID);
+              const [v4PoolPda] = PublicKey.findProgramAddressSync(
+                [Buffer.from("pool"), new PublicKey(process.env.LENDER_PUBKEY).toBuffer()],
+                V4_PROGRAM_ID,
+              );
+              const v4Pool = await v4Program.account.lendingPool.fetch(v4PoolPda);
+              const totalBorrowed = BigInt(v4Pool.totalBorrowed.toString());
+              if (totalBorrowed >= cap) {
+                console.warn(`[cosign-borrow] V4 canary cap reached: totalBorrowed=${totalBorrowed} >= cap=${cap}`);
+                return {
+                  status: 503,
+                  body: {
+                    error: "v4_canary_cap_reached",
+                    detail: `V4 pool has reached the operator-set canary borrow cap. New V4 borrows are paused until the cap is raised. V1/V2/V3 are unaffected.`,
+                  },
+                };
+              }
+            } catch (capErr) {
+              // Fail-open here — if we can't fetch pool state at borrow
+              // time, the pool's own liquidity check is still the hard
+              // backstop (you can't borrow what isn't there). Log so
+              // ops can see it.
+              console.warn(`[cosign-borrow] V4 cap check failed (allowing borrow): ${capErr.message}`);
+            }
+          }
           // ── LTV ladder resolution (category-aware) ─────────────────
           // 2026-06-13 root cause: this endpoint previously hardcoded the
           // memecoin ladder `{0:30, 1:25, 2:20}` for every borrow, regardless
