@@ -110,22 +110,43 @@ export async function handlePriceRefresh(req) {
     };
   }
 
-  // If the background attestor (or a recent JIT) made the feed
-  // fresh enough already, skip the on-chain tx entirely. Common
-  // case for popular mints — the attestor ticks every 30s.
+  // 2026-06-15: V4 borrows hit V4's distinct price_feed PDA, which has
+  // its own freshness requirement. The previous refresh path only
+  // touched the category-default program (V1 for memecoin, V3 for RWA),
+  // so V4 feeds went stale → site-side simulation failed with
+  // StalePriceAttestation before the user could even sign. Refresh
+  // BOTH the category-default AND the V4 feed (when V4 is configured).
+  // Cost: 1 extra tx (~0.000005 SOL) per refresh — cheap insurance.
+  let { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  const refreshV4 = !!PROGRAM_ID_V4;
+
   let ageSec = null;
+  let ageSecV4 = null;
   try {
     const { getPriceFeedAgeSeconds } = await import("../services/price-attestor.js");
     ageSec = await getPriceFeedAgeSeconds(mintStr);
+    if (refreshV4) {
+      try {
+        ageSecV4 = await getPriceFeedAgeSeconds(mintStr, PROGRAM_ID_V4);
+      } catch (e) {
+        console.warn(`[price/refresh] V4 age read failed for ${mintStr}:`, e.message?.slice(0, 100));
+      }
+    }
   } catch (err) {
-    // Treat as stale if we can't read the feed — JIT will create + attest.
     console.warn(`[price/refresh] age read failed for ${mintStr}:`, err.message?.slice(0, 100));
   }
 
-  if (ageSec !== null && ageSec <= FRESH_THRESHOLD_SEC) {
+  const defaultFresh = ageSec !== null && ageSec <= FRESH_THRESHOLD_SEC;
+  const v4Fresh = !refreshV4 || (ageSecV4 !== null && ageSecV4 <= FRESH_THRESHOLD_SEC);
+
+  if (defaultFresh && v4Fresh) {
     return {
       status: 200,
-      body: { ok: true, mint: mintStr, attested: false, feed_age_seconds: ageSec, reason: "already_fresh" },
+      body: {
+        ok: true, mint: mintStr, attested: false,
+        feed_age_seconds: ageSec, feed_age_seconds_v4: ageSecV4,
+        reason: "already_fresh",
+      },
     };
   }
 
@@ -135,18 +156,23 @@ export async function handlePriceRefresh(req) {
   let attestPromise;
   try {
     const mod = await import("../services/price-attestor.js");
-    attestPromise = (async () => {
+    const attestFor = async (programIdOverride) => {
       try {
-        return await mod.attestPrice(mintStr, Number(mintRow.decimals));
+        return await mod.attestPrice(mintStr, Number(mintRow.decimals), undefined, programIdOverride);
       } catch (err) {
-        // If the feed account doesn't exist yet, init + attest.
-        // Matches the same fallback cosign-borrow does for JIT.
         if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
-          await mod.initializePriceFeed(mintStr);
-          return await mod.attestPrice(mintStr, Number(mintRow.decimals));
+          await mod.initializePriceFeed(mintStr, programIdOverride);
+          return await mod.attestPrice(mintStr, Number(mintRow.decimals), undefined, programIdOverride);
         }
         throw err;
       }
+    };
+    attestPromise = (async () => {
+      // Attest the category-default feed FIRST so legacy borrows are
+      // covered even if V4 has a transient issue.
+      const defaultResult = defaultFresh ? null : await attestFor(null);
+      const v4Result = !refreshV4 || v4Fresh ? null : await attestFor(PROGRAM_ID_V4);
+      return { defaultResult, v4Result };
     })();
   } catch (err) {
     return {
@@ -185,10 +211,12 @@ export async function handlePriceRefresh(req) {
     body: {
       ok: true,
       mint: mintStr,
-      attested: true,
-      signature: result.signature,
-      price_sol: result.priceSol,
+      attested: !!(result.defaultResult || result.v4Result),
+      signature: result.defaultResult?.signature ?? null,
+      signature_v4: result.v4Result?.signature ?? null,
+      price_sol: result.defaultResult?.priceSol ?? result.v4Result?.priceSol ?? null,
       previous_age_seconds: ageSec,
+      previous_age_seconds_v4: ageSecV4,
     },
   };
 }
