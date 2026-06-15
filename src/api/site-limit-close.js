@@ -291,6 +291,7 @@ export async function handleSiteLimitCloseList(req, url) {
             l.collateral_mint, l.collateral_amount::text AS collateral_amount,
             l.original_loan_amount_lamports::text AS owed_lamports,
             l.start_timestamp, l.due_timestamp,
+            l.program_id,
             sm.symbol AS collateral_symbol, sm.decimals AS collateral_decimals,
             sm.category AS collateral_category, sm.enabled AS collateral_enabled
        FROM loans l
@@ -353,10 +354,26 @@ export async function handleSiteLimitCloseList(req, url) {
   const armedBelowByLoan = new Set(
     orders.filter((o) => o.status === "armed" && o.trigger_direction === "below").map((o) => Number(o.loan_id)),
   );
+  // V4-exclusive enforcement: when V4_EXIT_EXCLUSIVE_ENFORCE=true (the
+  // operator-stated policy posture as of 2026-06-15), only loans that
+  // landed on the V4 program can be armed with new exits. Mirrors the
+  // arm-core gate (`exits_require_v4_loan`) so the dashboard renders
+  // the ineligibility BEFORE the user signs an envelope that would
+  // just bounce. Operator hit this on 2026-06-15 with $KINS and $PUMP
+  // V1 loans that still showed the "Set upside auto-sell" CTA.
+  const v4EnforceOn = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+  const v4ProgramIdStr = process.env.PROGRAM_ID_V4 ?? null;
+
   const annotated = loans.map((l) => {
     const baseReasons = [];
     if (BigInt(l.owed_lamports) < MIN_LOAN_LAMPORTS) baseReasons.push("loan_below_minimum_size");
     if (!l.collateral_enabled) baseReasons.push("collateral_not_enabled");
+    // V4 enforcement: non-V4 loans can't take new exits. NOTE: this
+    // intentionally does NOT touch already-armed orders — those keep
+    // firing through their legacy path. Only blocks NEW arms.
+    if (v4EnforceOn && v4ProgramIdStr && l.program_id && l.program_id !== v4ProgramIdStr) {
+      baseReasons.push("exits_require_v4_loan");
+    }
     // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible
     // for limit-close. Engine's V2 fill path landed in PR B; arm-core
     // applies a weekend-aware initial-slippage bump for thin RWA routes.
