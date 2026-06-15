@@ -1,5 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
-import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
+import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4 } from "../solana/program.js";
 import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
@@ -86,12 +86,19 @@ export async function handleStats(ctx) {
         console.warn("[stats] V3 pool read failed:", err.message);
       }
     }
+    let v4 = null;
+    if (PROGRAM_ID_V4) {
+      try { v4 = await fetchPoolSnapshot(PROGRAM_ID_V4); }
+      catch (err) {
+        console.warn("[stats] V4 pool read failed:", err.message);
+      }
+    }
 
-    const totalDeposits = v1.totalDeposits + (v2?.totalDeposits ?? 0n) + (v3?.totalDeposits ?? 0n);
-    const totalFeesEarned = v1.totalFeesEarned + (v2?.totalFeesEarned ?? 0n) + (v3?.totalFeesEarned ?? 0n);
-    const totalLoansIssued = v1.totalLoansIssued + (v2?.totalLoansIssued ?? 0n) + (v3?.totalLoansIssued ?? 0n);
-    const totalLiquidations = v1.totalLiquidations + (v2?.totalLiquidations ?? 0n) + (v3?.totalLiquidations ?? 0n);
-    const totalVaultUi = (v1.vaultUiSol ?? 0) + (v2?.vaultUiSol ?? 0) + (v3?.vaultUiSol ?? 0);
+    const totalDeposits = v1.totalDeposits + (v2?.totalDeposits ?? 0n) + (v3?.totalDeposits ?? 0n) + (v4?.totalDeposits ?? 0n);
+    const totalFeesEarned = v1.totalFeesEarned + (v2?.totalFeesEarned ?? 0n) + (v3?.totalFeesEarned ?? 0n) + (v4?.totalFeesEarned ?? 0n);
+    const totalLoansIssued = v1.totalLoansIssued + (v2?.totalLoansIssued ?? 0n) + (v3?.totalLoansIssued ?? 0n) + (v4?.totalLoansIssued ?? 0n);
+    const totalLiquidations = v1.totalLiquidations + (v2?.totalLiquidations ?? 0n) + (v3?.totalLiquidations ?? 0n) + (v4?.totalLiquidations ?? 0n);
+    const totalVaultUi = (v1.vaultUiSol ?? 0) + (v2?.vaultUiSol ?? 0) + (v3?.vaultUiSol ?? 0) + (v4?.vaultUiSol ?? 0);
 
     const { rows: counts } = await query(
       `SELECT
@@ -281,7 +288,7 @@ export async function handleStats(ctx) {
       row("Repaid", String(r.repaid)),
       row("Liquidated", totalLiquidations.toString()),
       ``,
-      `POOL${(v2 || v3) ? ` (${["V1", v2 ? "V2" : null, v3 ? "V3" : null].filter(Boolean).join("+")})` : ""}`,
+      `POOL${(v2 || v3 || v4) ? ` (${["V1", v2 ? "V2" : null, v3 ? "V3" : null, v4 ? "V4" : null].filter(Boolean).join("+")})` : ""}`,
       row("LP deposited", `${totalDepositsSol} SOL`),
       row("Fees earned", `${totalFeesSol} SOL`),
       vaultSol ? row("Vault", `${vaultSol} wSOL`) : row("Vault", "—"),

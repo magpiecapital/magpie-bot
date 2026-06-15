@@ -263,9 +263,13 @@ export async function executeBorrow({
   // borrower seeing "InstructionDidNotDeserialize" (operator hit this
   // on 2026-06-14 borrowing SPCX from TG).
   const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
-  const isV3 = process.env.PROGRAM_ID_V3 && programId.toBase58() === process.env.PROGRAM_ID_V3;
+  const programIdB58 = programId.toBase58();
+  const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
+  const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+  // V3 and V4 both take the 5-arg shape (extra `category` u8).
+  const needsCategoryArg = isV3 || isV4;
   const categoryByte = RWA_CATEGORIES.has(category) ? 1 : 0;
-  const ixArgs = isV3
+  const ixArgs = needsCategoryArg
     ? [
         new BN(collateralAmountRaw.toString()),
         loanOption,
