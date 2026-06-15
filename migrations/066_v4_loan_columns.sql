@@ -53,5 +53,3 @@ UPDATE loans
 CREATE INDEX IF NOT EXISTS loans_auto_sells_fired_idx
   ON loans (auto_sells_fired)
   WHERE auto_sells_fired > 0;
-</content>
-</invoke>
