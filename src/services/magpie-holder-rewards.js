@@ -132,10 +132,12 @@ function loadLenderKeypair() {
 }
 
 /**
- * Add 10% of a loan fee to the holder reward pool. Idempotent NOT
- * guaranteed — caller must ensure they call once per fee event. Safe
- * to call from inside the loan-recording try/catch (errors don't
- * propagate up to the user-facing flow).
+ * Add the holder-share fraction of a loan fee to the holder reward
+ * pool. Fraction is read from governance_config at call time —
+ * currently 70% post-MGP-001 (ratified 2026-06-13), previously 10%.
+ * Idempotent NOT guaranteed — caller must ensure they call once per
+ * fee event. Safe to call from inside the loan-recording try/catch
+ * (errors don't propagate up to the user-facing flow).
  */
 /**
  * Credit a pre-computed lamport amount directly to the holder pool.

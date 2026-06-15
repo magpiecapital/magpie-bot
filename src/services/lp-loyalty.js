@@ -1,9 +1,12 @@
 /**
  * LP Loyalty Bonus Pool.
  *
- * Mechanic:
- *   - 2% of every loan fee accrues to the lp_loyalty_pool (source: the
- *     protocol's 5% slice — LPs keep their full 80% base yield).
+ * Mechanic (post-MGP-001 ratified 2026-06-13):
+ *   - 10% of every loan fee accrues to the lp_loyalty_pool. This IS
+ *     the LP yield stream — there is no separate "base 80% share"
+ *     anymore. The fee split is now 70% holders / 10% LP loyalty /
+ *     10% referrer / 10% protocol reserve, with 0% retained in the
+ *     lending pool itself.
  *   - Each LP's "weight" at snapshot time = current shares × seconds
  *     since their weighted_deposit_at (the time-weighted average of
  *     their deposit moments).
