@@ -633,6 +633,7 @@ async function handleLoans(req, url) {
 
   const { rows: allUserRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
+            l.current_collateral_amount, l.sol_proceeds_amount, l.auto_sells_fired,
             l.loan_amount_lamports, l.original_loan_amount_lamports,
             l.actual_received_lamports,
             l.ltv_percentage, l.duration_days,
@@ -675,6 +676,13 @@ async function handleLoans(req, url) {
       image: l.image_url || null,
       category: l.category || "memecoin",
       amount: l.collateral_amount?.toString?.() ?? null,
+      // V4 mixed-collateral fields. For V1/V2/V3 (and V4 loans before
+      // any auto-sell fires) current_amount equals amount, sol_proceeds
+      // is "0", and auto_sells_fired is 0 — site can branch on
+      // auto_sells_fired > 0 to render the mixed display.
+      current_amount: (l.current_collateral_amount ?? l.collateral_amount)?.toString?.() ?? null,
+      sol_proceeds_lamports: (l.sol_proceeds_amount ?? 0)?.toString?.() ?? "0",
+      auto_sells_fired: Number(l.auto_sells_fired ?? 0),
     },
     loan: {
       // Legacy field (kept for back-compat with existing site code):
@@ -713,8 +721,19 @@ async function handleLoans(req, url) {
         const owed = await getLiveOwedLamports(r).catch(() => BigInt(r.original_loan_amount_lamports ?? "0"));
         if (!owed || owed <= 0n) return [r.loan_id, null];
         if (r.decimals == null) return [r.loan_id, null];
-        const cVal = await collateralValueLamports(r.collateral_mint, r.collateral_amount, r.decimals);
-        if (!cVal || cVal <= 0n) return [r.loan_id, null];
+        // V4 mixed: use REMAINING SPL for the price lookup, then add
+        // already-realized SOL proceeds 1:1 to the value. For V1/V2/V3
+        // both branches collapse to the same expression (current ===
+        // amount, sol_proceeds === 0).
+        const isMixed = Number(r.auto_sells_fired ?? 0) > 0;
+        const splAmount = isMixed
+          ? (r.current_collateral_amount ?? r.collateral_amount)
+          : r.collateral_amount;
+        const splVal = await collateralValueLamports(r.collateral_mint, splAmount, r.decimals);
+        const cVal = (splVal && splVal > 0n)
+          ? splVal + BigInt(r.sol_proceeds_amount ?? 0)
+          : BigInt(r.sol_proceeds_amount ?? 0);
+        if (cVal <= 0n) return [r.loan_id, null];
         const ratio = Number(cVal) / Number(owed);
         return [r.loan_id, Number.isFinite(ratio) ? Number(ratio.toFixed(3)) : null];
       } catch {

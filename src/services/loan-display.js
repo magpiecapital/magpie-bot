@@ -79,6 +79,21 @@ function fmtSol(lamports, dp = 2) {
 }
 
 /**
+ * V4 mixed-collateral detector — returns true if any auto-sell has
+ * already converted part of the SPL collateral to SOL inside the loan
+ * vault. Pure V1/V2/V3 loans (and V4 loans before their first auto-sell)
+ * keep auto_sells_fired = 0, so this discriminator stays accurate
+ * regardless of program_id.
+ *
+ * The migration backfilled `current_collateral_amount = collateral_amount`
+ * for every existing row, so the SPL-side display falls back cleanly to
+ * the original amount when no auto-sell has fired.
+ */
+export function hasV4MixedCollateral(loan) {
+  return Number(loan?.auto_sells_fired ?? 0) > 0;
+}
+
+/**
  * Inline-button label for action menus (repay / topup / partialrepay /
  * extend). Constraint: stays under ~42 chars so Telegram doesn't
  * truncate on mobile.
@@ -129,13 +144,36 @@ export function formatLoanCard(loan, opts = {}) {
   const timeStr = formatTimeToDueLong(loan.due_timestamp);
   const idxStr = position != null ? `${position}. ` : "";
 
-  const collateralAmountStr = formatTokenAmount(
-    loan.collateral_amount,
-    loan.decimals ?? 9,
-  );
-  const collateralValueStr = collateralValueLamports != null
-    ? ` (worth ${fmtSol(collateralValueLamports, 3)} SOL)`
-    : "";
+  // V4 mixed-collateral rendering: when any auto-sell has fired, the
+  // collateral is split between the remaining SPL (current_collateral_amount)
+  // and accumulated SOL proceeds in the vault (sol_proceeds_amount,
+  // lamports). The user gets BOTH back at repay time, so the value line
+  // must reflect both legs.
+  let collateralAmountStr;
+  let collateralValueStr;
+  if (hasV4MixedCollateral(loan)) {
+    const remainingSplStr = formatTokenAmount(
+      loan.current_collateral_amount ?? loan.collateral_amount,
+      loan.decimals ?? 9,
+    );
+    const vaultSolStr = fmtSol(loan.sol_proceeds_amount ?? 0, 3);
+    collateralAmountStr = `${remainingSplStr} ${symbol} + ${vaultSolStr} SOL vault`;
+    if (collateralValueLamports != null) {
+      const totalValueLamports =
+        Number(collateralValueLamports) + Number(loan.sol_proceeds_amount ?? 0);
+      collateralValueStr = ` (worth ${fmtSol(totalValueLamports, 3)} SOL total)`;
+    } else {
+      collateralValueStr = "";
+    }
+  } else {
+    collateralAmountStr = formatTokenAmount(
+      loan.collateral_amount,
+      loan.decimals ?? 9,
+    );
+    collateralValueStr = collateralValueLamports != null
+      ? ` (worth ${fmtSol(collateralValueLamports, 3)} SOL)`
+      : "";
+  }
 
   let healthStr;
   if (healthRatio != null && Number.isFinite(healthRatio)) {
@@ -144,9 +182,16 @@ export function formatLoanCard(loan, opts = {}) {
     healthStr = "health —";
   }
 
+  // For V4 mixed loans collateralAmountStr already embeds the symbol
+  // ("1.2M BUTTCOIN + 0.42 SOL vault"), so skip the trailing " SYMBOL"
+  // that the legacy template appended.
+  const collateralLine = hasV4MixedCollateral(loan)
+    ? `   Collateral ${collateralAmountStr}${collateralValueStr} · ${healthStr} · ${loan.ltv_percentage}% LTV`
+    : `   Collateral ${collateralAmountStr} ${symbol}${collateralValueStr} · ${healthStr} · ${loan.ltv_percentage}% LTV`;
+
   return [
     `*${idxStr}${symbol}* — ${owed} SOL — ${timeStr}`,
-    `   Collateral ${collateralAmountStr} ${symbol}${collateralValueStr} · ${healthStr} · ${loan.ltv_percentage}% LTV`,
+    collateralLine,
   ].join("\n");
 }
 
