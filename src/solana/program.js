@@ -151,6 +151,23 @@ export function isRwaCategory(category) {
  */
 export function chooseProgramId(category, opts = {}) {
   const { hasExitArming = false, isToken2022 = false } = opts;
+  // V4_BORROWS_PAUSED — operator-controlled freeze flag for the V4
+  // program-upgrade window. When ON, every new V4 borrow refuses with
+  // a clear user-facing message. Existing V4 loans are NOT affected
+  // (they remain on-chain, accrue normally, and after the upgrade
+  // they become repayable). The pause runs at the routing layer so
+  // every entry point (TG /borrow, site, x402 agent) honors it.
+  //
+  // Operator-mandated 2026-06-15 PM as part of the Token-2022 V4
+  // sol_proceeds_vault init bug recovery plan (tasks #281-285).
+  if (hasExitArming && process.env.V4_BORROWS_PAUSED === "true") {
+    throw new Error(
+      "V4_BORROWS_PAUSED: New V4 borrows (with auto-sells) are temporarily " +
+      "paused while we ship a critical V4 program patch. Existing V4 loans " +
+      "are unaffected. This is expected to be brief — please try again shortly. " +
+      "If you need to borrow without an auto-sell, regular borrows still work.",
+    );
+  }
   if (hasExitArming) {
     if (!PROGRAM_ID_V4) {
       throw new Error(
