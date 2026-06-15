@@ -77,27 +77,52 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier, { all
   if (allowBelowOne && multiplier >= 1) {
     return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
-  const { getPriceInUsdCrossSourced } = await import("./price.js");
-  // getPriceInUsdCrossSourced THROWS on cross-source disagreement,
-  // single-source-only responses, and total fetcher failures. The
-  // trailing-stop arm path (and any multiplier arm) calls this — if
-  // it throws and we don't catch, the route handler emits a generic
-  // 500 with no useful detail. Operator hit this on 2026-06-15
-  // trying to set a trailing SL while Jupiter was rate-limited.
-  // Catch the throw, return a structured ok:false so the caller can
-  // emit a 502 with the actual reason.
-  let currentUsd;
+  // Arm-time price resolution uses a forgiving fallback ladder:
+  //
+  //   1. Cross-source (Jupiter + DexScreener agreement) — best
+  //   2. Single Jupiter
+  //   3. Single DexScreener
+  //
+  // The strict cross-source check is what FIRE time needs (a stale
+  // or manipulated price triggering a sale would cost real SOL).
+  // ARM time is just seeding the initial trigger; the watcher
+  // re-evaluates with strict cross-source at fire time, and for
+  // trailing stops the peak self-corrects on the first tick. So
+  // failing arm because Jupiter is rate-limited or DexScreener
+  // glitched is overkill — operator hit this 2026-06-15 trying to
+  // set a trailing SL during a Jupiter 429 spike.
+  const priceMod = await import("./price.js");
+  let currentUsd = null;
+  let lastErr = null;
   try {
-    currentUsd = await getPriceInUsdCrossSourced(collateralMint);
+    currentUsd = await priceMod.getPriceInUsdCrossSourced(collateralMint);
   } catch (err) {
+    lastErr = err;
+  }
+  if (!currentUsd || currentUsd <= 0) {
+    // Try Jupiter alone
+    try {
+      const jup = priceMod.jupiterPriceInUsd
+        ? await priceMod.jupiterPriceInUsd(collateralMint)
+        : null;
+      if (jup && jup > 0) currentUsd = jup;
+    } catch (err) { lastErr = err; }
+  }
+  if (!currentUsd || currentUsd <= 0) {
+    // Try DexScreener alone
+    try {
+      const dex = priceMod.dexscreenerPriceInUsd
+        ? await priceMod.dexscreenerPriceInUsd(collateralMint)
+        : null;
+      if (dex && dex > 0) currentUsd = dex;
+    } catch (err) { lastErr = err; }
+  }
+  if (!currentUsd || currentUsd <= 0) {
     return {
       ok: false,
       error: "price_unavailable",
-      detail: (err?.message || String(err)).slice(0, 240),
+      detail: (lastErr?.message || "No source returned a usable price").slice(0, 240),
     };
-  }
-  if (!currentUsd || currentUsd <= 0) {
-    return { ok: false, error: "Couldn't fetch current USD price right now — try again or use an explicit price target." };
   }
   const targetUsd = currentUsd * multiplier;
   const triggerValueMicro = BigInt(Math.round(targetUsd * 1e6));

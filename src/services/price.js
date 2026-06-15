@@ -293,7 +293,7 @@ export async function getPriceInSolCrossSourced(mint) {
  * Same cross-source resiliency model: prefer Jupiter, fall back to
  * DexScreener, agree-or-throw when both respond. Returns USD per token.
  */
-async function jupiterPriceInUsd(mint) {
+export async function jupiterPriceInUsd(mint) {
   const resp = await axios.get(JUPITER_API, {
     params: { ids: mint },
     timeout: 10_000,
@@ -303,7 +303,7 @@ async function jupiterPriceInUsd(mint) {
   return tokenUsd;
 }
 
-async function dexscreenerPriceInUsd(mint) {
+export async function dexscreenerPriceInUsd(mint) {
   const resp = await axios.get(
     `https://api.dexscreener.com/tokens/v1/solana/${mint}`,
     { timeout: 10_000 },
