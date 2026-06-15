@@ -94,7 +94,55 @@ export function translateTxError(err, ctx = {}) {
   const blob = raw + "\n" + logs;
   const flow = ctx.flow || "repay";
 
-  // Pattern 1: insufficient lamports — by far the most common
+  // Pattern 1a: SPL Token InsufficientFunds (custom error 0x1 thrown by
+  // Token-2022 or legacy Token program). Distinct from a lamports
+  // shortage — this means the borrower's COLLATERAL TOKEN balance is
+  // insufficient for the transfer. Translating this as "Not enough SOL"
+  // (the old behavior) told users to /deposit SOL when they actually
+  // needed more of the collateral token. Caught 2026-06-15 during V4
+  // testing: user successfully borrowed on V1 with X tokens, then
+  // tried V4 with the same amount but the V1 vault already held them.
+  const tokenInsufficient =
+    /Error: insufficient funds/i.test(blob) ||
+    /Program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb) failed: custom program error: 0x1/.test(blob);
+  if (tokenInsufficient && !/insufficient lamports/i.test(blob)) {
+    if (flow === "borrow" || flow === "reborrow") {
+      const cmd = flow === "reborrow" ? "/reborrow" : "/borrow";
+      return [
+        "⚠️ *Not enough of the collateral token in your wallet*",
+        "",
+        "The borrow tried to lock more of this token than you currently hold. Your SOL balance is fine — it's the collateral side that's short.",
+        "",
+        "*Common cause:* you already used some of this token for another loan, so the rest is locked in that loan's vault.",
+        "",
+        "*Two ways to fix:*",
+        "1. Try the borrow again with a smaller collateral amount that fits what's in your wallet",
+        `2. /repay the existing loan first to release the collateral, then ${cmd} again`,
+      ].join("\n");
+    }
+    if (flow === "topup") {
+      return [
+        "⚠️ *Not enough of the collateral token in your wallet*",
+        "",
+        "The top-up tried to add more tokens than you currently hold. Your SOL balance is fine — it's the collateral side that's short.",
+        "",
+        "Send more of the collateral token to your Magpie wallet via /deposit, then /topup again.",
+      ].join("\n");
+    }
+    // Generic SPL InsufficientFunds for other flows
+    return [
+      "⚠️ *Not enough tokens in your wallet for this transaction*",
+      "",
+      "The transaction tried to move more tokens than you currently hold. Your SOL balance is fine — it's a specific SPL token that's short.",
+      "",
+      "_Tap *Ask the agent* below for a walkthrough._",
+    ].join("\n");
+  }
+
+  // Pattern 1b: insufficient lamports — true SOL shortage from the
+  // Solana runtime. The pattern `insufficient lamports X, need Y` is
+  // emitted by the system program when an account-creation rent or
+  // transfer exceeds the payer's native balance.
   const insufficientMatch = blob.match(/insufficient lamports\s+(\d+),\s*need\s+(\d+)/i);
   if (insufficientMatch || /custom program error: 0x1/.test(blob)) {
     const have = insufficientMatch ? BigInt(insufficientMatch[1]) : null;
