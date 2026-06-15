@@ -177,8 +177,16 @@ export async function executeBorrow({
     [collateralMint],
   );
   const category = catRows[0]?.category ?? "memecoin";
-  // Exit-armed borrows force V4. Plain borrows take the category path.
-  const programId = chooseProgramId(category, { hasExitArming });
+  // Detect Token-2022 collateral. Token-2022 + exit-armed borrows are
+  // temporarily BLOCKED (operator-mandated V4 in-vault thesis 2026-06-15
+  // PM) until V4.x ships with the Token-2022 repay fix. Plain (no exit)
+  // borrows of Token-2022 collateral continue routing to V3 normally.
+  const collateralTokenProgram = await getMintTokenProgram(collateralMint);
+  const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+  const isToken2022 = collateralTokenProgram.equals(TOKEN_2022_PROGRAM_ID);
+  // Exit-armed borrows force V4 (refuses with TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED
+  // if Token-2022). Plain borrows take the category path.
+  const programId = chooseProgramId(category, { hasExitArming, isToken2022 });
   // Hard safety stop — refuse to open a loan if the program/category
   // pairing is wrong. The v2 pool must NEVER hold memecoin collateral,
   // and v1 must never hold RWA. Throws if violated; caller surfaces
