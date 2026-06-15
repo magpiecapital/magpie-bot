@@ -317,6 +317,35 @@ export function startPriceAttestor(intervalMs = 30_000) {
             throw attestErr;
           }
         }
+
+        // 2026-06-15: V4 pre-warm. V4's price_feed PDA is distinct from
+        // V1/V3 (same "price_v3" seed but different program ID gives a
+        // different PDA). V4 borrows hit a TWAP gate requiring 5 min of
+        // continuous price history — first-time-on-V4 mints would fail
+        // with StalePriceAttestation or TwapInsufficientHistory unless
+        // we keep V4 feeds fresh continuously in parallel with the
+        // category default. Drip-feed inits use the same per-tick cap.
+        try {
+          const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+          if (PROGRAM_ID_V4) {
+            try {
+              await attestPrice(mint, decimals, priceSol, PROGRAM_ID_V4);
+            } catch (v4Err) {
+              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(v4Err.message || "")) {
+                if (initsThisTick < MAX_INITS_PER_TICK) {
+                  await initializePriceFeed(mint, PROGRAM_ID_V4);
+                  initsThisTick++;
+                  console.log(`[PriceAttestor] Auto-initialized V4 feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
+                }
+              } else {
+                console.warn(`[PriceAttestor] V4 attest failed for ${mint.slice(0, 8)}...: ${v4Err.message?.slice(0, 100)}`);
+              }
+            }
+          }
+        } catch {
+          // Swallow — V4 pre-warm is best-effort, never block the
+          // primary V1/V3 attestation flow.
+        }
       } catch (err) {
         console.error(`[PriceAttestor] Failed for ${mint.slice(0, 8)}...: ${err.message}`);
       }
