@@ -110,7 +110,60 @@ const DEFAULT_CAP_MULTIPLIER = 8;         // cap = max(floor, slip × 8) capped 
 // shared with internal-agent-limitclose.js and the DB CHECK constraint.
 const MAX_INITIAL_SLIPPAGE_BPS = MAX_PROTOCOL_SLIPPAGE_BPS; // 25% — allow aggressive initial for moon-pump UX
 
-export async function armOrder({
+/**
+ * Public entry point — wraps the real implementation with a server-
+ * side audit log + a failure DM so the caller cannot silently die.
+ *
+ * Forcing function (2026-06-15): operator's V4 SPCX ladder. The user
+ * believed they armed a ladder, the strike was hit, no fire happened.
+ * Investigation revealed ZERO rows in limit_close_orders for the
+ * account, ever — every prior arm attempt failed BEFORE reaching the
+ * INSERT statement. Without an audit trail, those failures were
+ * invisible. This wrapper writes one row per attempt + DMs the user
+ * on every failure regardless of which caller (site/tg/agent_x402)
+ * invoked us.
+ *
+ * Contract preserved: identical args + identical return shape as the
+ * legacy armOrder. Wrapper is best-effort — audit failure does NOT
+ * mask a real arm result.
+ */
+export async function armOrder(args) {
+  let result;
+  try {
+    result = await armOrderImpl(args);
+  } catch (err) {
+    // Defensive: anything thrown out of armOrderImpl becomes a normal
+    // failure result so the audit/DM paths still fire and the caller
+    // gets a consistent shape.
+    console.error("[arm-core] unexpected exception inside armOrderImpl:", err?.stack || err?.message || err);
+    result = {
+      ok: false,
+      error: "exception",
+      detail: (err?.message || String(err)).slice(0, 400),
+    };
+  }
+
+  // Audit (best-effort, swallowed on error so we never mask the real result).
+  try {
+    await recordArmAttempt(args, result);
+  } catch (auditErr) {
+    console.warn("[arm-core] audit insert failed:", auditErr.message?.slice(0, 200));
+  }
+
+  // Failure-DM (best-effort, same swallow). Success DM is enqueued by
+  // the caller after this returns ok:true — preserves current contract.
+  if (!result.ok) {
+    try {
+      await enqueueArmFailedDm(args, result);
+    } catch (dmErr) {
+      console.warn("[arm-core] failure-DM enqueue failed:", dmErr.message?.slice(0, 200));
+    }
+  }
+
+  return result;
+}
+
+async function armOrderImpl({
   userId,
   source,                  // 'tg' | 'site' | 'agent_x402'
   sourceAgentPubkey = null,
@@ -1022,4 +1075,93 @@ export async function enqueueArmedDm({
   } catch (err) {
     console.warn("[arm-core] arm-DM enqueue failed:", err.message?.slice(0, 200));
   }
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Audit log + failure DM (operator-mandated 2026-06-15)
+ *
+ * recordArmAttempt: one row per armOrder call, success OR failure.
+ *   - On success: order_id populated, error_code/detail NULL.
+ *   - On failure: error_code = result.error, error_detail truncated.
+ *
+ * enqueueArmFailedDm: one DM per failure. The user gets ground-truth
+ *   feedback in seconds instead of staring at a silent dashboard.
+ * ──────────────────────────────────────────────────────────────── */
+
+function safeTruncate(s, n) {
+  if (s == null) return null;
+  const str = String(s);
+  return str.length > n ? str.slice(0, n) : str;
+}
+
+function jsonStringifyError(detail) {
+  if (detail == null) return null;
+  if (typeof detail === "string") return detail;
+  try { return JSON.stringify(detail); } catch { return String(detail); }
+}
+
+async function recordArmAttempt(args, result) {
+  // We deliberately NEVER throw from here — caller wraps in try/catch
+  // anyway, but defensive serialization keeps the audit path resilient.
+  const triggerValueStr =
+    args.triggerValueMicro != null
+      ? (typeof args.triggerValueMicro === "bigint"
+          ? args.triggerValueMicro.toString()
+          : String(args.triggerValueMicro))
+      : null;
+  const ladderGroupId =
+    args.ladderGroupId && /^[0-9a-f-]{36}$/i.test(String(args.ladderGroupId))
+      ? args.ladderGroupId
+      : null;
+
+  await query(
+    `INSERT INTO limit_close_arm_attempts
+       (user_id, loan_id_chain, loan_db_id, direction,
+        target_kind, target_value_micro, slice_pct, ladder_group_id,
+        source, source_agent_pubkey,
+        outcome, order_id, error_code, error_detail)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+    [
+      args.userId || null,
+      args.loanIdChain != null ? String(args.loanIdChain) : null,
+      result?.ok && result?.loan?.id ? result.loan.id : null,
+      args.triggerDirection || (args.direction || "above"),
+      args.triggerKind || null,
+      triggerValueStr,
+      args.slicePct ?? null,
+      ladderGroupId,
+      args.source || null,
+      args.sourceAgentPubkey || null,
+      result?.ok ? "success" : "failed",
+      result?.ok ? result.orderId || null : null,
+      result?.ok ? null : safeTruncate(result?.error, 64),
+      result?.ok ? null : safeTruncate(jsonStringifyError(result?.detail), 400),
+    ],
+  );
+}
+
+async function enqueueArmFailedDm(args, result) {
+  // Resolve TG chat — notification-sender reads users.telegram_id by
+  // user_id, so we don't need to lookup here. Just enqueue.
+  if (!args.userId) return;
+
+  const payload = {
+    direction: args.triggerDirection || args.direction || "above",
+    trigger_kind: args.triggerKind || null,
+    trigger_value_micro: args.triggerValueMicro != null
+      ? String(args.triggerValueMicro)
+      : null,
+    slice_pct: args.slicePct ?? null,
+    ladder_group_id: args.ladderGroupId || null,
+    source: args.source || null,
+    loan_id_chain: args.loanIdChain != null ? String(args.loanIdChain) : null,
+    error_code: safeTruncate(result?.error, 64),
+    error_detail: safeTruncate(jsonStringifyError(result?.detail), 400),
+  };
+
+  await query(
+    `INSERT INTO pending_notifications (user_id, channel, kind, payload, status)
+       VALUES ($1, 'tg', 'limit_close_arm_failed', $2::jsonb, 'pending')`,
+    [args.userId, JSON.stringify(payload)],
+  );
 }
