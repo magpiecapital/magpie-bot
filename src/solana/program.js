@@ -175,23 +175,18 @@ export function chooseProgramId(category, opts = {}) {
         "Either complete the V4 deploy / env setup, or build a plain borrow without an exit.",
       );
     }
-    // V4 IN-VAULT THESIS IS NON-NEGOTIABLE (operator-mandated 2026-06-15 PM,
-    // feedback_v4_in_vault_thesis_non_negotiable.md). When the currently-
-    // deployed V4 program version has a bug specific to Token-2022 collateral
-    // (operator hit it on loan id=763 SPCX V4: `incorrect program id for
-    // instruction` at RepayLoan), the answer is NOT to route around it via
-    // V3's legacy fire-and-close model — V3's model violates the V4 thesis
-    // by sending proceeds to the user wallet on fire. The answer is to
-    // BLOCK the borrow with a clear message until V4.x ships with the fix.
-    if (isToken2022) {
+    // V4 IN-VAULT THESIS IS NON-NEGOTIABLE: classic SPL AND Token-2022 both
+    // route through V4 and fire in-vault. The 2026-06-15 sol_proceeds_vault
+    // init bug is fixed (in-place upgrade at HA1hgvs..., sha256 0d57a4f3...);
+    // Token-2022 paths now resolve through `loan_token_program` (classic SPL
+    // Token Program) for sol_proceeds_vault init. Optional kill switch
+    // V4_TOKEN2022_EXITS_BLOCKED=true is left in place for fast emergency
+    // re-block without a redeploy — default OFF.
+    if (isToken2022 && process.env.V4_TOKEN2022_EXITS_BLOCKED === "true") {
       throw new Error(
         "TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED: Auto-sells on Token-2022 " +
-        "collateral (tokenized stocks, ETFs, metals) are temporarily paused " +
-        "while V4 is patched for in-vault repay handling. Two options: " +
-        "(a) borrow without an auto-sell attached, or " +
-        "(b) use a classic-SPL memecoin collateral if you need the exit feature. " +
-        "We'll re-enable Token-2022 exits the moment the V4 patch ships at a fresh " +
-        "program ID — existing loans won't be affected.",
+        "collateral are temporarily paused. Borrow without an auto-sell, or " +
+        "use a classic-SPL collateral. We'll re-enable Token-2022 exits shortly.",
       );
     }
     return PROGRAM_ID_V4;
