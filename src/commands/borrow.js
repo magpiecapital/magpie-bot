@@ -98,7 +98,13 @@ export function clearPending(chatId) {
   pending.delete(chatId);
 }
 
-const QUOTE_TTL_MS = 60_000; // 60-second quote expiry
+// Quote expiry. Was 60s — too tight for users who want to take a moment
+// to set up a custom auto-sell ladder during the exits step. The slippage
+// guard at execution time independently catches real price drift (>2%),
+// so a generous TTL doesn't sacrifice safety — it just lets people think
+// before committing. Operator-tuned 2026-06-15 after the timeout
+// complaint mid-ladder-build.
+const QUOTE_TTL_MS = 300_000; // 5-minute quote expiry
 const MAX_SLIPPAGE_PCT = 2; // reject if price moved >2% since quote
 
 function fmtSol(lamports) {
@@ -129,17 +135,45 @@ async function armConfiguredExits({ userId, loanIdChain, collateralMint, exits }
       triggerValueMicro = resolved.triggerValueMicro.toString();
     }
     const slippageBps = direction === "below" ? 300 : 200;
-    const armed = await armOrder({
-      userId,
-      source: "tg",
-      loanIdChain,
-      triggerKind,
-      triggerValueMicro,
-      triggerDirection: direction,
-      slippageBps,
-      sellDestination: "sol",
-      slicePct: sliceBps && sliceBps < 10000 ? sliceBps : undefined,
-    });
+    // Internal retry on transient failures so the user doesn't see a
+    // raw "insert_failed" or "resolve_failed" when a quick second try
+    // would have succeeded. We retry up to 2 extra times with a small
+    // backoff, only for codes that are known-transient. Codes like
+    // loan_already_has_active_order_in_direction, ladder_sum_exceeds_100,
+    // trigger_would_fire_immediately, user_concurrency_cap_reached are
+    // permanent — retrying would just produce the same error and slow
+    // things down. We bail on the FIRST attempt for those.
+    const TRANSIENT_CODES = new Set([
+      "insert_failed",
+      "resolve_failed",
+      "loan_not_found",
+      "internal_error",
+    ]);
+    let armed;
+    let attempt = 0;
+    const MAX_ATTEMPTS = 3;
+    while (attempt < MAX_ATTEMPTS) {
+      attempt++;
+      armed = await armOrder({
+        userId,
+        source: "tg",
+        loanIdChain,
+        triggerKind,
+        triggerValueMicro,
+        triggerDirection: direction,
+        slippageBps,
+        sellDestination: "sol",
+        slicePct: sliceBps && sliceBps < 10000 ? sliceBps : undefined,
+      });
+      if (armed.ok) break;
+      if (!TRANSIENT_CODES.has(armed.error)) break;
+      if (attempt < MAX_ATTEMPTS) {
+        // Brief backoff before retry — gives the DB / network a beat to
+        // settle and avoids hammering the same failed path back-to-back.
+        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        console.warn(`[borrow] armOrder transient failure on "${label}" (attempt ${attempt}/${MAX_ATTEMPTS}): ${armed.error}, retrying`);
+      }
+    }
     return armed.ok
       ? { ok: true, label, orderId: armed.orderId }
       : { ok: false, label, error: armed.error };
@@ -233,12 +267,39 @@ function escapeMd(s) {
     .replace(/\[/g, "\\[");
 }
 
+// Translate engine error codes into plain-language phrasing for the
+// funded-loan card. Users were seeing things like "failed
+// (insert_failed)" which means nothing to a human. Maps known codes
+// to friendly sentences; unknown codes get a generic message.
+function humanizeArmError(code) {
+  switch (code) {
+    case "insert_failed":
+      return "couldn't save it — try the retry button below";
+    case "loan_already_has_active_order_in_direction":
+      return "you already have an auto-sell going the same direction on this loan";
+    case "ladder_sum_exceeds_100":
+      return "this would push the total sell % above 100% (an existing leg is in the way)";
+    case "trigger_would_fire_immediately":
+      return "your target is already past the current price — set a further one";
+    case "user_concurrency_cap_reached":
+      return "you've hit the limit for armed auto-sells across all loans — cancel one first";
+    case "resolve_failed":
+      return "couldn't fetch a live price to convert your target — try the retry button";
+    case "internal_error":
+      return "something went wrong on our end — try the retry button below";
+    case "loan_not_found":
+      return "loan not recognized yet — try the retry button after a moment";
+    default:
+      return "couldn't set this one up — try the retry button below";
+  }
+}
+
 function renderExitsSummary(armResults) {
   if (!armResults || armResults.length === 0) return null;
   const lines = armResults.map((r) =>
     r.ok
       ? `• ${escapeMd(r.label)} — armed #${r.orderId}`
-      : `• ${escapeMd(r.label)} — failed (${escapeMd(r.error || "unknown")})`,
+      : `• ${escapeMd(r.label)} — ${escapeMd(humanizeArmError(r.error))}`,
   );
   return ["*Exits:*", ...lines].join("\n");
 }
@@ -918,7 +979,7 @@ export function registerBorrowCallbacks(bot) {
       exitsSummary ? "" : null,
       exitsSummary,
       anyExitFailed ? "" : null,
-      anyExitFailed ? "*An exit failed to arm — tap a button below to retry.*" : null,
+      anyExitFailed ? "*One of your auto-sells didn't go through — tap a button below to set a default, or use /takeprofit / /stoploss to retry the exact target.*" : null,
       "",
       allLegsArmed
         ? "/positions to check status · /limitorders to manage auto-sells"
@@ -946,7 +1007,7 @@ export function registerBorrowCallbacks(bot) {
       // Strip markdown stars from the summary for the plain-text version.
       exitsSummary ? exitsSummary.replace(/\*/g, "") : null,
       anyExitFailed ? "" : null,
-      anyExitFailed ? "An exit failed to arm — tap a button below to retry." : null,
+      anyExitFailed ? "One of your auto-sells didn't go through — tap a button below to set a default, or use /takeprofit / /stoploss to retry the exact target." : null,
       "",
       allLegsArmed
         ? "Run /positions to check status, /limitorders to manage auto-sells."
@@ -1004,13 +1065,21 @@ export function registerBorrowCallbacks(bot) {
     }
 
     // Notify operator if anything went sideways after on-chain success.
+    // Include per-leg error codes so the operator gets full diagnostic
+    // info instead of just "exit arm failed". This is how we'll pinpoint
+    // root causes like the operator's 2026-06-15 insert_failed leg
+    // without having to dig through Railway logs.
     if (!renderedOk || recordLoanFailed || anyExitFailed) {
       try {
         const { notifyAdmin, getNotifyBot } = await import("../services/admin-notify.js");
+        const failedLegs = exitArmResults
+          .filter((r) => !r.ok)
+          .map((r) => `${r.label}: ${r.error || "unknown"}`)
+          .join(" | ");
         const issues = [
           recordLoanFailed ? "recordLoan failed" : null,
           !renderedOk ? "card render failed" : null,
-          anyExitFailed ? "exit arm failed" : null,
+          anyExitFailed ? `exit arm failed [${failedLegs}]` : null,
         ].filter(Boolean).join(", ");
         const adminBot = getNotifyBot();
         if (adminBot) {
@@ -1023,7 +1092,15 @@ export function registerBorrowCallbacks(bot) {
     }
   }
 
-  // ── New tier callback — stores selection, opens the exits picker ──
+  // ── New tier callback — stores selection, then asks whether the
+  //     user wants to set up an auto-sell BEFORE the loan executes
+  //     (operator-tuned 2026-06-15). The full multi-option exits menu
+  //     was hounding users who just wanted to borrow and walk away,
+  //     so we now ask a single Yes/No first. "Just borrow" is the
+  //     primary action; users who want to pre-arm tap the secondary
+  //     button to reach the existing exits menu. Skip-path users
+  //     still get one-tap TP / SL / Bracket buttons on the funded-
+  //     loan card.
   bot.callbackQuery(/^borrow:tier:(\d+)$/, async (ctx) => {
     const option = Number(ctx.match[1]);
     const state = pending.get(ctx.chat.id);
@@ -1043,6 +1120,58 @@ export function registerBorrowCallbacks(bot) {
     }
     state.tier = tier;
     state.tierOption = option;
+    await ctx.answerCallbackQuery();
+    await showAutoSellGate(ctx, state);
+  });
+
+  // Shows the Yes/No gate after tier selection. "Just borrow" runs the
+  // borrow immediately with no pre-arms (user can still tap the
+  // protect buttons on the funded card). "Set auto-sells first"
+  // opens the multi-option exits menu.
+  async function showAutoSellGate(ctx, state) {
+    state.stage = "await_autosell_gate";
+    pending.set(ctx.chat.id, state);
+    const symbol = escapeMd(state.selected.symbol);
+    const tier = state.tier;
+    const receiveSol = ((Number(state.collateralValueLamports) * tier.ltv) / 100 / 1e9) * (1 - tier.feeBps / 10_000);
+    await ctx.editMessageText(
+      [
+        `*Ready to borrow ${receiveSol.toFixed(4)} SOL against ${symbol}*`,
+        "",
+        `Tier: ${tier.days} days at ${tier.ltv}% LTV`,
+        "",
+        "Want to set up an auto-sell now? (Optional — you can always set one up later from the funded-loan screen or /takeprofit.)",
+      ].join("\n"),
+      {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text("Just borrow", "borrow:gate:skip").row()
+          .text("Set auto-sells first", "borrow:gate:setup").row()
+          .text("← Change tier", "borrow:exits:retier")
+          .text("✕ Cancel", "borrow:cancel"),
+      },
+    );
+  }
+
+  // "Just borrow" — skip the exits menu entirely, run the borrow now.
+  bot.callbackQuery("borrow:gate:skip", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
+    state.exits = { type: "skip" };
+    await ctx.answerCallbackQuery();
+    await executeBorrowWithExits(ctx, state);
+  });
+
+  // "Set auto-sells first" — show the existing multi-option exits menu.
+  bot.callbackQuery("borrow:gate:setup", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired");
+      return;
+    }
     await ctx.answerCallbackQuery();
     await showExitsMenu(ctx, state);
   });
