@@ -301,7 +301,11 @@ export async function handleSiteLimitCloseList(req, url) {
     [walletRow.user_id, wallet],
   );
 
-  // Armed orders for those loans.
+  // Orders for those loans. Returns BOTH currently-active AND fired/
+  // cancelled orders within the loan's lifetime so the dashboard can
+  // show ladder progression (e.g. "80% leg fired @ $180 ✓ | 20% leg
+  // armed @ $182"). Slice_pct is included so the UI can render the
+  // ladder composition (default 10000 = 100% if column NULL).
   const loanIds = loans.map((l) => l.id);
   let orders = [];
   if (loanIds.length > 0) {
@@ -313,11 +317,22 @@ export async function handleSiteLimitCloseList(req, url) {
               max_slippage_bps_cap, auto_escalate_slippage,
               source, source_agent_pubkey,
               trailing_distance_bps,
-              peak_price_micros::text AS peak_price_micros
+              peak_price_micros::text AS peak_price_micros,
+              COALESCE(slice_pct, 10000) AS slice_pct,
+              ladder_group_id,
+              -- Fire details (NULL for non-fired orders)
+              fired_at,
+              proceeds_lamports::text AS proceeds_lamports,
+              net_to_user_lamports::text AS net_to_user_lamports,
+              tx_signature_swap,
+              tx_signature_repay
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
-          AND status IN ('armed','firing','twap_in_progress','awaiting_user')
-        ORDER BY armed_at DESC`,
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled')
+        ORDER BY
+          -- Active states sort first by armed_at DESC, history by fired_at DESC
+          CASE WHEN status IN ('fired','cancelled') THEN 1 ELSE 0 END,
+          armed_at DESC`,
       [loanIds],
     );
     orders = r.rows;
