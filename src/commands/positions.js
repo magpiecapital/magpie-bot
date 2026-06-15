@@ -174,8 +174,17 @@ export async function handlePositions(ctx) {
     // sent the user a DM but the user may have dismissed/missed it;
     // /loans reminds them they have a decision pending.
     const existing = orderByLoan.get(loan.id);
+    // V4-exclusive: only suggest /takeprofit when this loan is actually
+    // arm-eligible. V1/V3 loans under V4_EXIT_EXCLUSIVE_ENFORCE would
+    // refuse the arm with exits_require_v4_loan, so don't bait the user.
+    const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+    const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+    const canArmExits =
+      (!!v4ProgramId && loan.program_id === v4ProgramId) || !v4Enforced;
     if (!existing) {
-      lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+      if (canArmExits) {
+        lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+      }
     } else if (existing.status === "armed") {
       const trig = formatTriggerInline(existing.trigger_kind, existing.trigger_value_micro);
       const slip = (existing.slippage_bps / 100).toFixed(2);
