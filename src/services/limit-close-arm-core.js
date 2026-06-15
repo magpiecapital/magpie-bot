@@ -1004,16 +1004,25 @@ export async function modifyOrder({
 
   // Re-apply ownership guard so a stale userId or source_agent_pubkey
   // can't bypass scope between the SELECT and the UPDATE.
+  //
+  // Counter discipline: after the orderId push above, `up` points at
+  // the slot ALREADY USED by orderId ($3 in a 1-update case). Each
+  // additional param needs to bump `up` FIRST, then reference the
+  // new slot. The previous `++up - 1` / `up - 1` mix was off-by-one:
+  // it referenced the orderId slot AND added a 4th param to a 3-
+  // placeholder query, triggering Postgres:
+  //   bind message supplies 4 parameters, but prepared statement requires 3
+  // Operator hit this on 2026-06-15 trying to modify slippage.
   const updateConditions = ["status = 'armed'"];
   if (userId != null) {
-    updateConditions.push(`user_id = $${++up - 1}`);
-    updateParams.push(userId);
     up++;
+    updateConditions.push(`user_id = $${up}`);
+    updateParams.push(userId);
   }
   if (sourceAgentPubkey != null) {
-    updateConditions.push(`source = 'agent_x402' AND source_agent_pubkey = $${up - 1}`);
-    updateParams.push(sourceAgentPubkey);
     up++;
+    updateConditions.push(`source = 'agent_x402' AND source_agent_pubkey = $${up}`);
+    updateParams.push(sourceAgentPubkey);
   }
 
   const r = await query(
