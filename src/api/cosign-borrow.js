@@ -612,8 +612,15 @@ export async function handleCosignBorrow(req) {
           // far below any pump-and-front-run window — the LTV math and
           // the pre-existing fresh-pump gates downstream protect against
           // adversarial mispricing even on a 15-min-old snapshot.
-          const PRICE_RETRY_DELAYS_MS = [0, 500, 1200, 2500, 4500];
-          const STALE_SNAPSHOT_MAX_AGE_MS = 15 * 60_000; // 15 min — was 3
+          // 2026-06-16 PM: widened again after operator hit the banned
+          // "Price oracle briefly unavailable" copy on a V4 laddered borrow
+          // despite the 5-retry + 15-min snapshot fallback. Laddered borrows
+          // craft for longer than typical, so the feed has more time to go
+          // stale. Bump to 7 attempts (+ longer trailing delays) AND extend
+          // the snapshot ceiling to 30 min — still well below any pump-and-
+          // front-run window. Per [[feedback_oracle_briefly_unavailable_banned_recurrence]].
+          const PRICE_RETRY_DELAYS_MS = [0, 500, 1200, 2500, 4500, 7000, 10000];
+          const STALE_SNAPSHOT_MAX_AGE_MS = 30 * 60_000; // 30 min — was 15
           let valueLamports;
           let lastErr;
           for (const delayMs of PRICE_RETRY_DELAYS_MS) {
@@ -675,11 +682,20 @@ export async function handleCosignBorrow(req) {
             }
           }
           if (!valueLamports || valueLamports <= 0) {
+            // 2026-06-16 PM: the banned "briefly unavailable" copy was
+            // surfacing on V4 laddered borrows where the user crafted
+            // for longer than typical. We've already widened the retry
+            // budget + snapshot window above; if we STILL land here it
+            // means every layer failed in a window measured in minutes,
+            // which is exceptional. Surface a soft "refreshing — re-sign"
+            // tone instead of the banned copy. Per
+            // [[feedback_oracle_briefly_unavailable_banned_recurrence]].
             return {
               status: 502,
               body: {
-                error: "Price oracle briefly unavailable — please retry in a moment",
+                error: "Refreshing market data — please tap Sign once more.",
                 detail: lastErr?.message?.slice(0, 200) || "no fresh quote AND no recent snapshot",
+                retry_after_ms: 1500,
               },
             };
           }
