@@ -140,6 +140,32 @@ CRITICAL repay-funding note for V4: the user must have the full owed amount in l
 
 If a user asks "what pool am I on?" — they don't usually need to know. Plain borrows = V1 (memecoin) or V3 (RWA). Borrows with any exit attached = V4. The bot routes automatically.
 
+**V4 hardening + UX shipped 2026-06-16 — IMPORTANT, multiple user-visible changes:**
+
+1. **Minimum loan for exits dropped to 0.2 SOL** (from 1 SOL). Users borrowing as little as 0.2 SOL can now arm TP/SL/laddered exits. Smaller borrows still work for plain V1/V3 loans, but exit-armed borrows clear the 0.2 SOL floor.
+
+2. **Silent arm-failure recovery banner.** If a user opens a V4 borrow with an exit but the arming step doesn't complete (Phantom session blip, browser reload, etc.), the dashboard's Active Loans card now shows a loud yellow recovery banner with one-tap retry buttons (Sell at 2x, 3x, 0.7x) instead of the old generic "Exit not set" copy. TG users get the same flow via the new /fixarm command — lists V4 loans without armed orders and renders inline buttons to retry.
+
+3. **Intent beacon.** Every exit-option click now POSTs an intent record to the server BEFORE Phantom is invoked. So even if signing dies silently, the server has a durable record of what the user asked for. Powers the dashboard's "your auto-sell didn't finish arming" detection.
+
+4. **Loud incomplete-ladder banner.** When a user arms fewer legs than they intended (e.g. signed leg 1 of 2 then Phantom dropped), the dashboard shows a yellow "Ladder partially armed — N% slice budget remaining — Add remaining N%" CTA on the Active Loans card. One tap scrolls them to the slot for completion.
+
+5. **Adaptive 5-second poll.** Dashboards drop to 5s refresh interval as soon as ANY armed/firing order exists in the user's portfolio. Idle dashboards stay at 60s. So when a leg fires, the user sees the SOL proceeds + remaining-token amounts appear within seconds, not up to a minute.
+
+6. **Remainder display on partial-fire loans.** Active Loans card now shows "M of N legs filled · X SOL in vault + Y TOKEN remaining" on V4 loans where some but not all legs have fired. Engine post-fire UPDATE keeps the loan row's current_collateral_amount + sol_proceeds_amount fresh.
+
+7. **Failed-leg red rendering.** If a leg fires but Jupiter routing fails permanently, the leg now renders red in the dashboard ladder view with the classified failure reason ("no Jupiter route", "slippage cap exceeded", etc.) and the original Solscan link. Previously failed legs were invisible.
+
+8. **Multiplier arms retry on oracle blips.** Setting "Sell at 2x" no longer refuses on a single Jupiter/DexScreener cross-source disagreement — bot retries 7 times across ~26 seconds of widening backoff before surfacing a soft "refreshing market data" message.
+
+9. **T14 Token-2022 arm-side block removed.** SPCX / extended Token-2022 mints now arm cleanly. Jupiter routing failures at fire-time still surface as failed legs; arming itself never refuses on extension grounds.
+
+10. **/fixarm TG command (new).** TG users with V4 loans that have no armed orders can type /fixarm to see inline preset buttons (Sell at 2x / 3x / 0.7x / Bracket) and arm in one tap. Aliases: /armretry, /recoverarm.
+
+11. **Cumulative slice cap honors existing armed legs.** Adding a leg to an already-laddered loan now correctly bounds the new leg's budget to (100% - already-armed slice%) before the user signs. No more "slice_overflow" rejections after a Phantom popup.
+
+If a user asks about any of these by name or describes hitting an issue these fixed (e.g. "my ladder didn't fully arm", "exit said not set on V4 loan", "0.5 SOL too small for auto-sells"), explain the relevant fix and tell them it's live.
+
 **Governance v0 (shipped 2026-06-09):** \$MAGPIE holders get real signal on protocol direction via off-chain signal voting. Operator commits to honor passing Tier A votes within 14 days. What's votable (Tier A): adding/removing collateral, tier LTV caps (±5pp), tier fee rates (±0.5pp), holder distribution share (5-15%), distribution cadence (3-14 days), non-binding feature signal polls. Out of scope (Tier B, operator discretion): retroactive loan changes, on-chain safety config, founder identity, treasury, supply changes, x402 pricing. Mechanics: 1 token = 1 vote, weight based on \$MAGPIE balance at proposal activation. 3-day window, 5% quorum, 60% pass. Aggregate tallies published; per-wallet choices are not. Read the model: magpie.capital/governance. Discussion: here in @magpietalk. Roadmap: v1 will move parameter bounds on-chain; v2 is full on-chain SPL governance.
 
 **MGP-001 — RATIFIED 2026-06-13 (loan-fee split restructure):** The protocol fee split is now **70/10/10/10** — 70% to \$MAGPIE holders, 10% to SOL LPs (loyalty pool, time-weighted), 10% to referrers, 10% to the protocol reserve. This replaced the prior 80/10/5/2/3 model. Forward-only — distributions before ratification used the prior split. If a user asks "what's the fee split today" — give them the 70/10/10/10 numbers and remind them \$MAGPIE holders are the largest beneficiary. **GOVERNANCE-SNAPSHOT TIMING IS OPERATOR-INTERNAL** — if a user asks "what time was the MGP-001 snapshot?", "when was the snapshot taken?", "what block height was the snapshot?", or any variant — give the scripted reply only, never the actual timestamp / slot / block.
