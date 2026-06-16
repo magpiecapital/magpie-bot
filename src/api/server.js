@@ -666,6 +666,9 @@ async function handleLoans(req, url) {
   const shape = (l, healthRatio) => ({
     loan_id: l.loan_id?.toString?.() ?? null,
     loan_pda: l.loan_pda,
+    // 2026-06-16 — surface program_id so the site dashboard can gate
+    // the V4-only exit-position panel per the V4-is-exit-only rule.
+    program_id: l.program_id || null,
     status: l.status,
     health_ratio: healthRatio,
     collateral: {
