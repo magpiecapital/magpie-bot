@@ -465,28 +465,35 @@ async function armOrderImpl({
 
   // ── Token-2022 extension compatibility gate (T14, 2026-06-16) ─
   // Refuse exits on mints with extensions Jupiter can't model — these
-  // would fail every fire attempt and burn the user's retries until
-  // max_retries_exceeded. Better to refuse at arm-time with a clear
-  // message than to silently arm an order that can never fill.
-  // Scope: V4 in-vault exits depend on the Jupiter CPI inside
-  // convert_collateral_slice; V1/V2/V3 exits don't (they use the
-  // engine-side Jupiter call). Apply the gate only when V4 is the
-  // routing target.
+  // 2026-06-16 PM operator-mandated removal of T14's arm-side hard
+  // block (feedback_v4_arms_must_always_succeed.md). Every TP/SL/
+  // ladder specified by the user on any V4 collateral MUST persist
+  // as armed; Jupiter route friction is the engine's problem at
+  // fire-time via excludeDexes retry, not a reason to refuse the
+  // arm. We still probe extensions for telemetry — if it fails,
+  // attach a non-blocking warning so DM/UX can surface it — but
+  // arming proceeds.
   const v4Pid = process.env.PROGRAM_ID_V4 ?? null;
   const willRouteV4 = v4Pid && loan.program_id === v4Pid;
+  let _extensionWarning = null;
   if (willRouteV4) {
-    const compat = await checkExitCompatibility(loan.collateral_mint);
-    if (!compat.ok) {
-      return {
-        ok: false,
-        error: "exits_unsupported_on_extended_mint",
-        detail:
-          `This mint uses Token-2022 extension(s) [${compat.blocking.join(", ")}] ` +
-          `that Jupiter's aggregator can't route through reliably — auto-sells would ` +
-          `fail every attempt. You can still /repay this loan and reclaim collateral ` +
-          `normally; only the exit-armed flow is blocked.`,
-        blocking_extensions: compat.blocking,
-      };
+    try {
+      const compat = await checkExitCompatibility(loan.collateral_mint);
+      if (!compat.ok) {
+        _extensionWarning = {
+          kind: "token2022_extensions_present",
+          blocking_extensions: compat.blocking,
+          note:
+            `Mint uses Token-2022 extension(s) [${compat.blocking.join(", ")}]. ` +
+            `Engine will route via Jupiter with per-DEX exclusion retry; if all ` +
+            `routes fail at fire-time the order will be marked failed with a DM.`,
+        };
+        console.log(
+          `[arm-core] V4 extension annotation (non-blocking) mint=${loan.collateral_mint} ext=${compat.blocking.join(",")}`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[arm-core] extension probe error (non-blocking): ${err.message?.slice(0, 100)}`);
     }
   }
 
@@ -877,6 +884,7 @@ async function armOrderImpl({
     liquidityTierFloorBps: liquidityFloorBps,
     liquidityUsd: liqUsd,
     triggerDirection,
+    extensionWarning: _extensionWarning,
   };
 }
 
