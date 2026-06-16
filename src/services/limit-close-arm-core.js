@@ -141,6 +141,14 @@ export const VALID_TRIGGER_DIRECTIONS = new Set(["above", "below"]);
  * Returns { ok: true, triggerValueMicro: BigInt, currentUsd, targetUsd }
  * or { ok: false, error: string }.
  */
+// Layered retry budget for the cross-source price fetch. Mirrors the
+// cosign-borrow hardened pattern shipped 2026-06-16 PM
+// (feedback_oracle_must_never_block_borrow.md + feedback_oracle_
+// briefly_unavailable_banned_recurrence.md). A single transient
+// Jupiter rate-limit or DexScreener flake must NEVER cause a
+// multiplier-arm to refuse — the V4-arms-must-always-succeed rule.
+const PRICE_RETRY_DELAYS_MS = [0, 500, 1200, 2500, 4500, 7000, 10000];
+
 export async function resolveMultiplierToPrice(collateralMint, multiplier, { allowBelowOne = false } = {}) {
   if (multiplier == null || !Number.isFinite(multiplier) || multiplier <= 0) {
     return { ok: false, error: "Multiplier must be a positive number." };
@@ -152,26 +160,40 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier, { all
     return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
   const { getPriceInUsdCrossSourced } = await import("./price.js");
-  // getPriceInUsdCrossSourced THROWS on cross-source disagreement,
-  // single-source-only responses, and total fetcher failures. The
-  // trailing-stop arm path (and any multiplier arm) calls this — if
-  // it throws and we don't catch, the route handler emits a generic
-  // 500 with no useful detail. Operator hit this on 2026-06-15
-  // trying to set a trailing SL while Jupiter was rate-limited.
-  // Catch the throw, return a structured ok:false so the caller can
-  // emit a 502 with the actual reason.
-  let currentUsd;
-  try {
-    currentUsd = await getPriceInUsdCrossSourced(collateralMint);
-  } catch (err) {
+  // Layered retry: getPriceInUsdCrossSourced THROWS on cross-source
+  // disagreement, single-source-only responses, and total fetcher
+  // failures. Per the oracle-resilience rule, transient blips must
+  // be invisible to the user. We retry up to 7 times with widening
+  // backoff before surfacing the soft "Refreshing market data" copy.
+  let currentUsd = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < PRICE_RETRY_DELAYS_MS.length; attempt++) {
+    if (PRICE_RETRY_DELAYS_MS[attempt] > 0) {
+      await new Promise((r) => setTimeout(r, PRICE_RETRY_DELAYS_MS[attempt]));
+    }
+    try {
+      const px = await getPriceInUsdCrossSourced(collateralMint);
+      if (px && px > 0) {
+        currentUsd = px;
+        break;
+      }
+      lastErr = new Error(`empty_price_response`);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!currentUsd || currentUsd <= 0) {
     return {
       ok: false,
       error: "price_unavailable",
-      detail: (err?.message || String(err)).slice(0, 240),
+      // Soft, operator-approved tone. Never say "briefly unavailable"
+      // — that copy is permanently banned per
+      // feedback_oracle_briefly_unavailable_banned_recurrence.md.
+      detail:
+        "Refreshing market data — try again in a few seconds. " +
+        "If this persists, set an explicit USD or market-cap target instead of a multiplier.",
+      _internal: (lastErr?.message || String(lastErr ?? "")).slice(0, 240),
     };
-  }
-  if (!currentUsd || currentUsd <= 0) {
-    return { ok: false, error: "Couldn't fetch current USD price right now — try again or use an explicit price target." };
   }
   const targetUsd = currentUsd * multiplier;
   const triggerValueMicro = BigInt(Math.round(targetUsd * 1e6));
