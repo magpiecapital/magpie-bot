@@ -284,6 +284,11 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
   bot.command(["lc-status", "lcstatus", "lc_status"], lcStatus.handleLcStatus);
   const lcPerf = await import("./commands/lc-perf.js");
   bot.command(["lc-perf", "lcperf", "lc_perf"], lcPerf.handleLcPerf);
+  // V4 Hardening T7 (2026-06-15 PM) — one-shot V4 health snapshot
+  // (active loans + arms/fires + sol_proceeds_vault probe + canary
+  // tail + arm-attempt audit). Read-only diagnostic.
+  const v4Status = await import("./commands/v4-status.js");
+  bot.command(["v4-status", "v4status", "v4_status"], v4Status.handleV4Status);
   const scanImp = await import("./commands/scan-impersonators.js");
   bot.command(
     ["scan-impersonators", "scanimpersonators", "scan_impersonators"],
