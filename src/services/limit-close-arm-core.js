@@ -917,6 +917,315 @@ async function armOrderImpl({
   };
 }
 
+/* ─────────────────────────────────────────────────────────────────
+ * armOrderBatch — atomic multi-leg arming.
+ *
+ * Operator-mandated 2026-06-16 PM
+ * (feedback_one_signature_for_n_legs_always.md). Triggering incident:
+ * SPCX loans 798 + 802 both had silent leg-drops when the site looped
+ * N signMessage calls (Phantom session died between the first two).
+ * Now multi-leg ladders sign exactly ONCE → POST batch envelope →
+ * server validates every leg → inserts ALL or NONE inside a single
+ * DB transaction.
+ *
+ * Validation runs in two phases:
+ *   1. Shared validation (loan exists, owner match, V4 routing,
+ *      collateral enabled, loan size floor, mint not blocked)
+ *   2. Per-leg sanity (direction, kind, value range, slice 1..10000,
+ *      slippage cap, optional trailing)
+ *   3. Cumulative slice check across (existing armed legs + batch
+ *      legs) per direction
+ *
+ * Insert phase opens a DB transaction, INSERTs N rows sharing one
+ * ladder_group_id per direction (computed up-front), commits.
+ * Rollback on any per-row failure.
+ *
+ * Returns:
+ *   { ok: true,
+ *     orderIds: [int, int, ...],
+ *     ladderGroupIds: { above?: uuid, below?: uuid },
+ *     legs: [{ orderId, direction, triggerValueMicro, slicePctBps }] }
+ * or
+ *   { ok: false, error, failedLegIndex?, detail }
+ *
+ * Best-effort post-commit work (intent reconcile, single combined DM,
+ * audit trail) happens OUTSIDE the transaction so a failure there
+ * doesn't undo the armed state.
+ * ───────────────────────────────────────────────────────────────── */
+export async function armOrderBatch({
+  userId,
+  source = "site",
+  sourceAgentPubkey = null,
+  loanIdChain,
+  legs,                    // [{ direction, kind, valueMicro, sliceBps, slippageBps, expiresAt?, trailingDistanceBps? }]
+  intentIds = null,        // optional [intent_id, ...] same length as legs
+  armNotePrefix = null,
+}) {
+  if (!Array.isArray(legs) || legs.length === 0) {
+    return { ok: false, error: "no_legs_supplied" };
+  }
+  if (legs.length > 8) {
+    return { ok: false, error: "too_many_legs", detail: "max 8 legs per batch" };
+  }
+
+  // Phase 1 — Shared loan + eligibility load (single round trip).
+  const { rows: loanRows } = await query(
+    `SELECT l.id, l.loan_id::text AS loan_id_chain, l.user_id, l.collateral_mint,
+            l.collateral_amount::text AS coll_raw,
+            l.original_loan_amount_lamports::text AS owed,
+            l.program_id, l.status,
+            sm.symbol, sm.decimals, sm.category, sm.enabled
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      WHERE l.loan_id::text = $1 AND l.user_id = $2
+      LIMIT 1`,
+    [String(loanIdChain), userId],
+  );
+  if (loanRows.length === 0) {
+    return { ok: false, error: "loan_not_found_for_user" };
+  }
+  const loan = loanRows[0];
+  if (loan.status !== "active") {
+    return { ok: false, error: "loan_not_active", detail: loan.status };
+  }
+  if (BigInt(loan.owed) < MIN_LOAN_LAMPORTS) {
+    return {
+      ok: false,
+      error: "loan_below_minimum_size",
+      detail: `Loan is below the ${Number(MIN_LOAN_LAMPORTS) / 1e9} SOL minimum for limit-close orders.`,
+    };
+  }
+  if (loan.enabled === false) {
+    return { ok: false, error: "collateral_not_enabled" };
+  }
+  const v4Pid = process.env.PROGRAM_ID_V4 ?? null;
+  const v4EnforceOn = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+  if (v4EnforceOn && v4Pid && loan.program_id && loan.program_id !== v4Pid) {
+    return { ok: false, error: "exits_require_v4_loan" };
+  }
+
+  // Phase 2 — Per-leg parse + validation. No DB writes yet.
+  const parsed = [];
+  for (let i = 0; i < legs.length; i++) {
+    const leg = legs[i];
+    const dir = (leg.direction || "above").toLowerCase();
+    if (dir !== "above" && dir !== "below") {
+      return { ok: false, error: "invalid_direction", failedLegIndex: i };
+    }
+    const kind = leg.kind;
+    if (!VALID_TRIGGER_KINDS.has(kind)) {
+      return { ok: false, error: "invalid_trigger_kind", failedLegIndex: i };
+    }
+    let tvBI;
+    try {
+      tvBI = BigInt(String(leg.valueMicro));
+    } catch {
+      return { ok: false, error: "invalid_trigger_value", failedLegIndex: i };
+    }
+    if (tvBI < MIN_TRIGGER_VALUE_MICRO || tvBI > MAX_TRIGGER_VALUE_MICRO) {
+      return { ok: false, error: "trigger_value_out_of_range", failedLegIndex: i };
+    }
+    const slice = Number.isInteger(leg.sliceBps) ? leg.sliceBps : 10000;
+    if (slice < 1 || slice > 10000) {
+      return { ok: false, error: "invalid_slice_pct", failedLegIndex: i };
+    }
+    const slip = Number.isInteger(leg.slippageBps)
+      ? leg.slippageBps
+      : (dir === "below" ? 300 : 200);
+    if (slip < 10 || slip > MAX_PROTOCOL_SLIPPAGE_BPS) {
+      return { ok: false, error: "invalid_slippage_bps", failedLegIndex: i };
+    }
+    parsed.push({
+      idx: i,
+      direction: dir,
+      kind,
+      valueMicro: tvBI,
+      sliceBps: slice,
+      slippageBps: slip,
+      maxSlippageCapBps: Math.min(MAX_PROTOCOL_SLIPPAGE_BPS, Math.max(slip, 2500)),
+      expiresAt: leg.expiresAt || null,
+      trailingDistanceBps: Number.isInteger(leg.trailingDistanceBps) ? leg.trailingDistanceBps : null,
+    });
+  }
+
+  // Phase 3 — Cumulative slice cap per direction (existing armed +
+  // this batch). Mirrors the DB trigger from migration 064 / 065.
+  const existingSliceByDir = { above: 0, below: 0 };
+  const { rows: existingArmed } = await query(
+    `SELECT COALESCE(trigger_direction, 'above') AS dir, COALESCE(slice_pct, 10000) AS sp
+       FROM limit_close_orders
+      WHERE loan_id = $1 AND status = 'armed'`,
+    [loan.id],
+  );
+  for (const r of existingArmed) {
+    existingSliceByDir[r.dir] = (existingSliceByDir[r.dir] || 0) + Number(r.sp);
+  }
+  const batchSliceByDir = { above: 0, below: 0 };
+  for (const leg of parsed) batchSliceByDir[leg.direction] += leg.sliceBps;
+  for (const dir of ["above", "below"]) {
+    const total = (existingSliceByDir[dir] || 0) + (batchSliceByDir[dir] || 0);
+    if (total > 10000) {
+      return {
+        ok: false,
+        error: "ladder_sum_exceeds_100",
+        detail: `${dir === "above" ? "Take-profit" : "Stop-loss"} ladder would total ${(total / 100).toFixed(0)}% (existing ${(existingSliceByDir[dir] / 100).toFixed(0)}% + this batch ${(batchSliceByDir[dir] / 100).toFixed(0)}%).`,
+      };
+    }
+  }
+
+  // Phase 4 — Resolve ladder_group_id per direction. If an existing
+  // ladder group already covers that direction, reuse its id +
+  // original collateral snapshot. Else generate fresh ones.
+  const ladderGroupIds = {};
+  const originalCollateralByDir = {};
+  for (const dir of ["above", "below"]) {
+    const legsInDir = parsed.filter((l) => l.direction === dir);
+    if (legsInDir.length === 0) continue;
+    const { rows: existingGroupRows } = await query(
+      `SELECT ladder_group_id, original_collateral_amount::text AS oca
+         FROM limit_close_orders
+        WHERE loan_id = $1
+          AND COALESCE(trigger_direction, 'above') = $2
+          AND status = 'armed'
+          AND ladder_group_id IS NOT NULL
+        LIMIT 1`,
+      [loan.id, dir],
+    );
+    if (existingGroupRows.length > 0) {
+      ladderGroupIds[dir] = existingGroupRows[0].ladder_group_id;
+      originalCollateralByDir[dir] = existingGroupRows[0].oca;
+    } else if (legsInDir.length > 1 || (existingSliceByDir[dir] || 0) > 0) {
+      // Need a ladder_group_id when batch has multiple legs in this
+      // direction, OR when extending a single existing leg into a
+      // ladder. Single-direction single-leg with no existing legs
+      // stays group-less (cheaper writes for the simplest TP).
+      const { randomUUID } = await import("node:crypto");
+      ladderGroupIds[dir] = randomUUID();
+      originalCollateralByDir[dir] = loan.coll_raw;
+    } else {
+      ladderGroupIds[dir] = null;
+      originalCollateralByDir[dir] = null;
+    }
+  }
+
+  // Phase 5 — Atomic INSERT inside a DB transaction. Either every leg
+  // lands OR none do. No partial-arm state ever surfaces.
+  const { getClient } = await import("../db/pool.js");
+  const client = await getClient();
+  const insertedOrderIds = [];
+  try {
+    await client.query("BEGIN");
+    for (const leg of parsed) {
+      const lgid = ladderGroupIds[leg.direction];
+      const oca = originalCollateralByDir[leg.direction];
+      const noteBase = `armed via ${source} (batch ${parsed.length} legs)`;
+      const r = await client.query(
+        `INSERT INTO limit_close_orders
+           (user_id, loan_id, trigger_kind, trigger_value_micro,
+            trigger_direction,
+            slippage_bps, sell_destination, expires_at,
+            source, source_agent_pubkey, status, armed_at,
+            auto_escalate_slippage, max_slippage_bps_cap, initial_slippage_bps,
+            engine_program_id,
+            trailing_distance_bps, peak_price_micros,
+            slice_pct,
+            ladder_group_id,
+            original_collateral_amount,
+            notes)
+         VALUES ($1, $2, $3, $4,
+                 $5,
+                 $6, 'sol', $7,
+                 $8, $9, 'armed', NOW(),
+                 true, $10, $6,
+                 $11,
+                 $12, NULL,
+                 $13,
+                 $14,
+                 $15,
+                 $16)
+         RETURNING id`,
+        [
+          userId,
+          loan.id,
+          leg.kind,
+          leg.valueMicro.toString(),
+          leg.direction,
+          leg.slippageBps,
+          leg.expiresAt,
+          source,
+          sourceAgentPubkey,
+          leg.maxSlippageCapBps,
+          loan.program_id || null,
+          leg.trailingDistanceBps,
+          leg.sliceBps,
+          lgid,
+          oca,
+          armNotePrefix ? `${armNotePrefix}; ${noteBase}` : noteBase,
+        ],
+      );
+      insertedOrderIds.push(r.rows[0].id);
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    if (/TP\/SL ladder exceeds 100/i.test(err.message || "")) {
+      return { ok: false, error: "ladder_sum_exceeds_100", detail: err.message?.slice(0, 240) };
+    }
+    if (/duplicate key value violates unique constraint/i.test(err.message || "")) {
+      return { ok: false, error: "loan_already_has_active_order_in_direction" };
+    }
+    console.error("[arm-core:batch] insert failed:", err.message);
+    return { ok: false, error: "insert_failed", detail: err.message?.slice(0, 200) };
+  } finally {
+    client.release();
+  }
+
+  // Phase 6 — Post-commit best-effort work. Failures here do NOT undo
+  // the armed state. Each block guarded independently.
+
+  // Reconcile intents.
+  if (Array.isArray(intentIds) && intentIds.length === parsed.length) {
+    for (let i = 0; i < parsed.length; i++) {
+      const iid = intentIds[i];
+      const oid = insertedOrderIds[i];
+      if (iid == null) continue;
+      try {
+        await query(
+          `UPDATE arm_intents
+              SET status = 'armed', order_id = $2, armed_at = NOW(), updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'`,
+          [iid, oid],
+        );
+      } catch (e) {
+        console.warn("[arm-core:batch] intent reconcile failed:", e.message?.slice(0, 80));
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    orderIds: insertedOrderIds,
+    ladderGroupIds: {
+      above: ladderGroupIds.above ?? null,
+      below: ladderGroupIds.below ?? null,
+    },
+    legs: parsed.map((leg, i) => ({
+      orderId: insertedOrderIds[i],
+      direction: leg.direction,
+      triggerKind: leg.kind,
+      triggerValueMicro: leg.valueMicro.toString(),
+      slicePctBps: leg.sliceBps,
+      slippageBps: leg.slippageBps,
+    })),
+    loanDbId: loan.id,
+    loanIdChain: loan.loan_id_chain,
+    collateralMint: loan.collateral_mint,
+    collateralSymbol: loan.symbol,
+  };
+}
+
 /**
  * Modify an armed order in place — change trigger value, slippage,
  * sell destination, or expires_at without canceling first.

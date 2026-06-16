@@ -247,7 +247,7 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
     };
   }
 
-  return { ok: true, userId: walletRow.user_id, signerPubkey, fields };
+  return { ok: true, userId: walletRow.user_id, signerPubkey, fields, body };
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -982,4 +982,176 @@ export async function handleSiteLimitCloseIntent(req) {
     console.error("[intent] INSERT failed:", err.message?.slice(0, 200));
     return { status: 500, body: { error: "intent_persist_failed" } };
   }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * POST /api/v1/site/limit-close/arm-batch
+ *
+ * Operator-mandated 2026-06-16 PM
+ * (feedback_one_signature_for_n_legs_always.md). ONE Phantom signature
+ * arms ALL legs of a ladder atomically. Replaces the N-popups-for-N-
+ * legs pattern that caused silent-leg-drop UX disasters on loans 798
+ * and 802 when Phantom sessions died between sequential signs.
+ *
+ * Signed envelope shape:
+ *   magpie: limit-close-arm-batch/v1
+ *   From:   <signer_wallet>
+ *   LoanId: <chain_loan_id>
+ *   Legs:   <json-array>
+ *   Nonce / Timestamp via signed_message envelope
+ *
+ * Where Legs is a JSON-stringified array:
+ *   [
+ *     {"d":"above","k":"price_usd","v":"212000000","s":5000,"slip":200},
+ *     {"d":"above","k":"price_usd","v":"230000000","s":5000,"slip":200}
+ *   ]
+ *   - d: 'above' (TP) | 'below' (SL)
+ *   - k: 'price_usd' | 'mc_usd' | 'price_sol'
+ *   - v: trigger_value_micro as string
+ *   - s: slice_bps (1..10000)
+ *   - slip: slippage_bps initial (10..MAX_PROTOCOL_SLIPPAGE_BPS)
+ *   - intent_id (optional): pending arm_intents row id to mark armed
+ *
+ * Body may ALSO include `intent_ids: [int, ...]` at the top level so
+ * the server reconciles each leg's intent without it being in the
+ * signed payload. Either path works; signed payload takes precedence.
+ *
+ * Returns:
+ *   201 + { ok: true, order_ids: [...], ladder_group_ids: { above?, below? } }
+ * or
+ *   409 + { ok: false, error, failed_leg_index, detail }
+ * ───────────────────────────────────────────────────────────────── */
+export async function handleSiteLimitCloseArmBatch(req) {
+  const auth = await authSignedEnvelope(req, "limit-close-arm-batch/v1", [
+    "LoanId",
+    "Legs",
+  ]);
+  if (!auth.ok) {
+    return {
+      status: auth.status,
+      body: {
+        error: auth.error,
+        ...(auth.detail ? { detail: auth.detail } : {}),
+        ...(auth.expected ? { expected: auth.expected } : {}),
+        ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}),
+      },
+    };
+  }
+  const { userId, fields, body: rawBody } = auth;
+  const reqId = (Math.random() * 1e9 | 0).toString(36);
+
+  // Parse Legs (signed payload — tamper-proof from middlemen).
+  let legs;
+  try {
+    legs = JSON.parse(String(fields.Legs));
+  } catch (e) {
+    return { status: 400, body: { error: "legs_json_parse_failed", detail: e.message?.slice(0, 120) } };
+  }
+  if (!Array.isArray(legs)) {
+    return { status: 400, body: { error: "legs_not_an_array" } };
+  }
+  if (legs.length === 0) {
+    return { status: 400, body: { error: "no_legs_supplied" } };
+  }
+  if (legs.length > 8) {
+    return { status: 400, body: { error: "too_many_legs", detail: "max 8 per batch" } };
+  }
+
+  // Translate the compact wire shape (d/k/v/s/slip) to armOrderBatch's
+  // friendlier internal shape.
+  const armCoreLegs = [];
+  for (let i = 0; i < legs.length; i++) {
+    const l = legs[i];
+    if (!l || typeof l !== "object") {
+      return { status: 400, body: { error: "leg_not_object", failed_leg_index: i } };
+    }
+    armCoreLegs.push({
+      direction: l.d,
+      kind: l.k,
+      valueMicro: l.v,
+      sliceBps: Number.isInteger(l.s) ? l.s : 10000,
+      slippageBps: Number.isInteger(l.slip) ? l.slip : (l.d === "below" ? 300 : 200),
+      expiresAt: l.exp || null,
+    });
+  }
+
+  // intent_ids may travel on the body (cheaper than padding the
+  // signed envelope). Site populates them from the postArmIntent
+  // calls that happen leg-by-leg in the picker.
+  const intentIds = Array.isArray(rawBody?.intent_ids) ? rawBody.intent_ids : null;
+
+  console.log(
+    `[arm-batch] AUTH-OK req=${reqId} user_id=${userId} signer=${auth.signerPubkey.slice(0, 8)}… ` +
+    `loan_id_chain=${fields.LoanId} n_legs=${armCoreLegs.length} ` +
+    `legs=${armCoreLegs.map((l) => `${l.direction}@${l.valueMicro}/${l.sliceBps}bps`).join(",")}`,
+  );
+
+  // Hand off to arm-core batch primitive.
+  const { armOrderBatch } = await import("../services/limit-close-arm-core.js");
+  const result = await armOrderBatch({
+    userId,
+    source: "site",
+    loanIdChain: String(fields.LoanId),
+    legs: armCoreLegs,
+    intentIds,
+    armNotePrefix: `armed via site batch by ${auth.signerPubkey.slice(0, 8)}…`,
+  });
+
+  if (!result.ok) {
+    console.log(
+      `[arm-batch] FAIL req=${reqId} error=${result.error} failed_leg=${result.failedLegIndex ?? "n/a"} detail=${result.detail?.slice?.(0, 200) || ""}`,
+    );
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: result.error,
+        ...(result.failedLegIndex != null ? { failed_leg_index: result.failedLegIndex } : {}),
+        ...(result.detail ? { detail: result.detail } : {}),
+      },
+    };
+  }
+
+  console.log(
+    `[arm-batch] SUCCESS req=${reqId} order_ids=${result.orderIds.join(",")} ` +
+    `ladder_above=${result.ladderGroupIds.above?.slice(0, 8) || "-"} ` +
+    `ladder_below=${result.ladderGroupIds.below?.slice(0, 8) || "-"}`,
+  );
+
+  // Best-effort single combined DM. The site already shows immediate
+  // optimistic UI on the dashboard, so this is the operator-visible
+  // record for the borrower. Failure here does NOT undo the arm.
+  try {
+    const { enqueueNotification } = await import("../services/notification-sender.js");
+    await enqueueNotification({
+      userId,
+      kind: "limit_close_armed_batch",
+      payload: {
+        loan_id_chain: result.loanIdChain,
+        collateral_symbol: result.collateralSymbol,
+        n_legs: result.orderIds.length,
+        order_ids: result.orderIds,
+        legs: result.legs.map((l) => ({
+          order_id: l.orderId,
+          direction: l.direction,
+          trigger_kind: l.triggerKind,
+          trigger_value_micro: l.triggerValueMicro,
+          slice_pct_bps: l.slicePctBps,
+        })),
+        source: "site",
+      },
+    });
+  } catch (dmErr) {
+    console.warn(`[arm-batch] DM enqueue failed (non-fatal): ${dmErr.message?.slice(0, 120)}`);
+  }
+
+  return {
+    status: 201,
+    body: {
+      ok: true,
+      order_ids: result.orderIds,
+      ladder_group_ids: result.ladderGroupIds,
+      legs: result.legs,
+    },
+  };
 }
