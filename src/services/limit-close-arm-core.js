@@ -44,6 +44,80 @@
 import { query } from "../db/pool.js";
 import { runArmPreflight } from "./limit-close-preflight.js";
 import { MAX_PROTOCOL_SLIPPAGE_BPS } from "../lib/slippage-constants.js";
+import { PublicKey } from "@solana/web3.js";
+
+// T14 (2026-06-16) — Token-2022 extensions Jupiter's aggregator cannot
+// model. A V4 convert_collateral_slice firing through Jupiter will
+// always revert with InvalidTokenAccount on these mints because the
+// source-side ATA semantics depart from the classic SPL contract that
+// Jupiter's route plans assume. We refuse to arm exits on them at
+// arm-time rather than let the borrower hit "exit armed → never fires →
+// 11 retries → max_retries_exceeded" silently.
+//
+// Verified empirically 2026-06-16 against SPCX (8 extensions, every
+// Jupiter DEX failed) vs PUMP (TransferHook + metadata only, fired
+// fine). TransferHook alone is OK — Jupiter has explicit handling.
+// MetadataPointer / TokenMetadata / DefaultAccountState don't affect
+// swap math at all. The rest of the catalog DOES.
+const EXIT_BLOCKING_EXTENSIONS = new Set([
+  "PermanentDelegate",
+  "TransferFeeConfig",
+  "ConfidentialTransferMint",
+  "ConfidentialTransferFeeConfig",
+  "ScaledUiAmountConfig",
+  "InterestBearingConfig",
+  "PausableConfig",
+  "NonTransferable",
+  "MintCloseAuthority",
+]);
+
+const _exitCompatCache = new Map(); // mint → { compat, expires_at_ms }
+const EXIT_COMPAT_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Returns { ok: true } when the mint is exit-compatible (Jupiter can
+ * route through it for convert_collateral_slice), or
+ * { ok: false, blocking: [extNames...] } when one or more extensions
+ * make exit-firing unreliable.
+ *
+ * Classic SPL tokens always return { ok: true }.
+ * Token-2022 mints get their ExtensionTypes enumerated; blocking ones
+ * are returned in the rejection so the UI can explain WHY.
+ */
+async function checkExitCompatibility(mintStr) {
+  const cached = _exitCompatCache.get(mintStr);
+  if (cached && cached.expires_at_ms > Date.now()) return cached.compat;
+
+  let compat = { ok: true };
+  try {
+    const spl = await import("@solana/spl-token");
+    const { connection } = await import("../solana/connection.js");
+    const { getMint, TOKEN_2022_PROGRAM_ID, ExtensionType, getExtensionTypes } = spl;
+    const mintPk = new PublicKey(mintStr);
+    const info = await connection.getAccountInfo(mintPk);
+    if (info && info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      const m = await getMint(connection, mintPk, "confirmed", TOKEN_2022_PROGRAM_ID);
+      if (m.tlvData) {
+        const codes = getExtensionTypes(m.tlvData);
+        const names = codes.map((c) => ExtensionType[c] || `ext_${c}`);
+        const blocking = names.filter((n) => EXIT_BLOCKING_EXTENSIONS.has(n));
+        if (blocking.length > 0) {
+          compat = { ok: false, blocking };
+        }
+      }
+    }
+  } catch (err) {
+    // Probe failure → fail OPEN (allow arm) rather than blocking
+    // legitimate users when the RPC blips. The engine's pre-fire
+    // simulation gate will still catch a truly incompatible route.
+    console.warn(`[arm-core] exit-compat probe failed for ${mintStr}: ${err.message?.slice(0, 100)}`);
+  }
+  _exitCompatCache.set(mintStr, {
+    compat,
+    expires_at_ms: Date.now() + EXIT_COMPAT_TTL_MS,
+  });
+  return compat;
+}
 
 export const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL
 export const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -385,6 +459,33 @@ async function armOrderImpl({
         detail:
           "Exits live in V4 (in-vault auto-sell). This loan is on a legacy pool and can't be armed. " +
           "To use an exit: /repay this loan, then re-open the borrow with the exit set at borrow time — the new loan lands on V4 automatically.",
+      };
+    }
+  }
+
+  // ── Token-2022 extension compatibility gate (T14, 2026-06-16) ─
+  // Refuse exits on mints with extensions Jupiter can't model — these
+  // would fail every fire attempt and burn the user's retries until
+  // max_retries_exceeded. Better to refuse at arm-time with a clear
+  // message than to silently arm an order that can never fill.
+  // Scope: V4 in-vault exits depend on the Jupiter CPI inside
+  // convert_collateral_slice; V1/V2/V3 exits don't (they use the
+  // engine-side Jupiter call). Apply the gate only when V4 is the
+  // routing target.
+  const v4Pid = process.env.PROGRAM_ID_V4 ?? null;
+  const willRouteV4 = v4Pid && loan.program_id === v4Pid;
+  if (willRouteV4) {
+    const compat = await checkExitCompatibility(loan.collateral_mint);
+    if (!compat.ok) {
+      return {
+        ok: false,
+        error: "exits_unsupported_on_extended_mint",
+        detail:
+          `This mint uses Token-2022 extension(s) [${compat.blocking.join(", ")}] ` +
+          `that Jupiter's aggregator can't route through reliably — auto-sells would ` +
+          `fail every attempt. You can still /repay this loan and reclaim collateral ` +
+          `normally; only the exit-armed flow is blocked.`,
+        blocking_extensions: compat.blocking,
       };
     }
   }
