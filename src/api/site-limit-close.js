@@ -326,13 +326,19 @@ export async function handleSiteLimitCloseList(req, url) {
               proceeds_lamports::text AS proceeds_lamports,
               net_to_user_lamports::text AS net_to_user_lamports,
               tx_signature_swap,
-              tx_signature_repay
+              tx_signature_repay,
+              -- Failure details (populated when status = 'failed' or
+              -- 'max_retries_exceeded'). Dashboard renders the leg in
+              -- red with this reason per the active-loans-dashboard rule.
+              failure_reason,
+              failure_count,
+              cancellation_reason
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
-          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled')
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled','failed','max_retries_exceeded')
         ORDER BY
           -- Active states sort first by armed_at DESC, history by fired_at DESC
-          CASE WHEN status IN ('fired','cancelled') THEN 1 ELSE 0 END,
+          CASE WHEN status IN ('fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
           armed_at DESC`,
       [loanIds],
     );
