@@ -1876,6 +1876,39 @@ POOL COVERAGE (always-current as of 2026-06-15):
 - The engine knows which pool to fire against because every armed order stamps \`engine_program_id\` at arm time (sourced from the loan's on-chain owner). Cross-pool fires are structurally impossible.
 - Users NEVER need to know which pool their loan is in. Don't surface pool details unless they ask explicitly.
 
+### V4 / dashboard troubleshooting — common user flows
+
+When a user says "I tried to set a take-profit and nothing happened" / "the ladder didn't arm" / "Phantom keeps saying not authorized" — diagnose in this order:
+
+1. **"WalletSignTransactionError: method/account not authorized"** — this is a stale Phantom session. The dApp thinks the wallet is connected and authorized; Phantom no longer recognizes it. Fix: open Phantom extension → Settings → Trusted Apps → find magpie.capital → Revoke → reload the page → click Connect → approve in Phantom freshly. Tell the user it's a one-time cleanup; subsequent sessions work normally.
+
+2. **"User rejected the request" followed by sign failure** — the user (or autoConnect) hit cancel on a Phantom popup. Tell them: refresh, hit Connect, and explicitly approve in Phantom. Don't blame them — the dashboard's autoConnect can race the user's deliberate click.
+
+3. **Loud red error panel saying "Phantom session needs a reset"** — same as #1. The dashboard now detects this class automatically and shows the revoke+reconnect steps inline. Reassure the user that no funds are at risk.
+
+4. **"Exits live on V4" explainer on a non-V4 loan** — that's the correct V4_EXIT_EXCLUSIVE_ENFORCE refusal. Tell the user: "Your loan was opened on a legacy pool before V4 was default. To get auto-sells: /repay this loan, then re-open the borrow with the exit set in the SAME flow — the new loan will land on V4 automatically and the exit arms together."
+
+5. **"slice_overflow" / "Existing legs already use this slice"** — the user has armed ladder legs whose slice percentages sum near 100. Adding more would exceed. Tell them: list_my_take_profits, see what's there, either cancel one or pick a smaller slice for the new leg.
+
+6. **"take_profit_already_armed" / "stop_loss_already_armed"** — they already have a non-ladder arm on that direction. Cancel it first or switch to a ladder slice <100%.
+
+7. **"Deposit failed: Price oracle briefly unavailable"** — momentary cross-source disagreement on the collateral mint. Tell them to retry in ~30 seconds; the bot has 5 retries + 15-min snapshot fallback so it almost never surfaces this anymore. If they still see it after 3 tries, suggest /support and mention the mint.
+
+8. **Operator (admin) asking "is V4 healthy"** — call \`report_v4_health\`. Lead with the verdict ("HEALTHY" / "READY — no fires yet" / "DEGRADED — investigate"), then summarize active loans + 24h fires + any sol_proceeds_vault probe failures. If DEGRADED, point at the failing loan IDs and suggest /v4-status for the full report.
+
+9. **"What's a V4 loan?" / "What's the difference between V3 and V4?"** — V4 is the in-vault auto-sell program. On V4, when a ladder leg fires, the engine sells that slice of collateral inside the loan and the SOL accumulates in a per-loan vault (sol_proceeds_vault). The loan STAYS active. The user only sees the proceeds when they repay (or get liquidated). This is fundamentally different from V1/V3 which closed the loan on each fire and sent SOL directly to the wallet. V4 lets a single ladder cleanly scale out across multiple price levels without re-borrowing fees.
+
+10. **First-time user asking "how do I get a take-profit?"** — walk them through it: "Three steps. (1) Borrow against your token from the dashboard (magpie.capital/dashboard) or TG /borrow. (2) BEFORE you sign the borrow tx, set your ladder in the pre-borrow exit picker — pick a preset or build a custom one. (3) Sign the borrow tx + one Phantom envelope per ladder leg. After signing, the engine watches prices 24/7 and sells each leg automatically when its strike hits." Emphasize that exits work on V4 — the bot routes there automatically when an exit is attached.
+
+### Pip's bar — operator-mandated 2026-06-15 PM
+
+Pip is the protocol's front-line support voice. Be:
+- **Specific** — exact commands, exact prices, exact tool calls. Never "try the dashboard"; always "magpie.capital/dashboard → click the SPCX row → ..."
+- **Honest about failures** — if something's broken or unverified, say so. Don't pretend.
+- **Helpful first** — assume the user is acting in good faith and trying to use the protocol correctly.
+- **No emojis** (operator-banned).
+- **Public-info only for non-admins** — wallet balances, internal metrics, governance snapshot details stay operator-only.
+
 WHAT THE ENGINE ACTUALLY DOES ON FIRE (TP or SL):
 1. Re-confirms trigger is still hit via cross-sourced oracle (Jupiter + DexScreener + Pyth) — single-source disagreement reverts the order; both must agree.
 2. Runs a Jupiter pre-flight quote to confirm the swap would clear at the slippage cap.
@@ -2292,6 +2325,11 @@ const TOOLS = [
   {
     name: "list_my_take_profits",
     description: "Get the current user's armed take-profit (limit-close) orders across their active loans. Use when user asks 'show my take-profits', 'do I have a take-profit set', 'what limit orders are active', or after they've just armed one and want to see it.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "report_v4_health",
+    description: "ADMIN-ONLY: returns a comprehensive V4 protocol health snapshot — active V4 loans, 24h borrow/repay/fire counts, sol_proceeds_vault on-chain ownership across every active V4 loan, latest engine canary result, recent arm-attempt audit tail. Use when the operator asks 'is V4 healthy', 'how's V4 doing', 'any V4 issues', 'V4 status', 'V4 fires today'. Mirrors the data the /v4-status TG command shows. Refuses non-admin callers — the response is operator-internal.",
     input_schema: { type: "object", properties: {} },
   },
   {
@@ -3872,6 +3910,149 @@ const TOOL_HANDLERS = {
           source_agent_pubkey: r.source_agent_pubkey,
         };
       }),
+    };
+  },
+
+  // V4 Hardening T10 (2026-06-15 PM) — admin-only V4 health snapshot
+  // callable from Pip natural language. Same data as /v4-status. Refuses
+  // non-admin callers so V4 internals never leak through normal user
+  // conversations.
+  report_v4_health: async (_args, { userId }) => {
+    // Admin check: look up the user's telegram_id and gate on isAdmin.
+    let isAdminUser = false;
+    try {
+      const { rows: [u] } = await query(
+        `SELECT telegram_id FROM users WHERE id = $1`,
+        [userId],
+      );
+      if (u?.telegram_id) {
+        const { isAdmin } = await import("./admin.js");
+        isAdminUser = isAdmin(u.telegram_id);
+      }
+    } catch { /* fail closed below */ }
+    if (!isAdminUser) {
+      return { error: "admin_only", detail: "V4 health internals are operator-internal." };
+    }
+
+    const v4ProgramIdStr = process.env.PROGRAM_ID_V4;
+    if (!v4ProgramIdStr) {
+      return { error: "v4_not_configured" };
+    }
+
+    // Loan counts (24h window).
+    let counts = {};
+    try {
+      const { rows: [r] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+            COUNT(*) FILTER (WHERE status = 'active' AND start_timestamp > NOW() - INTERVAL '24 hours')::int AS borrows_24h,
+            COUNT(*) FILTER (WHERE status = 'repaid' AND end_timestamp > NOW() - INTERVAL '24 hours')::int AS repays_24h,
+            COUNT(*) FILTER (WHERE status = 'liquidated' AND end_timestamp > NOW() - INTERVAL '24 hours')::int AS liquidations_24h
+           FROM loans WHERE program_id = $1`,
+        [v4ProgramIdStr],
+      );
+      counts = r || {};
+    } catch (err) { counts.err = err.message?.slice(0, 80); }
+
+    // Arm + fire counts (24h window).
+    let armFire = {};
+    try {
+      const { rows: [r] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'armed')::int AS armed_total,
+            COUNT(*) FILTER (WHERE status = 'armed' AND armed_at > NOW() - INTERVAL '24 hours')::int AS armed_24h,
+            COUNT(*) FILTER (WHERE status = 'fired')::int AS fired_total,
+            COUNT(*) FILTER (WHERE status = 'fired' AND fired_at > NOW() - INTERVAL '24 hours')::int AS fired_24h
+           FROM limit_close_orders WHERE engine_program_id = $1`,
+        [v4ProgramIdStr],
+      );
+      armFire = r || {};
+    } catch (err) { armFire.err = err.message?.slice(0, 80); }
+
+    // sol_proceeds_vault probe summary (read-only on-chain).
+    let probe = { ok: 0, uninit: 0, token2022: 0, other: 0, rpc_blip: 0, failing_loan_ids: [] };
+    try {
+      const { PublicKey } = await import("@solana/web3.js");
+      const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+      const v4ProgramId = new PublicKey(v4ProgramIdStr);
+      const { rows: loans } = await query(
+        `SELECT id, loan_pda FROM loans WHERE program_id = $1 AND status = 'active' LIMIT 50`,
+        [v4ProgramIdStr],
+      );
+      for (const l of loans) {
+        try {
+          const loanPdaPk = new PublicKey(l.loan_pda);
+          const [vault] = PublicKey.findProgramAddressSync(
+            [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+            v4ProgramId,
+          );
+          const info = await connection.getAccountInfo(vault, "confirmed");
+          if (!info) probe.uninit++;
+          else if (info.owner.equals(TOKEN_PROGRAM_ID)) probe.ok++;
+          else if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+            probe.token2022++;
+            probe.failing_loan_ids.push(l.id);
+          } else {
+            probe.other++;
+            probe.failing_loan_ids.push(l.id);
+          }
+        } catch { probe.rpc_blip++; }
+      }
+    } catch (err) { probe.err = err.message?.slice(0, 80); }
+
+    // Latest V4 fire.
+    let last_fire = null;
+    try {
+      const { rows: [r] } = await query(
+        `SELECT loan_id, fired_at, slice_pct, proceeds_lamports::text AS proceeds, net_to_user_lamports::text AS net
+           FROM limit_close_orders WHERE engine_program_id = $1 AND status = 'fired'
+          ORDER BY fired_at DESC LIMIT 1`,
+        [v4ProgramIdStr],
+      );
+      last_fire = r ? {
+        loan_id: r.loan_id,
+        fired_at: r.fired_at,
+        age_minutes: r.fired_at ? Math.round((Date.now() - new Date(r.fired_at).getTime()) / 60000) : null,
+        slice_pct: (Number(r.slice_pct || 10000) / 100),
+        proceeds_sol: Number((Number(r.proceeds) / 1e9).toFixed(4)),
+        net_sol: Number((Number(r.net) / 1e9).toFixed(4)),
+      } : null;
+    } catch (err) { last_fire = { err: err.message?.slice(0, 80) }; }
+
+    // Latest canary tail (V4 only).
+    let canary = null;
+    try {
+      const { rows: [r] } = await query(
+        `SELECT run_at, overall_ok, duration_ms FROM engine_canary_runs
+           WHERE program_id = $1 ORDER BY run_at DESC LIMIT 1`,
+        [v4ProgramIdStr],
+      );
+      canary = r ? {
+        ok: r.overall_ok,
+        age_minutes: r.run_at ? Math.round((Date.now() - new Date(r.run_at).getTime()) / 60000) : null,
+        duration_ms: r.duration_ms,
+      } : null;
+    } catch { /* silent */ }
+
+    // Verdict — single-line summary so Pip can lead with it.
+    const v4HealthVerdict =
+      probe.token2022 > 0 || probe.other > 0
+        ? "DEGRADED — sol_proceeds_vault probe found bad-owner vault(s); investigate immediately"
+        : (counts.active === 0)
+          ? "IDLE — no active V4 loans yet"
+          : (armFire.fired_total === 0)
+            ? "READY — no fires yet; awaiting first real strike"
+            : "HEALTHY";
+
+    return {
+      verdict: v4HealthVerdict,
+      v4_program_id: v4ProgramIdStr,
+      loans: counts,
+      orders: armFire,
+      sol_proceeds_vault_probe: probe,
+      last_fire,
+      canary,
+      note: "Same data as /v4-status TG command. Run /v4-status for the full formatted report including the recent arm-attempt audit tail.",
     };
   },
 
