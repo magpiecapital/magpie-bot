@@ -1952,6 +1952,16 @@ async function router(req, res) {
         result = await handleSiteLimitCloseCancel(req);
         break;
       }
+      case "/api/v1/site/limit-close/intent": {
+        // Operator-mandated 2026-06-16 PM
+        // (feedback_every_arm_envelope_must_reach_server.md). Beacon
+        // POST recording user intent BEFORE Phantom signing. Unsigned
+        // — stores intent only; the signed /arm path is still
+        // required to actually arm an order.
+        const { handleSiteLimitCloseIntent } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseIntent(req);
+        break;
+      }
       case "/api/v1/site/limit-close/modify": {
         const { handleSiteLimitCloseModify } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseModify(req);
