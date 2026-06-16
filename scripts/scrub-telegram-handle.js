@@ -15,7 +15,7 @@
  * NULL the telegram_id (warning: that user can no longer use TG at all).
  *
  * Usage:
- *   railway run node scripts/scrub-telegram-handle.js --handle BlazedPunk
+ *   railway run node scripts/scrub-telegram-handle.js --handle <handle>
  *
  * Add --execute to actually run; without it, dry-run only.
  */
