@@ -1005,6 +1005,35 @@ export async function armOrderBatch({
   }
 
   // Phase 2 — Per-leg parse + validation. No DB writes yet.
+  // Multiplier kinds are resolved through the cross-source oracle in
+  // ONE batched fetch (single getPriceInUsdCrossSourced call for the
+  // mint, then each multiplier-kind leg = currentUsd * multiplier).
+  // This keeps the batch path consistent with single-arm pricing and
+  // covers preset ladders (which specify legs as e.g. 1.5x/2x/3x).
+  let currentUsdForMultiplier = null;
+  const hasMultiplierLeg = legs.some(
+    (l) => l && (l.kind === "multiplier" || (typeof l.multiplier === "number" && l.multiplier > 0)),
+  );
+  if (hasMultiplierLeg) {
+    try {
+      const { getPriceInUsdCrossSourced } = await import("./price.js");
+      currentUsdForMultiplier = await getPriceInUsdCrossSourced(loan.collateral_mint);
+    } catch (priceErr) {
+      return {
+        ok: false,
+        error: "price_unavailable",
+        detail: `Couldn't resolve multiplier legs (cross-source oracle): ${priceErr.message?.slice(0, 120) || String(priceErr).slice(0, 120)}`,
+      };
+    }
+    if (!currentUsdForMultiplier || currentUsdForMultiplier <= 0) {
+      return {
+        ok: false,
+        error: "price_unavailable",
+        detail: "Oracle returned empty price — try again in a few seconds.",
+      };
+    }
+  }
+
   const parsed = [];
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
@@ -1012,15 +1041,36 @@ export async function armOrderBatch({
     if (dir !== "above" && dir !== "below") {
       return { ok: false, error: "invalid_direction", failedLegIndex: i };
     }
-    const kind = leg.kind;
-    if (!VALID_TRIGGER_KINDS.has(kind)) {
-      return { ok: false, error: "invalid_trigger_kind", failedLegIndex: i };
-    }
+
+    // Resolve multiplier → price_usd here so downstream INSERT only
+    // ever stores concrete price/mc/sol triggers.
+    let kind = leg.kind;
     let tvBI;
-    try {
-      tvBI = BigInt(String(leg.valueMicro));
-    } catch {
-      return { ok: false, error: "invalid_trigger_value", failedLegIndex: i };
+    if (kind === "multiplier" || (typeof leg.multiplier === "number" && leg.multiplier > 0)) {
+      const m = leg.multiplier ?? Number(leg.valueMicro) / 1e6;
+      if (!Number.isFinite(m) || m <= 0) {
+        return { ok: false, error: "invalid_multiplier", failedLegIndex: i };
+      }
+      // For TP (above), multiplier MUST be > 1; for SL (below), MUST
+      // be < 1. Otherwise the order would fire instantly at arm time.
+      if (dir === "above" && m <= 1) {
+        return { ok: false, error: "tp_multiplier_must_exceed_1", failedLegIndex: i };
+      }
+      if (dir === "below" && m >= 1) {
+        return { ok: false, error: "sl_multiplier_must_be_below_1", failedLegIndex: i };
+      }
+      const targetUsd = currentUsdForMultiplier * m;
+      tvBI = BigInt(Math.round(targetUsd * 1e6));
+      kind = "price_usd";
+    } else {
+      if (!VALID_TRIGGER_KINDS.has(kind)) {
+        return { ok: false, error: "invalid_trigger_kind", failedLegIndex: i };
+      }
+      try {
+        tvBI = BigInt(String(leg.valueMicro));
+      } catch {
+        return { ok: false, error: "invalid_trigger_value", failedLegIndex: i };
+      }
     }
     if (tvBI < MIN_TRIGGER_VALUE_MICRO || tvBI > MAX_TRIGGER_VALUE_MICRO) {
       return { ok: false, error: "trigger_value_out_of_range", failedLegIndex: i };

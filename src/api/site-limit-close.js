@@ -1065,14 +1065,24 @@ export async function handleSiteLimitCloseArmBatch(req) {
     if (!l || typeof l !== "object") {
       return { status: 400, body: { error: "leg_not_object", failed_leg_index: i } };
     }
-    armCoreLegs.push({
+    // Multiplier kind needs to forward the raw multiplier to arm-core's
+    // batch oracle-resolve phase. l.multiplier OR l.v (which carries
+    // the multiplier as a stringified number when k==="multiplier").
+    const armLeg = {
       direction: l.d,
       kind: l.k,
       valueMicro: l.v,
       sliceBps: Number.isInteger(l.s) ? l.s : 10000,
       slippageBps: Number.isInteger(l.slip) ? l.slip : (l.d === "below" ? 300 : 200),
       expiresAt: l.exp || null,
-    });
+    };
+    if (l.k === "multiplier" || typeof l.multiplier === "number") {
+      armLeg.multiplier =
+        typeof l.multiplier === "number" && l.multiplier > 0
+          ? l.multiplier
+          : Number(l.v);
+    }
+    armCoreLegs.push(armLeg);
   }
 
   // intent_ids may travel on the body (cheaper than padding the
