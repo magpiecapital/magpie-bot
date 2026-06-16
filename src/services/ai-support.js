@@ -2295,6 +2295,11 @@ const TOOLS = [
     input_schema: { type: "object", properties: {} },
   },
   {
+    name: "report_v4_health",
+    description: "ADMIN-ONLY: returns a comprehensive V4 protocol health snapshot — active V4 loans, 24h borrow/repay/fire counts, sol_proceeds_vault on-chain ownership across every active V4 loan, latest engine canary result, recent arm-attempt audit tail. Use when the operator asks 'is V4 healthy', 'how's V4 doing', 'any V4 issues', 'V4 status', 'V4 fires today'. Mirrors the data the /v4-status TG command shows. Refuses non-admin callers — the response is operator-internal.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
     name: "explain_my_take_profit",
     description: "Look up the lifecycle of one of the user's take-profit orders and return a structured explanation: what they asked for, what happened at fire time, whether the engine escalated slippage or fell back to TWAP, and the final fill numbers. Use when user asks 'why did my TP fire at X%', 'why was my limit order so much slippage', 'what happened with order #N', 'explain my last take-profit'. Order MUST belong to the current user; defaults to the most recent order if no order_id is provided.",
     input_schema: {
@@ -3872,6 +3877,149 @@ const TOOL_HANDLERS = {
           source_agent_pubkey: r.source_agent_pubkey,
         };
       }),
+    };
+  },
+
+  // V4 Hardening T10 (2026-06-15 PM) — admin-only V4 health snapshot
+  // callable from Pip natural language. Same data as /v4-status. Refuses
+  // non-admin callers so V4 internals never leak through normal user
+  // conversations.
+  report_v4_health: async (_args, { userId }) => {
+    // Admin check: look up the user's telegram_id and gate on isAdmin.
+    let isAdminUser = false;
+    try {
+      const { rows: [u] } = await query(
+        `SELECT telegram_id FROM users WHERE id = $1`,
+        [userId],
+      );
+      if (u?.telegram_id) {
+        const { isAdmin } = await import("./admin.js");
+        isAdminUser = isAdmin(u.telegram_id);
+      }
+    } catch { /* fail closed below */ }
+    if (!isAdminUser) {
+      return { error: "admin_only", detail: "V4 health internals are operator-internal." };
+    }
+
+    const v4ProgramIdStr = process.env.PROGRAM_ID_V4;
+    if (!v4ProgramIdStr) {
+      return { error: "v4_not_configured" };
+    }
+
+    // Loan counts (24h window).
+    let counts = {};
+    try {
+      const { rows: [r] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+            COUNT(*) FILTER (WHERE status = 'active' AND start_timestamp > NOW() - INTERVAL '24 hours')::int AS borrows_24h,
+            COUNT(*) FILTER (WHERE status = 'repaid' AND end_timestamp > NOW() - INTERVAL '24 hours')::int AS repays_24h,
+            COUNT(*) FILTER (WHERE status = 'liquidated' AND end_timestamp > NOW() - INTERVAL '24 hours')::int AS liquidations_24h
+           FROM loans WHERE program_id = $1`,
+        [v4ProgramIdStr],
+      );
+      counts = r || {};
+    } catch (err) { counts.err = err.message?.slice(0, 80); }
+
+    // Arm + fire counts (24h window).
+    let armFire = {};
+    try {
+      const { rows: [r] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'armed')::int AS armed_total,
+            COUNT(*) FILTER (WHERE status = 'armed' AND armed_at > NOW() - INTERVAL '24 hours')::int AS armed_24h,
+            COUNT(*) FILTER (WHERE status = 'fired')::int AS fired_total,
+            COUNT(*) FILTER (WHERE status = 'fired' AND fired_at > NOW() - INTERVAL '24 hours')::int AS fired_24h
+           FROM limit_close_orders WHERE engine_program_id = $1`,
+        [v4ProgramIdStr],
+      );
+      armFire = r || {};
+    } catch (err) { armFire.err = err.message?.slice(0, 80); }
+
+    // sol_proceeds_vault probe summary (read-only on-chain).
+    let probe = { ok: 0, uninit: 0, token2022: 0, other: 0, rpc_blip: 0, failing_loan_ids: [] };
+    try {
+      const { PublicKey } = await import("@solana/web3.js");
+      const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+      const v4ProgramId = new PublicKey(v4ProgramIdStr);
+      const { rows: loans } = await query(
+        `SELECT id, loan_pda FROM loans WHERE program_id = $1 AND status = 'active' LIMIT 50`,
+        [v4ProgramIdStr],
+      );
+      for (const l of loans) {
+        try {
+          const loanPdaPk = new PublicKey(l.loan_pda);
+          const [vault] = PublicKey.findProgramAddressSync(
+            [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+            v4ProgramId,
+          );
+          const info = await connection.getAccountInfo(vault, "confirmed");
+          if (!info) probe.uninit++;
+          else if (info.owner.equals(TOKEN_PROGRAM_ID)) probe.ok++;
+          else if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+            probe.token2022++;
+            probe.failing_loan_ids.push(l.id);
+          } else {
+            probe.other++;
+            probe.failing_loan_ids.push(l.id);
+          }
+        } catch { probe.rpc_blip++; }
+      }
+    } catch (err) { probe.err = err.message?.slice(0, 80); }
+
+    // Latest V4 fire.
+    let last_fire = null;
+    try {
+      const { rows: [r] } = await query(
+        `SELECT loan_id, fired_at, slice_pct, proceeds_lamports::text AS proceeds, net_to_user_lamports::text AS net
+           FROM limit_close_orders WHERE engine_program_id = $1 AND status = 'fired'
+          ORDER BY fired_at DESC LIMIT 1`,
+        [v4ProgramIdStr],
+      );
+      last_fire = r ? {
+        loan_id: r.loan_id,
+        fired_at: r.fired_at,
+        age_minutes: r.fired_at ? Math.round((Date.now() - new Date(r.fired_at).getTime()) / 60000) : null,
+        slice_pct: (Number(r.slice_pct || 10000) / 100),
+        proceeds_sol: Number((Number(r.proceeds) / 1e9).toFixed(4)),
+        net_sol: Number((Number(r.net) / 1e9).toFixed(4)),
+      } : null;
+    } catch (err) { last_fire = { err: err.message?.slice(0, 80) }; }
+
+    // Latest canary tail (V4 only).
+    let canary = null;
+    try {
+      const { rows: [r] } = await query(
+        `SELECT run_at, overall_ok, duration_ms FROM engine_canary_runs
+           WHERE program_id = $1 ORDER BY run_at DESC LIMIT 1`,
+        [v4ProgramIdStr],
+      );
+      canary = r ? {
+        ok: r.overall_ok,
+        age_minutes: r.run_at ? Math.round((Date.now() - new Date(r.run_at).getTime()) / 60000) : null,
+        duration_ms: r.duration_ms,
+      } : null;
+    } catch { /* silent */ }
+
+    // Verdict — single-line summary so Pip can lead with it.
+    const v4HealthVerdict =
+      probe.token2022 > 0 || probe.other > 0
+        ? "DEGRADED — sol_proceeds_vault probe found bad-owner vault(s); investigate immediately"
+        : (counts.active === 0)
+          ? "IDLE — no active V4 loans yet"
+          : (armFire.fired_total === 0)
+            ? "READY — no fires yet; awaiting first real strike"
+            : "HEALTHY";
+
+    return {
+      verdict: v4HealthVerdict,
+      v4_program_id: v4ProgramIdStr,
+      loans: counts,
+      orders: armFire,
+      sol_proceeds_vault_probe: probe,
+      last_fire,
+      canary,
+      note: "Same data as /v4-status TG command. Run /v4-status for the full formatted report including the recent arm-attempt audit tail.",
     };
   },
 
