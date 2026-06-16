@@ -352,6 +352,35 @@ export async function handleSiteLimitCloseList(req, url) {
     orders = r.rows;
   }
 
+  // Pending intent reconciliation (operator-mandated 2026-06-16 PM,
+  // feedback_every_arm_envelope_must_reach_server.md). For each loan,
+  // look up arm_intents rows that are still pending (no matching
+  // armed order) so the dashboard can render the "Your auto-sell
+  // didn't finish arming" recovery banner with one-click retry.
+  let pendingIntents = [];
+  try {
+    const loanChainIds = loans.map((l) => l.loan_id);
+    if (loanChainIds.length > 0) {
+      const ir = await query(
+        `SELECT id, loan_id_chain, direction, target_kind,
+                target_value_micro::text AS target_value_micro,
+                slice_pct_bps, source, created_at
+           FROM arm_intents
+          WHERE wallet = $1
+            AND status = 'pending'
+            AND loan_id_chain = ANY($2::text[])
+            AND created_at > NOW() - INTERVAL '24 hour'
+          ORDER BY created_at DESC`,
+        [wallet, loanChainIds],
+      );
+      pendingIntents = ir.rows;
+    }
+  } catch (err) {
+    // arm_intents table may not exist yet on pre-071 schemas; degrade
+    // gracefully so the dashboard still renders.
+    console.warn(`[site-limit-close] arm_intents lookup failed (pre-071?): ${err.message?.slice(0, 80)}`);
+  }
+
   // Eligibility annotation per loan — same checks the arm endpoint
   // will apply. Surface it here so the UI can disable the Arm button
   // for ineligible loans with a clear reason.
@@ -414,6 +443,12 @@ export async function handleSiteLimitCloseList(req, url) {
       custodial: isCustodial,
       loans: annotated,
       orders,
+      // Pending arm intents (operator-mandated 2026-06-16 PM,
+      // feedback_every_arm_envelope_must_reach_server.md). Dashboard
+      // reconciles against orders: an intent without a matching armed
+      // order means the auto-arm chain silently failed → render the
+      // V4 recovery banner with one-click retry.
+      pending_intents: pendingIntents,
       generated_at: new Date().toISOString(),
     },
   };
@@ -842,4 +877,109 @@ export async function handleSiteLimitCloseCancel(req) {
   });
   if (!r.ok) return { status: 409, body: { error: r.error } };
   return { status: 200, body: { ok: true, cancelled_order_id: r.orderId } };
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * POST /api/v1/site/limit-close/intent
+ *
+ * Lightweight intent beacon, operator-mandated 2026-06-16 PM (per
+ * feedback_every_arm_envelope_must_reach_server.md). The site POSTs
+ * this BEFORE asking Phantom to sign so the server has a durable
+ * record of the user's intent even if the subsequent signed arm
+ * silently fails.
+ *
+ * Auth: unsigned. This endpoint stores intent, NOT authoritative
+ * state — no funds move, no orders arm. The wallet field is the
+ * user's claimed pubkey; we record it as-is and resolve to user_id
+ * via wallets.public_key lookup. A bad actor can spam intents on any
+ * wallet, but they can never cause an actual fire because the signed
+ * /arm endpoint still gates on Ed25519 verification + the cosign
+ * cron only acts on `status='armed'` rows.
+ *
+ * Body: {
+ *   wallet: string,
+ *   loan_id_chain: string,
+ *   direction: 'above' | 'below',
+ *   target_kind: 'multiplier' | 'price_usd' | 'mc_usd' | 'price_sol' | 'trailing',
+ *   target_value_micro: string | number,
+ *   slice_pct_bps?: number,
+ *   source?: string (defaults to 'site')
+ * }
+ *
+ * Returns: { ok: true, intent_id: number }
+ * The site uses intent_id when subsequently POSTing /arm so the
+ * server can mark the intent armed on success.
+ * ───────────────────────────────────────────────────────────────── */
+export async function handleSiteLimitCloseIntent(req) {
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== "object") {
+    return { status: 400, body: { error: "invalid_body" } };
+  }
+  const {
+    wallet,
+    loan_id_chain,
+    direction,
+    target_kind,
+    target_value_micro,
+    slice_pct_bps,
+    source,
+  } = body;
+
+  if (typeof wallet !== "string" || wallet.length < 32 || wallet.length > 44) {
+    return { status: 400, body: { error: "invalid_wallet" } };
+  }
+  if (typeof loan_id_chain !== "string" || !/^\d+$/.test(loan_id_chain)) {
+    return { status: 400, body: { error: "invalid_loan_id_chain" } };
+  }
+  if (direction !== "above" && direction !== "below") {
+    return { status: 400, body: { error: "invalid_direction" } };
+  }
+  const validKinds = new Set(["multiplier", "price_usd", "mc_usd", "price_sol", "trailing"]);
+  if (!validKinds.has(target_kind)) {
+    return { status: 400, body: { error: "invalid_target_kind" } };
+  }
+  // target_value_micro: accept string or number, store as numeric.
+  const tvm = typeof target_value_micro === "string" ? target_value_micro : String(target_value_micro);
+  if (!/^\d+$/.test(tvm)) {
+    return { status: 400, body: { error: "invalid_target_value_micro" } };
+  }
+  const sliceBps =
+    slice_pct_bps == null
+      ? null
+      : Number.isInteger(slice_pct_bps) && slice_pct_bps > 0 && slice_pct_bps <= 10000
+        ? slice_pct_bps
+        : null;
+  const src = typeof source === "string" && source.length <= 32 ? source : "site";
+
+  // Resolve user_id from wallets.public_key. Best-effort — intent is
+  // recorded even if the wallet isn't linked yet, which lets us spot
+  // "pre-link" intents on the reconciliation cron.
+  let userId = null;
+  try {
+    const walletRow = await query(
+      "SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1",
+      [wallet],
+    );
+    if (walletRow.rows.length > 0) userId = walletRow.rows[0].user_id;
+  } catch (err) {
+    console.warn("[intent] wallet lookup failed:", err.message?.slice(0, 100));
+  }
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO arm_intents
+         (user_id, wallet, loan_id_chain, direction, target_kind, target_value_micro, slice_pct_bps, source, status)
+       VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, 'pending')
+       RETURNING id, created_at`,
+      [userId, wallet, loan_id_chain, direction, target_kind, tvm, sliceBps, src],
+    );
+    const intent = rows[0];
+    return {
+      status: 201,
+      body: { ok: true, intent_id: intent.id, created_at: intent.created_at },
+    };
+  } catch (err) {
+    console.error("[intent] INSERT failed:", err.message?.slice(0, 200));
+    return { status: 500, body: { error: "intent_persist_failed" } };
+  }
 }
