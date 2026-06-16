@@ -1623,8 +1623,13 @@ const PUBLIC_ROUTES = new Set([
   // wallet check), so the API-key gate is bypassed.
   "/api/v1/site/limit-close",
   "/api/v1/site/limit-close/arm",
+  "/api/v1/site/limit-close/arm-preflight",
   "/api/v1/site/limit-close/modify",
   "/api/v1/site/limit-close/cancel",
+  // Intent beacon (no signature — handler validates shape only,
+  // stores intent for dashboard reconciliation). Operator rule
+  // feedback_every_arm_envelope_must_reach_server.md.
+  "/api/v1/site/limit-close/intent",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
