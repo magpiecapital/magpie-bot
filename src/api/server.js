@@ -666,6 +666,9 @@ async function handleLoans(req, url) {
   const shape = (l, healthRatio) => ({
     loan_id: l.loan_id?.toString?.() ?? null,
     loan_pda: l.loan_pda,
+    // 2026-06-16 — surface program_id so the site dashboard can gate
+    // the V4-only exit-position panel per the V4-is-exit-only rule.
+    program_id: l.program_id || null,
     status: l.status,
     health_ratio: healthRatio,
     collateral: {
@@ -745,11 +748,111 @@ async function handleLoans(req, url) {
     console.warn("[loans] health enrich failed:", err.message);
   }
 
+  // ── 2026-06-16 — optional ?include=orders ────────────────────────
+  // Site dashboard's Active Loans render needs every attached exit
+  // (TP/SL/Trailing/Ladder/Bracket) per V4 loan, in one round trip.
+  // Backward-compatible: only adds the `orders` field when explicitly
+  // requested. Per the V4-is-exit-only rule, orders only attach to V4
+  // loans in practice; V1/V2/V3 loans return an empty orders array.
+  const includeParam = url.searchParams.get("include") || "";
+  const wantsOrders = includeParam.split(",").map((s) => s.trim()).includes("orders");
+  let ordersByLoanId = new Map();
+  if (wantsOrders && activeRows.length > 0) {
+    try {
+      const activeIds = activeRows.map((r) => Number(r.id));
+      const { rows: orderRows } = await query(
+        `SELECT id, loan_id, status,
+                trigger_kind, trigger_value_micro, trigger_direction,
+                slippage_bps, max_slippage_bps_cap, slice_pct,
+                ladder_group_id, trailing_distance_bps, peak_price_micros,
+                armed_at, firing_started_at, fired_at, expires_at,
+                tx_signature_repay, proceeds_lamports, protocol_fee_lamports,
+                net_to_user_lamports, failure_reason, failure_count,
+                intervention_state, intervention_suggested_slippage_bps,
+                source
+           FROM limit_close_orders
+          WHERE loan_id = ANY($1::bigint[])
+            AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','failed','cancelled')
+          ORDER BY id`,
+        [activeIds],
+      );
+      for (const o of orderRows) {
+        const arr = ordersByLoanId.get(Number(o.loan_id)) || [];
+        // Derive `kind` for the UI from the order shape. The DB stores
+        // direction + ladder_group + trailing_distance; the dashboard
+        // wants a single label per order (tp / sl / trailing_tp /
+        // trailing_sl / ladder_tp / ladder_sl). Brackets are TP+SL
+        // co-existing on the same loan — the client groups them.
+        const isTrailing = o.trailing_distance_bps != null && Number(o.trailing_distance_bps) > 0;
+        const isLadder = o.ladder_group_id != null;
+        const direction = o.trigger_direction === "below" ? "sl" : "tp";
+        let kind = direction;
+        if (isTrailing) kind = `trailing_${direction}`;
+        else if (isLadder) kind = `ladder_${direction}`;
+        arr.push({
+          id: o.id,
+          loan_id: o.loan_id?.toString?.() || null,
+          kind, // 'tp' | 'sl' | 'trailing_tp' | 'trailing_sl' | 'ladder_tp' | 'ladder_sl'
+          direction: o.trigger_direction || "above",
+          status: o.status,
+          trigger: {
+            kind: o.trigger_kind,
+            value_micro: o.trigger_value_micro?.toString?.() || null,
+          },
+          slice_pct_bps: Number(o.slice_pct ?? 10000),
+          slippage_bps: o.slippage_bps,
+          max_slippage_bps_cap: o.max_slippage_bps_cap,
+          ladder_group_id: o.ladder_group_id ? Number(o.ladder_group_id) : null,
+          trailing: isTrailing
+            ? {
+                distance_bps: Number(o.trailing_distance_bps),
+                peak_price_micros: o.peak_price_micros?.toString?.() || null,
+              }
+            : null,
+          timestamps: {
+            armed_at: o.armed_at,
+            firing_started_at: o.firing_started_at,
+            fired_at: o.fired_at,
+            expires_at: o.expires_at,
+          },
+          execution: o.status === "fired"
+            ? {
+                tx_signature: o.tx_signature_repay,
+                proceeds_lamports: o.proceeds_lamports?.toString?.() || null,
+                protocol_fee_lamports: o.protocol_fee_lamports?.toString?.() || null,
+                net_to_user_lamports: o.net_to_user_lamports?.toString?.() || null,
+              }
+            : null,
+          failure: (o.failure_count && o.failure_count > 0) ? {
+            count: o.failure_count,
+            reason: o.failure_reason || null,
+          } : null,
+          intervention: o.intervention_state ? {
+            state: o.intervention_state,
+            suggested_slippage_bps: o.intervention_suggested_slippage_bps,
+          } : null,
+          source: o.source || null,
+        });
+        ordersByLoanId.set(Number(o.loan_id), arr);
+      }
+    } catch (err) {
+      console.warn("[loans] orders enrich failed:", err.message);
+    }
+  }
+
+  const shapeWithOrders = (r, healthRatio) => {
+    const base = shape(r, healthRatio);
+    if (wantsOrders) {
+      base.orders = ordersByLoanId.get(Number(r.id)) || [];
+    }
+    return base;
+  };
+
   return {
     status: 200,
     body: {
       wallet,
-      active: activeRows.map((r) => shape(r, healthByLoanId.get(r.loan_id) ?? null)),
+      active: activeRows.map((r) => shapeWithOrders(r, healthByLoanId.get(r.loan_id) ?? null)),
       history: historyRows.map((r) => shape(r, null)),
     },
   };
