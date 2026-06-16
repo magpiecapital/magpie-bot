@@ -1834,6 +1834,16 @@ async function router(req, res) {
         result = await handleSiteLimitCloseArm(req);
         break;
       }
+      case "/api/v1/site/limit-close/arm-preflight": {
+        // V4 Hardening T2 (2026-06-15): dry-run validator the dashboard
+        // calls before asking Phantom to sign. Public read — no
+        // envelope required. Mirrors the arm endpoint's eligibility
+        // + parsing checks so the dashboard can surface failures
+        // BEFORE the user signs.
+        const { handleSiteLimitCloseArmPreflight } = await import("./site-limit-close-preflight.js");
+        result = await handleSiteLimitCloseArmPreflight(req);
+        break;
+      }
       case "/api/v1/site/limit-close/cancel": {
         const { handleSiteLimitCloseCancel } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseCancel(req);
