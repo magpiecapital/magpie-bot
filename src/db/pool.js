@@ -64,6 +64,26 @@ export async function query(text, params) {
 }
 
 /**
+ * Connect-out a client for a transactional sequence (BEGIN…COMMIT).
+ * Use for atomic multi-row writes where partial state is unacceptable
+ * — e.g. armOrderBatch's all-or-nothing N-leg insert
+ * (feedback_one_signature_for_n_legs_always.md). Always release the
+ * client in a finally block.
+ *
+ * Pins to the primary pool — we intentionally do NOT fail over to the
+ * secondary on connection-class errors here, because if a transaction
+ * is on a different DB than the rest of the request's writes the user
+ * would see "phantom" partial state. Better to surface a hard fail
+ * and let the caller decide.
+ */
+export async function getClient() {
+  if (!pool) {
+    throw new Error("No primary database connection available for transactional client");
+  }
+  return await pool.connect();
+}
+
+/**
  * One-shot schema patches run on bot startup. Each statement must be
  * idempotent — safe to re-run on every boot. Use sparingly; prefer
  * proper migration files for non-urgent changes.

@@ -1623,6 +1623,7 @@ const PUBLIC_ROUTES = new Set([
   // wallet check), so the API-key gate is bypassed.
   "/api/v1/site/limit-close",
   "/api/v1/site/limit-close/arm",
+  "/api/v1/site/limit-close/arm-batch",
   "/api/v1/site/limit-close/arm-preflight",
   "/api/v1/site/limit-close/modify",
   "/api/v1/site/limit-close/cancel",
@@ -1940,6 +1941,15 @@ async function router(req, res) {
       case "/api/v1/site/limit-close/arm": {
         const { handleSiteLimitCloseArm } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseArm(req);
+        break;
+      }
+      case "/api/v1/site/limit-close/arm-batch": {
+        // Operator-mandated 2026-06-16 PM. One Phantom signature arms
+        // all legs of a ladder atomically. Replaces the N-popups-for-N-
+        // legs pattern that caused silent-leg-drop UX on loans 798/802.
+        // Per feedback_one_signature_for_n_legs_always.md.
+        const { handleSiteLimitCloseArmBatch } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseArmBatch(req);
         break;
       }
       case "/api/v1/site/limit-close/arm-preflight": {
