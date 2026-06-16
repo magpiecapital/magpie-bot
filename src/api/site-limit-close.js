@@ -442,9 +442,27 @@ export async function handleSiteLimitCloseList(req, url) {
  *   IssuedAt: <ISO timestamp>
  * ───────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseArm(req) {
+  // V4 Hardening T1 (2026-06-15 PM): structured entry log so every arm
+  // POST is visible in Railway, including those rejected by auth or
+  // parsing. Operator hit a class of bug where dashboard arms produced
+  // ZERO orders in DB and NO traces in bot logs — we couldn't tell if
+  // the request was even reaching the bot. This log closes that gap.
+  // Logs only request metadata (wallet, loan_id, envelope tag) — no
+  // private fields, no signatures.
+  const reqId = Math.random().toString(36).slice(2, 10);
+  console.log(`[arm] ENTRY req=${reqId} ip=${req.socket?.remoteAddress?.slice(0, 20) || "?"} ua="${(req.headers["user-agent"] || "").slice(0, 60)}"`);
   const auth = await authSignedEnvelope(req, "limit-close-arm/v1", ["LoanId"]);
-  if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
+  if (!auth.ok) {
+    console.warn(`[arm] AUTH-FAIL req=${reqId} status=${auth.status} error=${auth.error} detail=${(auth.detail || "").slice(0, 120)}`);
+    return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
+  }
   const { userId, fields } = auth;
+  console.log(
+    `[arm] AUTH-OK req=${reqId} user_id=${userId} signer=${auth.signerPubkey.slice(0, 8)}… ` +
+    `loan_id_chain=${fields.LoanId} direction=${fields.Direction || "above"} ` +
+    `target=${fields.Target || ""} price=${fields.Price || ""} mc=${fields.MC || ""} ` +
+    `trailing=${fields.Trailing || ""} slippage=${fields.Slippage || ""} slice=${fields.Slice || ""} dest=${fields.Dest || ""}`,
+  );
 
   // ── Parse direction ──
   // 2026-06-13: site now supports stop-loss arming. Old envelopes that
