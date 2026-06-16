@@ -146,6 +146,10 @@ async function showPerf(ctx, windowKey) {
   const V1_PROGRAM_ID = process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh";
   const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2 || null;
   const V3_PROGRAM_ID = process.env.PROGRAM_ID_V3 || null;
+  // V4 Hardening T6 (2026-06-15 PM): include V4 in the pool breakdown
+  // so the operator sees adoption + fire mix across V1/V2/V3/V4 at a
+  // glance instead of V4 silently bucketing as "unknown."
+  const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4 || null;
   const { rows: poolRows } = await query(
     `SELECT
         CASE
@@ -153,6 +157,7 @@ async function showPerf(ctx, windowKey) {
           WHEN engine_program_id = $1 THEN 'v1'
           WHEN engine_program_id = $2 THEN 'v2'
           WHEN engine_program_id = $3 THEN 'v3'
+          WHEN engine_program_id = $4 THEN 'v4'
           ELSE 'unknown'
         END AS pool,
         COUNT(*)::int AS n,
@@ -161,8 +166,46 @@ async function showPerf(ctx, windowKey) {
        FROM limit_close_orders
       WHERE 1=1 ${sqlClause}
       GROUP BY 1 ORDER BY n DESC`,
-    [V1_PROGRAM_ID, V2_PROGRAM_ID, V3_PROGRAM_ID],
+    [V1_PROGRAM_ID, V2_PROGRAM_ID, V3_PROGRAM_ID, V4_PROGRAM_ID],
   );
+
+  // V4-specific surface: active V4 loans + V4 borrows/repays/fires in
+  // the window. Lets the operator see "is V4 actually doing volume?"
+  // and "are V4 fires landing?" without parsing the full pool table.
+  let v4Summary = null;
+  if (V4_PROGRAM_ID) {
+    try {
+      const { rows: [activeRow] } = await query(
+        `SELECT COUNT(*)::int AS active FROM loans WHERE program_id = $1 AND status = 'active'`,
+        [V4_PROGRAM_ID],
+      );
+      const { rows: [windowRow] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'active' AND start_timestamp > $2)::int AS borrows,
+            COUNT(*) FILTER (WHERE status = 'repaid' AND end_timestamp > $2)::int AS repays,
+            COUNT(*) FILTER (WHERE status = 'liquidated' AND end_timestamp > $2)::int AS liquidations
+           FROM loans WHERE program_id = $1`,
+        [V4_PROGRAM_ID, since],
+      );
+      const { rows: [orderRow] } = await query(
+        `SELECT
+            COUNT(*) FILTER (WHERE status = 'armed' AND armed_at > $2)::int AS armed_in_window,
+            COUNT(*) FILTER (WHERE status = 'fired' AND fired_at > $2)::int AS fired_in_window
+           FROM limit_close_orders WHERE engine_program_id = $1`,
+        [V4_PROGRAM_ID, since],
+      );
+      v4Summary = {
+        active_loans: activeRow?.active || 0,
+        window_borrows: windowRow?.borrows || 0,
+        window_repays: windowRow?.repays || 0,
+        window_liquidations: windowRow?.liquidations || 0,
+        window_armed: orderRow?.armed_in_window || 0,
+        window_fired: orderRow?.fired_in_window || 0,
+      };
+    } catch (err) {
+      console.warn("[lc-perf] v4 telemetry read failed:", err.message?.slice(0, 80));
+    }
+  }
 
   // ── Trailing-stop telemetry ──
   // Trailing rolls live in trailing_distance_bps (mig 057). Counting
@@ -342,18 +385,29 @@ async function showPerf(ctx, windowKey) {
     "*Source breakdown:*",
     ...sources.map((s) => `• ${s.source.padEnd(12)} ${s.n}`),
     "",
-    "*Pool breakdown (V1 / V2 / V3):*",
+    "*Pool breakdown (V1 / V2 / V3 / V4):*",
     ...(poolRows.length === 0
       ? ["• (no orders in window)"]
       : poolRows.map((p) => {
           const label = p.pool === "v1" ? "v1 (memecoin)"
                       : p.pool === "v2" ? "v2 (RWA legacy)"
                       : p.pool === "v3" ? "v3 (RWA + memecoin)"
+                      : p.pool === "v4" ? "v4 (in-vault)"
                       : p.pool === "v1_legacy" ? "v1 (pre-mig050)"
                       : `unknown`;
           return `• ${label.padEnd(22)} total ${p.n}  fired ${p.fired}  armed ${p.armed}`;
         })),
     "",
+    ...(v4Summary ? [
+      "*V4 in-vault activity:*",
+      `• Active V4 loans:      ${v4Summary.active_loans}`,
+      `• V4 borrows in window: ${v4Summary.window_borrows}`,
+      `• V4 repays in window:  ${v4Summary.window_repays}`,
+      `• V4 liquidations:      ${v4Summary.window_liquidations}`,
+      `• V4 arms in window:    ${v4Summary.window_armed}`,
+      `• V4 fires in window:   *${v4Summary.window_fired}*`,
+      "",
+    ] : []),
     ...(trailingSummary ? [
       "*Trailing-stop orders:*",
       `• Armed: ${trailingSummary.armed}  ·  Fired: ${trailingSummary.fired}  ·  Failed: ${trailingSummary.failed}`,
