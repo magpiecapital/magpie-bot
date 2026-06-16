@@ -437,6 +437,14 @@ bot.command("crosspost", handleCommunityCrosspost);
   // the borrower's slippage cap.
   const lci = await import("./commands/limit-close-intervention.js");
   lci.registerLimitCloseInterventionCallbacks(bot);
+
+  // /fixarm — TG analog of the site's V4 silent-arm-recovery banner
+  // (operator-mandated 2026-06-16 PM). Detects V4 loans without
+  // armed orders and surfaces one-tap retry buttons. Companion to
+  // PR #147 (site recovery banner) so TG-only users get the same
+  // rescue path.
+  bot.command(["fixarm", "armretry", "recoverarm"], lc.handleFixArm);
+  lc.registerFixArmCallbacks(bot);
 }
 // Agent delegations — Tier 2 (x402 agentic wrapper). Users authorize
 // agents to arm limit-close orders on their behalf within explicit
