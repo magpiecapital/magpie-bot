@@ -257,6 +257,29 @@ export async function armOrder(args) {
     }
   }
 
+  // arm_intent reconciliation (operator-mandated 2026-06-16 PM,
+  // feedback_every_arm_envelope_must_reach_server.md). When the arm
+  // succeeds AND the caller passed an intent_id, mark that intent as
+  // armed + stamp the order_id. The dashboard's V4 recovery banner
+  // hides automatically once the intent is no longer 'pending'.
+  // Best-effort — a reconciliation failure must NOT mask the real
+  // arm result.
+  if (result.ok && args.intentId != null) {
+    try {
+      await query(
+        `UPDATE arm_intents
+            SET status = 'armed',
+                order_id = $2,
+                armed_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $1 AND status = 'pending'`,
+        [args.intentId, result.orderId],
+      );
+    } catch (intentErr) {
+      console.warn("[arm-core] arm_intent reconcile failed:", intentErr.message?.slice(0, 200));
+    }
+  }
+
   return result;
 }
 
