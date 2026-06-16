@@ -177,6 +177,7 @@ import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
+import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
 import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
 import { startWalletAttributionSentinel } from "./services/wallet-attribution-sentinel.js";
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
@@ -912,6 +913,13 @@ bot.start({
     // canonical TG-linked user). Closes the failure-mode behind PR #231
     // + #232 — operator hit it on V3 SPCX loan id=720 not visible in /repay.
     setTimeout(() => startWalletAttributionSentinel(bot), 125_000);
+    // V4 Hardening T5 (2026-06-15 PM) — sweeps every active V4 loan
+    // every 15 min and verifies the sol_proceeds_vault PDA is either
+    // uninitialized OR owned by classic SPL Token (NOT Token-2022).
+    // Catches any regression of the patched Token-2022 init bug class
+    // within minutes instead of when the next user hits it. Read-only;
+    // V4-only; degrades silently on RPC blip.
+    setTimeout(() => startV4LoanHealthProbe(bot), 130_000);
     // Loan actual-received watchdog — backfills + verifies the
     // on-chain SOL delta per borrow row. Catches the class of bug
     // where the dashboard shows ~$1 more "received" than the
