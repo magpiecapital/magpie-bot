@@ -1331,3 +1331,211 @@ export async function handleCancelLimitOrder(ctx) {
   }
   await ctx.reply(`Order #${orderId} cancelled.`);
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ * /fixarm — TG analog of the site's V4 silent-arm-recovery banner.
+ *
+ * Operator-mandated 2026-06-16 PM. Loan 800 PUMP V4 silent auto-arm
+ * failure exposed a UX gap: when arming chain dies silently, a TG
+ * user has no way to retry one-tap. This command:
+ *
+ *   1. Looks up the user's V4 active loans
+ *   2. For each loan with zero armed orders, renders inline preset
+ *      buttons: [Sell at 2x] [Sell at 3x] [Sell at 0.7x] [Bracket]
+ *   3. Tapping a button calls armOrder() directly through the same
+ *      arm-core that powers /takeprofit + /bracket
+ *
+ * Companion to the site recovery banner (PR #147) so TG-only users
+ * get the same one-tap rescue path.
+ *
+ * Per feedback_v4_loans_never_show_exit_not_set.md +
+ *     feedback_every_exit_click_must_arm.md.
+ * ───────────────────────────────────────────────────────────────── */
+export async function handleFixArm(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const user = await upsertUser(tgUser.id, tgUser.username);
+  const v4ProgramId = process.env.PROGRAM_ID_V4 ?? null;
+  if (!v4ProgramId) {
+    return ctx.reply("V4 routing is not configured on this bot instance.");
+  }
+
+  // Find user's active V4 loans whose only "armed" status count is
+  // zero. These are the candidates for the silent-arm recovery flow.
+  const { rows: loans } = await query(
+    `SELECT l.id AS db_id, l.loan_id::text AS loan_id_chain,
+            l.collateral_mint, sm.symbol AS symbol,
+            sm.decimals AS decimals
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      WHERE l.user_id = $1
+        AND l.status = 'active'
+        AND l.program_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM limit_close_orders o
+           WHERE o.loan_id = l.id
+             AND o.status IN ('armed','firing','twap_in_progress','awaiting_user')
+        )
+      ORDER BY l.id DESC
+      LIMIT 5`,
+    [user.id, v4ProgramId],
+  );
+
+  if (loans.length === 0) {
+    return ctx.reply(
+      "No V4 loans need recovery. Either you have no V4 loans, or every active V4 loan already has at least one armed order. Use /limitorders to inspect.",
+    );
+  }
+
+  // Lazy-load grammy InlineKeyboard so this file's existing callers
+  // don't pay the import on warm paths.
+  const { InlineKeyboard } = await import("grammy");
+
+  for (const ln of loans) {
+    const sym = ln.symbol || ln.collateral_mint.slice(0, 4) + "…";
+    const kb = new InlineKeyboard()
+      .text("Sell at 2x", `fixarm:tp:${ln.loan_id_chain}:2`)
+      .text("Sell at 3x", `fixarm:tp:${ln.loan_id_chain}:3`)
+      .row()
+      .text("Sell at 0.7x", `fixarm:sl:${ln.loan_id_chain}:0.7`)
+      .text("Bracket 2x / 0.7x", `fixarm:br:${ln.loan_id_chain}`)
+      .row()
+      .text("Skip this loan", `fixarm:skip:${ln.loan_id_chain}`);
+
+    await ctx.reply(
+      `*V4 loan on ${sym}* — no armed exit found.\n\n` +
+        `This loan landed on V4 because you set up an auto-sell, but the arming step didn't complete. ` +
+        `Pick a preset to retry now — single Telegram tap:`,
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
+  }
+}
+
+export function registerFixArmCallbacks(bot) {
+  bot.callbackQuery(/^fixarm:skip:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery("Skipped.");
+    await ctx.editMessageText("Skipped — you can re-run /fixarm anytime.");
+  });
+
+  bot.callbackQuery(/^fixarm:(tp|sl):(\d+):([\d.]+)$/, async (ctx) => {
+    const [, side, loanIdChain, mulStr] = ctx.match;
+    const multiplier = Number(mulStr);
+    const direction = side === "sl" ? "below" : "above";
+    if (!Number.isFinite(multiplier) || multiplier <= 0) {
+      await ctx.answerCallbackQuery("Invalid multiplier.");
+      return;
+    }
+    await ctx.answerCallbackQuery("Arming…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    // Find the loan's collateral mint so we can resolve the multiplier
+    // through the same cross-source oracle the site uses.
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found in your account.`);
+      return;
+    }
+
+    const r = await resolveMultiplierToPrice(loan.collateral_mint, multiplier, {
+      allowBelowOne: direction === "below",
+    });
+    if (!r.ok) {
+      await ctx.editMessageText(
+        `Couldn't resolve ${multiplier}x target: ${r.detail || r.error}\n\nTry again in a few seconds.`,
+      );
+      return;
+    }
+
+    const armed = await armOrder({
+      userId: user.id,
+      source: "tg",
+      loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: r.triggerValueMicro.toString(),
+      triggerDirection: direction,
+      slippageBps: direction === "below" ? 300 : 200,
+      sellDestination: "sol",
+    });
+
+    if (!armed.ok) {
+      await ctx.editMessageText(
+        `❌ Arm failed (${armed.error}). ${armed.detail || ""}\n\nUse /limitclose ${loanIdChain} at ${multiplier}x to retry manually.`,
+      );
+      return;
+    }
+
+    const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+    const sideLabel = side === "tp" ? "Take-profit" : "Stop-loss";
+    await ctx.editMessageText(
+      `✓ ${sideLabel} armed at *${multiplier}x* — fires at $${fmt(r.targetUsd)}.\n\n` +
+        `Order #${armed.orderId}. Manage via /limitorders.`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  bot.callbackQuery(/^fixarm:br:(\d+)$/, async (ctx) => {
+    const [, loanIdChain] = ctx.match;
+    await ctx.answerCallbackQuery("Arming bracket…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found.`);
+      return;
+    }
+
+    const tpR = await resolveMultiplierToPrice(loan.collateral_mint, 2, { allowBelowOne: false });
+    const slR = await resolveMultiplierToPrice(loan.collateral_mint, 0.7, { allowBelowOne: true });
+    if (!tpR.ok || !slR.ok) {
+      await ctx.editMessageText(
+        `Couldn't resolve bracket prices: ${tpR.detail || slR.detail || "oracle blip"}. Try again in a few seconds.`,
+      );
+      return;
+    }
+
+    // Arm TP first, then SL. If SL fails, we leave TP armed (still
+    // protective on the upside) and tell the user. Matches /bracket
+    // best-effort semantics.
+    const tpArm = await armOrder({
+      userId: user.id, source: "tg", loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: tpR.triggerValueMicro.toString(),
+      triggerDirection: "above",
+      slippageBps: 200,
+      sellDestination: "sol",
+    });
+    if (!tpArm.ok) {
+      await ctx.editMessageText(`❌ TP arm failed (${tpArm.error}). Bracket aborted.`);
+      return;
+    }
+    const slArm = await armOrder({
+      userId: user.id, source: "tg", loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: slR.triggerValueMicro.toString(),
+      triggerDirection: "below",
+      slippageBps: 300,
+      sellDestination: "sol",
+    });
+    if (!slArm.ok) {
+      await ctx.editMessageText(
+        `✓ TP armed (order #${tpArm.orderId}) at 2x.\n` +
+          `❌ SL failed (${slArm.error}). Re-try with /sl ${loanIdChain} at 0.7x.`,
+      );
+      return;
+    }
+
+    await ctx.editMessageText(
+      `✓ Bracket armed — TP order #${tpArm.orderId} at 2x, SL order #${slArm.orderId} at 0.7x. Manage via /limitorders.`,
+    );
+  });
+}
