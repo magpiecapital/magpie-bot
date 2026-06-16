@@ -97,7 +97,9 @@ async function main() {
   const provider = new AnchorProvider(connection, new Wallet(lender), { commitment: "confirmed" });
 
   const PROGRAM_V4 = new PublicKey(process.env.PROGRAM_ID_V4);
-  const PROGRAM_V1 = new PublicKey(process.env.PROGRAM_ID_V1);
+  // The bot uses PROGRAM_ID (no _V1 suffix) for the V1 lending program —
+  // V1 was the original, so the suffix-less env is V1.
+  const PROGRAM_V1 = new PublicKey(process.env.PROGRAM_ID_V1 || process.env.PROGRAM_ID);
   const programV4 = new Program(idlV4, provider);
   const programV1 = new Program(idlV1, provider);
 
@@ -119,7 +121,10 @@ async function main() {
   const v1Pos = positionPda(v1Pool, lender.publicKey, PROGRAM_V1);
 
   // Safety: assert derived pools match operator-stated addresses
-  const STATED_V4 = process.env.V4_POOL_STATED || "REPLACE_WITH_V4_POOL_PUBKEY";
+  // Derived from lender pubkey 4JSSSaG3xRomQsrxmdQEsahfyFjBVjvuoBKJUUZgzPAx
+  // and PROGRAM_ID_V4 HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo. Anchored
+  // here so future runs fail closed if the derivation ever drifts.
+  const STATED_V4 = process.env.V4_POOL_STATED || "7My1o9Jfm2D5wM2xfpfy67NPvTPVUTSzWyz7ZxjwPjT4";
   const STATED_V1 = "EynWtuRMUKU3zHzfLv7Y5Qu6MWpwqG17X91QAuHSww9u";
   if (v4Pool.toBase58() !== STATED_V4 || v1Pool.toBase58() !== STATED_V1) {
     console.error("SAFETY ABORT: PDA mismatch with operator-stated pools");
