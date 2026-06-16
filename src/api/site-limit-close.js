@@ -289,6 +289,13 @@ export async function handleSiteLimitCloseList(req, url) {
   const { rows: loans } = await query(
     `SELECT l.id, l.loan_id::text AS loan_id, l.loan_pda,
             l.collateral_mint, l.collateral_amount::text AS collateral_amount,
+            -- Remainder watcher columns (migration 066, engine maintains
+            -- them per fire). NULL on pre-066 rows → site falls back to
+            -- collateral_amount cleanly.
+            COALESCE(l.current_collateral_amount, l.collateral_amount)::text
+              AS current_collateral_amount,
+            COALESCE(l.sol_proceeds_amount, 0)::text AS sol_proceeds_amount,
+            COALESCE(l.auto_sells_fired, 0) AS auto_sells_fired,
             l.original_loan_amount_lamports::text AS owed_lamports,
             l.start_timestamp, l.due_timestamp,
             l.program_id,
