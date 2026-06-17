@@ -906,6 +906,28 @@ export async function applyStartupPatches() {
     // $MAGPIE auto-defaults to unlimited (it's our protocol token —
     // there's no upside in arbitrarily capping borrows against it).
     `ALTER TABLE supported_mints ADD COLUMN IF NOT EXISTS max_open_lamports NUMERIC(20,0)`,
+
+    // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
+    // (feedback_distribution_wallet_must_be_auto_funded.md).
+    // Records every move of accrued fees from fee_wallet (lender pubkey's
+    // wSOL ATA) → distribution wallet (CHCAMWtn). 'planned' rows are
+    // the idempotency anchor: written BEFORE tx broadcast so a crash
+    // mid-flight leaves a reconcilable audit trail. 'confirmed' rows
+    // include the on-chain tx_signature.
+    `CREATE TABLE IF NOT EXISTS fee_wallet_sweeps (
+       id              BIGSERIAL PRIMARY KEY,
+       source_pubkey   TEXT NOT NULL,
+       dest_pubkey     TEXT NOT NULL,
+       amount_lamports NUMERIC(30,0) NOT NULL,
+       status          TEXT NOT NULL CHECK (status IN ('planned','confirmed','failed','reconciled')),
+       tx_signature    TEXT,
+       reason          TEXT,
+       err             TEXT,
+       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_status_idx ON fee_wallet_sweeps(status) WHERE status = 'planned'`,
+    `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_created_idx ON fee_wallet_sweeps(created_at DESC)`,
   ];
   for (const sql of patches) {
     try {
