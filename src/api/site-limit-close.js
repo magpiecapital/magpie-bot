@@ -641,12 +641,23 @@ export async function handleSiteLimitCloseArm(req) {
   }
 
   // ── Load loan to resolve multiplier (needs collateral_mint) ──
+  // Race-tolerant: same 6s/400ms poll as armOrder / armOrderBatch. The
+  // borrow tx may have confirmed but /sync-loan hasn't committed the
+  // loans row yet when a multiplier-arm fires immediately after.
   if (multiplierUsed != null) {
-    const { rows: [loanLite] } = await query(
-      `SELECT collateral_mint FROM loans
-        WHERE user_id = $1 AND loan_id = $2 AND status = 'active'`,
-      [userId, fields.LoanId],
-    );
+    const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+    const LOAN_LOOKUP_INTERVAL_MS = 400;
+    let loanLite = null;
+    for (;;) {
+      const { rows } = await query(
+        `SELECT collateral_mint FROM loans
+          WHERE user_id = $1 AND loan_id = $2 AND status = 'active'`,
+        [userId, fields.LoanId],
+      );
+      if (rows.length > 0) { loanLite = rows[0]; break; }
+      if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
+      await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
+    }
     if (!loanLite) return { status: 404, body: { error: "loan_not_found_for_signer" } };
     // allowBelowOne is the contract with resolveMultiplierToPrice — it
     // rejects mismatched direction/multiplier pairs as a defense-in-
