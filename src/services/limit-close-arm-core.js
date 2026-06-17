@@ -1119,14 +1119,31 @@ async function armOrderBatchImpl({
   intentIds = null,        // optional [intent_id, ...] same length as legs
   armNotePrefix = null,
 }) {
+  // Per-phase structured logging tagged with reqId so the operator can
+  // grep Railway logs for the exact failing phase when an arm doesn't
+  // land. Operator-mandated rule:
+  // feedback_next_spcx_ladder_must_arm_display_execute.md — the four-
+  // link success chain (arm → display → reflect → execute) cannot fail
+  // silently again. Logs are JSON for grep-ability.
+  const reqId = `arm-batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const phaseLog = (phase, extra = {}) => {
+    console.log(
+      `[arm-batch-trace] ${JSON.stringify({ req_id: reqId, phase, source, user_id: userId, loan_id_chain: String(loanIdChain), ...extra })}`,
+    );
+  };
+  phaseLog("entry", { n_legs: Array.isArray(legs) ? legs.length : null });
+
   if (!Array.isArray(legs) || legs.length === 0) {
+    phaseLog("reject_no_legs");
     return { ok: false, error: "no_legs_supplied" };
   }
   if (legs.length > 8) {
+    phaseLog("reject_too_many_legs", { n_legs: legs.length });
     return { ok: false, error: "too_many_legs", detail: "max 8 legs per batch" };
   }
 
   // Phase 1 — Shared loan + eligibility load (single round trip).
+  phaseLog("phase_1_loan_lookup_start");
   const { rows: loanRows } = await query(
     `SELECT l.id, l.loan_id::text AS loan_id_chain, l.user_id, l.collateral_mint,
             l.collateral_amount::text AS coll_raw,
@@ -1161,6 +1178,8 @@ async function armOrderBatchImpl({
   if (v4EnforceOn && v4Pid && loan.program_id && loan.program_id !== v4Pid) {
     return { ok: false, error: "exits_require_v4_loan" };
   }
+
+  phaseLog("phase_1_loan_ok", { loan_db_id: loan.id, program_id: loan.program_id, status: loan.status, symbol: loan.symbol, category: loan.category });
 
   // Phase 2 — Per-leg parse + validation. No DB writes yet.
   // Multiplier kinds are resolved through the cross-source oracle in
@@ -1256,6 +1275,8 @@ async function armOrderBatchImpl({
     });
   }
 
+  phaseLog("phase_2_parse_ok", { parsed_legs: parsed.map((p) => ({ dir: p.direction, kind: p.kind, val: p.valueMicro.toString(), slice: p.sliceBps, slip: p.slippageBps })) });
+
   // Phase 3 — Cumulative slice cap per direction (existing armed +
   // this batch). Mirrors the DB trigger from migration 064 / 065.
   const existingSliceByDir = { above: 0, below: 0 };
@@ -1280,6 +1301,8 @@ async function armOrderBatchImpl({
       };
     }
   }
+
+  phaseLog("phase_3_slice_cap_ok", { existing_above: existingSliceByDir.above, existing_below: existingSliceByDir.below, batch_above: batchSliceByDir.above, batch_below: batchSliceByDir.below });
 
   // Phase 4 — Resolve ladder_group_id per direction. If an existing
   // ladder group already covers that direction, reuse its id +
@@ -1315,6 +1338,8 @@ async function armOrderBatchImpl({
       originalCollateralByDir[dir] = null;
     }
   }
+
+  phaseLog("phase_4_ladder_groups_ok", { ladder_group_ids: ladderGroupIds });
 
   // Phase 5 — Atomic INSERT inside a DB transaction. Either every leg
   // lands OR none do. No partial-arm state ever surfaces.
@@ -1372,12 +1397,15 @@ async function armOrderBatchImpl({
         ],
       );
       insertedOrderIds.push(r.rows[0].id);
+      phaseLog("phase_5_leg_inserted", { leg_idx: parsed.indexOf(leg), order_id: r.rows[0].id, direction: leg.direction, slice_bps: leg.sliceBps });
     }
     await client.query("COMMIT");
+    phaseLog("phase_5_commit_ok", { order_ids: insertedOrderIds });
   } catch (err) {
     try {
       await client.query("ROLLBACK");
     } catch (_) {}
+    phaseLog("phase_5_insert_failed", { err: (err.message || String(err)).slice(0, 200) });
     if (/TP\/SL ladder exceeds 100/i.test(err.message || "")) {
       return { ok: false, error: "ladder_sum_exceeds_100", detail: err.message?.slice(0, 240) };
     }
