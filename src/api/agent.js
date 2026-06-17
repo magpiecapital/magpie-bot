@@ -138,13 +138,28 @@ export async function findOrCreateAgentUser(walletPubkey) {
     [synthTg, `agent_${walletPubkey.slice(0, 8)}`],
   );
   const userId = rows[0].id;
-  // Ensure a wallets row exists for this pubkey (source='agent_x402')
-  await query(
-    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
-     VALUES ($1, $2, '', '', '', 'agent_x402', TRUE)
-     ON CONFLICT (public_key) DO NOTHING`,
-    [userId, walletPubkey],
+  // Ensure a wallets row exists for this pubkey (source='agent_x402').
+  // wallets has NO unique constraint on public_key (pool.js drops it on
+  // every boot), so ON CONFLICT (public_key) throws "no unique or
+  // exclusion constraint". Use SELECT-then-INSERT with race-tolerance.
+  // Caught by audit 2026-06-17 PM same root cause as wallet-owner-resolver.
+  const existsCheck = await query(
+    `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+    [walletPubkey, userId],
   );
+  if (existsCheck.rowCount === 0) {
+    try {
+      await query(
+        `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
+         VALUES ($1, $2, '', '', '', 'agent_x402', TRUE)`,
+        [userId, walletPubkey],
+      );
+    } catch (raceErr) {
+      if (!/duplicate key|unique constraint/i.test(raceErr.message || "")) {
+        throw raceErr;
+      }
+    }
+  }
   return userId;
 }
 
