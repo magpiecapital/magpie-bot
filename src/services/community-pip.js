@@ -160,9 +160,19 @@ If a user asks "what pool am I on?" — they don't usually need to know. Plain b
 
 9. **T14 Token-2022 arm-side block removed.** SPCX / extended Token-2022 mints now arm cleanly. Jupiter routing failures at fire-time still surface as failed legs; arming itself never refuses on extension grounds.
 
-10. **/fixarm TG command (new).** TG users with V4 loans that have no armed orders can type /fixarm to see inline preset buttons (Sell at 2x / 3x / 0.7x / Bracket) and arm in one tap. Aliases: /armretry, /recoverarm.
+10. **/fixarm TG command.** TG users with V4 loans that have no armed orders can type /fixarm to see inline retry buttons. As of 2026-06-16 PM the buttons are **intent-aware** — they render the EXACT strike the user originally requested (e.g. "Sell at 1.3x") read from the server-side arm_intents ledger, not generic 2x/3x/0.7x defaults. Falls back to the preset buttons only when no pending intent exists for that loan. Aliases: /armretry, /recoverarm.
 
 11. **Cumulative slice cap honors existing armed legs.** Adding a leg to an already-laddered loan now correctly bounds the new leg's budget to (100% - already-armed slice%) before the user signs. No more "slice_overflow" rejections after a Phantom popup.
+
+12. **TG V4 arm path full hardening — shipped 2026-06-16 PM:**
+   - **/sell <loan_id> at <strike>** is now a registered command alias — natural verb for arming a TP without typing /takeprofit. Routes through the same arm-core. If a user types "/sell 810 at 1.3x" and asks why nothing happened in the past, that was the pre-fix UX gap.
+   - **Breadcrumb intents on every TG arm path** (/sell, /takeprofit, /stoploss, /bracket, /trailingstop, ladders). The server records the user's exact requested strike in the arm_intents ledger BEFORE armOrder runs. If anything downstream fails (Jupiter blip, parser issue, network glitch), the strike is preserved and /fixarm + dashboard banner + a proactive DM all show the user's actual ask, not a default.
+   - **/preview <loan_id> at <strike>** + **/previewsl** (and aliases /checkarm, /preflight, /checkarmsl) — dry-run any TP or SL through the full validation + oracle + slice math stack WITHOUT persisting. Mirror of the x402 /agent/preflight + site /arm-preflight. If a user asks "can I check whether this arm would succeed?" — recommend this.
+   - **Proactive stale-intent DM watcher.** A pending arm_intent on a V4 loan that hasn't resolved within 90s triggers a TG DM to the user with a one-tap retry button (same fixarm:intent callback). User never has to notice the issue themselves.
+   - **Failure DM one-tap retry.** When an armOrder call fails, the DM that goes to the user now has a "Retry now" inline button (when the intent was recorded). One tap re-runs the exact same arm.
+   - **Site recovery banner intent-aware.** Same as /fixarm — renders "Sell at 1.3x" with the actual strike pulled from arm_intents, not hardcoded defaults.
+
+If a user reports a TG arm "dropped" or "didn't go through" — explain the breadcrumb system: their intent is on file, /fixarm will show it as a one-tap retry button with their exact strike. They can also wait ~90s and a DM will arrive automatically.
 
 If a user asks about any of these by name or describes hitting an issue these fixed (e.g. "my ladder didn't fully arm", "exit said not set on V4 loan", "0.5 SOL too small for auto-sells"), explain the relevant fix and tell them it's live.
 
