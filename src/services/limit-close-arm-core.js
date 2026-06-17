@@ -158,26 +158,46 @@ export async function resolveMultiplierToPrice(collateralMint, multiplier, { all
     return { ok: false, error: "Stop-loss multiplier must be < 1 (e.g. 0.7 for 70% of current)." };
   }
   const { getPriceInUsdCrossSourced } = await import("./price.js");
-  // getPriceInUsdCrossSourced THROWS on cross-source disagreement,
-  // single-source-only responses, and total fetcher failures. The
-  // trailing-stop arm path (and any multiplier arm) calls this — if
-  // it throws and we don't catch, the route handler emits a generic
-  // 500 with no useful detail. Operator hit this on 2026-06-15
-  // trying to set a trailing SL while Jupiter was rate-limited.
-  // Catch the throw, return a structured ok:false so the caller can
-  // emit a 502 with the actual reason.
-  let currentUsd;
-  try {
-    currentUsd = await getPriceInUsdCrossSourced(collateralMint);
-  } catch (err) {
+  // Retry-with-backoff on transient oracle failures (operator-mandated
+  // 2026-06-16 PM, feedback_v4_exit_requests_must_execute.md). Every
+  // V4 exit request must execute — single Jupiter blip can't be the
+  // reason an arm rejects. ~26s budget across 7 attempts is the same
+  // shape used by the multiplier arm-side gap fix (task #309) and
+  // long enough to outlast typical 5-10s rate-limit windows while
+  // short enough that an operator typing /sell sees a fail-soft
+  // reply within a reasonable wait. Cross-source price disagreement
+  // (not transient) still fails fast — only NETWORK / RATE-LIMIT
+  // errors retry.
+  const MAX_ATTEMPTS = 7;
+  const baseDelaysMs = [0, 500, 1500, 3000, 5000, 7000, 9000];
+  let currentUsd = null;
+  let lastErrMsg = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    if (baseDelaysMs[attempt] > 0) {
+      await new Promise((r) => setTimeout(r, baseDelaysMs[attempt]));
+    }
+    try {
+      currentUsd = await getPriceInUsdCrossSourced(collateralMint);
+      if (currentUsd && currentUsd > 0) break;
+    } catch (err) {
+      lastErrMsg = (err?.message || String(err)).slice(0, 240);
+      // Hard-stop on permanent failures — disagreement is a safety
+      // signal, not a transient one. "No USD price data" with no
+      // working sources is also worth surfacing immediately.
+      if (/sources disagree/i.test(lastErrMsg) || /No USD price data/i.test(lastErrMsg)) {
+        return { ok: false, error: "price_unavailable", detail: lastErrMsg };
+      }
+      currentUsd = null;
+      // Otherwise (single-source refusal, rate limit, network blip) —
+      // retry on the next loop iteration.
+    }
+  }
+  if (!currentUsd || currentUsd <= 0) {
     return {
       ok: false,
       error: "price_unavailable",
-      detail: (err?.message || String(err)).slice(0, 240),
+      detail: lastErrMsg || "Couldn't fetch current USD price after retries — try again or use an explicit price target.",
     };
-  }
-  if (!currentUsd || currentUsd <= 0) {
-    return { ok: false, error: "Couldn't fetch current USD price right now — try again or use an explicit price target." };
   }
   const targetUsd = currentUsd * multiplier;
   const triggerValueMicro = BigInt(Math.round(targetUsd * 1e6));
