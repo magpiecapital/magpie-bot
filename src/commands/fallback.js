@@ -54,6 +54,177 @@ const HANDLER_MAP = {
 // Solana base58 address pattern (32-44 chars of base58 alphabet)
 const SOLANA_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+// Verbs users naturally reach for when they want to set an exit on a
+// loan. None of these were registered as bot.command() pre-2026-06-16.
+// Operator-mandated 2026-06-16 PM: ANY user expression of arm intent
+// must be RECOGNIZED, never silently ignored
+// (feedback_exit_strategy_must_always_be_recognized.md).
+//
+// Direction-implied verbs are routed without ambiguity. Neutral verbs
+// (sell, exit, target) defer to the parsed strike's impliedDirection
+// (multiplier >= 1 → TP, multiplier < 1 → SL; "-N%" → SL; "+N%" → TP).
+const ARM_INTENT_VERBS = {
+  // neutral — direction inferred from strike
+  sell: "neutral",
+  exit: "neutral",
+  target: "neutral",
+  goal: "neutral",
+  strike: "neutral",
+  trigger: "neutral",
+  closeat: "neutral",
+  // TP-implying
+  buy: "above",
+  sellat: "above",
+  sellabove: "above",
+  tpat: "above",
+  selltop: "above",
+  protectgains: "above",
+  // SL-implying
+  stop: "below",
+  stopat: "below",
+  stopabove: "below",
+  stopbelow: "below",
+  slat: "below",
+  floor: "below",
+  protect: "below",
+  protectfloor: "below",
+  downto: "below",
+  // bracket
+  tpsl: "bracket",
+  protectboth: "bracket",
+  bothlegs: "bracket",
+};
+
+/**
+ * If the unrecognized command is arm-intent-shaped, re-dispatch to the
+ * correct registered handler with the same arg shape and return true.
+ * Otherwise return false so the caller can render the generic "I
+ * don't recognize that command" reply.
+ */
+async function maybeRedirectArmIntent(ctx, text) {
+  // Extract the leading /command token.
+  const m = /^\/([a-z_]+)(?:@\w+)?\b/i.exec(text);
+  if (!m) return false;
+  const verb = m[1].toLowerCase();
+  const known = ARM_INTENT_VERBS[verb];
+  if (!known) return false;
+
+  // Strip the leading /<verb>; pass the rest as "/<canonical> <rest>"
+  // so the registered handler's parser sees the same args the user
+  // typed. Preserves loan_id + strike + slip= etc unchanged.
+  const rest = text.slice(m[0].length).trim();
+
+  // For unambiguous direction, route directly.
+  if (known === "above") {
+    return await dispatchAsCommand(ctx, "takeprofit", rest);
+  }
+  if (known === "below") {
+    return await dispatchAsCommand(ctx, "stoploss", rest);
+  }
+  if (known === "bracket") {
+    return await dispatchAsCommand(ctx, "bracket", rest);
+  }
+
+  // Neutral verb: infer direction from the strike. Use the parser to
+  // see what direction the strike implies. If parser fails, surface a
+  // helpful reply asking the user to clarify.
+  let parsed;
+  try {
+    const mod = await import("../lib/strike-price-parser.js");
+    // Heuristic: find the strike portion. Common shapes:
+    //   <loan_id> at <strike>
+    //   <loan_id> <strike>
+    //   <loan_id> at 1.3x slip=2%
+    // Grab the first non-loan token after "at" (or after loan_id).
+    const tokens = rest.split(/\s+/).filter(Boolean);
+    // skip first token (loan id) if it's a number
+    let idx = 0;
+    if (/^\d+$/.test(tokens[0] || "")) idx = 1;
+    // skip "at" / "sell" / "buy" filler
+    while (
+      tokens[idx] &&
+      ["at", "sell", "buy", "to", "around", "near"].includes(tokens[idx].toLowerCase())
+    )
+      idx += 1;
+    const strikeText = tokens.slice(idx).join(" ");
+    if (strikeText) {
+      parsed = mod.parseStrike(strikeText, {});
+    }
+  } catch (e) {
+    console.warn("[fallback-arm-redirect] parseStrike failed:", e.message?.slice(0, 100));
+  }
+
+  if (parsed?.ok && parsed.impliedDirection) {
+    const canonical = parsed.impliedDirection === "below" ? "stoploss" : "takeprofit";
+    return await dispatchAsCommand(ctx, canonical, rest);
+  }
+
+  // Strike ambiguous — ask the user explicitly. Inline buttons let them
+  // pick without re-typing the strike.
+  const safeRest = rest.replace(/[`*_]/g, "");
+  await ctx.reply(
+    [
+      `I recognize you wanted to set an exit, but I need to know which side.`,
+      ``,
+      `If you want to *sell ABOVE current price* (take-profit):`,
+      `  /takeprofit ${safeRest}`,
+      ``,
+      `If you want to *sell BELOW current price* (stop-loss):`,
+      `  /stoploss ${safeRest}`,
+      ``,
+      `Or send /preview ${safeRest} to dry-run without committing.`,
+    ].join("\n"),
+    { parse_mode: "Markdown" },
+  );
+  return true;
+}
+
+/**
+ * Re-dispatch an unrecognized arm-shaped command as if the user had
+ * typed the canonical command. Constructs a fresh ctx with
+ * ctx.message.text rewritten so the handler's parser sees what it
+ * expects, then invokes the handler directly.
+ */
+async function dispatchAsCommand(ctx, canonicalCmd, restArgs) {
+  const newText = `/${canonicalCmd}${restArgs ? " " + restArgs : ""}`;
+  // Shallow-clone the context's message so we don't mutate grammy
+  // internal state mid-update. The handlers only read ctx.message.text
+  // and ctx.from / ctx.chat for behavior, so a property override on
+  // the message is sufficient.
+  const origMessage = ctx.message;
+  const newMessage = { ...origMessage, text: newText };
+  Object.defineProperty(ctx, "message", {
+    value: newMessage,
+    configurable: true,
+    writable: true,
+  });
+
+  try {
+    const lc = await import("./limit-close.js");
+    if (canonicalCmd === "takeprofit") return await runAndOk(lc.handleLimitClose, ctx);
+    if (canonicalCmd === "stoploss") return await runAndOk(lc.handleStopLoss, ctx);
+    if (canonicalCmd === "bracket") return await runAndOk(lc.handleBracket, ctx);
+  } catch (e) {
+    console.warn(`[fallback-arm-redirect] dispatch ${canonicalCmd} failed: ${e.message?.slice(0, 200)}`);
+    return false;
+  } finally {
+    // Restore original message so any downstream middleware sees the
+    // original text. (No middleware runs after handleFallback today,
+    // but this keeps the contract clean.)
+    Object.defineProperty(ctx, "message", {
+      value: origMessage,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return false;
+}
+
+async function runAndOk(handler, ctx) {
+  await handler(ctx);
+  return true;
+}
+
 export async function handleFallback(ctx) {
   // Skip non-DM chats entirely — fallback is meant for 1:1 conversation
   // with the bot. In groups, the bot replying to every text message
@@ -74,8 +245,18 @@ export async function handleFallback(ctx) {
   // tweet URL doesn't trigger this.
   if (await maybeAutoCrosspostTweet(ctx, text)) return;
 
-  // Ignore messages that start with / (those are unrecognized commands)
+  // Smart redirect for arm-intent-shaped unknown commands
+  // (operator-mandated 2026-06-16 PM,
+  // feedback_exit_strategy_must_always_be_recognized.md). When the
+  // user types an unrecognized command that LOOKS like they're trying
+  // to set an exit ("/sell 810 at 1.3x", "/buy 810 at $0.005",
+  // "/target 810 at $150m"), parse the strike, infer direction from
+  // it, and re-dispatch to the correct registered handler with the
+  // bot.command argv shape. NEVER silently ignore an arm-shaped
+  // message.
   if (text.startsWith("/")) {
+    const armRedirect = await maybeRedirectArmIntent(ctx, text);
+    if (armRedirect) return;
     await ctx.reply(
       `I don't recognize that command. Try /help to see what I can do.`,
     );
