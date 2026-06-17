@@ -78,6 +78,13 @@ export async function handleActivity(req, url) {
     ),
     // auto_protect_actions doesn't have wallet info — join with loans
     // so we can filter the same way (by loan's borrower wallet).
+    //
+    // Activity feed is TRANSACTIONAL ONLY — operator-mandated 2026-06-17
+    // (feedback_activity_feed_transactional_only.md). Advisories like
+    // 'insufficient_funds_warning' / 'partial_repay_failed' clutter the
+    // feed and look like errors to users. Filter to tx-backed action_types
+    // here (signature IS NOT NULL guarantees a real on-chain action).
+    // Advisory rows stay in DB for admin debugging via /lc-perf etc.
     query(
       `SELECT ap.id, ap.loan_id, ap.action_type, ap.amount_lamports::text AS amount,
               ap.health_before, ap.health_after, ap.signature, ap.created_at,
@@ -85,6 +92,8 @@ export async function handleActivity(req, url) {
          FROM auto_protect_actions ap
          JOIN loans l ON l.id = ap.loan_id
         WHERE ap.user_id = $1
+          AND ap.signature IS NOT NULL
+          AND ap.action_type NOT IN ('insufficient_funds_warning', 'partial_repay_failed')
         ORDER BY ap.created_at DESC
         LIMIT $2`,
       [userId, limit],
