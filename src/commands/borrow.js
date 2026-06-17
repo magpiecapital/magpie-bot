@@ -644,6 +644,21 @@ export function registerBorrowCallbacks(bot) {
     await quoteAndRenderTiers(ctx, state);
   });
 
+  // One-tap "Retry borrow" — re-runs executeBorrowWithExits using the
+  // SAME state (selected token, % choice, tier, exit selection, etc.).
+  // Used when attestPrice fails during submit due to transient infra
+  // (Jupiter 429, Solana congestion, RPC blip). State is preserved so
+  // the user doesn't have to walk back through 4 wizard steps.
+  bot.callbackQuery("borrow:retry_submit", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired — run /borrow again");
+      return;
+    }
+    await ctx.answerCallbackQuery("Retrying…");
+    await executeBorrowWithExits(ctx, state);
+  });
+
   // Renders the exits picker AFTER a tier is selected. User can pre-arm
   // TP / SL / Bracket / Custom strike / Ladder before the loan executes —
   // exits land in the same transaction window as the borrow so the user
@@ -842,9 +857,14 @@ export function registerBorrowCallbacks(bot) {
             await initializePriceFeed(state.selected.mint, attestProgramId);
             await attestPrice(state.selected.mint, state.selected.decimals, undefined, attestProgramId);
           } catch (initErr) {
-            pending.delete(ctx.chat.id);
+            // KEEP state — show retry button. The borrow hasn't started.
+            pending.set(ctx.chat.id, state);
+            const kb = new InlineKeyboard()
+              .text("🔁 Retry borrow", "borrow:retry_submit").row()
+              .text("✕ Cancel", "borrow:cancel");
             await say(
-              `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
+              `⚠️ *Couldn't initialize on-chain price feed for ${state.selected.symbol}*\n\n_${initErr.message?.slice(0, 200) || "(unknown error)"}_\n\nYour collateral + tier selection are saved — tap to retry.`,
+              { parse_mode: "Markdown", reply_markup: kb },
             );
             return;
           }
@@ -856,16 +876,29 @@ export function registerBorrowCallbacks(bot) {
           if (recheckAge !== null && recheckAge < 110) {
             // Close enough — proceed with the borrow anyway.
           } else {
-            pending.delete(ctx.chat.id);
+            // KEEP state — show retry button so user can re-trigger when
+            // Solana congestion eases. No need to walk back through
+            // token + % + tier + exit selections.
+            pending.set(ctx.chat.id, state);
+            const kb = new InlineKeyboard()
+              .text("🔁 Retry borrow", "borrow:retry_submit").row()
+              .text("✕ Cancel", "borrow:cancel");
             await say(
-              `⚠️ Solana network is congested right now and our price refresh tx didn't confirm.\n\nGive it a minute and try /borrow again — it usually clears quickly.`,
+              `⚠️ *Solana network congested*\n\nOur price refresh tx didn't confirm. Usually clears within a minute. Your collateral + tier are saved — tap to retry.`,
+              { parse_mode: "Markdown", reply_markup: kb },
             );
             return;
           }
         } else {
-          pending.delete(ctx.chat.id);
+          // KEEP state — show retry button. attestPrice failures are
+          // usually transient (Jupiter 429, RPC blip, brief outage).
+          pending.set(ctx.chat.id, state);
+          const kb = new InlineKeyboard()
+            .text("🔁 Retry borrow", "borrow:retry_submit").row()
+            .text("✕ Cancel", "borrow:cancel");
           await say(
-            `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
+            `⚠️ *Couldn't refresh on-chain price for ${state.selected.symbol}*\n\n_${attestErr.message?.slice(0, 200) || "(unknown error)"}_\n\nYour collateral + tier are saved — tap to retry.`,
+            { parse_mode: "Markdown", reply_markup: kb },
           );
           return;
         }
