@@ -1142,21 +1142,42 @@ async function armOrderBatchImpl({
     return { ok: false, error: "too_many_legs", detail: "max 8 legs per batch" };
   }
 
-  // Phase 1 — Shared loan + eligibility load (single round trip).
+  // Phase 1 — Shared loan + eligibility load with race-tolerant polling.
+  //
+  // Mirrors the single-arm lookup loop earlier in this file (~ line 467).
+  // The pre-borrow ladder picker beacons intents and signs the batch arm
+  // seconds after the borrow tx confirms — sometimes before /sync-loan
+  // has committed the loans row. Without retry, the batch returns
+  // loan_not_found_for_user immediately and the user's intent beacons
+  // flip to status='failed' (recovery banner then has to do the work
+  // of re-prompting for retry). Triggered 2026-06-17 on operator's
+  // SPCX loan 820: intents 15/16 failed at 05:28:46, loan row landed
+  // at 05:28:51 — 5s late. Poll up to 6s/400ms, same envelope/sig.
   phaseLog("phase_1_loan_lookup_start");
-  const { rows: loanRows } = await query(
-    `SELECT l.id, l.loan_id::text AS loan_id_chain, l.user_id, l.collateral_mint,
-            l.collateral_amount::text AS coll_raw,
-            l.original_loan_amount_lamports::text AS owed,
-            l.program_id, l.status,
-            sm.symbol, sm.decimals, sm.category, sm.enabled
-       FROM loans l
-       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-      WHERE l.loan_id::text = $1 AND l.user_id = $2
-      LIMIT 1`,
-    [String(loanIdChain), userId],
-  );
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const LOAN_LOOKUP_INTERVAL_MS = 400;
+  let loanRows;
+  let lookupAttempts = 0;
+  for (;;) {
+    lookupAttempts += 1;
+    ({ rows: loanRows } = await query(
+      `SELECT l.id, l.loan_id::text AS loan_id_chain, l.user_id, l.collateral_mint,
+              l.collateral_amount::text AS coll_raw,
+              l.original_loan_amount_lamports::text AS owed,
+              l.program_id, l.status,
+              sm.symbol, sm.decimals, sm.category, sm.enabled
+         FROM loans l
+         LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+        WHERE l.loan_id::text = $1 AND l.user_id = $2
+        LIMIT 1`,
+      [String(loanIdChain), userId],
+    ));
+    if (loanRows.length > 0) break;
+    if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
+    await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
+  }
   if (loanRows.length === 0) {
+    phaseLog("phase_1_loan_not_found", { lookup_attempts: lookupAttempts });
     return { ok: false, error: "loan_not_found_for_user" };
   }
   const loan = loanRows[0];
@@ -1179,7 +1200,7 @@ async function armOrderBatchImpl({
     return { ok: false, error: "exits_require_v4_loan" };
   }
 
-  phaseLog("phase_1_loan_ok", { loan_db_id: loan.id, program_id: loan.program_id, status: loan.status, symbol: loan.symbol, category: loan.category });
+  phaseLog("phase_1_loan_ok", { loan_db_id: loan.id, program_id: loan.program_id, status: loan.status, symbol: loan.symbol, category: loan.category, lookup_attempts: lookupAttempts });
 
   // Phase 2 — Per-leg parse + validation. No DB writes yet.
   // Multiplier kinds are resolved through the cross-source oracle in
