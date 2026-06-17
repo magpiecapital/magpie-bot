@@ -712,6 +712,16 @@ export async function handleTrailingStop(ctx) {
   }
 
   const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 trail fire,
+  // proceeds accumulate in the per-loan sol_proceeds_vault and the
+  // loan STAYS active until borrower-signed repay. Legacy programs
+  // close the loan on fire.
+  const v4ProgramIdTrail = process.env.PROGRAM_ID_V4 || null;
+  const isV4Trail = !!v4ProgramIdTrail && armed.loan?.program_id === v4ProgramIdTrail;
+  const fireLine = isV4Trail
+    ? `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak — sells into SOL on-chain, proceeds accumulate inside your loan's vault. Run /repay when you want the SOL released.`
+    : `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`;
   return ctx.reply([
     `*Trailing stop armed* on loan #${loan_id}`,
     "",
@@ -720,7 +730,7 @@ export async function handleTrailingStop(ctx) {
     `Initial floor: $${fmt(r.targetUsd)} (-${(trailingDistanceBps / 100).toFixed(1)}%)`,
     `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
     "",
-    `Floor rises with each new high. Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`,
+    `Floor rises with each new high. ${fireLine}`,
     `Order ID: \`${armed.orderId}\` — \`/limitorders\` to view, \`/cancellimitorder ${armed.orderId}\` to cancel.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
@@ -959,6 +969,16 @@ export async function handleBracket(ctx) {
     : sl.kind === "mc_usd"
       ? `MC $${(slResolved.resolvedMc / 1e6).toFixed(1)}M`
       : `$${fmt(slResolved.resolvedUsd)}`;
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 the first
+  // leg to fire converts its slice into SOL inside the per-loan vault
+  // and sibling-cancels the other leg; the loan stays Active and the
+  // user releases the SOL via /repay. Legacy programs close the loan.
+  const v4ProgramIdBracket = process.env.PROGRAM_ID_V4 || null;
+  const isV4Bracket = !!v4ProgramIdBracket && tpArm.loan?.program_id === v4ProgramIdBracket;
+  const bracketFireLine = isV4Bracket
+    ? `First leg to fire converts that slice to SOL inside your loan's vault, auto-cancels the other leg, and leaves the loan Active. Run /repay when you want the SOL released.`
+    : `First leg to fire closes the loan and auto-cancels the other.`;
   return ctx.reply([
     `*Bracket armed* on loan #${loan_id}`,
     "",
@@ -967,7 +987,7 @@ export async function handleBracket(ctx) {
     `Slippage: ${(slippage_bps / 100).toFixed(2)}% · proceeds → ${sell_destination.toUpperCase()}`,
     expiresAtIso ? `Both legs expire: ${new Date(expiresAtIso).toISOString().slice(0, 10)}` : null,
     "",
-    `First leg to fire closes the loan and auto-cancels the other.`,
+    bracketFireLine,
     `\`/limitorders\` to view, \`/cancellimitorder <id>\` to cancel either leg.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
