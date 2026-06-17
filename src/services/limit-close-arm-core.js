@@ -225,6 +225,27 @@ const MAX_INITIAL_SLIPPAGE_BPS = MAX_PROTOCOL_SLIPPAGE_BPS; // 25% — allow agg
  * mask a real arm result.
  */
 export async function armOrder(args) {
+  // Breadcrumb intent (operator-mandated 2026-06-16 PM,
+  // feedback_tg_v4_must_match_site_quality.md). Every arm path — TG
+  // /sell, /takeprofit, /stoploss, /bracket, /trailingstop, ladders,
+  // Pip-driven arms, agent x402 — MUST leave an arm_intent row in
+  // 'pending' state BEFORE the armOrderImpl gates so the dashboard's
+  // V4 silent-arm recovery banner can render the user's exact strike
+  // if anything below fails. Site flow passes args.intentId because
+  // it already wrote one via /api/v1/site/limit-close/intent; in that
+  // case we don't write again. Best-effort: a write failure here does
+  // NOT abort the arm.
+  if (args.intentId == null && args.source !== "site") {
+    try {
+      const intentId = await writeBreadcrumbIntent(args);
+      if (intentId != null) args.intentId = intentId;
+    } catch (e) {
+      console.warn(
+        `[arm-core] breadcrumb intent write failed (continuing): ${e.message?.slice(0, 160)}`,
+      );
+    }
+  }
+
   let result;
   try {
     result = await armOrderImpl(args);
@@ -1714,4 +1735,123 @@ async function enqueueArmFailedDm(args, result) {
        VALUES ($1, 'tg', 'limit_close_arm_failed', $2::jsonb, 'pending')`,
     [args.userId, JSON.stringify(payload)],
   );
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Breadcrumb arm intent (operator-mandated 2026-06-16 PM,
+ * feedback_tg_v4_must_match_site_quality.md).
+ *
+ * Writes an arm_intent row in 'pending' state for any arm path that
+ * didn't already record one (TG /sell, /takeprofit, /stoploss,
+ * /bracket, /trailingstop, /ladder, Pip arms, agent x402). The
+ * intent acts as a durable record of the user's exact requested
+ * strike so:
+ *   - If armOrderImpl rejects (gate failure, ineligibility, etc.),
+ *     the dashboard V4 silent-arm-recovery banner can render the
+ *     exact strike as the retry CTA — not generic 2x/3x/0.7x.
+ *   - If armOrderImpl succeeds, the existing reconciliation path
+ *     marks the intent 'armed' and the dashboard hides the banner.
+ *
+ * Returns the new intent_id or null on any failure. Best-effort:
+ * a write failure must NEVER block the arm. Wallet lookup is
+ * derived from loans.borrower_wallet via the chain loan id — this
+ * is the wallet the user actually borrowed with, which is what
+ * arm_intents.wallet must contain for the dashboard's
+ * loan_id_chain filter to surface this intent.
+ * ──────────────────────────────────────────────────────────────── */
+async function writeBreadcrumbIntent(args) {
+  // Skip if we don't have what we need to write a useful breadcrumb.
+  if (!args.loanIdChain || !args.triggerKind || args.triggerValueMicro == null) {
+    return null;
+  }
+  // Skip dry-run paths — those are questions, not commitments.
+  if (args.dryRun) return null;
+
+  // Lookup borrower_wallet from loans by chain id. Defensive: only
+  // act when we get exactly one row to avoid cross-program ambiguity.
+  let walletPk;
+  let userId = args.userId || null;
+  try {
+    const { rows } = await query(
+      `SELECT borrower_wallet, user_id
+         FROM loans
+        WHERE loan_id::text = $1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [String(args.loanIdChain)],
+    );
+    if (rows.length === 0) return null;
+    walletPk = rows[0].borrower_wallet;
+    if (!userId && rows[0].user_id) userId = rows[0].user_id;
+  } catch (e) {
+    console.warn(`[arm-core] breadcrumb loan lookup failed: ${e.message?.slice(0, 120)}`);
+    return null;
+  }
+
+  if (!walletPk || typeof walletPk !== "string" || walletPk.length < 32 || walletPk.length > 44) {
+    return null;
+  }
+
+  const targetKind = String(args.triggerKind);
+  const validKinds = new Set(["multiplier", "price_usd", "mc_usd", "price_sol", "trailing"]);
+  if (!validKinds.has(targetKind)) return null;
+
+  const tvm =
+    typeof args.triggerValueMicro === "bigint"
+      ? args.triggerValueMicro.toString()
+      : String(args.triggerValueMicro);
+  if (!/^\d+$/.test(tvm)) return null;
+
+  const direction =
+    args.triggerDirection === "below" || args.direction === "below" ? "below" : "above";
+
+  const sliceBpsRaw = args.slicePct;
+  const sliceBps =
+    sliceBpsRaw == null || sliceBpsRaw === 10000
+      ? null
+      : Number.isInteger(sliceBpsRaw) && sliceBpsRaw > 0 && sliceBpsRaw < 10000
+        ? sliceBpsRaw
+        : null;
+
+  // De-dupe: if an identical pending intent already exists for the
+  // same loan+direction+strike+slice in the last 5 min, reuse its id
+  // instead of writing a duplicate. Prevents UI noise from repeated
+  // /sell attempts at the same strike.
+  try {
+    const dedup = await query(
+      `SELECT id FROM arm_intents
+        WHERE wallet = $1
+          AND loan_id_chain = $2
+          AND direction = $3
+          AND target_kind = $4
+          AND target_value_micro = $5::numeric
+          AND COALESCE(slice_pct_bps, 0) = COALESCE($6::int, 0)
+          AND status = 'pending'
+          AND created_at > NOW() - INTERVAL '5 minutes'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [walletPk, String(args.loanIdChain), direction, targetKind, tvm, sliceBps],
+    );
+    if (dedup.rows.length > 0) return dedup.rows[0].id;
+  } catch (e) {
+    // Fall through to insert; dedupe is best-effort.
+    console.warn(`[arm-core] breadcrumb dedupe lookup failed: ${e.message?.slice(0, 120)}`);
+  }
+
+  const src = String(args.source || "unknown").slice(0, 32);
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO arm_intents
+         (user_id, wallet, loan_id_chain, direction, target_kind, target_value_micro,
+          slice_pct_bps, source, status)
+       VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, 'pending')
+       RETURNING id`,
+      [userId, walletPk, String(args.loanIdChain), direction, targetKind, tvm, sliceBps, src],
+    );
+    return rows[0]?.id ?? null;
+  } catch (e) {
+    console.warn(`[arm-core] breadcrumb intent INSERT failed: ${e.message?.slice(0, 200)}`);
+    return null;
+  }
 }
