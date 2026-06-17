@@ -398,6 +398,12 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("takeprofit", lc.handleLimitClose);
   bot.command("tp", lc.handleLimitClose);
   bot.command("lo", lc.handleLimitClose);
+  // /sell — operator-mandated 2026-06-16 PM after PUMP loan 810: users
+  // reach for "sell at 1.3x" before they reach for "takeprofit at 1.3x".
+  // Routes to handleLimitClose which infers direction from the parsed
+  // strike (multiplier >= 1 → above/TP, < 1 → below/SL). Natural verb,
+  // same arm-core path.
+  bot.command("sell", lc.handleLimitClose);
   // Stop-loss — same arm-core path, direction='below' flips the engine's
   // trigger comparator from >= to <=. 1% protocol fee applies in BOTH
   // directions (operator rule 2026-06-12). Cutting losses before the
