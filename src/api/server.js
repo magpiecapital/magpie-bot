@@ -1622,6 +1622,11 @@ const PUBLIC_ROUTES = new Set([
   // "Refreshing oracle…" instead of letting the user click into a
   // StalePriceAttestation rejection.
   "/api/v1/v4/feed-health",
+  // V4 TWAP precise-value read. Sprint Item 4 (T15). Returns the
+  // bot-computed safe collateral_value the site can submit instead of
+  // multiplying by the legacy 0.89. Drops the under-shoot from 11% to
+  // ~0.3% — same precision as the on-chain TWAP attestation.
+  "/api/v1/v4/twap",
   // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
   // POST + DELETE require an Ed25519-signed envelope. Security is
   // enforced internally by the handler (signature verification + linked
@@ -1944,6 +1949,15 @@ async function router(req, res) {
         // the recommendation field to gate the borrow CTA.
         const { handleV4FeedHealth } = await import("./v4-feed-health.js");
         result = await handleV4FeedHealth(req, url);
+        break;
+      }
+      case "/api/v1/v4/twap": {
+        // Sprint Item 4 (T15) — precise collateral_value computation
+        // from the V4 on-chain TWAP. Replaces the legacy 0.89
+        // multiplier (11% under-shoot) with a 30bps headroom (~0.3%
+        // under-shoot) site value.
+        const { handleV4Twap } = await import("./v4-twap.js");
+        result = await handleV4Twap(req, url);
         break;
       }
       case "/api/v1/site/limit-close": {
