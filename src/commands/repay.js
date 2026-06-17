@@ -249,12 +249,30 @@ export function registerRepayCallbacks(bot) {
         }
       } catch { /* non-critical */ }
 
+      // V4 vault-SOL release line — operator-mandated
+      // (feedback_v4_in_vault_thesis_non_negotiable.md). For V4 loans
+      // with any sol_proceeds_amount, the repay tx releases that SOL
+      // back to the user alongside the SPL collateral. Show it
+      // explicitly so V4 users see the V4 thesis play out end-to-end.
+      // The loan row was fetched BEFORE the repay so its
+      // sol_proceeds_amount is the exact balance just released.
+      const v4ProgramIdRepay = process.env.PROGRAM_ID_V4 || null;
+      const isV4Repay = !!v4ProgramIdRepay && loan.program_id === v4ProgramIdRepay;
+      const vaultLamportsReleased = isV4Repay
+        ? BigInt(loan.sol_proceeds_amount || 0)
+        : 0n;
+      const vaultReleasedLine =
+        vaultLamportsReleased > 0n
+          ? `_Plus ${fmtSol(vaultLamportsReleased)} SOL released from your V4 loan's vault._`
+          : null;
+
       await ctx.editMessageText(
         [
           "*Loan repaid*",
           "",
           `${loan.symbol ?? "?"} loan · ${fmtSol(owedNow)} SOL`,
           "Collateral returned to your wallet.",
+          vaultReleasedLine,
           milestoneLine,
           `[View tx](https://solscan.io/tx/${result.signature})`,
         ].filter(Boolean).join("\n"),
