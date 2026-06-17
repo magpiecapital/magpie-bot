@@ -838,10 +838,16 @@ bot.start({
     setTimeout(() => startExtendLoanWatcher(), 40_000);
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
     // queries supported_mints (enabled=TRUE) every tick, so newly approved
-    // tokens get attested without a restart. Drift-gated to keep cost low.
-    // 45s interval so refresh fires before the 60s force-attest gap.
-    // Keeps on-chain feed timestamp comfortably under 120s contract limit.
-    setTimeout(() => startPriceAttestor(45_000), 35_000);
+    // tokens get attested without a restart.
+    //
+    // 20s interval: V4's on-chain TWAP needs 8 samples in the rolling
+    // 5-minute window. At 20s ticks the V4 throttle (MAX_GAP_MS_V4=35s)
+    // writes every other tick → ~40s effective cadence → 7-8 samples in
+    // any 5-min window. Previous 45s interval gave ~90s effective cadence
+    // (only 3-4 samples in window), which caused SPCX V3 borrows to fail
+    // with PriceImpactPumpDetected when price moved during the long gap.
+    // Operator hit it 2026-06-17 PM. Forensic: scripts/diagnose-spcx-twap-lag.mjs
+    setTimeout(() => startPriceAttestor(20_000), 35_000);
     // RWA screener — discovers Backed Finance xStocks + similar via DexScreener
     // search every 4h. Auto-adds new mints meeting liquidity/volume thresholds.
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.

@@ -262,8 +262,15 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // V4 feed is fresh too — leaving the V4 PDA stale.
   const lastAttestAtV4 = new Map();
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
-  // feed timestamp never crosses the contract's 120s staleness limit.
-  const MAX_GAP_MS = 60_000;
+  // feed timestamp never crosses the contract's 120s staleness limit AND
+  // so the V3 on-chain TWAP fills its 8-samples-in-5-minutes window even
+  // for low-volatility tokens (xStocks, BTC). Previous value (60s) plus
+  // the drift-skip (drift < 0.5%) meant stable RWA prices were attested
+  // only every 90-120s, leaving the TWAP window with 2-3 samples instead
+  // of 8 — which surfaced as PriceImpactPumpDetected the moment any spot
+  // movement landed against the stale TWAP. Operator hit this on SPCX
+  // 2026-06-17 PM. Diagnostic: scripts/diagnose-spcx-twap-lag.mjs
+  const MAX_GAP_MS = 30_000;
   // V4 needs a TIGHTER cadence than V1/V3 because the on-chain TWAP rule
   // requires 8 samples within a rolling 5-minute window. At 60s pushes a
   // 5-minute window only contains ~5 samples — so every freshly-enabled
