@@ -2,7 +2,7 @@ import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
 import { ensureWallet } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
-import { collateralValueLamports } from "../services/price.js";
+import { collateralValueLamports, warmPriceCache } from "../services/price.js";
 import { executeBorrow, recordLoan } from "../services/loans.js";
 import { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } from "../services/price-attestor.js";
 import { isBorrowingPaused } from "../services/admin.js";
@@ -27,6 +27,95 @@ import { getEligibleTiers, getTierByOption, MEMECOIN_TIERS as LTV_TIERS } from "
 
 // In-memory pending state per Telegram chat; fine for MVP, move to DB for prod.
 const pending = new Map();
+
+/**
+ * Fetch the collateral value and render the tier picker. Used by the
+ * preset-% buttons, the custom-% text path, AND the "Retry quote" inline
+ * button. Extracted 2026-06-17 PM (operator-mandated reliability sprint)
+ * so a transient price-fetch failure becomes a one-tap retry instead of
+ * "Run /borrow to try again" — which lost the user's collateral selection
+ * + % choice + balance lookup.
+ *
+ * Contract: caller has set `state.collateralRaw`, `state.humanAmount`, and
+ * `state.selected` on `state`. This function handles `state.collateralValueLamports`,
+ * `state.quotedAt`, pending-map persistence, AND the user-facing render
+ * (success or retry).
+ */
+async function quoteAndRenderTiers(ctx, state) {
+  let valueLamports;
+  try {
+    valueLamports = await collateralValueLamports(
+      state.selected.mint,
+      state.collateralRaw,
+      state.selected.decimals,
+    );
+  } catch (err) {
+    console.error(`[borrow] price fetch error for ${state.selected.symbol}:`, err.message);
+    // CRITICAL reliability: keep the user's session. They've already
+    // picked a token and an amount — making them /borrow over a Jupiter
+    // 429 means they lose the wizard state and have to start over. The
+    // price.js layer already serves stale-but-recent cached prices when
+    // available; if THIS still failed, it's a genuine multi-source
+    // outage and the next attempt in a few seconds is likely to succeed.
+    pending.set(ctx.chat.id, state);
+    const retries = (state.quoteRetries || 0) + 1;
+    state.quoteRetries = retries;
+    pending.set(ctx.chat.id, state);
+    const retryKb = new InlineKeyboard()
+      .text("🔁 Retry quote", "borrow:retry_quote")
+      .row()
+      .text("✕ Cancel", "borrow:cancel");
+    const msg = retries < 3
+      ? [
+          "⚠️ *Couldn't fetch the price right now*",
+          "",
+          `_Likely a transient rate limit on one of our price sources. Your ${state.selected.symbol} selection and amount are saved — tap to retry, no need to restart._`,
+        ].join("\n")
+      : [
+          "⚠️ *Price sources are slow right now*",
+          "",
+          `_${retries} retries so far. Both Jupiter and DexScreener may be heavily rate-limited; usually clears within a minute. Tap to keep trying — your selection stays put._`,
+        ].join("\n");
+    return ctx.reply(msg, { parse_mode: "Markdown", reply_markup: retryKb });
+  }
+  state.collateralValueLamports = valueLamports;
+  state.quotedAt = Date.now();
+  state.quoteRetries = 0;
+  pending.set(ctx.chat.id, state);
+
+  const tiers = await getEligibleTiers({ category: state.selected.category });
+  const kb = new InlineKeyboard();
+  const tierLines = tiers.map((t) => {
+    const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
+    const fee = loanSol * (t.feeBps / 10_000);
+    const receive = loanSol - fee;
+    const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
+    const shortName = shortMatch ? shortMatch[1] : t.label;
+    kb.text(
+      `${shortName} — ${receive.toFixed(4)} SOL`,
+      `borrow:tier:${t.option}`,
+    ).row();
+    return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
+  });
+  kb.text("✕ Cancel", "borrow:cancel");
+
+  const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
+  await ctx.reply(
+    [
+      `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
+      `*Value:* ${fmtSol(valueLamports)} SOL`,
+      riskBlock ? "" : null,
+      riskBlock || null,
+      "",
+      "*Choose a loan tier:*",
+      ...tierLines,
+      "",
+      "_Amount shown is what you receive after the tier fee._",
+      "⏱ _This quote expires in 60 seconds._",
+    ].filter((l) => l != null).join("\n"),
+    { parse_mode: "Markdown", reply_markup: kb },
+  );
+}
 
 // Pre-borrow ladder presets. Slice values in basis points sum to 10000 per preset.
 // Multipliers are anchors off the borrow-time spot price; resolveMultiplierToPrice
@@ -402,6 +491,14 @@ export function registerBorrowCallbacks(bot) {
 
     pending.set(ctx.chat.id, { userId: user.id, selected, stage: "amount" });
 
+    // Reliability: warm the cross-source price cache for this mint NOW
+    // so the next callback (% pick) hits a populated cache even if
+    // Jupiter goes 429 in the next minute. Best-effort fire-and-forget;
+    // any error is swallowed by warmPriceCache and the % path still
+    // does a live fetch — the warm just makes that fetch's fallback
+    // path solid. Operator-mandated reliability rule 2026-06-17 PM.
+    warmPriceCache(mint);
+
     const kb = new InlineKeyboard()
       .text("25%", "borrow:pct:25").text("50%", "borrow:pct:50")
       .text("75%", "borrow:pct:75").text("100%", "borrow:pct:100")
@@ -509,67 +606,11 @@ export function registerBorrowCallbacks(bot) {
     state.collateralRaw = rawBig;
     state.humanAmount = amount;
     delete state.stage;
-    pending.set(ctx.chat.id, state);
-
-    // Fetch value and show tier selection.
-    let valueLamports;
-    try {
-      valueLamports = await collateralValueLamports(
-        state.selected.mint,
-        rawBig,
-        state.selected.decimals,
-      );
-    } catch (err) {
-      console.error("[borrow] price fetch error:", err.message);
-      pending.delete(ctx.chat.id);
-      return ctx.reply("⚠️ Couldn't fetch price right now. Run /borrow to try again.");
-    }
-
-    state.collateralValueLamports = valueLamports;
-    state.quotedAt = Date.now();
-    pending.set(ctx.chat.id, state);
-
-    // Resolve tier schedule based on the selected mint's category.
-    // RWA collateral (stock/etf/metal) lands the higher-LTV ladder
-    // out of rwa_loan_tiers; memecoin (and uncategorized) get MEMECOIN_TIERS.
-    const tiers = await getEligibleTiers({ category: state.selected.category });
-    // Telegram inline-button labels visually truncate around 30-40 chars
-    // on mobile — RWA tiers' full label "50% LTV · 7d · 2.5% fee
-    // (RWA Express) → ~1.2345 SOL" cut off the receive amount to
-    // "→ ~..." in the UI (operator screenshot 2026-06-13). Render the
-    // full breakdown in the message body (Markdown, no length limit)
-    // and keep buttons short.
-    const kb = new InlineKeyboard();
-    const tierLines = tiers.map((t) => {
-      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
-      const fee = loanSol * (t.feeBps / 10_000);
-      const receive = loanSol - fee;
-      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
-      const shortName = shortMatch ? shortMatch[1] : t.label;
-      kb.text(
-        `${shortName} — ${receive.toFixed(4)} SOL`,
-        `borrow:tier:${t.option}`,
-      ).row();
-      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
-    });
-    kb.text("✕ Cancel", "borrow:cancel");
-
-    const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
-    await ctx.reply(
-      [
-        `*Collateral:* ${amount.toLocaleString()} ${state.selected.symbol}`,
-        `*Value:* ${fmtSol(valueLamports)} SOL`,
-        riskBlock ? "" : null,
-        riskBlock || null,
-        "",
-        "*Choose a loan tier:*",
-        ...tierLines,
-        "",
-        "_Amount shown is what you receive after the tier fee._",
-        "⏱ _This quote expires in 60 seconds._",
-      ].filter((l) => l != null).join("\n"),
-      { parse_mode: "Markdown", reply_markup: kb },
-    );
+    // Delegate to the shared helper. On price fetch failure the helper
+    // KEEPS state + shows a Retry button — no more "Run /borrow to try
+    // again" that loses the user's entire wizard. Operator-mandated
+    // reliability rule 2026-06-17 PM.
+    await quoteAndRenderTiers(ctx, state);
   });
 
   bot.callbackQuery(/^borrow:pct:(\d+)$/, async (ctx) => {
@@ -583,61 +624,39 @@ export function registerBorrowCallbacks(bot) {
     const rawBig = (BigInt(state.selected.rawAmount) * BigInt(pct)) / 100n;
     state.collateralRaw = rawBig;
     state.humanAmount = state.selected.humanAmount * (pct / 100);
-    pending.set(ctx.chat.id, state);
-
-    // Fetch value in lamports for each LTV tier and timestamp the quote.
-    let valueLamports;
-    try {
-      valueLamports = await collateralValueLamports(
-        state.selected.mint,
-        rawBig,
-        state.selected.decimals,
-      );
-    } catch (err) {
-      console.error("[borrow] price fetch error (pct):", err.message);
-      pending.delete(ctx.chat.id);
-      return ctx.reply("⚠️ Couldn't fetch price right now. Run /borrow to try again.");
-    }
-    state.collateralValueLamports = valueLamports;
-    state.quotedAt = Date.now();
-    pending.set(ctx.chat.id, state);
-
-    // Same category-aware tier resolution as the prior flow.
-    // See note above on tier-label truncation on mobile — render the
-    // breakdown in the message body and keep button labels short.
-    const tiers = await getEligibleTiers({ category: state.selected.category });
-    const kb = new InlineKeyboard();
-    const tierLines = tiers.map((t) => {
-      const loanSol = ((valueLamports * t.ltv) / 100) / 1e9;
-      const fee = loanSol * (t.feeBps / 10_000);
-      const receive = loanSol - fee;
-      const shortMatch = t.label.match(/\(([^)]+)\)\s*$/);
-      const shortName = shortMatch ? shortMatch[1] : t.label;
-      kb.text(
-        `${shortName} — ${receive.toFixed(4)} SOL`,
-        `borrow:tier:${t.option}`,
-      ).row();
-      return `• *${shortName}* — ${t.ltv}% LTV · ${t.days}d · ${(t.feeBps / 100).toFixed(1)}% fee → *${receive.toFixed(4)} SOL*`;
-    });
-    kb.text("✕ Cancel", "borrow:cancel");
-
-    const riskBlock = await renderRiskBlock(state.selected.symbol).catch(() => "");
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(
-      [
-        `*Collateral:* ${state.humanAmount.toLocaleString()} ${state.selected.symbol}`,
-        `*Value:* ${fmtSol(valueLamports)} SOL`,
-        riskBlock ? "" : null,
-        riskBlock || null,
-        "",
-        "*Choose a loan tier:*",
-        ...tierLines,
-        "",
-        "_Amount shown is what you receive after the tier fee._",
-        "⏱ _This quote expires in 60 seconds._",
-      ].filter((l) => l != null).join("\n"),
-      { parse_mode: "Markdown", reply_markup: kb },
-    );
+    // Delegate to the shared helper. On price fetch failure the helper
+    // KEEPS state + shows a Retry button — no more "Run /borrow to try
+    // again" that loses the user's collateral + % choice.
+    await quoteAndRenderTiers(ctx, state);
+  });
+
+  // One-tap "Retry quote" — re-runs the price fetch + tier render using
+  // the SAME state the user already built up. State is preserved across
+  // any number of retries; each tap just re-tries the fetch.
+  bot.callbackQuery("borrow:retry_quote", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.collateralRaw) {
+      await ctx.answerCallbackQuery("Session expired — run /borrow again");
+      return;
+    }
+    await ctx.answerCallbackQuery("Retrying…");
+    await quoteAndRenderTiers(ctx, state);
+  });
+
+  // One-tap "Retry borrow" — re-runs executeBorrowWithExits using the
+  // SAME state (selected token, % choice, tier, exit selection, etc.).
+  // Used when attestPrice fails during submit due to transient infra
+  // (Jupiter 429, Solana congestion, RPC blip). State is preserved so
+  // the user doesn't have to walk back through 4 wizard steps.
+  bot.callbackQuery("borrow:retry_submit", async (ctx) => {
+    const state = pending.get(ctx.chat.id);
+    if (!state || !state.tier) {
+      await ctx.answerCallbackQuery("Session expired — run /borrow again");
+      return;
+    }
+    await ctx.answerCallbackQuery("Retrying…");
+    await executeBorrowWithExits(ctx, state);
   });
 
   // Renders the exits picker AFTER a tier is selected. User can pre-arm
@@ -838,9 +857,14 @@ export function registerBorrowCallbacks(bot) {
             await initializePriceFeed(state.selected.mint, attestProgramId);
             await attestPrice(state.selected.mint, state.selected.decimals, undefined, attestProgramId);
           } catch (initErr) {
-            pending.delete(ctx.chat.id);
+            // KEEP state — show retry button. The borrow hasn't started.
+            pending.set(ctx.chat.id, state);
+            const kb = new InlineKeyboard()
+              .text("🔁 Retry borrow", "borrow:retry_submit").row()
+              .text("✕ Cancel", "borrow:cancel");
             await say(
-              `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${initErr.message}\n\nTry /borrow again in a minute.`,
+              `⚠️ *Couldn't initialize on-chain price feed for ${state.selected.symbol}*\n\n_${initErr.message?.slice(0, 200) || "(unknown error)"}_\n\nYour collateral + tier selection are saved — tap to retry.`,
+              { parse_mode: "Markdown", reply_markup: kb },
             );
             return;
           }
@@ -852,16 +876,29 @@ export function registerBorrowCallbacks(bot) {
           if (recheckAge !== null && recheckAge < 110) {
             // Close enough — proceed with the borrow anyway.
           } else {
-            pending.delete(ctx.chat.id);
+            // KEEP state — show retry button so user can re-trigger when
+            // Solana congestion eases. No need to walk back through
+            // token + % + tier + exit selections.
+            pending.set(ctx.chat.id, state);
+            const kb = new InlineKeyboard()
+              .text("🔁 Retry borrow", "borrow:retry_submit").row()
+              .text("✕ Cancel", "borrow:cancel");
             await say(
-              `⚠️ Solana network is congested right now and our price refresh tx didn't confirm.\n\nGive it a minute and try /borrow again — it usually clears quickly.`,
+              `⚠️ *Solana network congested*\n\nOur price refresh tx didn't confirm. Usually clears within a minute. Your collateral + tier are saved — tap to retry.`,
+              { parse_mode: "Markdown", reply_markup: kb },
             );
             return;
           }
         } else {
-          pending.delete(ctx.chat.id);
+          // KEEP state — show retry button. attestPrice failures are
+          // usually transient (Jupiter 429, RPC blip, brief outage).
+          pending.set(ctx.chat.id, state);
+          const kb = new InlineKeyboard()
+            .text("🔁 Retry borrow", "borrow:retry_submit").row()
+            .text("✕ Cancel", "borrow:cancel");
           await say(
-            `⚠️ Couldn't refresh on-chain price for ${state.selected.symbol}: ${attestErr.message}\n\nTry /borrow again in a minute.`,
+            `⚠️ *Couldn't refresh on-chain price for ${state.selected.symbol}*\n\n_${attestErr.message?.slice(0, 200) || "(unknown error)"}_\n\nYour collateral + tier are saved — tap to retry.`,
+            { parse_mode: "Markdown", reply_markup: kb },
           );
           return;
         }
