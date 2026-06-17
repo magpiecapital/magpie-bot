@@ -310,7 +310,14 @@ function fmtTrigger(kind, value_micro) {
 
 /* ─── /limitclose ──────────────────────────────────────────────── */
 
-export async function handleLimitClose(ctx, direction = "above") {
+export async function handleLimitClose(ctx, direction = "above", opts = {}) {
+  // opts.dryRun (operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md): run every
+  // validation, oracle quote, slice/ladder check, and arm-core gate
+  // — but skip the INSERT. Mirror of the x402 preflight endpoint;
+  // closes the "did this arm actually validate?" question on TG
+  // BEFORE the user gets a confusing failure DM.
+  const dryRun = opts.dryRun === true;
   const tgUser = ctx.from;
   if (!tgUser) return;
   const text = ctx.message?.text ?? "";
@@ -364,6 +371,7 @@ export async function handleLimitClose(ctx, direction = "above") {
     sellDestination: dest,
     expiresAt: expire_iso,
     slicePct: parseResult.parsed.slice_pct,
+    dryRun,
   });
 
   if (!armed.ok) {
@@ -463,6 +471,39 @@ export async function handleLimitClose(ctx, direction = "above") {
     return ctx.reply(m, { parse_mode: "Markdown" });
   }
 
+  // Dry-run preview — operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md. armOrder with
+  // dryRun:true returned ok=true having validated every gate without
+  // persisting. Tell the user explicitly that nothing was armed, then
+  // show what WOULD have armed so they can choose to commit.
+  if (dryRun && armed.ok) {
+    const loanD = armed.loan;
+    const mintD = armed.mint;
+    const triggerLabelD = fmtTrigger(trigger_kind, trigger_value_micro);
+    const isSlD = direction === "below";
+    const symD = mintD?.symbol || "your collateral";
+    const owedSolD = loanD?.owed ? (Number(loanD.owed) / 1e9).toFixed(4) : "?";
+    const appliedD = armed.initialSlippageBpsApplied ?? slippage_bps;
+    const originalD = armed.initialSlippageBpsRequested ?? slippage_bps;
+    const bumpedD = appliedD !== originalD;
+    return ctx.reply(
+      [
+        `*Preview only — nothing armed.*`,
+        ``,
+        `Loan: #${loanD?.loan_id || loan_id} (${symD}) · owes ${owedSolD} SOL`,
+        `Direction: ${isSlD ? "stop-loss" : "take-profit"}`,
+        `Trigger: ${triggerLabelD}`,
+        multiplierContextLine ? `_${multiplierContextLine}_` : null,
+        `Slippage: ${(appliedD / 100).toFixed(2)}%${bumpedD ? ` _(would be bumped from ${(originalD / 100).toFixed(2)}%)_` : ""}`,
+        `Destination: ${dest.toUpperCase()}`,
+        ``,
+        `All gates passed at this moment. Run \`/${isSlD ? "stoploss" : "takeprofit"} ${loan_id} at ${multiplier ? `${multiplier}x` : triggerLabelD}\` (without "preview") to actually arm it.`,
+        `_Liquidity can shift between now and a real arm._`,
+      ].filter(Boolean).join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
   // Success — render the confirmation. arm-core surfaces any liquidity
   // bump via initialSlippageBpsRequested vs initialSlippageBpsApplied
   // so we can show the bump line when relevant.
@@ -515,8 +556,24 @@ export async function handleLimitClose(ctx, direction = "above") {
 // Thin wrapper that delegates to handleLimitClose with direction='below'.
 // Shares every gate, fill-guarantee, and 1% fee — only the trigger
 // comparator flips at fire time (see magpie-limitclose isTriggerHit).
-export async function handleStopLoss(ctx) {
-  return handleLimitClose(ctx, "below");
+export async function handleStopLoss(ctx, opts = {}) {
+  return handleLimitClose(ctx, "below", opts);
+}
+
+/* ─── /preview ─────────────────────────────────────────────────── */
+// TG arm pre-flight (operator-mandated 2026-06-16 PM,
+// feedback_tg_must_follow_v4_at_highest_level.md). Mirror of the
+// site / x402 dry-run endpoints — runs the entire validation +
+// oracle + slice / cap stack against the user's loan and reports
+// whether an arm WOULD succeed right now, without persisting.
+// Lets the user catch "trigger would fire immediately" / "loan
+// below minimum size" / "ladder sum exceeds 100" before they
+// commit a slot.
+export async function handlePreviewTp(ctx) {
+  return handleLimitClose(ctx, "above", { dryRun: true });
+}
+export async function handlePreviewSl(ctx) {
+  return handleLimitClose(ctx, "below", { dryRun: true });
 }
 
 /* ─── /trailingstop ────────────────────────────────────────────── */
