@@ -390,6 +390,23 @@ function renderPipUpsideAlert(p) {
   return p?.text || "";
 }
 
+function renderArmIntentStale(p) {
+  // p contains: intent_id, loan_id_chain, collateral_symbol,
+  // target_kind, target_value_micro, slice_pct_bps, direction,
+  // strike_label, recovery_command, recovery_callback, message_text
+  // The watcher pre-renders message_text so we just need to expose it.
+  if (typeof p.message_text === "string" && p.message_text.length > 0) {
+    return p.message_text;
+  }
+  const sym = p.collateral_symbol || "your loan";
+  const verb = p.direction === "above" ? "auto-sell" : "stop-loss";
+  return [
+    `Your ${verb} on ${sym} (loan #${p.loan_id_chain}) didn't finish arming — strike was *${p.strike_label || "the level you set"}*.`,
+    "",
+    `Tap to retry now or use /fixarm.`,
+  ].join("\n");
+}
+
 function renderLimitCloseStalenessNudge(p) {
   const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
   return [
@@ -455,6 +472,7 @@ function renderEnginePreflightFailed(p) {
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
   limit_close_arm_failed:   renderLimitCloseArmFailed,
+  arm_intent_stale:         renderArmIntentStale,
   limit_close_fired:           renderLimitCloseFired,
   limit_close_v4_fired:        renderLimitCloseV4Fired,
   limit_close_failed:          renderLimitCloseFailed,
@@ -548,6 +566,19 @@ async function tick(bot) {
                 .text("Keep active", `lcstale:keep:${row.payload.order_id}`)
                 .text("Cancel order", `lcstale:cancel:${row.payload.order_id}`);
               extra = { reply_markup: kb };
+            } else if (row.kind === "arm_intent_stale") {
+              // One-tap retry: routes to the existing fixarm:intent
+              // callback in src/commands/limit-close.js so the same
+              // arm-via-intent path the dashboard uses lands here too.
+              const cbData = row.payload?.recovery_callback;
+              if (typeof cbData === "string" && cbData.length > 0 && cbData.length <= 64) {
+                const { InlineKeyboard } = await import("grammy");
+                const kb = new InlineKeyboard().text(
+                  `Retry ${row.payload.strike_label || "now"}`,
+                  cbData,
+                );
+                extra = { reply_markup: kb };
+              }
             } else if (row.kind === "limit_close_retrying") {
               // Lets the user bail mid-retry if they no longer want the
               // engine to keep escalating. Cancel is hard-cancel — order

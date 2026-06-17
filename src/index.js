@@ -171,6 +171,7 @@ import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
+import { startStaleArmIntentWatcher } from "./services/stale-arm-intent-watcher.js";
 import { startLimitCloseNearTriggerWatcher } from "./services/limit-close-near-trigger-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
 import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js";
@@ -398,6 +399,12 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("takeprofit", lc.handleLimitClose);
   bot.command("tp", lc.handleLimitClose);
   bot.command("lo", lc.handleLimitClose);
+  // /sell — operator-mandated 2026-06-16 PM after PUMP loan 810: users
+  // reach for "sell at 1.3x" before they reach for "takeprofit at 1.3x".
+  // Routes to handleLimitClose which infers direction from the parsed
+  // strike (multiplier >= 1 → above/TP, < 1 → below/SL). Natural verb,
+  // same arm-core path.
+  bot.command("sell", lc.handleLimitClose);
   // Stop-loss — same arm-core path, direction='below' flips the engine's
   // trigger comparator from >= to <=. 1% protocol fee applies in BOTH
   // directions (operator rule 2026-06-12). Cutting losses before the
@@ -889,6 +896,14 @@ bot.start({
     // orders are old AND trigger far from current price. One-time
     // nudge per order. See feedback_tg_changes_careful.
     setTimeout(() => startLimitCloseStalenessWatcher(), 90_000);
+    // Stale-arm-intent watcher — every 60s DMs users whose V4 arm
+    // intents (recorded by site / TG / Pip / x402) haven't resolved
+    // to an armed order within 90s. Proactive recovery for silent
+    // arm drops; reactive surfaces (/fixarm + site recovery banner)
+    // still work without this, but the watcher catches users who
+    // never look. Operator-mandated 2026-06-16 PM after PUMP loan
+    // 810. See [[feedback_tg_v4_must_match_site_quality]].
+    setTimeout(() => startStaleArmIntentWatcher(), 30_000);
     // Near-trigger nudge — every 5 min DMs users whose armed orders
     // are within ~10% of firing. One-time per arm; reset on modify so
     // a re-tuned trigger gets a fresh nudge if it lands in the band.
