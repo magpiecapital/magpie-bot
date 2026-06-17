@@ -95,22 +95,41 @@ export async function resolveOrAutoLinkWalletOwner(publicKey, source = "anonymou
   const existing = await resolveWalletOwner(publicKey);
   if (existing) return existing;
 
-  // Slow path: auto-create user + wallets row.
+  // Slow path: auto-create user + wallets row. Two SQL-level traps the
+  // audit caught 2026-06-17 PM (both shipped broken in PR #344):
+  //   1. users.telegram_id was NOT NULL — fixed in migration 072.
+  //   2. wallets has NO unique constraint on public_key (pool.js startup
+  //      patches drop it on every boot), so ON CONFLICT (public_key)
+  //      threw "no unique or exclusion constraint matches". Use the same
+  //      SELECT-then-INSERT race-tolerant pattern as account-link.js.
   try {
     const { rows: [newUser] } = await query(
       `INSERT INTO users (telegram_id, created_at)
        VALUES (NULL, NOW())
        RETURNING id`,
     );
-    await query(
-      `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
-       VALUES ($1, $2, $3, TRUE, NOW())
-       ON CONFLICT (public_key) DO NOTHING`,
-      [newUser.id, publicKey, source],
+    // Re-check before insert in case another concurrent call won the race.
+    const existsCheck = await query(
+      `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+      [publicKey, newUser.id],
     );
+    if (existsCheck.rowCount === 0) {
+      try {
+        await query(
+          `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+           VALUES ($1, $2, $3, TRUE, NOW())`,
+          [newUser.id, publicKey, source],
+        );
+      } catch (insertErr) {
+        // Tolerate duplicate-key race from a sibling auto-link path —
+        // the row already exists, which is what we wanted.
+        if (!/duplicate key|unique constraint/i.test(insertErr.message || "")) {
+          throw insertErr;
+        }
+      }
+    }
     const retry = await resolveWalletOwner(publicKey);
     if (retry) return retry;
-    // ON CONFLICT raced — return null and let the caller log/retry.
     console.warn(`[wallet-resolver] auto-link race on ${publicKey.slice(0, 8)}…`);
     return null;
   } catch (err) {
