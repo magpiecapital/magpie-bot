@@ -174,7 +174,19 @@ If a user asks "what pool am I on?" — they don't usually need to know. Plain b
 
 If a user reports a TG arm "dropped" or "didn't go through" — explain the breadcrumb system: their intent is on file, /fixarm will show it as a one-tap retry button with their exact strike. They can also wait ~90s and a DM will arrive automatically.
 
-If a user asks about any of these by name or describes hitting an issue these fixed (e.g. "my ladder didn't fully arm", "exit said not set on V4 loan", "0.5 SOL too small for auto-sells"), explain the relevant fix and tell them it's live.
+13. **Recovery banner deduplication + cleanup wave — shipped 2026-06-17 night:**
+   - **Server /intent endpoint dedupes** by (wallet, loan, direction, strike, slice) in a 5-min window. Repeated user retries return the EXISTING intent_id, not new rows. The 4-duplicate-buttons SPCX banner class is impossible to recreate.
+   - **Dashboard banner deduplicates at render time** as last-line-of-defense. If somehow duplicate rows reach the DB, the UI still shows ONE button per unique (direction, strike, slice). The user's request is a SET, not a LIST.
+   - **armOrderBatch reconciles failed arms to status='failed'** with error_code + error_detail. Recovery banner only shows truly pending intents now; failed corpses drop off.
+   - **Stale-pending expire sweep (every 60s)** marks intents > 1h old with no matching armed order as 'failed' with code 'expired_pending'. Cleans up legacy cruft.
+   - **P1 admin DM on every arm-batch failure** with structured payload (error_code, failed_leg, intent_ids, legs summary). Operator sees diagnosis pushed in real-time instead of having to grep Railway logs.
+   - **Multiplier resolve retry-with-backoff (7 retries × 26s).** Jupiter rate-limit blips no longer reject /sell /tp /sl /trailingstop /bracket /preview arms. Cross-source disagreement still fails fast (safety preserved).
+   - **TG /stats 'Liquidated' now uses DB count** (real user loans liquidated), not on-chain pool counter (which included pre-DB-tracking events). Matches site /stats exactly.
+   - **V4 in-vault verbiage on borrow + repay + arm-success DMs.** Users see end-to-end V4 thesis: borrow lands on V4 → fire converts slice to SOL in vault → /repay releases SOL.
+
+If a user describes "I retried and got 4 buttons" / "my arm sat there saying retry" / "ladder didn't fully arm but I tried twice" — these are all closed. The full intent state lifecycle (pending → armed OR pending → failed) is now correct end-to-end.
+
+If a user asks about any of these by name or describes hitting an issue these fixed (e.g. "my ladder didn't fully arm", "exit said not set on V4 loan", "0.5 SOL too small for auto-sells", "4 duplicate buttons"), explain the relevant fix and tell them it's live.
 
 **Governance v0 (shipped 2026-06-09):** \$MAGPIE holders get real signal on protocol direction via off-chain signal voting. Operator commits to honor passing Tier A votes within 14 days. What's votable (Tier A): adding/removing collateral, tier LTV caps (±5pp), tier fee rates (±0.5pp), holder distribution share (5-15%), distribution cadence (3-14 days), non-binding feature signal polls. Out of scope (Tier B, operator discretion): retroactive loan changes, on-chain safety config, founder identity, treasury, supply changes, x402 pricing. Mechanics: 1 token = 1 vote, weight based on \$MAGPIE balance at proposal activation. 3-day window, 5% quorum, 60% pass. Aggregate tallies published; per-wallet choices are not. Read the model: magpie.capital/governance. Discussion: here in @magpietalk. Roadmap: v1 will move parameter bounds on-chain; v2 is full on-chain SPL governance.
 
