@@ -464,7 +464,7 @@ async function armOrderImpl({
   // Same envelope, same nonce, no extra wallet prompts. The loan
   // reliably lands within 1-3s in practice; the longer window covers
   // RPC blips.
-  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
   const LOAN_LOOKUP_INTERVAL_MS = 400;
   let loan = null;
   for (;;) {
@@ -1152,9 +1152,13 @@ async function armOrderBatchImpl({
   // flip to status='failed' (recovery banner then has to do the work
   // of re-prompting for retry). Triggered 2026-06-17 on operator's
   // SPCX loan 820: intents 15/16 failed at 05:28:46, loan row landed
-  // at 05:28:51 — 5s late. Poll up to 6s/400ms, same envelope/sig.
+  // at 05:28:51 — 5s late. Initial fix was 6s/400ms; bumped to 30s/400ms
+  // on 2026-06-17 PM after operator's loan 830 took 9s to commit (the
+  // 6s window timed out before the loan landed). 30s is 3x worst-case
+  // so future Solana congestion doesn't re-trip this. Same envelope/sig.
+  // See feedback_arm_lookup_window_must_outlast_cosign_borrow.md.
   phaseLog("phase_1_loan_lookup_start");
-  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
   const LOAN_LOOKUP_INTERVAL_MS = 400;
   let loanRows;
   let lookupAttempts = 0;
