@@ -1792,12 +1792,21 @@ async function writeBreadcrumbIntent(args) {
     return null;
   }
 
-  const targetKind = String(args.triggerKind);
+  // Trailing-stop arms pass triggerKind=price_usd + trailingDistanceBps;
+  // for the intent ledger they're 'trailing' with target_value_micro =
+  // the trailing distance in bps. arm_intents schema: target_kind
+  // CHECK ('multiplier','price_usd','mc_usd','price_sol','trailing').
+  const isTrailing =
+    args.trailingDistanceBps != null &&
+    Number.isInteger(args.trailingDistanceBps) &&
+    args.trailingDistanceBps > 0;
+  const targetKind = isTrailing ? "trailing" : String(args.triggerKind);
   const validKinds = new Set(["multiplier", "price_usd", "mc_usd", "price_sol", "trailing"]);
   if (!validKinds.has(targetKind)) return null;
 
-  const tvm =
-    typeof args.triggerValueMicro === "bigint"
+  const tvm = isTrailing
+    ? String(args.trailingDistanceBps)
+    : typeof args.triggerValueMicro === "bigint"
       ? args.triggerValueMicro.toString()
       : String(args.triggerValueMicro);
   if (!/^\d+$/.test(tvm)) return null;
