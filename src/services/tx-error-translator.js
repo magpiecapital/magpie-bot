@@ -154,20 +154,22 @@ export function translateTxError(err, ctx = {}) {
     return [
       "⚠️ *Price oracle still warming up*",
       "",
-      "V4 needs about 5 minutes of price history to lend safely on this token. The oracle hasn't filled its 5-minute TWAP window yet — usually because the token was just enabled or the network has been quiet.",
+      "The lending program needs about 5 minutes of price history to lend safely on this token. The oracle hasn't filled its 5-minute TWAP window yet — usually because the token was just enabled or the network has been quiet.",
       "",
-      "*What to do:* wait ~5 minutes and try /borrow again. The oracle pushes a price sample every ~30–60s.",
+      "*What to do:* wait ~5 minutes and try /borrow again. The oracle pushes a price sample every ~30s.",
       "",
       "_This isn't a wallet issue — your balance is fine._",
     ].join("\n");
   }
   if (anchorCode === 6017 || /PriceImpactPumpDetected/i.test(blob)) {
     return [
-      "⚠️ *Spot price moved too far above the TWAP*",
+      "⚠️ *Spot price moved too far above the 5-min TWAP*",
       "",
-      "V4 refuses to lend when the spot price is more than 15% above the 5-minute TWAP — pump protection.",
+      "The lending program refuses to lend when the latest attested price is more than 15% above the trailing 5-minute average — pump protection (applies to both V3 and V4 borrows).",
       "",
-      "Wait a few minutes for the TWAP to catch up, or try a smaller collateral amount.",
+      "*What to do:* wait 1-2 minutes for the TWAP to catch up, then /borrow again. Collateral size doesn't change this check — only price stability does.",
+      "",
+      "_This isn't a wallet issue — your balance is fine._",
     ].join("\n");
   }
   if (anchorCode === 6013 || /StalePriceAttestation/i.test(blob)) {
