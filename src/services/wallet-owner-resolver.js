@@ -69,6 +69,59 @@ export async function resolveWalletOwner(publicKey) {
 }
 
 /**
+ * Resolve OR auto-create the user+wallet row for an anonymous wallet.
+ *
+ * Operator-mandated 2026-06-17 PM after a Phantom-only wallet borrowed
+ * on V4 successfully but the loan never landed in DB (cosign-borrow
+ * silently skipped recordLoan because the wallet had no `wallets` row).
+ * For V4 anonymous wallets, the borrow MUST persist; otherwise the
+ * dashboard's Active Loans tab shows nothing and the user can't manage
+ * the loan they just paid for.
+ *
+ * Behavior:
+ *   1. If a wallets row exists, return its user_id (same as resolveWalletOwner).
+ *   2. Otherwise INSERT a new user (telegram_id NULL) + wallets row
+ *      (source=source, is_active=true), then return the new user_id.
+ *
+ * Race-safe: the wallets table has `UNIQUE (public_key)` enforced by
+ * the schema, so a concurrent INSERT for the same wallet falls back
+ * to the existing row via ON CONFLICT DO NOTHING + re-fetch.
+ *
+ * Mandated by feedback_anonymous_wallets_full_feature_parity_v4.md.
+ */
+export async function resolveOrAutoLinkWalletOwner(publicKey, source = "anonymous_borrow") {
+  if (!publicKey || typeof publicKey !== "string") return null;
+  // Fast path: existing row.
+  const existing = await resolveWalletOwner(publicKey);
+  if (existing) return existing;
+
+  // Slow path: auto-create user + wallets row.
+  try {
+    const { rows: [newUser] } = await query(
+      `INSERT INTO users (telegram_id, created_at)
+       VALUES (NULL, NOW())
+       RETURNING id`,
+    );
+    await query(
+      `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+       VALUES ($1, $2, $3, TRUE, NOW())
+       ON CONFLICT (public_key) DO NOTHING`,
+      [newUser.id, publicKey, source],
+    );
+    const retry = await resolveWalletOwner(publicKey);
+    if (retry) return retry;
+    // ON CONFLICT raced — return null and let the caller log/retry.
+    console.warn(`[wallet-resolver] auto-link race on ${publicKey.slice(0, 8)}…`);
+    return null;
+  } catch (err) {
+    console.error(
+      `[wallet-resolver] auto-link insert failed for ${publicKey.slice(0, 8)}…: ${err.message?.slice(0, 200)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Variant that returns the full wallet row (user_id + metadata) so
  * callers that need more than just the id (e.g. cosign-borrow checking
  * is_active) don't have to re-query.
