@@ -928,6 +928,40 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_status_idx ON fee_wallet_sweeps(status) WHERE status = 'planned'`,
     `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_created_idx ON fee_wallet_sweeps(created_at DESC)`,
+
+    // 2026-06-17 — Pending-arm queue (architectural fix for the race
+    // class that bit operator 3 times on loan 820, 826, 830). When
+    // armOrderBatch's 30s polling window expires without finding the
+    // loan, we store the signed envelope here and a background
+    // watcher retries every 10s while the envelope is fresh (5 min).
+    // User never has to re-sign. Schema captures the minimum to
+    // replay: parsed legs, intent_ids, source, and the envelope
+    // metadata for audit. The envelope IS valuable (replay-attack
+    // surface within 5min) — operator-only DB access + auto-purge
+    // post-expiry keep the blast radius bounded.
+    // See feedback_loan_830_full_postmortem_and_defenses.md.
+    `CREATE TABLE IF NOT EXISTS pending_arms (
+       id                   BIGSERIAL PRIMARY KEY,
+       user_id              INT NOT NULL,
+       signer_pubkey        TEXT NOT NULL,
+       wallet               TEXT NOT NULL,
+       loan_id_chain        TEXT NOT NULL,
+       legs                 JSONB NOT NULL,
+       intent_ids           BIGINT[],
+       source               TEXT NOT NULL,
+       arm_note_prefix      TEXT,
+       envelope_issued_at   TIMESTAMPTZ NOT NULL,
+       status               TEXT NOT NULL CHECK (status IN ('pending','armed','expired','failed')),
+       retry_count          INT NOT NULL DEFAULT 0,
+       last_retry_at        TIMESTAMPTZ,
+       last_retry_error     TEXT,
+       order_ids            BIGINT[],
+       created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_pending_idx ON pending_arms(status, envelope_issued_at) WHERE status = 'pending'`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_wallet_idx ON pending_arms(wallet, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_loan_id_idx ON pending_arms(loan_id_chain) WHERE status IN ('pending', 'armed')`,
   ];
   for (const sql of patches) {
     try {

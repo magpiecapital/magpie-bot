@@ -457,6 +457,39 @@ export async function handleSiteLimitCloseList(req, url) {
     };
   });
 
+  // Tier-2 architectural fix (defense C in
+  // feedback_loan_830_full_postmortem_and_defenses.md). Surface
+  // pending_arms rows so the dashboard can render an "Arming…"
+  // state instead of the recovery banner when the race window is
+  // still open. The watcher will replay these every 10s; once orders
+  // land they'll appear in the `orders` array above and the dashboard
+  // can flip the loan card from arming → armed in-place.
+  let pendingArms = [];
+  try {
+    const loanChainIds = loans.map((l) => l.loan_id);
+    if (loanChainIds.length > 0) {
+      const par = await query(
+        `SELECT id, loan_id_chain, status, legs, intent_ids,
+                envelope_issued_at, retry_count, last_retry_at,
+                last_retry_error, order_ids,
+                EXTRACT(EPOCH FROM (envelope_issued_at + INTERVAL '5 minutes' - NOW()))::int
+                  AS seconds_remaining
+           FROM pending_arms
+          WHERE wallet = $1
+            AND loan_id_chain = ANY($2::text[])
+            AND status = 'pending'
+            AND envelope_issued_at >= NOW() - INTERVAL '5 minutes'
+          ORDER BY created_at DESC`,
+        [wallet, loanChainIds],
+      );
+      pendingArms = par.rows;
+    }
+  } catch (err) {
+    // pending_arms table may not exist on pre-Tier-2 schemas; degrade
+    // gracefully.
+    console.warn(`[site-limit-close] pending_arms lookup failed: ${err.message?.slice(0, 80)}`);
+  }
+
   return {
     status: 200,
     body: {
@@ -470,6 +503,11 @@ export async function handleSiteLimitCloseList(req, url) {
       // order means the auto-arm chain silently failed → render the
       // V4 recovery banner with one-click retry.
       pending_intents: pendingIntents,
+      // Tier-2 pending_arms — dashboard should render an "Arming…"
+      // state for loans with any row here, NOT the recovery banner.
+      // The watcher will replay these every 10s while the user's
+      // signature stays fresh (5 min ceiling).
+      pending_arms: pendingArms,
       generated_at: new Date().toISOString(),
     },
   };
@@ -1167,6 +1205,24 @@ export async function handleSiteLimitCloseArmBatch(req) {
     `legs=${armCoreLegs.map((l) => `${l.direction}@${l.valueMicro}/${l.sliceBps}bps`).join(",")}`,
   );
 
+  // Envelope context for the Tier-2 pending-arm queue
+  // (feedback_loan_830_full_postmortem_and_defenses.md, defense B).
+  // If arm-core's phase 1 can't find the loan within the 30s polling
+  // window, it writes a pending_arm row using THIS envelope context and
+  // the background watcher retries every 10s while the signature is
+  // still inside the 5-min freshness window. User never has to re-sign.
+  // We pass the parsed IssuedAt rather than the full signed-message
+  // bytes because the watcher doesn't re-verify the signature — that
+  // already happened above; we just need the freshness anchor.
+  const envelopeIssuedAtMs = Date.parse(fields.IssuedAt);
+  const envelope = Number.isFinite(envelopeIssuedAtMs)
+    ? {
+        signer_pubkey: auth.signerPubkey,
+        wallet: auth.signerPubkey,
+        envelope_issued_at_ms: envelopeIssuedAtMs,
+      }
+    : null;
+
   // Hand off to arm-core batch primitive.
   const { armOrderBatch } = await import("../services/limit-close-arm-core.js");
   const result = await armOrderBatch({
@@ -1176,7 +1232,28 @@ export async function handleSiteLimitCloseArmBatch(req) {
     legs: armCoreLegs,
     intentIds,
     armNotePrefix: `armed via site batch by ${auth.signerPubkey.slice(0, 8)}…`,
+    envelope,
   });
+
+  // Pending-arm queued path (race-tolerant). Returns 202 so the site
+  // can switch to an "Arming…" state and poll until orders land.
+  if (result.ok && result.pending === true) {
+    console.log(
+      `[arm-batch] PENDING req=${reqId} pending_arm_id=${result.pending_arm_id} ` +
+      `loan_id_chain=${fields.LoanId} expires_at_ms=${result.envelope_expires_at_ms}`,
+    );
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        pending: true,
+        pending_arm_id: result.pending_arm_id,
+        envelope_expires_at_ms: result.envelope_expires_at_ms,
+        retry_in_ms: result.retry_in_ms,
+        detail: result.detail,
+      },
+    };
+  }
 
   if (!result.ok) {
     console.log(
