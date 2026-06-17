@@ -1073,18 +1073,35 @@ async function handlePublicPoolStats() {
 }
 
 async function handleAdminPoolStats(req, url) {
-  const wallet = url.searchParams.get("wallet");
-  if (!wallet) {
-    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  // SECURITY (audit HIGH#4 2026-06-17 PM): the prior gate was
+  // `wallet === LENDER_PUBKEY` — but the lender pubkey is publicly readable
+  // on-chain (it's stamped into every loan PDA's borrower field's sibling
+  // accounts). Anyone could read it from any V4 loan tx, hit the endpoint,
+  // and exfil operator-private fee splits.
+  //
+  // Real auth: require a header `X-Admin-Token` matching env-stored
+  // ADMIN_API_TOKEN (32+ random bytes operator manages out-of-band). Falls
+  // back to the public-pubkey gate ONLY when ADMIN_API_TOKEN is unset, so
+  // legacy bootstrap deployments aren't bricked — but with a loud log so
+  // operator notices and rotates a token in.
+  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+  const provided = (req.headers["x-admin-token"] || "").toString().trim();
+  const wallet = url.searchParams.get("wallet"); // still used downstream
+  if (ADMIN_API_TOKEN) {
+    if (!provided || provided !== ADMIN_API_TOKEN) {
+      return { status: 403, body: { error: "Forbidden" } };
+    }
+  } else {
+    console.warn(
+      "[admin] ADMIN_API_TOKEN unset — falling back to LENDER_PUBKEY-equality gate (audit HIGH#4 mitigation). Set ADMIN_API_TOKEN to a 32-byte random hex/base64 string and rotate the deploy.",
+    );
+    if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+    const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
+    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    }
   }
-
-  // Gate: only the configured creator/lender wallet can see this view.
-  // Anyone querying with a different wallet gets a 403, not a 404, so we
-  // don't leak existence of the endpoint.
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
-  }
 
   const { PublicKey } = await import("@solana/web3.js");
   const { getReadOnlyProgram } = await import("../solana/program.js");
@@ -1390,10 +1407,24 @@ async function computeLifetimeStats() {
 }
 
 async function handleAdminLifetimeStats(req, url) {
+  // Same auth model as handleAdminPoolStats (audit HIGH#4 2026-06-17 PM).
+  // X-Admin-Token header REQUIRED when ADMIN_API_TOKEN env is set;
+  // public-pubkey fallback only when unset, with a loud warn.
+  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+  const provided = (req.headers["x-admin-token"] || "").toString().trim();
   const wallet = url.searchParams.get("wallet");
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+  if (ADMIN_API_TOKEN) {
+    if (!provided || provided !== ADMIN_API_TOKEN) {
+      return { status: 403, body: { error: "Forbidden" } };
+    }
+  } else {
+    console.warn(
+      "[admin] ADMIN_API_TOKEN unset on lifetime-stats — falling back to LENDER_PUBKEY-equality gate. Set ADMIN_API_TOKEN and rotate the deploy.",
+    );
+    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    }
   }
 
   const now = Date.now();
