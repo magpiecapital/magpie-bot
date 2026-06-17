@@ -286,7 +286,15 @@ export async function handleStats(ctx) {
       row("Active loans", String(r.active)),
       row("Issued lifetime", totalLoansIssued.toString()),
       row("Repaid", String(r.repaid)),
-      row("Liquidated", totalLiquidations.toString()),
+      // "Liquidated" uses the DB count (loans.status='liquidated'),
+      // not the on-chain pool counter. The on-chain pool counter
+      // (totalLiquidations) is a lifetime accumulator that includes
+      // pre-DB-tracking program events, devnet test invocations, and
+      // historical liquidations whose loans rows were never created.
+      // Operator reported TG=44 vs site=11 — 11 is the truthful number
+      // (real user loans that got liquidated). DB count matches the
+      // site's transparency endpoint exactly. 2026-06-17 04:25 UTC.
+      row("Liquidated", String(r.liquidated)),
       ``,
       `POOL${(v2 || v3 || v4) ? ` (${["V1", v2 ? "V2" : null, v3 ? "V3" : null, v4 ? "V4" : null].filter(Boolean).join("+")})` : ""}`,
       row("LP deposited", `${totalDepositsSol} SOL`),
