@@ -224,7 +224,7 @@ export async function handleAgentLimitCloseArm(req) {
   // Race-tolerant: agents acting on autonomous policies can fire within
   // seconds of a borrow tx confirming. Same 6s/400ms poll the other
   // arm paths use so /sync-loan has a chance to commit the loans row.
-  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
   const LOAN_LOOKUP_INTERVAL_MS = 400;
   let walletGuard = null;
   for (;;) {
@@ -550,7 +550,7 @@ export async function handleAgentLimitClosePreflight(req) {
   }
 
   // Wallet binding + loan owed lookup (same as /arm) — race-tolerant.
-  const PREFLIGHT_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+  const PREFLIGHT_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
   const PREFLIGHT_LOOKUP_INTERVAL_MS = 400;
   let walletGuard = null;
   for (;;) {
