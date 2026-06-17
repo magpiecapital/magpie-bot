@@ -993,7 +993,55 @@ async function armOrderImpl({
  * audit trail) happens OUTSIDE the transaction so a failure there
  * doesn't undo the armed state.
  * ───────────────────────────────────────────────────────────────── */
-export async function armOrderBatch({
+export async function armOrderBatch(args) {
+  // Thin wrapper around the existing implementation that ALSO
+  // reconciles the supplied intent_ids on FAILURE (not just success).
+  // Without this, a failed batch arm leaves the intents stuck at
+  // status='pending' — the recovery banner keeps surfacing them
+  // forever even though the arm hard-failed. Operator-mandated
+  // (feedback_no_duplicate_intents_in_recovery_banner_NEVER.md):
+  // status must match reality; pending means "in flight or unresolved",
+  // not "we tried and gave up."
+  let result;
+  try {
+    result = await armOrderBatchImpl(args);
+  } catch (err) {
+    console.error("[arm-core:batch] unexpected throw:", err?.stack || err?.message || err);
+    result = {
+      ok: false,
+      error: "exception",
+      detail: (err?.message || String(err)).slice(0, 240),
+    };
+  }
+  if (!result.ok && Array.isArray(args.intentIds) && args.intentIds.length > 0) {
+    const ids = args.intentIds.filter((x) => x != null);
+    if (ids.length > 0) {
+      try {
+        await query(
+          `UPDATE arm_intents
+              SET status = 'failed',
+                  error_code = $2,
+                  error_detail = $3,
+                  updated_at = NOW()
+            WHERE id = ANY($1::bigint[]) AND status = 'pending'`,
+          [
+            ids,
+            safeTruncate(result.error, 64),
+            safeTruncate(jsonStringifyError(result.detail), 400),
+          ],
+        );
+      } catch (rcErr) {
+        console.warn(
+          "[arm-core:batch] failure-intent reconcile failed:",
+          rcErr.message?.slice(0, 120),
+        );
+      }
+    }
+  }
+  return result;
+}
+
+async function armOrderBatchImpl({
   userId,
   source = "site",
   sourceAgentPubkey = null,
