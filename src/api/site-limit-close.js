@@ -219,7 +219,7 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
   // src/services/wallet-owner-resolver.js. We need encrypted_secret
   // here so we can't use the helper directly — inline the same
   // ranking so the chosen row is consistent with /repay etc.
-  const { rows: [walletRow] } = await query(
+  let { rows: [walletRow] } = await query(
     `SELECT w.user_id, w.encrypted_secret, w.source
        FROM wallets w
        JOIN users u ON u.id = w.user_id
@@ -231,21 +231,88 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
     [signerPubkey],
   );
   if (!walletRow) {
-    return { ok: false, status: 403, error: "wallet_not_linked",
-             detail: "This wallet isn't linked to a Magpie account. Link via the TG bot first." };
+    // Auto-create a TG-less user + wallet row so any Phantom-only
+    // wallet can arm V4 exits without first connecting to the TG bot.
+    // Operator-mandated 2026-06-17 PM:
+    //   "I want EVERY SINGLE wallet, it doesn't matter where it came
+    //    from, TG or not, to be able to execute these exit order loans
+    //    on the V4 pool."
+    //
+    // We INSERT atomically: create the user (telegram_id NULL),
+    // then the wallet row, then re-fetch via the same ranking query.
+    // The V4-only enforcement still blocks V1/V2/V3 arms, so this
+    // open auto-create only opens V4 exit arming to anonymous wallets
+    // — never plain V1/V2/V3 loan management.
+    //
+    // If the user later /links this wallet via TG, the wallet-owner-
+    // resolver attaches the existing wallet row to their TG user_id
+    // (no duplicate, no data loss).
+    //
+    // See feedback_v4_auto_sells_no_custodial_requirement_2026_06_17.md.
+    try {
+      const { rows: [newUser] } = await query(
+        `INSERT INTO users (telegram_id, created_at)
+         VALUES (NULL, NOW())
+         RETURNING id`,
+      );
+      await query(
+        `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+         VALUES ($1, $2, 'site_v4_autolink', TRUE, NOW())
+         ON CONFLICT (public_key) DO NOTHING`,
+        [newUser.id, signerPubkey],
+      );
+      const refetch = await query(
+        `SELECT w.user_id, w.encrypted_secret, w.source
+           FROM wallets w
+           JOIN users u ON u.id = w.user_id
+          WHERE w.public_key = $1
+          ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+                   w.is_active DESC,
+                   w.created_at DESC
+          LIMIT 1`,
+        [signerPubkey],
+      );
+      walletRow = refetch.rows[0];
+      if (!walletRow) {
+        // Defensive: if the INSERT raced and the row still isn't visible,
+        // surface a transient error rather than a confusing 403.
+        return {
+          ok: false,
+          status: 503,
+          error: "auto_link_race",
+          detail: "Wallet auto-link is racing. Retry in a moment.",
+        };
+      }
+      console.log(`[site-limit-close] auto-linked wallet ${signerPubkey.slice(0, 8)}… → user_id=${walletRow.user_id} (V4 anonymous, no TG)`);
+    } catch (insertErr) {
+      console.error(`[site-limit-close] auto-link insert failed for ${signerPubkey.slice(0, 8)}…:`, insertErr.message);
+      return {
+        ok: false,
+        status: 500,
+        error: "auto_link_failed",
+        detail: insertErr.message?.slice(0, 200) || "wallet auto-link failed",
+      };
+    }
   }
-  // The engine needs a custodial keypair to autonomously fire the
-  // repay+sell tx. wallets.encrypted_secret holds the encrypted key
-  // for custodial + imported wallets. Phantom-only wallets get NULL
-  // and can't have autonomous take-profit.
-  if (!walletRow.encrypted_secret || walletRow.encrypted_secret.length === 0) {
-    return {
-      ok: false, status: 403,
-      error: "requires_linked_custodial_wallet",
-      detail: "Autonomous take-profit needs a Magpie custodial keypair to sign the repay+sell tx at fire time. " +
-              "Connect via the Telegram bot or import a key to enable.",
-    };
-  }
+  // HISTORICAL — the custodial-keypair check that lived here was OBSOLETE
+  // for V4 loans. The engine fires `convert_collateral_slice` signed by
+  // the lender keypair (not the borrower's). Engine-side borrower-keypair
+  // skip already landed in task #327 + execution.js line 909 V4 branch.
+  // The auth-time check was a leftover from V1/V2/V3 — it forced users
+  // with Phantom-only wallets to /import their key just to use auto-sells
+  // that wouldn't actually need their signature.
+  //
+  // Operator-mandated 2026-06-17 PM:
+  //   "EVERY SINGLE WALLET, whether it is TG linked or not needs to
+  //    bypass this. WE CANNOT have it set up to only support wallets
+  //    that are connected to the TG."
+  //
+  // Defense-in-depth: V1/V2/V3 loans STILL block arming via
+  // `exits_require_v4_loan` (V4_EXIT_EXCLUSIVE_ENFORCE=true) — the only
+  // path that reaches the arm-core insert is a V4 loan, which the engine
+  // can fire without the borrower's keypair. No regression vector.
+  //
+  // See feedback_v4_auto_sells_no_custodial_requirement_2026_06_17.md.
 
   return { ok: true, userId: walletRow.user_id, signerPubkey, fields, body };
 }
@@ -282,7 +349,20 @@ export async function handleSiteLimitCloseList(req, url) {
       },
     };
   }
-  const isCustodial = !!walletRow.encrypted_secret;
+  // Align GET's custodial check with POST's stricter version at line 241.
+  // An empty Buffer is TRUTHY in JS (`!!Buffer.from([])` === true) but
+  // unusable as a signing key, so the old `!!encrypted_secret` would
+  // wrongly report `custodial: true` for a Phantom-only wallet whose
+  // wallets.encrypted_secret column was a zero-length Buffer. The POST
+  // /arm path correctly catches that with `length === 0` and 403s with
+  // `requires_linked_custodial_wallet`. The lie at GET-time let the site
+  // open the borrow flow, the user signed + funded a V4 loan, then the
+  // arm-batch 403'd → recovery banner forever. Operator hit this on
+  // 2026-06-17 PM. See
+  // feedback_custodial_check_get_post_mismatch_2026_06_17.md.
+  const isCustodial =
+    !!walletRow.encrypted_secret &&
+    (walletRow.encrypted_secret.length ?? 0) > 0;
 
   // Loans owned by this wallet (status='active' only — take-profit
   // is for active loans).
