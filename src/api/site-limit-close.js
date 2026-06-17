@@ -352,11 +352,20 @@ export async function handleSiteLimitCloseList(req, url) {
     orders = r.rows;
   }
 
-  // Pending intent reconciliation (operator-mandated 2026-06-16 PM,
-  // feedback_every_arm_envelope_must_reach_server.md). For each loan,
-  // look up arm_intents rows that are still pending (no matching
-  // armed order) so the dashboard can render the "Your auto-sell
-  // didn't finish arming" recovery banner with one-click retry.
+  // Intent reconciliation for the recovery banner (operator-mandated
+  // 2026-06-17 — see feedback_recovery_banner_must_show_failed_
+  // intents_too.md). Returns both 'pending' (arm in flight) AND
+  // 'failed' (arm rejected within the recent 1h window) intents so
+  // the banner can render the user's EXACT strike as a one-tap retry
+  // — even when the prior attempt hard-failed and the
+  // failure-reconcile flipped status to 'failed'. Without 'failed' in
+  // this filter, the banner falls back to generic 2x/3x/0.7x defaults
+  // and the user loses sight of what they actually asked for.
+  //
+  // 1h window prevents stale week-old failed corpses from haunting
+  // the banner forever; recent failures are immediately recoverable.
+  // The 24h window for 'pending' is kept for in-flight intents (rare
+  // but possible — webhook delays etc.).
   let pendingIntents = [];
   try {
     const loanChainIds = loans.map((l) => l.loan_id);
@@ -364,12 +373,14 @@ export async function handleSiteLimitCloseList(req, url) {
       const ir = await query(
         `SELECT id, loan_id_chain, direction, target_kind,
                 target_value_micro::text AS target_value_micro,
-                slice_pct_bps, source, created_at
+                slice_pct_bps, source, status, error_code, created_at
            FROM arm_intents
           WHERE wallet = $1
-            AND status = 'pending'
             AND loan_id_chain = ANY($2::text[])
-            AND created_at > NOW() - INTERVAL '24 hour'
+            AND (
+              (status = 'pending' AND created_at > NOW() - INTERVAL '24 hour')
+              OR (status = 'failed' AND created_at > NOW() - INTERVAL '1 hour')
+            )
           ORDER BY created_at DESC`,
         [wallet, loanChainIds],
       );
