@@ -1391,23 +1391,88 @@ export async function handleFixArm(ctx) {
   // don't pay the import on warm paths.
   const { InlineKeyboard } = await import("grammy");
 
+  // Intent-aware retry (operator-mandated 2026-06-16 PM,
+  // feedback_tg_v4_must_match_site_quality.md). For each candidate
+  // loan, look up pending arm_intents and surface the EXACT requested
+  // strike as the primary retry button — not generic 2x/3x/0.7x
+  // defaults. The hardcoded presets render only as a SECONDARY tier
+  // when no intent exists for the loan.
+  const loanChainIds = loans.map((l) => l.loan_id_chain);
+  const intentsByLoanChain = new Map();
+  if (loanChainIds.length > 0) {
+    try {
+      const { rows: intents } = await query(
+        `SELECT id, loan_id_chain, direction, target_kind,
+                target_value_micro::text AS target_value_micro,
+                slice_pct_bps
+           FROM arm_intents
+          WHERE wallet IN (
+            SELECT public_key FROM wallets WHERE user_id = $1
+          )
+            AND status = 'pending'
+            AND loan_id_chain = ANY($2::text[])
+            AND created_at > NOW() - INTERVAL '24 hour'
+          ORDER BY created_at DESC`,
+        [user.id, loanChainIds],
+      );
+      for (const r of intents) {
+        const arr = intentsByLoanChain.get(r.loan_id_chain) || [];
+        arr.push(r);
+        intentsByLoanChain.set(r.loan_id_chain, arr);
+      }
+    } catch (e) {
+      console.warn(`[fixarm] intent lookup failed (continuing with defaults): ${e.message?.slice(0, 100)}`);
+    }
+  }
+
   for (const ln of loans) {
     const sym = ln.symbol || ln.collateral_mint.slice(0, 4) + "…";
-    const kb = new InlineKeyboard()
-      .text("Sell at 2x", `fixarm:tp:${ln.loan_id_chain}:2`)
-      .text("Sell at 3x", `fixarm:tp:${ln.loan_id_chain}:3`)
-      .row()
-      .text("Sell at 0.7x", `fixarm:sl:${ln.loan_id_chain}:0.7`)
-      .text("Bracket 2x / 0.7x", `fixarm:br:${ln.loan_id_chain}`)
-      .row()
-      .text("Skip this loan", `fixarm:skip:${ln.loan_id_chain}`);
+    const intents = intentsByLoanChain.get(ln.loan_id_chain) || [];
 
-    await ctx.reply(
-      `*V4 loan on ${sym}* — no armed exit found.\n\n` +
-        `This loan landed on V4 because you set up an auto-sell, but the arming step didn't complete. ` +
-        `Pick a preset to retry now — single Telegram tap:`,
-      { parse_mode: "Markdown", reply_markup: kb },
-    );
+    const kb = new InlineKeyboard();
+    let intentButtonsRendered = 0;
+    for (const intent of intents) {
+      const v = Number(intent.target_value_micro) / 1e6;
+      const sliceBps = intent.slice_pct_bps ?? 10000;
+      let label;
+      // Callback shape: fixarm:intent:<loan_id_chain>:<intent_id> —
+      // handler reads the intent row to drive the arm. Stays under
+      // Telegram's 64-byte callback_data limit.
+      if (intent.target_kind === "multiplier") {
+        const verb = intent.direction === "above" ? "Sell at" : "Stop at";
+        label = `${verb} ${v}x`;
+        if (sliceBps < 10000) label += ` (${(sliceBps / 100).toFixed(0)}%)`;
+      } else if (intent.target_kind === "price_usd") {
+        const usd =
+          v >= 1 ? `$${v.toFixed(2)}` : v >= 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(8)}`;
+        label = `${intent.direction === "above" ? "Sell at" : "Stop at"} ${usd}`;
+      } else if (intent.target_kind === "mc_usd") {
+        const mc =
+          v >= 1e9 ? `$${(v / 1e9).toFixed(2)}B mc` : `$${(v / 1e6).toFixed(2)}M mc`;
+        label = `${intent.direction === "above" ? "Sell at" : "Stop at"} ${mc}`;
+      } else {
+        label = `Retry ${intent.target_kind} ${v}`;
+      }
+      kb.text(label, `fixarm:intent:${ln.loan_id_chain}:${intent.id}`).row();
+      intentButtonsRendered += 1;
+    }
+
+    if (intentButtonsRendered === 0) {
+      kb.text("Sell at 2x", `fixarm:tp:${ln.loan_id_chain}:2`)
+        .text("Sell at 3x", `fixarm:tp:${ln.loan_id_chain}:3`)
+        .row()
+        .text("Sell at 0.7x", `fixarm:sl:${ln.loan_id_chain}:0.7`)
+        .text("Bracket 2x / 0.7x", `fixarm:br:${ln.loan_id_chain}`)
+        .row();
+    }
+    kb.text("Skip this loan", `fixarm:skip:${ln.loan_id_chain}`);
+
+    const headline =
+      intentButtonsRendered > 0
+        ? `*V4 loan on ${sym}* — your auto-sell didn't finish arming.\n\nWe have your exact strike on file. One tap retries it without losing the original target.`
+        : `*V4 loan on ${sym}* — no armed exit found.\n\nThis loan landed on V4 because you set up an auto-sell, but the arming step didn't complete. Pick a preset to retry now — single Telegram tap:`;
+
+    await ctx.reply(headline, { parse_mode: "Markdown", reply_markup: kb });
   }
 }
 
@@ -1474,6 +1539,118 @@ export function registerFixArmCallbacks(bot) {
     await ctx.editMessageText(
       `✓ ${sideLabel} armed at *${multiplier}x* — fires at $${fmt(r.targetUsd)}.\n\n` +
         `Order #${armed.orderId}. Manage via /limitorders.`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  // Intent-aware retry handler (operator-mandated 2026-06-16 PM,
+  // feedback_tg_v4_must_match_site_quality.md). Loads the pending
+  // arm_intent row, resolves to a concrete trigger, calls armOrder
+  // with intentId so the existing reconcile path marks the intent
+  // 'armed' on success and the banner auto-hides.
+  bot.callbackQuery(/^fixarm:intent:(\d+):(\d+)$/, async (ctx) => {
+    const [, loanIdChain, intentIdStr] = ctx.match;
+    const intentId = Number(intentIdStr);
+    if (!Number.isInteger(intentId) || intentId <= 0) {
+      await ctx.answerCallbackQuery("Invalid intent.");
+      return;
+    }
+    await ctx.answerCallbackQuery("Arming…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    const { rows: [intent] } = await query(
+      `SELECT ai.id, ai.loan_id_chain, ai.direction, ai.target_kind,
+              ai.target_value_micro::text AS target_value_micro,
+              ai.slice_pct_bps
+         FROM arm_intents ai
+         JOIN wallets w ON w.public_key = ai.wallet AND w.user_id = $1
+        WHERE ai.id = $2
+          AND ai.loan_id_chain = $3
+          AND ai.status = 'pending'
+        LIMIT 1`,
+      [user.id, intentId, loanIdChain],
+    );
+    if (!intent) {
+      await ctx.editMessageText(
+        `That intent isn't pending anymore — it may have already armed. /limitorders to inspect.`,
+      );
+      return;
+    }
+
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found in your account.`);
+      return;
+    }
+
+    let triggerKind;
+    let triggerValueMicro;
+    let labelForUser;
+    const targetVal = Number(intent.target_value_micro) / 1e6;
+    if (intent.target_kind === "multiplier") {
+      const r = await resolveMultiplierToPrice(loan.collateral_mint, targetVal, {
+        allowBelowOne: intent.direction === "below",
+      });
+      if (!r.ok) {
+        await ctx.editMessageText(
+          `Couldn't resolve ${targetVal}x target: ${r.detail || r.error}\n\nTry again in a few seconds.`,
+        );
+        return;
+      }
+      triggerKind = "price_usd";
+      triggerValueMicro = r.triggerValueMicro.toString();
+      labelForUser = `${targetVal}x`;
+    } else if (
+      intent.target_kind === "price_usd" ||
+      intent.target_kind === "mc_usd" ||
+      intent.target_kind === "price_sol"
+    ) {
+      triggerKind = intent.target_kind;
+      triggerValueMicro = intent.target_value_micro;
+      if (intent.target_kind === "mc_usd") {
+        labelForUser =
+          targetVal >= 1e9 ? `$${(targetVal / 1e9).toFixed(2)}B mc` : `$${(targetVal / 1e6).toFixed(2)}M mc`;
+      } else if (intent.target_kind === "price_usd") {
+        labelForUser =
+          targetVal >= 1 ? `$${targetVal.toFixed(2)}` : targetVal >= 0.01 ? `$${targetVal.toFixed(4)}` : `$${targetVal.toFixed(8)}`;
+      } else {
+        labelForUser = `${targetVal.toFixed(6)} SOL`;
+      }
+    } else {
+      await ctx.editMessageText(`Intent kind \`${intent.target_kind}\` not retryable here yet. Use /limitclose ${loanIdChain} ${targetVal} manually.`);
+      return;
+    }
+
+    const sliceBps = intent.slice_pct_bps && intent.slice_pct_bps < 10000 ? intent.slice_pct_bps : 10000;
+
+    const armed = await armOrder({
+      userId: user.id,
+      source: "tg",
+      loanIdChain,
+      triggerKind,
+      triggerValueMicro,
+      triggerDirection: intent.direction,
+      slicePct: sliceBps,
+      slippageBps: intent.direction === "below" ? 300 : 200,
+      sellDestination: "sol",
+      intentId,
+    });
+
+    if (!armed.ok) {
+      await ctx.editMessageText(
+        `Arm failed (${armed.error}). ${armed.detail || ""}\n\nUse /limitclose ${loanIdChain} ${targetVal}${intent.target_kind === "multiplier" ? "x" : ""} to retry manually.`,
+      );
+      return;
+    }
+
+    const verb = intent.direction === "above" ? "Take-profit" : "Stop-loss";
+    await ctx.editMessageText(
+      `✓ ${verb} armed at *${labelForUser}* — exact strike you asked for.\n\nOrder #${armed.orderId}. Manage via /limitorders.`,
       { parse_mode: "Markdown" },
     );
   });
