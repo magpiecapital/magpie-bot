@@ -1001,6 +1001,19 @@ export function registerBorrowCallbacks(bot) {
     // "borrow failed" miscommunication for a borrow that actually
     // succeeded.
 
+    // V4 in-vault explainer (operator-mandated rule
+    // feedback_v4_in_vault_thesis_non_negotiable.md). When the loan is
+    // on V4 AND any auto-sell is involved (either armed-in-flow or
+    // pickable via the retry buttons), the borrow card MUST tell the
+    // user how V4 fires actually behave — proceeds accumulate in the
+    // per-loan vault, loan stays Active, /repay releases SOL. Without
+    // this, V4 borrowers who see a fire DM later might expect SOL in
+    // their wallet and panic.
+    const showV4Note = isV4Loan && (allLegsArmed || (canArmExits && !allLegsArmed));
+    const v4InVaultLine = showV4Note
+      ? "_V4 in-vault auto-sell: when a target hits, the engine sells that slice on-chain — SOL accumulates inside your loan's vault, loan stays Active. Run /repay anytime to release the SOL._"
+      : null;
+
     const markdownLines = [
       "✅ *Loan funded*",
       "",
@@ -1031,6 +1044,7 @@ export function registerBorrowCallbacks(bot) {
         : `\`/stoploss ${result.loanId} at 0.7x\` (sell if down 30%)`,
       allLegsArmed || !canArmExits ? null : "",
       allLegsArmed || !canArmExits ? null : "/positions to check status · /share to flex on the timeline",
+      v4InVaultLine,
     ].filter((l) => l != null);
 
     const plainTextLines = [
