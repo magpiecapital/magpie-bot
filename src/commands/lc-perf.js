@@ -144,7 +144,10 @@ async function showPerf(ctx, windowKey) {
   // the operator how RWA + memecoin adoption is tracking across all
   // three pools now that V3 is live.
   const V1_PROGRAM_ID = process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh";
-  const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2 || null;
+  // V2 deprecated + purged 2026-06-17 PM. Historical V2 loans still surface
+  // in the DB aggregation below via their stored program_id string but no
+  // new V2 data will accrue.
+  const V2_PROGRAM_ID = null;
   const V3_PROGRAM_ID = process.env.PROGRAM_ID_V3 || null;
   // V4 Hardening T6 (2026-06-15 PM): include V4 in the pool breakdown
   // so the operator sees adoption + fire mix across V1/V2/V3/V4 at a
