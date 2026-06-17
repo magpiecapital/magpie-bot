@@ -52,9 +52,10 @@ import { getTierByOption } from "../services/loan-tier-resolver.js";
 const V1_PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh",
 );
-const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2
-  ? new PublicKey(process.env.PROGRAM_ID_V2)
-  : null;
+// V2 deprecated + purged 2026-06-17 PM. Forced null so cosign-borrow's
+// program allowlist never accepts V2 borrows. Existing V2 loans are
+// historical-only in DB. See feedback_v2_purged_from_protocol.
+const V2_PROGRAM_ID = null;
 // V3 program — once routing flips for RWA (ROUTE_RWA_TO_V3=true), the site
 // builds borrow txs targeting this program. Without including it in the
 // allowlist + magpie-program check, every V3 borrow returns 403 with

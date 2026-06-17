@@ -60,13 +60,18 @@ export const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || idl.address,
 );
 
-// v2 program (RWA-capable; newer anchor-spl with PausableConfig + ScaledUiAmount
-// support). Only set in env once v2 is deployed + validated. Until then, every
-// borrow routes to v1 — RWA mints remain disabled in DB so no user can hit
-// a not-yet-routable path.
-export const PROGRAM_ID_V2 = process.env.PROGRAM_ID_V2
-  ? new PublicKey(process.env.PROGRAM_ID_V2)
-  : null;
+// V2 (RWA-capable lending program) was DEPRECATED + WOUND-DOWN 2026-06-17 PM.
+// Pool drained to 0, FATHER bad-loan liquidated, LP funds + accumulated value
+// recovered to lender wallet. V3 + V4 cover everything V2 did. Historical V2
+// loans still display in DB (program_id column references the V2 pubkey for
+// credit-history continuity) but no new V2 loans will ever route.
+//
+// PROGRAM_ID_V2 is forced to null regardless of env so chooseProgramId can
+// never return it and downstream code that gates on `if (PROGRAM_ID_V2)`
+// short-circuits. Other modules can keep importing it safely.
+//
+// See project_magpie_v2_winddown_2026_06_17 + feedback_v2_purged_from_protocol.
+export const PROGRAM_ID_V2 = null;
 
 // v3 = on-chain TWAP memecoin program. Only routable when BOTH:
 //   - PROGRAM_ID_V3 is set (program deployed to mainnet)
@@ -193,7 +198,8 @@ export function chooseProgramId(category, opts = {}) {
   }
   if (RWA_CATEGORIES.has(category)) {
     if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
-    if (PROGRAM_ID_V2) return PROGRAM_ID_V2;
+    // V2 deprecated 2026-06-17 PM — wound down and purged. RWAs route
+    // to V3 (preferred) or fall through to V1.
     return PROGRAM_ID;
   }
   // Non-RWA path
