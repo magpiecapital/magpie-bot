@@ -1716,6 +1716,13 @@ async function enqueueArmFailedDm(args, result) {
   // user_id, so we don't need to lookup here. Just enqueue.
   if (!args.userId) return;
 
+  // intent_id flows in from the breadcrumb writer (or from a site-side
+  // caller that passed args.intentId explicitly). Notification-sender
+  // attaches a one-tap retry button keyed by intent_id so the user can
+  // recover from a failure without leaving Telegram. Operator-mandated
+  // rule: one-tap recovery on every failure (feedback_tg_must_follow_
+  // v4_at_highest_level.md). When no intent_id is available the button
+  // falls back to a /fixarm prompt.
   const payload = {
     direction: args.triggerDirection || args.direction || "above",
     trigger_kind: args.triggerKind || null,
@@ -1726,6 +1733,7 @@ async function enqueueArmFailedDm(args, result) {
     ladder_group_id: args.ladderGroupId || null,
     source: args.source || null,
     loan_id_chain: args.loanIdChain != null ? String(args.loanIdChain) : null,
+    intent_id: args.intentId ?? null,
     error_code: safeTruncate(result?.error, 64),
     error_detail: safeTruncate(jsonStringifyError(result?.detail), 400),
   };
