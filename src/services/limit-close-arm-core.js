@@ -1838,7 +1838,16 @@ async function writeBreadcrumbIntent(args) {
     console.warn(`[arm-core] breadcrumb dedupe lookup failed: ${e.message?.slice(0, 120)}`);
   }
 
-  const src = String(args.source || "unknown").slice(0, 32);
+  // arm_intents.source has a CHECK constraint: 'site' | 'tg' |
+  // 'agent_x402' | 'post_borrow_picker'. Map any caller-supplied
+  // source to the closest allowed value, default 'tg' (covers TG
+  // commands + Pip + anything else without an explicit source).
+  const rawSrc = String(args.source || "").toLowerCase();
+  let src;
+  if (rawSrc === "site") src = "site";
+  else if (rawSrc === "agent_x402" || rawSrc === "x402") src = "agent_x402";
+  else if (rawSrc === "post_borrow_picker") src = "post_borrow_picker";
+  else src = "tg";
 
   try {
     const { rows } = await query(
