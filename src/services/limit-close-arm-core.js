@@ -45,6 +45,7 @@ import { query } from "../db/pool.js";
 import { runArmPreflight } from "./limit-close-preflight.js";
 import { MAX_PROTOCOL_SLIPPAGE_BPS } from "../lib/slippage-constants.js";
 import { PublicKey } from "@solana/web3.js";
+import { notifyAdmin } from "./admin-notify.js";
 
 // T14 (2026-06-16) — Token-2022 extensions Jupiter's aggregator cannot
 // model. A V4 convert_collateral_slice firing through Jupiter will
@@ -1038,8 +1039,76 @@ export async function armOrderBatch(args) {
       }
     }
   }
+
+  // Operator-facing observability for every arm-batch failure.
+  // Mandated 2026-06-17 PM (feedback_v4_ladder_arms_must_execute_not_
+  // sit_pending.md): treat the recovery banner as a P1 alert. Every
+  // time the banner would render, the operator gets a real-time DM
+  // with the structured failure context so it never sits silent.
+  //
+  // Layered output:
+  //   1) Structured console log (Railway-grep-able)
+  //   2) Direct admin DM with the same payload
+  //
+  // Throttled by (loan_id, error_code) — same combo within 10 min
+  // doesn't re-DM. Tracked via an in-process Map (lives until restart);
+  // a Railway restart resets the throttle which is the right behavior
+  // (operator should re-see the alert after a deploy).
+  if (!result.ok) {
+    const errorCode = result.error || "unknown";
+    const failedLegIdx = result.failedLegIndex ?? null;
+    const legsSummary = Array.isArray(args.legs)
+      ? args.legs.map((l, i) => `[${i}]${l?.direction || "?"}@${l?.valueMicro || l?.multiplier || "?"}/${l?.sliceBps || 10000}bps`).join(",")
+      : "n/a";
+    const structuredLine = JSON.stringify({
+      evt: "arm_batch_failed",
+      ts: new Date().toISOString(),
+      source: args.source || null,
+      user_id: args.userId || null,
+      loan_id_chain: args.loanIdChain || null,
+      error_code: errorCode,
+      failed_leg_index: failedLegIdx,
+      detail: typeof result.detail === "string" ? result.detail.slice(0, 240) : result.detail,
+      legs: legsSummary,
+      intent_ids: Array.isArray(args.intentIds) ? args.intentIds : null,
+    });
+    console.error(`[arm-batch-fail-alert] ${structuredLine}`);
+
+    const throttleKey = `${args.loanIdChain || "?"}|${errorCode}`;
+    if (!_armBatchAlertThrottle) _armBatchAlertThrottle = new Map();
+    const lastSent = _armBatchAlertThrottle.get(throttleKey) || 0;
+    const ALERT_THROTTLE_MS = 10 * 60 * 1000; // 10 min
+    if (Date.now() - lastSent >= ALERT_THROTTLE_MS) {
+      _armBatchAlertThrottle.set(throttleKey, Date.now());
+      try {
+        const lines = [
+          "*P1 ALERT: arm-batch failed*",
+          "",
+          `Source: \`${args.source || "?"}\``,
+          `Loan: #${args.loanIdChain || "?"}`,
+          `User: ${args.userId || "?"}`,
+          `Error: \`${errorCode}\`${failedLegIdx != null ? ` (leg ${failedLegIdx})` : ""}`,
+          typeof result.detail === "string" && result.detail
+            ? `Detail: ${result.detail.slice(0, 200)}`
+            : null,
+          `Legs: \`${legsSummary.slice(0, 200)}\``,
+          Array.isArray(args.intentIds) && args.intentIds.some((x) => x != null)
+            ? `Intent IDs (now marked failed): ${args.intentIds.filter((x) => x != null).join(", ")}`
+            : null,
+          "",
+          `_Throttled to once per (loan, error_code) per 10 min._`,
+        ].filter(Boolean).join("\n");
+        await notifyAdmin(lines, { parse_mode: "Markdown" });
+      } catch (dmErr) {
+        console.warn("[arm-core:batch] admin DM failed:", dmErr.message?.slice(0, 120));
+      }
+    }
+  }
+
   return result;
 }
+
+let _armBatchAlertThrottle = null;
 
 async function armOrderBatchImpl({
   userId,
