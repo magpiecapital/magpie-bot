@@ -155,6 +155,98 @@ async function expireStaleRows(bot) {
         console.warn(`[pending-arm] expire intent reconcile failed: ${e.message?.slice(0, 120)}`);
       }
     }
+
+    // Sprint Item 5 (V4 hardening 2026-06-17) — surface the expiry to
+    // the BORROWER via TG, with a one-tap retry. Operator-mandated:
+    // the recovery banner is a safety net, not a workflow — the user
+    // should be PROACTIVELY nudged that their auto-sell setup needs a
+    // quick re-sign. Without this DM, the user only finds out when
+    // they happen to check the dashboard.
+    //
+    // Best-effort: missing TG link, missing bot handle, or any send
+    // failure logs + continues. We do NOT block any other watcher
+    // behavior on the DM landing.
+    try {
+      await sendBorrowerExpiryDm(bot, row);
+    } catch (e) {
+      console.warn(`[pending-arm] borrower DM failed for pending_arm_id=${row.id}: ${e.message?.slice(0, 120)}`);
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Borrower-facing expiry DM with a one-tap retry CTA.
+ *
+ * Sprint Item 5 (feedback_v4_hardening_sprint_2026_06_17.md).
+ * ───────────────────────────────────────────────────────────────── */
+async function sendBorrowerExpiryDm(bot, row) {
+  if (!bot) return;
+
+  // Resolve telegram_id from the borrower's user_id. wallet/user_id are
+  // populated when the original /arm-batch came in; if the user has
+  // never linked TG, telegram_id is NULL and we silently skip.
+  const { rows: [userRow] } = await query(
+    `SELECT telegram_id FROM users WHERE id = $1`,
+    [row.user_id],
+  );
+  if (!userRow?.telegram_id) {
+    console.log(`[pending-arm] no TG link for user_id=${row.user_id} — skipping borrower expiry DM`);
+    return;
+  }
+
+  // Resolve the symbol for friendlier copy. Falls back gracefully if
+  // the loan never landed AND no supported_mints lookup is possible.
+  let symbol = "your loan";
+  try {
+    const { rows: [m] } = await query(
+      `SELECT sm.symbol
+         FROM supported_mints sm
+        WHERE sm.mint = (
+          SELECT collateral_mint FROM loans WHERE loan_id::text = $1 LIMIT 1
+        )`,
+      [String(row.loan_id_chain)],
+    );
+    if (m?.symbol) symbol = m.symbol;
+  } catch {}
+
+  const nLegs = Array.isArray(row.legs) ? row.legs.length : 0;
+  const lines = [
+    `Quick heads-up — your auto-sell setup on ${symbol} loan #${row.loan_id_chain} ` +
+      `needs a re-sign.`,
+    ``,
+    `We tried for 5 minutes to land the ${nLegs} ${nLegs === 1 ? "leg" : "legs"} you signed, ` +
+      `but the borrow itself didn't confirm in that window. Your signature has expired ` +
+      `for security reasons.`,
+    ``,
+    `Open your dashboard to retry — your strikes are still saved.`,
+  ];
+
+  try {
+    await bot.telegram.sendMessage(
+      Number(userRow.telegram_id),
+      lines.join("\n"),
+      {
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Open dashboard to retry",
+                url: process.env.SITE_DASHBOARD_URL || "https://magpie.capital/dashboard",
+              },
+            ],
+          ],
+        },
+      },
+    );
+    console.log(
+      `[pending-arm] borrower DM sent — pending_arm_id=${row.id} user_id=${row.user_id} tg=${userRow.telegram_id}`,
+    );
+  } catch (sendErr) {
+    // Most common: user blocked the bot. Log + drop.
+    console.warn(
+      `[pending-arm] borrower DM send failed for pending_arm_id=${row.id}: ${sendErr.message?.slice(0, 120)}`,
+    );
   }
 }
 
