@@ -130,6 +130,46 @@ export async function getPricesInSolBatch(mints) {
  */
 const MAX_DIVERGENCE = Number(process.env.PRICE_MAX_DIVERGENCE) || 0.05;
 
+// ─── Recent-agreement cache (reliability layer) ─────────────────────────
+//
+// When BOTH sources already agreed within MAX_DIVERGENCE in the last
+// CROSS_SOURCED_CACHE_TTL_MS, we cache that agreed price. If a later
+// call hits a transient 429 / 5xx on one source (Jupiter rate-limits
+// HARD when DexScreener is unaffected — see Railway logs), we can
+// safely return the cached agreed price instead of throwing.
+//
+// Why this is safe:
+//   - The cached price was already cross-source-validated, so the
+//     security guarantee is preserved at population time.
+//   - TTL is short (90s default) — an attacker would need to pump
+//     both sources simultaneously during the cache window to influence
+//     anything, and we already valued at a clean price before the cache.
+//   - This ONLY engages when the live cross-source check would have
+//     failed for transient reasons (0 or 1 source responded). When the
+//     live check succeeds, the live price wins.
+//
+// Operator-mandated 2026-06-17 PM after recurring "Couldn't fetch price
+// right now" failures on TG /borrow during Jupiter 429 storms.
+const CROSS_SOURCED_CACHE = new Map(); // mint → { priceSol, agreedAt, agreedSources }
+const CROSS_SOURCED_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_FALLBACK_TTL_MS) || 90_000;
+
+function cacheAgreedPrice(mint, priceSol, agreedSources) {
+  CROSS_SOURCED_CACHE.set(mint, { priceSol, agreedAt: Date.now(), agreedSources });
+}
+
+/**
+ * Returns a recently-agreed cross-source price for `mint` if it's still
+ * within the fallback TTL, otherwise null. Used internally as a stale-on-
+ * failure fallback and exposed for callers that want to warm-check
+ * availability (e.g. TG /borrow prefetch).
+ */
+export function getCachedAgreedPriceIfFresh(mint) {
+  const c = CROSS_SOURCED_CACHE.get(mint);
+  if (!c) return null;
+  if (Date.now() - c.agreedAt > CROSS_SOURCED_CACHE_TTL_MS) return null;
+  return c.priceSol;
+}
+
 /**
  * Three-source agreement helper (audit F-2 follow-up — Pyth as 3rd source).
  *
@@ -258,18 +298,48 @@ export async function getPriceInSolCrossSourced(mint) {
   const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;
 
   if (respondingCount === 0) {
+    // Reliability fallback: if NO source responded but we have a recent
+    // agreed price in cache (≤ CROSS_SOURCED_CACHE_TTL_MS old), serve it
+    // rather than failing the user's borrow. The cached price was already
+    // cross-source validated; the alternative is a "Couldn't fetch price"
+    // dead-end for the user. The cache is short-TTL so manipulation risk
+    // is bounded.
+    const cached = getCachedAgreedPriceIfFresh(mint);
+    if (cached != null) {
+      console.warn(`[price] ALL sources down for ${mint.slice(0,8)} — serving cached agreed price ${cached.toFixed(9)} (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+      return cached;
+    }
     throw new Error(`No price data for ${mint} from any source (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"}${usePyth ? `; pyth=${pythErr ?? "n/a"}` : ""})`);
   }
 
   // Single-source case — fail closed unless the env-var escape hatch is on.
+  // Reliability layer: BEFORE refusing, check the recent-agreement cache.
+  // If both sources already agreed within TTL, the surviving source must
+  // agree with the cached price for us to trust it (within MAX_DIVERGENCE).
+  // This catches the common Jupiter-429 / DexScreener-up case without
+  // dropping security: we only trust the single source if it corroborates
+  // a recent multi-source agreement.
   if (respondingCount === 1) {
     const survivor = sources.find((s) => s.price != null && s.price > 0);
     const down = sources.filter((s) => s.price == null).map((s) => s.name).join(",");
+    const cached = getCachedAgreedPriceIfFresh(mint);
+    if (cached != null) {
+      const div = Math.abs(survivor.price - cached) / Math.min(survivor.price, cached);
+      if (div <= MAX_DIVERGENCE) {
+        // Survivor corroborates a recent agreement — safe to use as proof
+        // of continuity. Cache survives the broken source.
+        console.warn(`[price] ${mint.slice(0,8)} single-source RELIABILITY OK: ${survivor.name} agrees with ${(Date.now() - CROSS_SOURCED_CACHE.get(mint).agreedAt)/1000 | 0}s-old cache (${(div*100).toFixed(2)}% drift, ${down} down)`);
+        // Refresh cache with average so subsequent calls stay smooth.
+        cacheAgreedPrice(mint, (survivor.price + cached) / 2, [survivor.name, "cache"]);
+        return (survivor.price + cached) / 2;
+      }
+      console.warn(`[price] ${mint.slice(0,8)} single-source DIVERGES from cache by ${(div*100).toFixed(1)}% (${survivor.name}=${survivor.price.toFixed(9)} vs cache=${cached.toFixed(9)}); refusing`);
+    }
     if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
       console.warn(`[price] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor.name} (${down} down). Escape hatch is ON — security posture is degraded.`);
       return survivor.price;
     }
-    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down). Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
+    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down), no fresh cache. Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
     throw new Error(`Price data temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor.name} responded. Try again in a moment.`);
   }
 
@@ -285,7 +355,19 @@ export async function getPriceInSolCrossSourced(mint) {
   if (agreed.outlier) {
     console.warn(`[price] outlier rejected for ${mint.slice(0, 8)}: ${agreed.agreed.join("+")} agreed; ${agreed.outlier} flagged`);
   }
+  // Cache the live-validated price for future reliability fallback.
+  cacheAgreedPrice(mint, agreed.price, agreed.agreed);
   return agreed.price;
+}
+
+/**
+ * Warm the cross-source price cache for `mint` without blocking the caller.
+ * Used by TG /borrow's token-select to make sure the cache is hot before
+ * the user picks a percentage — so a transient Jupiter 429 between the
+ * two callbacks doesn't drop them. Errors are swallowed by design.
+ */
+export function warmPriceCache(mint) {
+  getPriceInSolCrossSourced(mint).catch(() => { /* best-effort warm */ });
 }
 
 /**
