@@ -1362,6 +1362,41 @@ async function armOrderBatchImpl({
 
   phaseLog("phase_4_ladder_groups_ok", { ladder_group_ids: ladderGroupIds });
 
+  // Phase 4b — Defensive intent breadcrumbs (per-leg).
+  //
+  // The site path beacons intents BEFORE signing the batch envelope,
+  // and threads the intent_id back through legs[i].intent_id. But if
+  // the per-leg beacon HTTP call failed (transient network blip), the
+  // sig+batch still proceeds and that leg has no server-side record.
+  // If Phase 5 INSERT then also fails (rare — concurrency, ladder cap),
+  // the recovery banner has nothing to show the user. Zero-error-
+  // messages mandate (feedback_every_arm_must_succeed_zero_error_messages.md)
+  // says we cannot lose the user's exact strike. Write defensive
+  // breadcrumbs here for any leg without an intent_id — best-effort,
+  // failure here does not abort the batch.
+  for (let i = 0; i < parsed.length; i += 1) {
+    const callerIntentId = Array.isArray(intentIds) ? intentIds[i] : null;
+    if (callerIntentId != null) continue; // site beacon already wrote one
+    const leg = parsed[i];
+    try {
+      const bcId = await writeBreadcrumbIntent({
+        userId,
+        loanIdChain: String(loanIdChain),
+        triggerKind: leg.kind,
+        triggerValueMicro: leg.valueMicro,
+        direction: leg.direction,
+        slicePct: leg.sliceBps < 10000 ? leg.sliceBps : null,
+        source,
+      });
+      if (bcId != null) {
+        if (!Array.isArray(intentIds)) intentIds = new Array(parsed.length).fill(null);
+        intentIds[i] = bcId;
+      }
+    } catch (e) {
+      console.warn(`[arm-batch] phase_4b breadcrumb failed for leg ${i}: ${e.message?.slice(0, 120)}`);
+    }
+  }
+
   // Phase 5 — Atomic INSERT inside a DB transaction. Either every leg
   // lands OR none do. No partial-arm state ever surfaces.
   const { getClient } = await import("../db/pool.js");
