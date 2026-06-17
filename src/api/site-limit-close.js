@@ -965,6 +965,45 @@ export async function handleSiteLimitCloseIntent(req) {
     console.warn("[intent] wallet lookup failed:", err.message?.slice(0, 100));
   }
 
+  // De-dupe before INSERT — operator-mandated 2026-06-17 03:50 UTC
+  // (feedback_no_duplicate_intents_in_recovery_banner_NEVER.md, ZERO
+  // TOLERANCE). If an identical pending intent exists for the same
+  // (wallet, loan_id_chain, direction, target_kind, target_value_micro,
+  // slice_pct_bps) within the last 5 minutes, return its id instead of
+  // writing a new row. Prevents the SPCX loan 816 incident where user
+  // retried a 2-leg ladder twice and ended up with 4 duplicate pending
+  // intents surfaced as 4 buttons on the recovery banner.
+  //
+  // The 5-min window is the same idempotency window used by the
+  // breadcrumb writer in arm-core.js — every entry point must agree.
+  try {
+    const dedup = await query(
+      `SELECT id, created_at FROM arm_intents
+        WHERE wallet = $1
+          AND loan_id_chain = $2
+          AND direction = $3
+          AND target_kind = $4
+          AND target_value_micro = $5::numeric
+          AND COALESCE(slice_pct_bps, 0) = COALESCE($6::int, 0)
+          AND status = 'pending'
+          AND created_at > NOW() - INTERVAL '5 minutes'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [wallet, loan_id_chain, direction, target_kind, tvm, sliceBps],
+    );
+    if (dedup.rows.length > 0) {
+      const existing = dedup.rows[0];
+      return {
+        status: 200,
+        body: { ok: true, intent_id: existing.id, created_at: existing.created_at, deduped: true },
+      };
+    }
+  } catch (err) {
+    // Dedupe is best-effort. If it fails, fall through to INSERT —
+    // safety net is still in place via the dashboard's dedupe logic.
+    console.warn("[intent] dedupe lookup failed (proceeding):", err.message?.slice(0, 120));
+  }
+
   try {
     const { rows } = await query(
       `INSERT INTO arm_intents
