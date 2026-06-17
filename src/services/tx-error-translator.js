@@ -139,12 +139,66 @@ export function translateTxError(err, ctx = {}) {
     ].join("\n");
   }
 
+  // Pattern 1b-pre: V4 program-specific Anchor errors. V4 returns
+  // Anchor codes in the 6000–6027 range (hex 0x1770–0x178b). The naive
+  // `/custom program error: 0x1/` test below matches ANY hex starting
+  // with 0x1 — including 0x1780 (TwapInsufficientHistory = 6016) —
+  // which used to render as "Not enough SOL for gas + ATA rent" even
+  // when the wallet had plenty of SOL. Operator hit this 2026-06-17 PM
+  // borrowing $BP on V4 (TWAP window hadn't filled). Route each known
+  // V4 code to its OWN user-actionable message BEFORE falling through
+  // to the lamports path.
+  const anchorCodeMatch = blob.match(/Error (?:Number|Code): (\d{4,5})|Error Number: (\d{4,5})/);
+  const anchorCode = anchorCodeMatch ? Number(anchorCodeMatch[1] || anchorCodeMatch[2]) : null;
+  if (anchorCode === 6016 || /TwapInsufficientHistory/i.test(blob)) {
+    return [
+      "⚠️ *Price oracle still warming up*",
+      "",
+      "V4 needs about 5 minutes of price history to lend safely on this token. The oracle hasn't filled its 5-minute TWAP window yet — usually because the token was just enabled or the network has been quiet.",
+      "",
+      "*What to do:* wait ~5 minutes and try /borrow again. The oracle pushes a price sample every ~30–60s.",
+      "",
+      "_This isn't a wallet issue — your balance is fine._",
+    ].join("\n");
+  }
+  if (anchorCode === 6017 || /PriceImpactPumpDetected/i.test(blob)) {
+    return [
+      "⚠️ *Spot price moved too far above the TWAP*",
+      "",
+      "V4 refuses to lend when the spot price is more than 15% above the 5-minute TWAP — pump protection.",
+      "",
+      "Wait a few minutes for the TWAP to catch up, or try a smaller collateral amount.",
+    ].join("\n");
+  }
+  if (anchorCode === 6013 || /StalePriceAttestation/i.test(blob)) {
+    return [
+      "⚠️ *Price attestation expired*",
+      "",
+      "The on-chain price feed for this token is older than 2 minutes. The bot's attestor should refresh it on the next tick.",
+      "",
+      "Try /borrow again in ~30 seconds.",
+    ].join("\n");
+  }
+  if (anchorCode === 6014 || /CollateralValueExceedsAttestation/i.test(blob)) {
+    return [
+      "⚠️ *Borrow value too high vs. on-chain TWAP*",
+      "",
+      "The borrow amount exceeds what the TWAP-attested collateral price allows. Try a slightly smaller %.",
+    ].join("\n");
+  }
+
   // Pattern 1b: insufficient lamports — true SOL shortage from the
   // Solana runtime. The pattern `insufficient lamports X, need Y` is
   // emitted by the system program when an account-creation rent or
   // transfer exceeds the payer's native balance.
+  //
+  // The `0x1\b` boundary is load-bearing: without it, the regex matches
+  // V4 error 0x1780 (TwapInsufficientHistory = 6016) and every other
+  // 0x1NNN code, producing the "Not enough SOL" mis-translation that
+  // operator hit 2026-06-17 PM. The boundary requires a non-hex char
+  // (or end-of-string) immediately after the "1".
   const insufficientMatch = blob.match(/insufficient lamports\s+(\d+),\s*need\s+(\d+)/i);
-  if (insufficientMatch || /custom program error: 0x1/.test(blob)) {
+  if (insufficientMatch || /custom program error: 0x1(?![0-9a-fA-F])/.test(blob)) {
     const have = insufficientMatch ? BigInt(insufficientMatch[1]) : null;
     const need = insufficientMatch ? BigInt(insufficientMatch[2]) : null;
     const short = (have != null && need != null) ? need - have : null;
