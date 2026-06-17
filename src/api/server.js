@@ -1617,6 +1617,11 @@ const PUBLIC_ROUTES = new Set([
   // tx — closes the window where Phantom rejects with StalePriceAttestation
   // before the user can even sign.
   "/api/v1/price/refresh",
+  // V4 feed-health read. Sprint Item 3 (V4 hardening 2026-06-17). Site
+  // calls before rendering the Borrow CTA so a cold V4 feed shows
+  // "Refreshing oracle…" instead of letting the user click into a
+  // StalePriceAttestation rejection.
+  "/api/v1/v4/feed-health",
   // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
   // POST + DELETE require an Ed25519-signed envelope. Security is
   // enforced internally by the handler (signature verification + linked
@@ -1931,6 +1936,14 @@ async function router(req, res) {
       case "/api/v1/price/refresh": {
         const { handlePriceRefresh } = await import("./price-refresh.js");
         result = await handlePriceRefresh(req);
+        break;
+      }
+      case "/api/v1/v4/feed-health": {
+        // Sprint Item 3 (V4 hardening 2026-06-17) — read-only freshness
+        // probe for a single mint's V4 + default price feeds. Site uses
+        // the recommendation field to gate the borrow CTA.
+        const { handleV4FeedHealth } = await import("./v4-feed-health.js");
+        result = await handleV4FeedHealth(req, url);
         break;
       }
       case "/api/v1/site/limit-close": {
