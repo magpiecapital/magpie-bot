@@ -524,9 +524,23 @@ export async function handleLimitClose(ctx, direction = "above", opts = {}) {
     ? `*Stop-loss armed* — order #${orderId}${expiryLabel}`
     : `*Take-profit armed* — order #${orderId}${expiryLabel}`;
   const triggerVerb = isStopLoss ? "drops to" : "hits";
-  const purpose = isStopLoss
-    ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
-    : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`;
+  // V4 in-vault behavior vs V1/V2/V3 fire-and-close behavior. The
+  // operator-mandated V4 thesis is non-negotiable
+  // (feedback_v4_in_vault_thesis_non_negotiable): on V4 fires, SOL
+  // accumulates inside the per-loan sol_proceeds_vault and the loan
+  // STAYS ACTIVE; the only path to the user's wallet is borrower-
+  // signed repay. Legacy programs sell + repay + close in one shot.
+  // The success DM must describe what will actually happen so users
+  // know to repay when they want their SOL.
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const isV4 = !!v4ProgramId && loan?.program_id === v4ProgramId;
+  const purpose = isV4
+    ? (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`
+        : `When ${symbol} ${triggerVerb} your target, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`)
+    : (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
+        : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`);
   const listCmd = isStopLoss ? "/stoplosses" : "/takeprofitorders";
 
   await ctx.reply(
