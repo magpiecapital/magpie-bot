@@ -588,6 +588,27 @@ async function tick(bot) {
               const kb = new InlineKeyboard()
                 .text("Cancel this order", `lcret:cancel:${row.payload.order_id}`);
               extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_arm_failed") {
+              // One-tap retry on every failure (operator-mandated rule
+              // feedback_tg_must_follow_v4_at_highest_level.md). When the
+              // breadcrumb writer left an intent_id behind, route the
+              // retry through the same fixarm:intent handler the
+              // dashboard banner uses. Otherwise just point the user at
+              // /fixarm so they can pick from their pending intents.
+              const intentId = row.payload?.intent_id;
+              const loanIdChain = row.payload?.loan_id_chain;
+              if (
+                intentId != null &&
+                typeof loanIdChain === "string" &&
+                loanIdChain.length > 0
+              ) {
+                const cbData = `fixarm:intent:${loanIdChain}:${intentId}`;
+                if (cbData.length <= 64) {
+                  const { InlineKeyboard } = await import("grammy");
+                  const kb = new InlineKeyboard().text("Retry now", cbData);
+                  extra = { reply_markup: kb };
+                }
+              }
             } else if (row.kind === "limit_close_fired") {
               // Receipt-confirmation keyboard. Solscan links are already
               // inline in the body, but tap-once buttons are friendlier
