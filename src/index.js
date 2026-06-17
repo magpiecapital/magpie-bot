@@ -169,6 +169,7 @@ import { startAutoProtect } from "./services/auto-protect.js";
 import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
 import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
 import { startPendingArmRetryWatcher } from "./services/pending-arm-retry-watcher.js";
+import { startV4RepayReadinessWatcher } from "./services/v4-repay-readiness-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
@@ -1005,6 +1006,11 @@ bot.start({
     // user never has to re-sign. See
     // feedback_loan_830_full_postmortem_and_defenses.md.
     setTimeout(() => startPendingArmRetryWatcher(bot), 140_000);
+    // V4 repay-readiness watcher — every hour, surfaces upcoming
+    // funding gaps to V4 borrowers BEFORE they're stranded at the
+    // repay screen. 4-tier DM ladder (72h / 24h / 6h / 1h). See
+    // feedback_v4_hardening_sprint_2026_06_17.md Item 1.
+    setTimeout(() => startV4RepayReadinessWatcher(bot), 150_000);
     // Conditional-borrow watcher — fires agent intents when their
     // trigger condition (price/time/liquidity) matches. Postgres
     // advisory lock ensures single-instance even across replicas.

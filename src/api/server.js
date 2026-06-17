@@ -1617,6 +1617,13 @@ const PUBLIC_ROUTES = new Set([
   // tx — closes the window where Phantom rejects with StalePriceAttestation
   // before the user can even sign.
   "/api/v1/price/refresh",
+  // V4 repay preflight. Public read-only GET returning owed / wallet /
+  // vault / deficit breakdown so the dashboard can render the funding-
+  // gap widget BEFORE the user clicks Repay. Mandated by Item 1 of the
+  // 2026-06-17 V4 hardening sprint
+  // (feedback_v4_hardening_sprint_2026_06_17.md). No auth — reads
+  // on-chain state only; the loan PDA + wallet are both pubkeys.
+  "/api/v1/v4/repay-preflight",
   // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
   // POST + DELETE require an Ed25519-signed envelope. Security is
   // enforced internally by the handler (signature verification + linked
@@ -1931,6 +1938,15 @@ async function router(req, res) {
       case "/api/v1/price/refresh": {
         const { handlePriceRefresh } = await import("./price-refresh.js");
         result = await handlePriceRefresh(req);
+        break;
+      }
+      case "/api/v1/v4/repay-preflight": {
+        // Item 1 of the 2026-06-17 V4 hardening sprint
+        // (feedback_v4_hardening_sprint_2026_06_17.md). Public GET
+        // returning owed / wallet / vault / deficit so the site can
+        // render a precise funding-gap widget before the user signs.
+        const { handleV4RepayPreflight } = await import("./v4-repay-preflight.js");
+        result = await handleV4RepayPreflight(req, url);
         break;
       }
       case "/api/v1/site/limit-close": {
