@@ -50,6 +50,14 @@ import {
   resolveMultiplierToPrice,
   MIN_LOAN_LAMPORTS,
 } from "../services/limit-close-arm-core.js";
+// Kill-switch helpers — TG /lock (per-user) + /sitedisable (global). Every
+// signed-envelope handler in this module honors these so a user who
+// suspects compromise can pause site-side actions from TG (operator-
+// mandated audit HIGH#3 2026-06-17 PM). Already-armed orders keep firing
+// through the engine path; only NEW arms/cancels/modifies/intents are
+// gated by the lock.
+import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -339,6 +347,13 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
  * ───────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseList(req, url) {
   if (req.method !== "GET") return { status: 405, body: { error: "GET only" } };
+  // Global kill switch (audit HIGH#3) — during a /sitedisable incident,
+  // even reads are paused to prevent dashboards from rendering stale
+  // state that conflicts with the actual chain truth. Per-user /lock is
+  // skipped here because List is unauthenticated public-read and locking
+  // a wallet shouldn't hide their orders from themselves.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const wallet = url.searchParams.get("wallet") || "";
   if (!isValidPubkey(wallet)) return { status: 400, body: { error: "invalid_wallet" } };
 
@@ -655,12 +670,20 @@ export async function handleSiteLimitCloseArm(req) {
   // private fields, no signatures.
   const reqId = Math.random().toString(36).slice(2, 10);
   console.log(`[arm] ENTRY req=${reqId} ip=${req.socket?.remoteAddress?.slice(0, 20) || "?"} ua="${(req.headers["user-agent"] || "").slice(0, 60)}"`);
+  // Global kill switch (audit HIGH#3) — operator can /sitedisable all
+  // site-signed writes during an incident without touching the engine.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-arm/v1", ["LoanId"]);
   if (!auth.ok) {
     console.warn(`[arm] AUTH-FAIL req=${reqId} status=${auth.status} error=${auth.error} detail=${(auth.detail || "").slice(0, 120)}`);
     return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   }
   const { userId, fields } = auth;
+  // Per-user kill switch (audit HIGH#3) — borrower can /lock their
+  // account from TG when they suspect Phantom compromise.
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
   console.log(
     `[arm] AUTH-OK req=${reqId} user_id=${userId} signer=${auth.signerPubkey.slice(0, 8)}… ` +
     `loan_id_chain=${fields.LoanId} direction=${fields.Direction || "above"} ` +
@@ -927,9 +950,14 @@ export async function handleSiteLimitCloseArm(req) {
  * move gap.
  * ────────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseModify(req) {
+  // Kill switches (audit HIGH#3): /sitedisable before auth, /lock after.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-modify/v1", ["OrderId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   const { userId, fields } = auth;
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
 
   const orderId = Number(fields.OrderId);
   if (!Number.isInteger(orderId)) return { status: 400, body: { error: "invalid_OrderId" } };
@@ -1030,9 +1058,17 @@ export async function handleSiteLimitCloseModify(req) {
 }
 
 export async function handleSiteLimitCloseCancel(req) {
+  // Kill switches (audit HIGH#3): /sitedisable + /lock honored on cancel too.
+  // The lock matters most here — a user who suspects compromise can /lock and
+  // an attacker still can't cancel their stop-loss right before manipulating
+  // the price down.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-cancel/v1", ["OrderId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   const { userId, fields } = auth;
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
 
   const orderId = Number(fields.OrderId);
   if (!Number.isInteger(orderId)) return { status: 400, body: { error: "invalid_OrderId" } };
@@ -1077,7 +1113,55 @@ export async function handleSiteLimitCloseCancel(req) {
  * The site uses intent_id when subsequently POSTing /arm so the
  * server can mark the intent armed on success.
  * ───────────────────────────────────────────────────────────────── */
+// Layered DoS / spoofing defense for the unsigned intent beacon (audit
+// HIGH#2 2026-06-17 PM):
+//   - Global /sitedisable kill switch.
+//   - Per-IP rate limit so an attacker can't spam from one origin.
+//   - Per-wallet rate limit so even IP-rotated attackers can't flood a
+//     specific victim's recovery banner.
+//   - Hard cap on pending arm_intents per wallet so the table can't be
+//     used as a DB-bloat vector.
+//
+// The site will upgrade to signed-envelope intents in a follow-up; until
+// then this bounds the damage while keeping legitimate dashboards working.
+const INTENT_IP_WINDOW_MS = 60_000;
+const INTENT_IP_MAX = 30;
+const intentIpBuckets = new Map();
+const INTENT_WALLET_WINDOW_MS = 60 * 60_000; // 1 hour
+const INTENT_WALLET_MAX = 20;
+const intentWalletBuckets = new Map();
+const INTENT_WALLET_PENDING_CAP = 30;
+function intentIpKey(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+function checkIntentBucket(map, key, windowMs, maxCount) {
+  const now = Date.now();
+  const bucket = map.get(key) || [];
+  const fresh = bucket.filter((t) => now - t < windowMs);
+  if (fresh.length >= maxCount) return false;
+  fresh.push(now);
+  map.set(key, fresh);
+  // Periodic eviction so the map is bounded — audit API#6/Bot#6.
+  if (map.size > 5000 && Math.random() < 0.004) {
+    for (const [k, v] of map.entries()) {
+      if (v.every((t) => now - t >= windowMs)) map.delete(k);
+    }
+  }
+  return true;
+}
+
 export async function handleSiteLimitCloseIntent(req) {
+  // Global kill switch (audit HIGH#3) — intent beacons paused too.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
+
+  // Per-IP rate limit BEFORE body parse so a flood can't OOM us on read.
+  if (!checkIntentBucket(intentIpBuckets, intentIpKey(req), INTENT_IP_WINDOW_MS, INTENT_IP_MAX)) {
+    return { status: 429, body: { error: "intent_rate_limit" } };
+  }
+
   const body = await readJsonBody(req);
   if (!body || typeof body !== "object") {
     return { status: 400, body: { error: "invalid_body" } };
@@ -1095,6 +1179,38 @@ export async function handleSiteLimitCloseIntent(req) {
   if (typeof wallet !== "string" || wallet.length < 32 || wallet.length > 44) {
     return { status: 400, body: { error: "invalid_wallet" } };
   }
+
+  // Per-wallet rate limit. Stops an IP-rotating attacker from spraying
+  // intents on one victim's recovery banner — they can hit 20 in an
+  // hour total, not per IP. Combined with the pending-cap below this
+  // bounds the recovery-banner-spoofing attack to a small constant.
+  if (!checkIntentBucket(intentWalletBuckets, wallet, INTENT_WALLET_WINDOW_MS, INTENT_WALLET_MAX)) {
+    return { status: 429, body: { error: "wallet_intent_rate_limit" } };
+  }
+
+  // Pending-cap per wallet — bounds DB bloat AND recovery-banner-spoof
+  // surface. A legitimate dashboard never has > ~5 pending intents at
+  // once (one per pre-borrow exit leg, at most).
+  try {
+    const { rows: [{ count }] } = await query(
+      `SELECT COUNT(*)::int AS count FROM arm_intents
+        WHERE wallet = $1 AND status = 'pending'
+          AND created_at > NOW() - INTERVAL '24 hours'`,
+      [wallet],
+    );
+    if (count >= INTENT_WALLET_PENDING_CAP) {
+      return {
+        status: 429,
+        body: {
+          error: "too_many_pending_intents",
+          detail: `Wallet has ${count} pending intents in last 24h. Clear via the dashboard or wait.`,
+        },
+      };
+    }
+  } catch (err) {
+    console.warn("[intent] pending-cap check failed:", err.message?.slice(0, 120));
+  }
+
   if (typeof loan_id_chain !== "string" || !/^\d+$/.test(loan_id_chain)) {
     return { status: 400, body: { error: "invalid_loan_id_chain" } };
   }
@@ -1228,6 +1344,9 @@ export async function handleSiteLimitCloseIntent(req) {
  *   409 + { ok: false, error, failed_leg_index, detail }
  * ───────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseArmBatch(req) {
+  // Kill switches (audit HIGH#3): gate batch-arm same as single arm.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-arm-batch/v1", [
     "LoanId",
     "Legs",
@@ -1244,6 +1363,9 @@ export async function handleSiteLimitCloseArmBatch(req) {
     };
   }
   const { userId, fields, body: rawBody } = auth;
+  // Kill switch (audit HIGH#3): per-user /lock applies to batch-arm too.
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
   const reqId = (Math.random() * 1e9 | 0).toString(36);
 
   // Parse Legs (signed payload — tamper-proof from middlemen).
