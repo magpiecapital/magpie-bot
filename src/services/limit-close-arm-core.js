@@ -1141,6 +1141,19 @@ async function armOrderBatchImpl({
   legs,                    // [{ direction, kind, valueMicro, sliceBps, slippageBps, expiresAt?, trailingDistanceBps? }]
   intentIds = null,        // optional [intent_id, ...] same length as legs
   armNotePrefix = null,
+  // Tier-2 architectural defense
+  // (feedback_loan_830_full_postmortem_and_defenses.md). If the caller
+  // supplied a signed-envelope context, we can queue the arm for
+  // background retry instead of hard-failing when the loan row hasn't
+  // committed yet. Shape:
+  //   { signer_pubkey, wallet, envelope_issued_at_ms }
+  // The watcher uses envelope_issued_at_ms to enforce the 5-min
+  // freshness rule. Storing signer + wallet preserves the audit trail
+  // (who signed, when) for the eventual replay.
+  envelope = null,
+  // When true, skip the pending-arm queue path. The watcher sets this
+  // when replaying so a second race doesn't re-queue the same arm.
+  skipPendingQueue = false,
 }) {
   // Per-phase structured logging tagged with reqId so the operator can
   // grep Railway logs for the exact failing phase when an arm doesn't
@@ -1211,6 +1224,64 @@ async function armOrderBatchImpl({
   }
   if (loanRows.length === 0) {
     phaseLog("phase_1_loan_not_found", { lookup_attempts: lookupAttempts });
+
+    // ── Tier-2 architectural fix
+    // (feedback_loan_830_full_postmortem_and_defenses.md, defense B) ──
+    // If the caller supplied a signed envelope context AND we aren't
+    // already in a retry replay, queue the arm for the background
+    // pending-arm watcher. The watcher polls every 10s and replays
+    // while the envelope is still within its 5-min freshness window.
+    // User never has to re-sign; the recovery banner is reduced from
+    // a routine UX state to a true exception.
+    if (envelope && !skipPendingQueue) {
+      const issuedAtMs = Number(envelope.envelope_issued_at_ms);
+      if (Number.isFinite(issuedAtMs) && issuedAtMs > 0) {
+        const ageMs = Date.now() - issuedAtMs;
+        const ENVELOPE_FRESH_MS = 5 * 60 * 1000;
+        if (ageMs < ENVELOPE_FRESH_MS - 30_000) {
+          // Need >30s of freshness left so the watcher gets at least
+          // one retry attempt.
+          try {
+            const pending = await persistPendingArm({
+              userId,
+              signerPubkey: envelope.signer_pubkey || null,
+              wallet: envelope.wallet || envelope.signer_pubkey || null,
+              loanIdChain: String(loanIdChain),
+              legs,
+              intentIds: Array.isArray(intentIds) ? intentIds.filter((x) => x != null) : null,
+              source,
+              armNotePrefix,
+              envelopeIssuedAtMs: issuedAtMs,
+            });
+            phaseLog("phase_1_queued_for_retry", {
+              pending_arm_id: pending.id,
+              envelope_age_ms: ageMs,
+              envelope_remaining_ms: ENVELOPE_FRESH_MS - ageMs,
+            });
+            return {
+              ok: true,
+              pending: true,
+              pending_arm_id: pending.id,
+              envelope_expires_at_ms: issuedAtMs + ENVELOPE_FRESH_MS,
+              retry_in_ms: 10_000,
+              detail:
+                "Loan not yet committed to DB — arm queued for background retry while user's signature is still valid.",
+            };
+          } catch (qErr) {
+            console.warn(
+              `[arm-batch] pending_arms insert failed: ${qErr.message?.slice(0, 160)} — falling back to hard-fail path`,
+            );
+            // Fall through to the existing DM + return-error path so
+            // we never silently swallow this failure mode.
+          }
+        } else {
+          phaseLog("phase_1_envelope_too_stale_for_queue", {
+            envelope_age_ms: ageMs,
+          });
+        }
+      }
+    }
+
     // Tier-1 defense per
     // feedback_loan_830_full_postmortem_and_defenses.md: admin DM on
     // FIRST occurrence of loan_not_found_for_user, throttled per
@@ -1223,13 +1294,12 @@ async function armOrderBatchImpl({
       const now = Date.now();
       if (!_lnfThrottle.get(key) || now - _lnfThrottle.get(key) > 60 * 60 * 1000) {
         _lnfThrottle.set(key, now);
-        const ageMs = Date.now() - (Number(process.env.ARM_LOOKUP_DEADLINE_MS) || 30_000);
         await notifyAdmin(
-          `🚨 arm-batch RACE: loan_not_found_for_user\n` +
+          `arm-batch RACE: loan_not_found_for_user\n` +
           `loan_id_chain: ${loanIdChain}\n` +
           `user_id: ${userId}\n` +
           `polled ${lookupAttempts}x over ${Number(process.env.ARM_LOOKUP_DEADLINE_MS || 30_000) / 1000}s — loan never appeared\n` +
-          `Possible causes: cosign-borrow DB-write delayed > polling window, OR loan never created (user cancelled mid-flow)`,
+          `Possible causes: cosign-borrow DB-write delayed > polling window, OR loan never created (user cancelled mid-flow), OR envelope not supplied so queue-and-retry skipped`,
         );
       }
     } catch {}
@@ -1939,6 +2009,53 @@ function safeTruncate(s, n) {
   if (s == null) return null;
   const str = String(s);
   return str.length > n ? str.slice(0, n) : str;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * persistPendingArm — write a row to the pending_arms queue.
+ *
+ * Used by armOrderBatchImpl when phase_1 can't find the loan inside
+ * the 30s polling window AND the caller supplied a signed envelope.
+ * The watcher service (pending-arm-retry-watcher.js) replays this
+ * row every 10s for the rest of the 5-min envelope freshness window.
+ *
+ * Mandated by [[feedback_loan_830_full_postmortem_and_defenses]].
+ * ───────────────────────────────────────────────────────────────── */
+async function persistPendingArm({
+  userId,
+  signerPubkey,
+  wallet,
+  loanIdChain,
+  legs,
+  intentIds,
+  source,
+  armNotePrefix,
+  envelopeIssuedAtMs,
+}) {
+  const { rows } = await query(
+    `INSERT INTO pending_arms (
+       user_id, signer_pubkey, wallet, loan_id_chain,
+       legs, intent_ids, source, arm_note_prefix,
+       envelope_issued_at, status
+     ) VALUES (
+       $1, $2, $3, $4,
+       $5::jsonb, $6, $7, $8,
+       to_timestamp($9::double precision / 1000.0), 'pending'
+     )
+     RETURNING id`,
+    [
+      userId,
+      signerPubkey,
+      wallet,
+      String(loanIdChain),
+      JSON.stringify(legs),
+      Array.isArray(intentIds) && intentIds.length > 0 ? intentIds : null,
+      source,
+      armNotePrefix || null,
+      Number(envelopeIssuedAtMs),
+    ],
+  );
+  return rows[0];
 }
 
 function jsonStringifyError(detail) {
