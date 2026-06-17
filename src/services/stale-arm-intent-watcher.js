@@ -60,6 +60,39 @@ async function runOnce() {
     return;
   }
 
+  // Expire any pending intent older than 1h that still has no matching
+  // armed/firing order. Operator-mandated 2026-06-17 03:50 UTC
+  // (feedback_no_duplicate_intents_in_recovery_banner_NEVER.md):
+  // pending status must reflect reality. After 1h with no armed order,
+  // the arm definitely didn't go through — mark the row as expired so
+  // the recovery banner stops surfacing it forever. The user can always
+  // re-arm; the new attempt creates a fresh intent (or dedupes back to
+  // a still-valid pending one within the 5-min window).
+  try {
+    const { rowCount } = await query(
+      `UPDATE arm_intents ai
+          SET status = 'failed',
+              error_code = 'expired_pending',
+              error_detail = 'No matching armed/firing order materialized within 1h of the intent. Arm did not complete.',
+              updated_at = NOW()
+        WHERE ai.status = 'pending'
+          AND ai.created_at < NOW() - INTERVAL '1 hour'
+          AND NOT EXISTS (
+            SELECT 1 FROM limit_close_orders o
+             JOIN loans l ON l.id = o.loan_id
+             WHERE l.loan_id::text = ai.loan_id_chain
+               AND o.status IN ('armed','firing','twap_in_progress','awaiting_user','fired')
+               AND o.trigger_direction = ai.direction
+               AND o.trigger_value_micro = ai.target_value_micro
+          )`,
+    );
+    if (rowCount > 0) {
+      console.log(`[stale-arm-intent-watcher] expired ${rowCount} pending intent(s) > 1h old`);
+    }
+  } catch (e) {
+    console.warn(`[stale-arm-intent-watcher] expire-old-pendings failed: ${e.message?.slice(0, 120)}`);
+  }
+
   // Pull pending intents that:
   //   1) sit > MIN_AGE_SECONDS old
   //   2) are no older than MAX_AGE_HOURS (don't nudge ancient ones)
