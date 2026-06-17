@@ -250,17 +250,36 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
     //
     // See feedback_v4_auto_sells_no_custodial_requirement_2026_06_17.md.
     try {
+      // SQL traps the audit caught 2026-06-17 PM (PR #344 shipped these
+      // broken — every anon V4 arm has been silently 500'ing since):
+      //   1. users.telegram_id was NOT NULL — fixed in migration 072.
+      //   2. wallets has NO unique constraint on public_key (pool.js
+      //      drops it on every boot), so ON CONFLICT (public_key) threw
+      //      "no unique or exclusion constraint". Use the SELECT-then-
+      //      INSERT pattern proven in account-link.js.
       const { rows: [newUser] } = await query(
         `INSERT INTO users (telegram_id, created_at)
          VALUES (NULL, NOW())
          RETURNING id`,
       );
-      await query(
-        `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
-         VALUES ($1, $2, 'site_v4_autolink', TRUE, NOW())
-         ON CONFLICT (public_key) DO NOTHING`,
-        [newUser.id, signerPubkey],
+      const existsCheck = await query(
+        `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+        [signerPubkey, newUser.id],
       );
+      if (existsCheck.rowCount === 0) {
+        try {
+          await query(
+            `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+             VALUES ($1, $2, 'site_v4_autolink', TRUE, NOW())`,
+            [newUser.id, signerPubkey],
+          );
+        } catch (raceErr) {
+          // Tolerate concurrent autolink — both INSERTs are equivalent.
+          if (!/duplicate key|unique constraint/i.test(raceErr.message || "")) {
+            throw raceErr;
+          }
+        }
+      }
       const refetch = await query(
         `SELECT w.user_id, w.encrypted_secret, w.source
            FROM wallets w
@@ -274,8 +293,6 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
       );
       walletRow = refetch.rows[0];
       if (!walletRow) {
-        // Defensive: if the INSERT raced and the row still isn't visible,
-        // surface a transient error rather than a confusing 403.
         return {
           ok: false,
           status: 503,

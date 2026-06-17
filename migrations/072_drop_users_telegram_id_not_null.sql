@@ -1,0 +1,22 @@
+-- Migration 072: drop NOT NULL on users.telegram_id
+--
+-- Anonymous-wallet (Phantom-only, no Telegram) borrowers need a `users`
+-- row to satisfy the wallets.user_id foreign key, but they have no
+-- Telegram identity. The auto-link path in
+-- src/services/wallet-owner-resolver.js (resolveOrAutoLinkWalletOwner)
+-- and src/api/site-limit-close.js (authSignedEnvelope auto-link block)
+-- both INSERT users with telegram_id=NULL.
+--
+-- Until now the schema rejected those INSERTs at runtime, silently
+-- breaking every anon V4 borrow + arm. Caught by audit 2026-06-17 PM
+-- on confirmation that the post-fix sql layer was the root cause of
+-- operator's wallet 3J1Ut4tK1 dashboard-empty incident.
+--
+-- The UNIQUE constraint is preserved — NULL values do not conflict on
+-- UNIQUE in Postgres, so multiple anon users can coexist while every
+-- real Telegram link stays unique.
+--
+-- Safe: no existing data violates the new constraint (NOT NULL → NULL
+-- allowed strictly relaxes), no foreign keys reference the column.
+
+ALTER TABLE users ALTER COLUMN telegram_id DROP NOT NULL;
