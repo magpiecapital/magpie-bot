@@ -186,8 +186,17 @@ export async function handleSyncLoan(req) {
     // can have multiple rows in wallets (site_native + imported); we
     // want the user who'll actually run /repay etc. See
     // src/services/wallet-owner-resolver.js.
-    const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
-    const resolvedUserId = await resolveWalletOwner(borrowerStr);
+    // 2026-06-17 PM — auto-link anonymous wallets. Without this, a
+    // Phantom-only wallet's V4 borrow succeeds on chain but never
+    // reaches DB (cosign-borrow ALSO has the gate; both paths use the
+    // auto-link resolver now). Operator-mandated parity with the V4
+    // anon-wallet sprint. See
+    // feedback_cosign_borrow_must_auto_link_anonymous_wallets.md.
+    const { resolveOrAutoLinkWalletOwner } = await import("../services/wallet-owner-resolver.js");
+    const resolvedUserId = await resolveOrAutoLinkWalletOwner(
+      borrowerStr,
+      "sync_loan_autolink",
+    );
     const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
     if (!walletRow) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
