@@ -378,8 +378,18 @@ export async function handleSiteLimitCloseList(req, url) {
           WHERE wallet = $1
             AND loan_id_chain = ANY($2::text[])
             AND (
+              -- Banner-surface window for unfinished-arm intents. The
+              -- whole point is to never lose the user's exact strike:
+              -- if they came back the next day to the same V4 loan,
+              -- the banner must STILL surface their target so they can
+              -- one-click retry. The original 1h window evaporated the
+              -- strike right when operator hit it (2026-06-17 night,
+              -- intents 15/16 went out of window at ~67 min old).
+              -- 24h matches the 'pending' window and is long enough to
+              -- catch overnight retries while keeping ancient failures
+              -- from spamming the banner forever.
               (status = 'pending' AND created_at > NOW() - INTERVAL '24 hour')
-              OR (status = 'failed' AND created_at > NOW() - INTERVAL '1 hour')
+              OR (status = 'failed' AND created_at > NOW() - INTERVAL '24 hour')
             )
           ORDER BY created_at DESC`,
         [wallet, loanChainIds],
