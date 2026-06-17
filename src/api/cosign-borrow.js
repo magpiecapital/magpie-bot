@@ -877,8 +877,17 @@ export async function handleCosignBorrow(req) {
         // Same TG-preferring resolver as the proposed-loan-lamports gate
         // above. Both must agree or recordLoan attributes to a different
         // user than the gates validated.
-        const { resolveWalletOwner: resolveWalletOwnerForRecord } = await import("../services/wallet-owner-resolver.js");
-        const recordUserId = await resolveWalletOwnerForRecord(borrowerStr);
+        // 2026-06-17 PM — for V4 anonymous borrowers (Phantom-only
+        // wallets with no `wallets` row), auto-link instead of skipping
+        // recordLoan. Without this, the borrow succeeds on chain but
+        // the dashboard's Active Loans tab is empty — operator hit
+        // exactly that scenario on wallet 3J1Ut4tK1... See
+        // feedback_cosign_borrow_must_auto_link_anonymous_wallets.md.
+        const { resolveOrAutoLinkWalletOwner } = await import("../services/wallet-owner-resolver.js");
+        const recordUserId = await resolveOrAutoLinkWalletOwner(
+          borrowerStr,
+          "cosign_borrow_autolink",
+        );
         const walletRow = recordUserId ? { user_id: recordUserId } : null;
         if (walletRow) {
           await recordLoan({
