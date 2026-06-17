@@ -264,6 +264,16 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
   // feed timestamp never crosses the contract's 120s staleness limit.
   const MAX_GAP_MS = 60_000;
+  // V4 needs a TIGHTER cadence than V1/V3 because the on-chain TWAP rule
+  // requires 8 samples within a rolling 5-minute window. At 60s pushes a
+  // 5-minute window only contains ~5 samples — so every freshly-enabled
+  // V4 token hits TwapInsufficientHistory on its first borrow (operator
+  // hit this on $BP 2026-06-17 PM, see feedback_tg_borrow_must_be_reliable).
+  // 35s pushes land 8+ samples in any 5-min window → TWAP ready ~5 min
+  // after a token first gets attested. Configurable so a future tightening
+  // of the on-chain rule (or a desire to widen for SOL spend) is one env
+  // bump away.
+  const MAX_GAP_MS_V4 = Number(process.env.V4_ATTEST_MAX_GAP_MS) || 35_000;
   // Cap on-chain inits per tick — drip-feed backfill of missing feeds to
   // avoid bursting Helius RPC and triggering 429 rate limits.
   const MAX_INITS_PER_TICK = 5;
@@ -361,7 +371,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
           const { PROGRAM_ID_V4 } = await import("../solana/program.js");
           if (PROGRAM_ID_V4) {
             const sinceV4 = Date.now() - (lastAttestAtV4.get(mint) || 0);
-            if (sinceV4 >= MAX_GAP_MS) {
+            if (sinceV4 >= MAX_GAP_MS_V4) {
               try {
                 await attestPrice(mint, decimals, priceSol, PROGRAM_ID_V4);
                 lastAttestAtV4.set(mint, Date.now());

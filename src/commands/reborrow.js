@@ -92,8 +92,21 @@ export async function handleReborrow(ctx) {
   let valueLamports;
   try {
     valueLamports = await collateralValueLamports(match.mint, useRaw, match.decimals);
-  } catch {
-    return ctx.reply("⚠️ Couldn't fetch price right now. Try /borrow instead.");
+  } catch (err) {
+    // The cross-source cache (PR #347) means most transient failures here
+    // already serve a cached agreed price. If we still failed, it's a real
+    // multi-source outage — one re-tap of /reborrow almost always succeeds.
+    // Don't push the user to a different command; just tell them to retry.
+    console.error(`[reborrow] price fetch error for ${match.symbol}:`, err.message);
+    const kb = new InlineKeyboard().text("🔁 Retry /reborrow", "reborrow:retry");
+    return ctx.reply(
+      [
+        "⚠️ *Couldn't fetch the price right now*",
+        "",
+        `_Both Jupiter and DexScreener are slow on ${match.symbol} for a moment. Usually clears within 30s — tap to retry._`,
+      ].join("\n"),
+      { parse_mode: "Markdown", reply_markup: kb },
+    );
   }
 
   const loanAmountPreFee = Math.floor((valueLamports * tier.ltv) / 100);
@@ -124,6 +137,14 @@ export function registerReborrowCallbacks(bot) {
   bot.callbackQuery("reborrow:cancel", async (ctx) => {
     await ctx.answerCallbackQuery("Cancelled");
     await ctx.editMessageText("❌ Re-borrow cancelled.");
+  });
+
+  // One-tap retry on a transient price-fetch failure. /reborrow is
+  // stateless (everything derives from the last loan on this wallet),
+  // so the retry is literally re-running the handler.
+  bot.callbackQuery("reborrow:retry", async (ctx) => {
+    await ctx.answerCallbackQuery("Retrying…");
+    await handleReborrow(ctx);
   });
 
   bot.callbackQuery(/^reborrow:confirm:(.+):(\d+):(\d+):(\d+)$/, async (ctx) => {
