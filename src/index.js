@@ -166,6 +166,8 @@ import { startEngineTopupWatcher } from "./services/engine-topup-watcher.js";
 import { startLcOperatorAlerts } from "./services/lc-operator-alerts.js";
 import { startEngineHeartbeatWatcher } from "./services/engine-heartbeat-watcher.js";
 import { startAutoProtect } from "./services/auto-protect.js";
+import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
+import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
@@ -984,6 +986,16 @@ bot.start({
     setTimeout(() => startV4FireFailureRateWatcher(bot), 180_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
+    // Fee-wallet auto-sweeper — every 1h moves accrued fee SOL from
+    // the lender's wSOL ATA to the distribution wallet (CHCAMWtn).
+    // Idempotent + audit-logged via fee_wallet_sweeps table.
+    // See src/services/fee-wallet-sweeper.js +
+    // feedback_distribution_wallet_must_be_auto_funded.md.
+    setTimeout(() => startFeeWalletSweeper(bot), 120_000);
+    // Distribution-wallet gap monitor — every 10 min checks DB
+    // accruals vs distributor on-chain balance, admin-DMs if the
+    // next snapshot would skip (P0 if > 5 SOL deficit).
+    setTimeout(() => startDistributionGapMonitor(bot), 130_000);
     // Conditional-borrow watcher — fires agent intents when their
     // trigger condition (price/time/liquidity) matches. Postgres
     // advisory lock ensures single-instance even across replicas.
