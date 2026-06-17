@@ -405,6 +405,13 @@ bot.command("crosspost", handleCommunityCrosspost);
   // strike (multiplier >= 1 → above/TP, < 1 → below/SL). Natural verb,
   // same arm-core path.
   bot.command("sell", lc.handleLimitClose);
+  // /preview, /previewsl — TG arm pre-flight (operator-mandated
+  // 2026-06-16 PM, feedback_tg_must_follow_v4_at_highest_level.md).
+  // Dry-run any /takeprofit or /stoploss without persisting. Mirror
+  // of x402's /agent/preflight + site's /arm-preflight so TG users
+  // get the same "would this work?" check before committing a slot.
+  bot.command(["preview", "checkarm", "preflight"], lc.handlePreviewTp);
+  bot.command(["previewsl", "checkarmsl"], lc.handlePreviewSl);
   // Stop-loss — same arm-core path, direction='below' flips the engine's
   // trigger comparator from >= to <=. 1% protocol fee applies in BOTH
   // directions (operator rule 2026-06-12). Cutting losses before the

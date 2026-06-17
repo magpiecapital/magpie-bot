@@ -310,7 +310,14 @@ function fmtTrigger(kind, value_micro) {
 
 /* ─── /limitclose ──────────────────────────────────────────────── */
 
-export async function handleLimitClose(ctx, direction = "above") {
+export async function handleLimitClose(ctx, direction = "above", opts = {}) {
+  // opts.dryRun (operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md): run every
+  // validation, oracle quote, slice/ladder check, and arm-core gate
+  // — but skip the INSERT. Mirror of the x402 preflight endpoint;
+  // closes the "did this arm actually validate?" question on TG
+  // BEFORE the user gets a confusing failure DM.
+  const dryRun = opts.dryRun === true;
   const tgUser = ctx.from;
   if (!tgUser) return;
   const text = ctx.message?.text ?? "";
@@ -364,6 +371,7 @@ export async function handleLimitClose(ctx, direction = "above") {
     sellDestination: dest,
     expiresAt: expire_iso,
     slicePct: parseResult.parsed.slice_pct,
+    dryRun,
   });
 
   if (!armed.ok) {
@@ -463,6 +471,39 @@ export async function handleLimitClose(ctx, direction = "above") {
     return ctx.reply(m, { parse_mode: "Markdown" });
   }
 
+  // Dry-run preview — operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md. armOrder with
+  // dryRun:true returned ok=true having validated every gate without
+  // persisting. Tell the user explicitly that nothing was armed, then
+  // show what WOULD have armed so they can choose to commit.
+  if (dryRun && armed.ok) {
+    const loanD = armed.loan;
+    const mintD = armed.mint;
+    const triggerLabelD = fmtTrigger(trigger_kind, trigger_value_micro);
+    const isSlD = direction === "below";
+    const symD = mintD?.symbol || "your collateral";
+    const owedSolD = loanD?.owed ? (Number(loanD.owed) / 1e9).toFixed(4) : "?";
+    const appliedD = armed.initialSlippageBpsApplied ?? slippage_bps;
+    const originalD = armed.initialSlippageBpsRequested ?? slippage_bps;
+    const bumpedD = appliedD !== originalD;
+    return ctx.reply(
+      [
+        `*Preview only — nothing armed.*`,
+        ``,
+        `Loan: #${loanD?.loan_id || loan_id} (${symD}) · owes ${owedSolD} SOL`,
+        `Direction: ${isSlD ? "stop-loss" : "take-profit"}`,
+        `Trigger: ${triggerLabelD}`,
+        multiplierContextLine ? `_${multiplierContextLine}_` : null,
+        `Slippage: ${(appliedD / 100).toFixed(2)}%${bumpedD ? ` _(would be bumped from ${(originalD / 100).toFixed(2)}%)_` : ""}`,
+        `Destination: ${dest.toUpperCase()}`,
+        ``,
+        `All gates passed at this moment. Run \`/${isSlD ? "stoploss" : "takeprofit"} ${loan_id} at ${multiplier ? `${multiplier}x` : triggerLabelD}\` (without "preview") to actually arm it.`,
+        `_Liquidity can shift between now and a real arm._`,
+      ].filter(Boolean).join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
   // Success — render the confirmation. arm-core surfaces any liquidity
   // bump via initialSlippageBpsRequested vs initialSlippageBpsApplied
   // so we can show the bump line when relevant.
@@ -483,9 +524,23 @@ export async function handleLimitClose(ctx, direction = "above") {
     ? `*Stop-loss armed* — order #${orderId}${expiryLabel}`
     : `*Take-profit armed* — order #${orderId}${expiryLabel}`;
   const triggerVerb = isStopLoss ? "drops to" : "hits";
-  const purpose = isStopLoss
-    ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
-    : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`;
+  // V4 in-vault behavior vs V1/V2/V3 fire-and-close behavior. The
+  // operator-mandated V4 thesis is non-negotiable
+  // (feedback_v4_in_vault_thesis_non_negotiable): on V4 fires, SOL
+  // accumulates inside the per-loan sol_proceeds_vault and the loan
+  // STAYS ACTIVE; the only path to the user's wallet is borrower-
+  // signed repay. Legacy programs sell + repay + close in one shot.
+  // The success DM must describe what will actually happen so users
+  // know to repay when they want their SOL.
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const isV4 = !!v4ProgramId && loan?.program_id === v4ProgramId;
+  const purpose = isV4
+    ? (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`
+        : `When ${symbol} ${triggerVerb} your target, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`)
+    : (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
+        : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`);
   const listCmd = isStopLoss ? "/stoplosses" : "/takeprofitorders";
 
   await ctx.reply(
@@ -515,8 +570,24 @@ export async function handleLimitClose(ctx, direction = "above") {
 // Thin wrapper that delegates to handleLimitClose with direction='below'.
 // Shares every gate, fill-guarantee, and 1% fee — only the trigger
 // comparator flips at fire time (see magpie-limitclose isTriggerHit).
-export async function handleStopLoss(ctx) {
-  return handleLimitClose(ctx, "below");
+export async function handleStopLoss(ctx, opts = {}) {
+  return handleLimitClose(ctx, "below", opts);
+}
+
+/* ─── /preview ─────────────────────────────────────────────────── */
+// TG arm pre-flight (operator-mandated 2026-06-16 PM,
+// feedback_tg_must_follow_v4_at_highest_level.md). Mirror of the
+// site / x402 dry-run endpoints — runs the entire validation +
+// oracle + slice / cap stack against the user's loan and reports
+// whether an arm WOULD succeed right now, without persisting.
+// Lets the user catch "trigger would fire immediately" / "loan
+// below minimum size" / "ladder sum exceeds 100" before they
+// commit a slot.
+export async function handlePreviewTp(ctx) {
+  return handleLimitClose(ctx, "above", { dryRun: true });
+}
+export async function handlePreviewSl(ctx) {
+  return handleLimitClose(ctx, "below", { dryRun: true });
 }
 
 /* ─── /trailingstop ────────────────────────────────────────────── */
@@ -641,6 +712,16 @@ export async function handleTrailingStop(ctx) {
   }
 
   const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 trail fire,
+  // proceeds accumulate in the per-loan sol_proceeds_vault and the
+  // loan STAYS active until borrower-signed repay. Legacy programs
+  // close the loan on fire.
+  const v4ProgramIdTrail = process.env.PROGRAM_ID_V4 || null;
+  const isV4Trail = !!v4ProgramIdTrail && armed.loan?.program_id === v4ProgramIdTrail;
+  const fireLine = isV4Trail
+    ? `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak — sells into SOL on-chain, proceeds accumulate inside your loan's vault. Run /repay when you want the SOL released.`
+    : `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`;
   return ctx.reply([
     `*Trailing stop armed* on loan #${loan_id}`,
     "",
@@ -649,7 +730,7 @@ export async function handleTrailingStop(ctx) {
     `Initial floor: $${fmt(r.targetUsd)} (-${(trailingDistanceBps / 100).toFixed(1)}%)`,
     `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
     "",
-    `Floor rises with each new high. Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`,
+    `Floor rises with each new high. ${fireLine}`,
     `Order ID: \`${armed.orderId}\` — \`/limitorders\` to view, \`/cancellimitorder ${armed.orderId}\` to cancel.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
@@ -888,6 +969,16 @@ export async function handleBracket(ctx) {
     : sl.kind === "mc_usd"
       ? `MC $${(slResolved.resolvedMc / 1e6).toFixed(1)}M`
       : `$${fmt(slResolved.resolvedUsd)}`;
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 the first
+  // leg to fire converts its slice into SOL inside the per-loan vault
+  // and sibling-cancels the other leg; the loan stays Active and the
+  // user releases the SOL via /repay. Legacy programs close the loan.
+  const v4ProgramIdBracket = process.env.PROGRAM_ID_V4 || null;
+  const isV4Bracket = !!v4ProgramIdBracket && tpArm.loan?.program_id === v4ProgramIdBracket;
+  const bracketFireLine = isV4Bracket
+    ? `First leg to fire converts that slice to SOL inside your loan's vault, auto-cancels the other leg, and leaves the loan Active. Run /repay when you want the SOL released.`
+    : `First leg to fire closes the loan and auto-cancels the other.`;
   return ctx.reply([
     `*Bracket armed* on loan #${loan_id}`,
     "",
@@ -896,7 +987,7 @@ export async function handleBracket(ctx) {
     `Slippage: ${(slippage_bps / 100).toFixed(2)}% · proceeds → ${sell_destination.toUpperCase()}`,
     expiresAtIso ? `Both legs expire: ${new Date(expiresAtIso).toISOString().slice(0, 10)}` : null,
     "",
-    `First leg to fire closes the loan and auto-cancels the other.`,
+    bracketFireLine,
     `\`/limitorders\` to view, \`/cancellimitorder <id>\` to cancel either leg.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
