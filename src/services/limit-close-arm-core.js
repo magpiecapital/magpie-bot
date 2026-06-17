@@ -60,6 +60,12 @@ import { notifyAdmin } from "./admin-notify.js";
 // fine). TransferHook alone is OK — Jupiter has explicit handling.
 // MetadataPointer / TokenMetadata / DefaultAccountState don't affect
 // swap math at all. The rest of the catalog DOES.
+// loan_not_found_for_user admin-DM throttle — Tier-1 defense per
+// feedback_loan_830_full_postmortem_and_defenses.md. Operator must
+// learn about race failures within seconds, not by reading their
+// dashboard. Throttled per loan to avoid DM spam on repeated retries.
+const _lnfThrottle = new Map(); // key: loan_id_chain -> last_dm_ts_ms
+
 const EXIT_BLOCKING_EXTENSIONS = new Set([
   "PermanentDelegate",
   "TransferFeeConfig",
@@ -485,7 +491,24 @@ async function armOrderImpl({
     if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
     await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
   }
-  if (!loan) return { ok: false, error: "loan_not_found_for_user" };
+  if (!loan) {
+    // Tier-1 defense: admin DM on first occurrence per
+    // feedback_loan_830_full_postmortem_and_defenses.md.
+    try {
+      const key = `loan_not_found:${loanIdChain}`;
+      const now = Date.now();
+      if (!_lnfThrottle.get(key) || now - _lnfThrottle.get(key) > 60 * 60 * 1000) {
+        _lnfThrottle.set(key, now);
+        await notifyAdmin(
+          `🚨 single-arm RACE: loan_not_found_for_user\n` +
+          `loan_id_chain: ${loanIdChain}\n` +
+          `user_id: ${userId}\n` +
+          `Single-arm path polled for ${Number(process.env.ARM_LOOKUP_DEADLINE_MS || 30_000) / 1000}s — loan never appeared`,
+        );
+      }
+    } catch {}
+    return { ok: false, error: "loan_not_found_for_user" };
+  }
   if (loan.status !== "active") {
     return { ok: false, error: "loan_not_active", detail: loan.status };
   }
@@ -1158,8 +1181,14 @@ async function armOrderBatchImpl({
   // so future Solana congestion doesn't re-trip this. Same envelope/sig.
   // See feedback_arm_lookup_window_must_outlast_cosign_borrow.md.
   phaseLog("phase_1_loan_lookup_start");
-  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
-  const LOAN_LOOKUP_INTERVAL_MS = 400;
+  // Env-tunable. Floor 30s per
+  // feedback_arm_lookup_window_must_outlast_cosign_borrow.md. Operator
+  // can bump via Railway env without a code deploy if Solana congestion
+  // pushes commit latency higher.
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() +
+    Number(process.env.ARM_LOOKUP_DEADLINE_MS || 30_000);
+  const LOAN_LOOKUP_INTERVAL_MS =
+    Number(process.env.ARM_LOOKUP_INTERVAL_MS || 400);
   let loanRows;
   let lookupAttempts = 0;
   for (;;) {
@@ -1182,6 +1211,28 @@ async function armOrderBatchImpl({
   }
   if (loanRows.length === 0) {
     phaseLog("phase_1_loan_not_found", { lookup_attempts: lookupAttempts });
+    // Tier-1 defense per
+    // feedback_loan_830_full_postmortem_and_defenses.md: admin DM on
+    // FIRST occurrence of loan_not_found_for_user, throttled per
+    // (loan, hour). Operator must never find out about a race
+    // failure by reading their own dashboard. Best-effort —
+    // notification failures never block the response.
+    try {
+      const { notifyAdmin } = await import("./admin-notify.js");
+      const key = `loan_not_found:${loanIdChain}`;
+      const now = Date.now();
+      if (!_lnfThrottle.get(key) || now - _lnfThrottle.get(key) > 60 * 60 * 1000) {
+        _lnfThrottle.set(key, now);
+        const ageMs = Date.now() - (Number(process.env.ARM_LOOKUP_DEADLINE_MS) || 30_000);
+        await notifyAdmin(
+          `🚨 arm-batch RACE: loan_not_found_for_user\n` +
+          `loan_id_chain: ${loanIdChain}\n` +
+          `user_id: ${userId}\n` +
+          `polled ${lookupAttempts}x over ${Number(process.env.ARM_LOOKUP_DEADLINE_MS || 30_000) / 1000}s — loan never appeared\n` +
+          `Possible causes: cosign-borrow DB-write delayed > polling window, OR loan never created (user cancelled mid-flow)`,
+        );
+      }
+    } catch {}
     return { ok: false, error: "loan_not_found_for_user" };
   }
   const loan = loanRows[0];
