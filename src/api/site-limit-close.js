@@ -655,7 +655,7 @@ export async function handleSiteLimitCloseArm(req) {
   // borrow tx may have confirmed but /sync-loan hasn't committed the
   // loans row yet when a multiplier-arm fires immediately after.
   if (multiplierUsed != null) {
-    const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 6_000;
+    const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
     const LOAN_LOOKUP_INTERVAL_MS = 400;
     let loanLite = null;
     for (;;) {
