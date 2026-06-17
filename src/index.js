@@ -168,6 +168,7 @@ import { startEngineHeartbeatWatcher } from "./services/engine-heartbeat-watcher
 import { startAutoProtect } from "./services/auto-protect.js";
 import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
 import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
+import { startPendingArmRetryWatcher } from "./services/pending-arm-retry-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
@@ -996,6 +997,14 @@ bot.start({
     // accruals vs distributor on-chain balance, admin-DMs if the
     // next snapshot would skip (P0 if > 5 SOL deficit).
     setTimeout(() => startDistributionGapMonitor(bot), 130_000);
+    // Pending-arm retry watcher — Tier-2 architectural fix for the
+    // arm-race failure class. When arm-core's 30s phase-1 polling
+    // window expires, the arm is queued to pending_arms with the
+    // signed-envelope freshness anchor. This watcher polls every 10s
+    // and replays the arm the moment the loan row lands in DB —
+    // user never has to re-sign. See
+    // feedback_loan_830_full_postmortem_and_defenses.md.
+    setTimeout(() => startPendingArmRetryWatcher(bot), 140_000);
     // Conditional-borrow watcher — fires agent intents when their
     // trigger condition (price/time/liquidity) matches. Postgres
     // advisory lock ensures single-instance even across replicas.
