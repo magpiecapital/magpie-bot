@@ -68,6 +68,31 @@ async function tick(bot) {
 
   if (newlyEscalated.length === 0) return;
 
+  // Refresh Pip's pre-analysis for every escalated ticket BEFORE we
+  // alert the operator. State drifts — a ticket opened 12h ago about a
+  // pending tx may have settled, or a stuck loan may have unstuck, or
+  // the user's situation may have changed entirely. The operator should
+  // see Pip's CURRENT read, not the one from when the ticket was filed.
+  // 2026-06-18 PM: feedback_pip_must_proactively_resolve_every_ticket.
+  let runPipPreAnalysis;
+  try {
+    ({ runPipPreAnalysis } = await import("./auto-ticket-resolver.js"));
+  } catch (err) {
+    console.warn("[ticket-age] could not load runPipPreAnalysis:", err.message);
+  }
+  if (runPipPreAnalysis) {
+    for (const e of newlyEscalated) {
+      try {
+        const r = await runPipPreAnalysis(e.id);
+        if (!r?.ok) console.warn(`[ticket-age] pre-analysis refresh #${e.id} skipped: ${r?.reason}`);
+      } catch (err) {
+        console.warn(`[ticket-age] pre-analysis refresh #${e.id} threw:`, err.message);
+      }
+      // small breathing room between agent invocations
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+  }
+
   // Group by tier for a tidy summary
   const byTier = {};
   for (const e of newlyEscalated) {
@@ -90,7 +115,7 @@ async function tick(bot) {
         "",
         ...sections,
         "",
-        "Use `/tickets` for the full list with messages, `/reply <#> <text>` to respond, `/close <#>` to resolve.",
+        "Pip pre-analysis was refreshed on each. Open `/tickets <#>` to see her current read; reply via `/reply <#> <text>`.",
       ].join("\n"),
       { parse_mode: "Markdown" },
     );
