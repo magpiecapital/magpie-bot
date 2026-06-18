@@ -344,11 +344,108 @@ async function distributeOne(row) {
   return { ok: true };
 }
 
+/**
+ * Distribute a recovery_credits row. Out-of-band SOL the operator (or a
+ * future buyback / contribution flow) deposited directly to the rewards
+ * distributor wallet. No on-chain transfer needed — the SOL is already
+ * there. Same 80/10/10 split as profitable defaults: holder + LP-loyalty
+ * + protocol-reserve. No referrer dimension (these aren't loans).
+ *
+ * Operator-mandated 2026-06-18 PM as part of the exploit-into-positive
+ * spin: 4 SOL deposited goes into the holder + LP + protocol-reserve
+ * pools the same way a profitable default would.
+ */
+async function distributeRecoveryCredit(row) {
+  const amount = BigInt(row.amount_lamports);
+  if (amount <= 0n) {
+    await query(
+      `UPDATE recovery_credits SET distribution_status = 'distributed', distributed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [row.id],
+    );
+    return { ok: true, reason: "zero_amount_skip" };
+  }
+  // Same 80/10/10 split as profitable defaults with no-referrer fallback.
+  // Holder gets default 70% + the rolled 10% referrer share = 80%.
+  const HOLDER_BPS = 8_000n;
+  const LP_BPS = 1_000n;
+  const RESERVE_BPS = 1_000n;
+  const TOTAL_BPS = 10_000n;
+  const holderShare = (amount * HOLDER_BPS) / TOTAL_BPS;
+  const lpShare = (amount * LP_BPS) / TOTAL_BPS;
+  const reserveShare = amount - holderShare - lpShare; // sweep rounding
+
+  // Race-safe claim.
+  const claim = await query(
+    `UPDATE recovery_credits
+        SET distribution_status = 'distributing', updated_at = NOW()
+      WHERE id = $1 AND distribution_status = 'awaiting_distribution'
+      RETURNING id`,
+    [row.id],
+  );
+  if (claim.rowCount === 0) {
+    return { ok: false, reason: "claim_lost_race" };
+  }
+
+  const errors = [];
+  try {
+    const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
+    if (holderShare > 0n) await creditHolderPoolDirect(holderShare);
+  } catch (err) {
+    errors.push(`holder: ${err.message?.slice(0, 80)}`);
+  }
+  try {
+    const { creditLpLoyaltyPoolDirect } = await import("./lp-loyalty.js");
+    if (lpShare > 0n) await creditLpLoyaltyPoolDirect(lpShare);
+  } catch (err) {
+    errors.push(`lp: ${err.message?.slice(0, 80)}`);
+  }
+  try {
+    const { creditProtocolReserveDirect } = await import("./protocol-reserve.js");
+    if (reserveShare > 0n) {
+      await creditProtocolReserveDirect({
+        loanDbId: null,
+        amountLamports: reserveShare,
+        eventType: `recovery_${row.kind}`,
+      });
+    }
+  } catch (err) {
+    errors.push(`reserve: ${err.message?.slice(0, 80)}`);
+  }
+
+  await query(
+    `UPDATE recovery_credits
+        SET distribution_status = $2,
+            holder_share_lamports = $3,
+            lp_loyalty_share_lamports = $4,
+            protocol_reserve_share_lamports = $5,
+            distributed_at = CASE WHEN $2 = 'distributed' THEN NOW() ELSE NULL END,
+            updated_at = NOW()
+      WHERE id = $1`,
+    [
+      row.id,
+      errors.length === 0 ? "distributed" : "awaiting_distribution",
+      holderShare.toString(),
+      lpShare.toString(),
+      reserveShare.toString(),
+    ],
+  );
+  if (errors.length > 0) {
+    console.warn(`[liq-distribute] recovery_credit #${row.id} partial fail: ${errors.join("; ")}`);
+    return { ok: false, reason: errors.join("; ") };
+  }
+  console.log(
+    `[liq-distribute] recovery_credit #${row.id} (${row.kind}) distributed ${(Number(amount) / 1e9).toFixed(4)} SOL ` +
+      `(H ${(Number(holderShare) / 1e9).toFixed(4)} / L ${(Number(lpShare) / 1e9).toFixed(4)} / P ${(Number(reserveShare) / 1e9).toFixed(4)})`,
+  );
+  return { ok: true };
+}
+
 async function tick() {
   if (_ticking) return;
   if (DISABLED) return;
   _ticking = true;
   try {
+    // Pass 1 — liquidation_economics
     const { rows } = await query(
       `SELECT id, loan_id, collateral_mint, collateral_symbol,
               borrower_wallet, net_profit_lamports::text AS net_profit_lamports,
@@ -361,7 +458,6 @@ async function tick() {
         ORDER BY sale_detected_at ASC NULLS FIRST
         LIMIT 25`,
     );
-    if (rows.length === 0) return;
     let succeeded = 0;
     let failed = 0;
     for (const row of rows) {
@@ -371,7 +467,38 @@ async function tick() {
       }));
       if (r.ok) succeeded++; else failed++;
     }
-    console.log(`[liq-distribute] tick: distributed=${succeeded} failed=${failed}`);
+    if (rows.length > 0) {
+      console.log(`[liq-distribute] tick liq: distributed=${succeeded} failed=${failed}`);
+    }
+
+    // Pass 2 — recovery_credits (operator contributions, exploit recoveries, etc.)
+    try {
+      const { rows: rcRows } = await query(
+        `SELECT id, kind, amount_lamports::text AS amount_lamports
+           FROM recovery_credits
+          WHERE distribution_status = 'awaiting_distribution'
+          ORDER BY created_at ASC
+          LIMIT 25`,
+      );
+      let rcOk = 0;
+      let rcFail = 0;
+      for (const row of rcRows) {
+        const r = await distributeRecoveryCredit(row).catch((err) => ({
+          ok: false,
+          reason: `unexpected: ${err.message?.slice(0, 80)}`,
+        }));
+        if (r.ok) rcOk++; else rcFail++;
+      }
+      if (rcRows.length > 0) {
+        console.log(`[liq-distribute] tick recovery: distributed=${rcOk} failed=${rcFail}`);
+      }
+    } catch (err) {
+      // recovery_credits table may not exist yet on a fresh deploy
+      // before migration 078 applies — skip gracefully.
+      if (!/relation .* does not exist/i.test(err.message || "")) {
+        console.warn(`[liq-distribute] recovery_credits pass failed: ${err.message?.slice(0, 160)}`);
+      }
+    }
   } catch (err) {
     console.warn(`[liq-distribute] tick failed: ${err.message?.slice(0, 200)}`);
   } finally {
