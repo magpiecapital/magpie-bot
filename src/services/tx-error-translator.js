@@ -152,13 +152,9 @@ export function translateTxError(err, ctx = {}) {
   const anchorCode = anchorCodeMatch ? Number(anchorCodeMatch[1] || anchorCodeMatch[2]) : null;
   if (anchorCode === 6016 || /TwapInsufficientHistory/i.test(blob)) {
     return [
-      "⚠️ *Price oracle still warming up*",
+      "*Oracle is finalizing — tap Borrow once more.*",
       "",
-      "The lending program needs about 5 minutes of price history to lend safely on this token. The oracle hasn't filled its 5-minute TWAP window yet — usually because the token was just enabled or the network has been quiet.",
-      "",
-      "*What to do:* wait ~5 minutes and try /borrow again. The oracle pushes a price sample every ~30s.",
-      "",
-      "_This isn't a wallet issue — your balance is fine._",
+      "We're filling the last few price samples. This should clear in 30–60 seconds. Your collateral and tier selection are saved.",
     ].join("\n");
   }
   if (anchorCode === 6017 || /PriceImpactPumpDetected/i.test(blob)) {
