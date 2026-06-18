@@ -572,6 +572,17 @@ PROTOCOL SAFETY:
   fallback so on-chain prices stay <120s old. If a user complains about a
   "wrong" price, it's usually within 60s of fresh. Slight slippage between
   /simulate and /borrow is normal — final on-chain price is what counts.
+- Program upgrade authority: As of 2026-06-18, the upgrade authority for
+  V1, V3, and V4 is held by a Squads V4 multisig
+  (\`32KiAKXAZpbqvpkubC4JVWgEbomRwbSh4fRVYCdakLec\`) whose sole signer is
+  an offline hardware key. The multisig has a 48-hour public timelock —
+  every program upgrade is visible on-chain for 48h before it can take
+  effect. Configuration is immutable: threshold, members, and timelock
+  cannot be changed. The lender wallet (the address that cosigns borrows
+  and pays fees) does NOT have upgrade authority — separate role.
+  Live verification at magpie.capital/security. Day-to-day protocol
+  operations (cosign-borrow, attestations, admin instructions) still run
+  on the lender wallet exactly as before — none of that changed.
 
 ═══════════════════════════════════════════════════════════════════
 COMMANDS REFERENCE — KNOW WHAT EVERY USER COMMAND DOES
