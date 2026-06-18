@@ -459,8 +459,9 @@ async function probeCreditCoverage(bot) {
     if (audit.missing_repay > 0) parts.push(`${audit.missing_repay} repay`);
     if (audit.missing_liquidated > 0) parts.push(`${audit.missing_liquidated} liquidated`);
     await alertIfNew(bot, KIND,
-      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 6h; investigate the WRITE path if this persists.`,
-      audit.total >= 10 ? "crit" : "warn",
+      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 1h. ` +
+      `If the same loan persists across two self-monitor ticks, the live WRITE path dropped — investigate before the healer hides it.`,
+      audit.total >= 3 ? "crit" : "warn",
     );
   } else {
     await alertRecovery(bot, KIND, `Credit-event coverage clean (0 gaps).`);
