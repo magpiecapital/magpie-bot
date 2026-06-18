@@ -217,20 +217,35 @@ export async function tallyProposal({
   const { capped, uncapturableWeight } = applyWhaleCap(voterWeights, capFraction);
 
   let yesWeight = 0n, noWeight = 0n, abstainWeight = 0n;
+  // Per-choice weights — required for multi-choice ballots like MGP-003
+  // (A/B/C/D/ABSTAIN). Pre-2026-06-18, every non-yes/no vote silently
+  // collected into abstain so the UI bars were always 0% for the actual
+  // choices. See feedback_voting_ux_must_feel_solid.md.
+  const perChoiceWeights = new Map();
   for (const [voter, w] of capped) {
     // Normalize case before comparison. Votes are stored as the literal
-    // choice strings from the proposal's `choices` array (e.g. "YES",
-    // "NO", "ABSTAIN" for MGP-001 — see ACTIVE_PROPOSALS in
-    // src/api/governance-api.js:51-53). Without normalization, every
-    // uppercase vote fell into the `else` branch and was counted as
-    // abstain — meaning MGP-001's 15+ live YES votes would have tallied
-    // as 0% YES, failing the proposal at autopilot close.
-    const choice = (votes.get(voter) || "").toLowerCase();
-    if (choice === "yes") yesWeight += w;
-    else if (choice === "no") noWeight += w;
-    else abstainWeight += w;
+    // choice strings from the proposal's `choices` array. Without
+    // normalization, every uppercase vote fell into `else` and was
+    // counted as abstain — caught at MGP-001 close.
+    const rawChoice = votes.get(voter) || "";
+    const choiceLower = rawChoice.toLowerCase();
+    if (choiceLower === "yes") yesWeight += w;
+    else if (choiceLower === "no") noWeight += w;
+    else if (choiceLower === "abstain") abstainWeight += w;
+    // Per-choice bucket — uppercase canonical to match ballot string set.
+    // Vote that doesn't fit yes/no/abstain still gets bucketed (so A/B/C/D
+    // ballots correctly tally their actual winner instead of silently
+    // collapsing everything to abstain).
+    const choiceUpper = rawChoice.toUpperCase();
+    if (choiceUpper) {
+      perChoiceWeights.set(choiceUpper, (perChoiceWeights.get(choiceUpper) || 0n) + w);
+    }
   }
-  const castWeight = yesWeight + noWeight + abstainWeight;
+  // castWeight: sum across ALL per-choice buckets, not just yes/no/abstain.
+  // For multi-choice ballots this is the only way to get the right
+  // denominator for participation_pct.
+  let castWeight = 0n;
+  for (const w of perChoiceWeights.values()) castWeight += w;
 
   let totalEligibleWeight = 0n;
   for (const w of eligible.values()) totalEligibleWeight += w;
@@ -264,6 +279,13 @@ export async function tallyProposal({
       abstain_weight: abstainWeight.toString(),
       cast_weight: castWeight.toString(),
       uncapturable_weight: uncapturableWeight.toString(),
+      // Per-choice weights as { CHOICE: raw_weight_string }.
+      // Always present (empty object for proposals with zero votes).
+      // Front-end uses this directly to render bars for multi-choice
+      // ballots (A/B/C/D-style) instead of guessing from yes/no/abstain.
+      per_choice: Object.fromEntries(
+        Array.from(perChoiceWeights.entries()).map(([k, v]) => [k, v.toString()]),
+      ),
     },
     percentages: {
       participation_pct: participationPct,
