@@ -60,6 +60,50 @@ async function runOnce() {
     return;
   }
 
+  // Forward-reconcile pass: pending intents whose target order DID
+  // arm successfully but the arm endpoint was called without intent_id
+  // (or the intent_id was dropped by a retry/redirect). The order is
+  // live on-chain; the intent should reflect that. Without this pass
+  // the dashboard's recovery banner keeps surfacing a "didn't finish"
+  // warning for an arm that actually finished — caught 2026-06-18 with
+  // 2 user-visible stuck intents (#38, #44 on SPCX 226FhXy5W / 3LfT7WLc).
+  // Match key is the same triple the expire pass uses (loan + direction
+  // + strike) so semantics stay consistent.
+  try {
+    const reconcileRes = await query(
+      `UPDATE arm_intents ai
+          SET status = 'armed',
+              order_id = matched.order_id,
+              armed_at = COALESCE(matched.created_at, NOW()),
+              updated_at = NOW()
+         FROM (
+           SELECT DISTINCT ON (ai2.id)
+                  ai2.id AS intent_id, o.id AS order_id, o.created_at
+             FROM arm_intents ai2
+             JOIN loans l ON l.loan_id::text = ai2.loan_id_chain
+             JOIN limit_close_orders o
+               ON o.loan_id = l.id
+              AND o.status IN ('armed','firing','twap_in_progress','awaiting_user')
+              AND o.trigger_direction = ai2.direction
+              AND o.trigger_value_micro = ai2.target_value_micro
+            WHERE ai2.status = 'pending'
+            ORDER BY ai2.id, o.created_at ASC
+         ) AS matched
+        WHERE ai.id = matched.intent_id
+          AND ai.status = 'pending'
+        RETURNING ai.id`,
+    );
+    if (reconcileRes.rowCount > 0) {
+      console.log(
+        `[stale-arm-intent-watcher] reconciled ${reconcileRes.rowCount} pending intent(s) to armed (matching order already on-chain)`,
+      );
+    }
+  } catch (e) {
+    console.warn(
+      `[stale-arm-intent-watcher] forward-reconcile failed: ${e.message?.slice(0, 160)}`,
+    );
+  }
+
   // Expire any pending intent older than 1h that still has no matching
   // armed/firing order. Operator-mandated 2026-06-17 03:50 UTC
   // (feedback_no_duplicate_intents_in_recovery_banner_NEVER.md):
