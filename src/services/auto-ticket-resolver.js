@@ -37,10 +37,20 @@ const FIRST_RUN_DELAY_MS = 60 * 1000;               // 60s after boot
 // rather than have the AI keep trying. The AI clearly isn't cracking it.
 const DEAD_LETTER_FOLLOWUP_COUNT = 3;
 
-// Reasons we do NOT auto-resolve — these genuinely need a human.
+// Reasons we do NOT auto-DM the user — these genuinely need a human
+// to read Pip's pre-analysis and decide on the actual reply. The
+// pre-analysis ITSELF still runs for every ticket (see runPipPreAnalysis
+// below) — only the user-facing auto-DM is gated.
+//
+// 2026-06-18 PM: bug_report was REMOVED from this list per operator
+// directive (feedback_pip_must_proactively_resolve_every_ticket). Most
+// "bug reports" are actually misreads of system state (e.g. ticket #60
+// where Pip's "other linked wallets" wording made a normal account look
+// anomalous). Pip's second-pass catches those before they ever reach the
+// operator. Genuine bugs still surface because Pip's analysis will say
+// "this is a real issue" in the pre-analysis, and aging tiers escalate.
 const SKIP_REASONS = [
   "security_incident",
-  "bug_report",
   "refund_request",
 ];
 
@@ -101,6 +111,92 @@ export async function resolveTicketImmediate(bot, ticketId) {
     return await resolveTicket(bot, t);
   } catch (err) {
     console.warn(`[auto-resolver] immediate fire for #${ticketId} failed:`, err.message);
+    return { ok: false, reason: err.message?.slice(0, 100) };
+  }
+}
+
+/**
+ * Run Pip's admin-facing pre-analysis on a ticket. Always runs on EVERY
+ * ticket — including SKIP_REASONS — so the operator sees Pip's read of
+ * the situation in /tickets <N> when deciding how to /reply.
+ *
+ * Writes the agent's output to support_tickets.pip_pre_analysis. Does
+ * NOT DM the user. Does NOT change ticket status. Safe to call any time
+ * — re-running it just refreshes the analysis with current state, which
+ * is what we want when the ticket-aging-watcher fires a tier alert.
+ *
+ * Operator-mandated 2026-06-18 PM
+ * (feedback_pip_must_proactively_resolve_every_ticket).
+ *
+ * @param {number} ticketId
+ * @returns {Promise<{ok: boolean, reason?: string, text?: string}>}
+ */
+export async function runPipPreAnalysis(ticketId) {
+  if (!isAiSupportEnabled()) {
+    return { ok: false, reason: "ai_disabled" };
+  }
+  try {
+    const { rows } = await query(
+      `SELECT t.id, t.user_id, t.message, u.telegram_username
+         FROM support_tickets t
+         JOIN users u ON u.id = t.user_id
+        WHERE t.id = $1`,
+      [ticketId],
+    );
+    const t = rows[0];
+    if (!t) return { ok: false, reason: "ticket_not_found" };
+
+    const cleanMessage = unwrapTicketMessage(t.message);
+    if (!cleanMessage) return { ok: false, reason: "empty_message" };
+
+    // Reset the user's conversation so the analysis runs on a clean
+    // slate — same pattern as resolveTicket below. Their old chat is
+    // gone but that's fine: a fresh ticket means a fresh problem and
+    // the agent shouldn't carry over yesterday's context.
+    try { await resetConversation(t.user_id); } catch { /* non-critical */ }
+
+    const prompt = [
+      "(SYSTEM — admin-only pre-analysis pass. Your output goes to the operator's /tickets dashboard, NOT to the user. Do not address the user, do not start with a greeting, do not include sign-offs.)",
+      "",
+      "A user has opened a support ticket. Use your diagnostic tools (list_my_loans, list_my_wallets, lookup_loan, get_my_wallet, check_my_token_balance, get_my_holder_stats, check_tx, etc.) to take a careful read of their actual account state. Then write four short sections for the operator:",
+      "",
+      "WHAT THE USER ASKED — one sentence summarizing the actual question or complaint.",
+      "",
+      "CURRENT STATE — what you found via tools. Loan IDs, wallet pubkeys, balances, recent tx sigs, anything load-bearing. Be specific.",
+      "",
+      "ROOT CAUSE — is this a real issue, a misunderstanding, a system bug, or an information gap? Be honest. If the user reported a 'bug' but tools show their account is fine, say so.",
+      "",
+      "RECOMMENDED ADMIN ACTION — what should the operator /reply, or is there a product issue to fix? If the user just needs to be told their account is fine, draft the exact reply text.",
+      "",
+      "User's ticket message:",
+      "",
+      cleanMessage,
+    ].join("\n");
+
+    let result;
+    try {
+      result = await chatWithAgent(t.user_id, prompt, {
+        username: t.telegram_username,
+      });
+    } catch (err) {
+      return { ok: false, reason: `agent_error: ${err.message?.slice(0, 100)}` };
+    }
+    if (!result || !result.text) return { ok: false, reason: "agent_no_response" };
+
+    // Reset conversation again so the user's NEXT chat (if any) starts
+    // fresh. The pre-analysis prompt above is admin-framed and we don't
+    // want it leaking into the user's view.
+    try { await resetConversation(t.user_id); } catch { /* non-critical */ }
+
+    await query(
+      `UPDATE support_tickets
+          SET pip_pre_analysis = $2,
+              pip_pre_analyzed_at = NOW()
+        WHERE id = $1`,
+      [ticketId, result.text.slice(0, 4000)],
+    );
+    return { ok: true, text: result.text };
+  } catch (err) {
     return { ok: false, reason: err.message?.slice(0, 100) };
   }
 }

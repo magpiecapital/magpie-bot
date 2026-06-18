@@ -4169,15 +4169,56 @@ const TOOL_HANDLERS = {
     }
 
     if (scopedRows.length === 0) {
+      // The user has loans on the account, but none of them match the
+      // wallet they're currently signing with. Figure out WHERE the
+      // loans actually live so the agent can tell them which wallet to
+      // use — instead of vague "OTHER linked wallets" wording that
+      // makes a single-wallet account sound like it has multiple
+      // linked addresses (2026-06-18 PM, ticket #60 fix).
+      const otherWalletPubkeys = Array.from(new Set(
+        rows
+          .filter((r) => !scopedRows.includes(r))
+          .map((r) => r.borrower_wallet)
+          .filter(Boolean),
+      ));
+      // What wallets does the user have on their Magpie account?
+      let linkedWallets = [];
+      try {
+        const { rows: w } = await query(
+          `SELECT public_key, label, is_active FROM wallets WHERE user_id = $1 ORDER BY is_active DESC, created_at ASC`,
+          [userId],
+        );
+        linkedWallets = w;
+      } catch { /* best-effort */ }
+      const otherWalletsOnAccount = otherWalletPubkeys.filter(
+        (pk) => linkedWallets.some((lw) => lw.public_key === pk),
+      );
+      const otherWalletsOffAccount = otherWalletPubkeys.filter(
+        (pk) => !linkedWallets.some((lw) => lw.public_key === pk),
+      );
+      let note;
+      if (otherWalletCount === 0) {
+        note = "User has no loans on record. They may need to /borrow to take one out.";
+      } else if (otherWalletsOffAccount.length > 0) {
+        // The loans are on wallets the user took them from directly,
+        // not on Magpie-linked wallets. Most common pattern: site Pip
+        // with browser Phantom connected to a wallet other than the
+        // user's Magpie custodial.
+        note = `User has 0 loans on the wallet they're currently using (${scopedWallet}). Their ${otherWalletCount} loan(s) live on wallet(s) ${otherWalletsOffAccount.map((p) => p.slice(0, 8) + "…").join(", ")}. If the user only has ONE wallet on their Magpie account, they may have taken these loans by signing from a different wallet (e.g. their custodial Magpie wallet via TG /borrow). Tell them which wallet the loans live on, and that they need to use THAT wallet to see/manage them.`;
+      } else {
+        note = `User has 0 loans on the wallet they're currently using (${scopedWallet}). Their ${otherWalletCount} loan(s) live on another wallet they've linked to this Magpie account: ${otherWalletsOnAccount.map((p) => p.slice(0, 8) + "…").join(", ")}. Tell them to switch to that wallet (via TG /wallets or on the site) to see those loans.`;
+      }
       return {
         total: 0,
         active_count: 0,
         loans: [],
         scoped_to_wallet: scopedWallet,
         other_wallets_loan_count: otherWalletCount,
-        note: otherWalletCount > 0
-          ? `User has 0 loans on the currently-active wallet (${scopedWallet}). ${otherWalletCount} loan(s) live on OTHER linked wallets — tell them to switch wallets if they want those.`
-          : "User has no loans on record. They may need to /borrow to take one out.",
+        other_wallet_pubkeys: otherWalletPubkeys,
+        linked_wallets_on_account: linkedWallets.map((w) => ({
+          pubkey: w.public_key, label: w.label, is_active: w.is_active,
+        })),
+        note,
       };
     }
 
@@ -4937,35 +4978,76 @@ const TOOL_HANDLERS = {
       [userId, `[AI-escalated] ${detail}`],
     );
 
-    // Fire-and-forget: kick the auto-resolver IMMEDIATELY for this
-    // brand-new ticket. The user gets their "ticket opened" message
-    // first; the AI follow-up DM lands seconds later via the resolver's
-    // own send. Critical-reason tickets (security_incident, bug_report,
-    // refund_request) are SKIP_REASONS in the resolver so admin still
-    // gets primacy on those — for those we DM the operator directly
-    // since the resolver won't, and they explicitly need a human.
-    const SKIP_REASONS = ["security_incident", "bug_report", "refund_request"];
+    // Fire-and-forget — two parallel paths for every new ticket:
+    //
+    //   (1) ALWAYS: runPipPreAnalysis writes Pip's admin-facing read
+    //       of the ticket to support_tickets.pip_pre_analysis. Operator
+    //       sees it in /tickets <N> and can /reply in seconds knowing
+    //       exactly what Pip looked at. No user-facing DM here.
+    //
+    //   (2) FOR NON-SKIP REASONS: resolveTicketImmediate sends the
+    //       user-facing DM with Pip's answer (today's auto-resolve
+    //       behavior). This is what makes the user feel heard within
+    //       seconds of opening the ticket.
+    //
+    // bug_report was REMOVED from SKIP_REASONS 2026-06-18 PM after
+    // ticket #60 — most "bugs" are misreads of system state, and Pip's
+    // second-pass catches them. Operator directive
+    // (feedback_pip_must_proactively_resolve_every_ticket): every
+    // ticket gets a Pip pass. SKIP_REASONS now only covers categories
+    // where the AI must NOT speak to the user without operator review:
+    // security_incident (potential exploit / compromise reports) and
+    // refund_request (money movement disputes).
+    const SKIP_REASONS = ["security_incident", "refund_request"];
+
+    // Always: pre-analysis
+    if (botRef) {
+      import("./auto-ticket-resolver.js")
+        .then(({ runPipPreAnalysis }) => runPipPreAnalysis(t.id))
+        .then((r) => {
+          if (!r?.ok) console.warn(`[ai-support] pre-analysis #${t.id} failed: ${r?.reason}`);
+        })
+        .catch((err) => console.warn(`[ai-support] pre-analysis fire for #${t.id} failed:`, err.message));
+    }
+
+    // Non-SKIP: also send user-facing auto-DM
     if (botRef && !SKIP_REASONS.includes(escalation_reason)) {
       import("./auto-ticket-resolver.js")
         .then(({ resolveTicketImmediate }) => resolveTicketImmediate(botRef, t.id))
         .catch((err) => console.warn(`[ai-support] immediate-resolve fire for #${t.id} failed:`, err.message));
     } else if (SKIP_REASONS.includes(escalation_reason)) {
-      // Critical-reason escalation — DM operator directly. These
-      // categories explicitly bypass auto-resolution because they
-      // need human judgment (potential exploit reports, money
-      // movement disputes, bug reports affecting users). Without
-      // this DM the ticket would silently sit until /mytickets is
-      // checked.
+      // SKIP_REASONS — operator must read pre-analysis and reply themselves.
+      // DM the operator now so they know there's something to look at.
+      // The DM includes the pre-analysis if it lands within a short
+      // window; otherwise it goes out and the operator pulls the
+      // pre-analysis from /tickets <N>.
       import("./admin-notify.js")
-        .then(({ notifyAdmin }) =>
-          notifyAdmin(
+        .then(async ({ notifyAdmin }) => {
+          // Give the pre-analysis a couple seconds to land so it can
+          // be included inline. If it doesn't, we still DM — operator
+          // hits /tickets <N> for the full read.
+          let preAnalysis = null;
+          for (let i = 0; i < 6 && !preAnalysis; i++) {
+            await new Promise((res) => setTimeout(res, 2000));
+            try {
+              const { rows: r } = await query(
+                `SELECT pip_pre_analysis FROM support_tickets WHERE id = $1`,
+                [t.id],
+              );
+              if (r[0]?.pip_pre_analysis) preAnalysis = r[0].pip_pre_analysis;
+            } catch { /* keep looping */ }
+          }
+          await notifyAdmin(
             `🚨 CRITICAL ticket #${t.id} (${escalation_reason})\n\n` +
             `User: ${userId}\n` +
             `Summary: ${(summary || "").slice(0, 400)}\n` +
             (what_i_tried ? `AI tried: ${what_i_tried.slice(0, 400)}\n` : "") +
-            `\nReply via /mytickets or DM the user directly.`,
-          ),
-        )
+            (preAnalysis
+              ? `\n— Pip pre-analysis —\n${preAnalysis.slice(0, 2000)}\n`
+              : `\n(Pip pre-analysis still running — check /tickets ${t.id} in a moment.)\n`) +
+            `\nReply via /reply ${t.id} <text> · Close via /close ${t.id}`,
+          );
+        })
         .catch((err) => console.warn(`[ai-support] critical-ticket DM failed for #${t.id}:`, err.message));
     }
     return { ticket_id: t.id, status: "open", reason: escalation_reason };
