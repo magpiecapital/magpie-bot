@@ -23,6 +23,7 @@ import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { isAdmin } from "../services/admin.js";
+import { getJupiterBudgetStats } from "../services/jupiter-budget.js";
 
 function fmt(n) {
   if (n == null) return "?";
@@ -61,6 +62,10 @@ export async function handleV4Status(ctx) {
   catch { return ctx.reply(`PROGRAM_ID_V4 invalid: \`${v4ProgramIdStr}\``, { parse_mode: "Markdown" }); }
 
   await ctx.reply("Collecting V4 health snapshot…");
+
+  // Jupiter budget stats (rolling 60s window) — cheap, no I/O
+  let jupBudget = null;
+  try { jupBudget = getJupiterBudgetStats(); } catch { /* best-effort */ }
 
   // ── 1. Loan + activity counts ──
   const sinceWindow = "INTERVAL '24 hours'";
@@ -230,6 +235,15 @@ export async function handleV4Status(ctx) {
       : armAuditTail.slice(0, 5).map((a) =>
           `• ${fmtAge(ageMs(a.created_at))}: \`${a.status || "?"}\` loan ${a.loan_id || "?"} ${a.error_code ? `(${a.error_code})` : ""}`,
         ).join("\n"),
+    "",
+    `*Jupiter budget (rolling 60s)*`,
+    ...(jupBudget
+      ? [
+          `• OK: ${jupBudget.jup_ok} · 429: ${jupBudget.jup_429} · err: ${jupBudget.jup_err} · ratio_429: ${jupBudget.ratio_429}`,
+          `• Bucket: ${Math.floor(jupBudget.bucket.tokens_available)}/${jupBudget.bucket.budget_max} (${jupBudget.bucket.budget_per_sec}/sec)`,
+          `• Defers to Dex: ${jupBudget.budget_defer} · backoff skips: ${jupBudget.backoff_skip} · mints in backoff: ${jupBudget.mints_in_backoff}`,
+        ]
+      : ["• stats unavailable"]),
   ];
 
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });

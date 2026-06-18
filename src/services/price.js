@@ -1,6 +1,17 @@
 import axios from "axios";
 import "dotenv/config";
 import { hasPythCoverage, pythPriceInSol, pythPriceInUsd } from "./pyth-price.js";
+import {
+  routeFor,
+  tryAcquireJupiterToken,
+  recordJupiterOk,
+  recordJupiter429,
+  recordJupiterErr,
+  recordBudgetDefer,
+  recordBackoffSkip,
+  clearMintJupiterBackoff,
+  isMintInJupiterBackoff,
+} from "./jupiter-budget.js";
 
 // Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
 // prices are derived as token_usd / sol_usd.
@@ -27,16 +38,29 @@ const JUP_BATCH_SIZE = 50;
  * path used by the on-chain price-feed attestor.
  */
 async function jupiterPriceInSol(mint) {
-  const resp = await axios.get(JUPITER_API, {
-    params: { ids: `${mint},${SOL_MINT}` },
-    timeout: 10_000,
-  });
-  const tokenUsd = resp.data?.[mint]?.usdPrice;
-  const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
-  if (!tokenUsd || !solUsd) {
-    throw new Error(`No price data for mint ${mint}`);
+  try {
+    const resp = await axios.get(JUPITER_API, {
+      params: { ids: `${mint},${SOL_MINT}` },
+      timeout: 10_000,
+    });
+    const tokenUsd = resp.data?.[mint]?.usdPrice;
+    const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+    if (!tokenUsd || !solUsd) {
+      recordJupiterErr();
+      throw new Error(`No price data for mint ${mint}`);
+    }
+    recordJupiterOk();
+    clearMintJupiterBackoff(mint);
+    return tokenUsd / solUsd;
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status === 429) {
+      recordJupiter429(mint);
+    } else if (!err?.response?.status?.toString().startsWith("2")) {
+      recordJupiterErr();
+    }
+    throw err;
   }
-  return tokenUsd / solUsd;
 }
 
 function isTransientPriceError(err) {
@@ -49,12 +73,50 @@ function isTransientPriceError(err) {
 }
 
 export async function getPriceInSol(mint) {
-  // Attempt 1: Jupiter
+  // Route decision: budget + backoff + RWA-class aware. See
+  // jupiter-budget.js for the policy.
+  const { route, reason } = await routeFor(mint);
+
+  if (route === "dexscreener_only") {
+    // Jupiter is off the table this round. Dex or bust.
+    recordBackoffSkip();
+    return await dexscreenerPriceInSol(mint);
+  }
+
+  if (route === "dexscreener_first") {
+    if (reason !== "rwa-category=stock" && reason !== "rwa-category=etf" && reason !== "rwa-category=metal") {
+      // Memecoin being deferred — note it for metrics.
+      recordBudgetDefer();
+    }
+    try {
+      return await dexscreenerPriceInSol(mint);
+    } catch (errDex) {
+      // Dex failed. Try Jupiter ONLY if budget allows + not in backoff.
+      if (isMintInJupiterBackoff(mint) || !tryAcquireJupiterToken()) {
+        throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter skipped: ${reason})`);
+      }
+      try {
+        return await jupiterPriceInSol(mint);
+      } catch (errJup) {
+        throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter: ${errJup.message})`);
+      }
+    }
+  }
+
+  // jupiter_first path — original logic with budget consumption.
+  if (!tryAcquireJupiterToken()) {
+    // Edge: routeFor said we had budget but it raced out. Defer to Dex.
+    recordBudgetDefer();
+    try {
+      return await dexscreenerPriceInSol(mint);
+    } catch (errDex) {
+      throw new Error(`No price for ${mint} (Jupiter budget exhausted; Dex: ${errDex.message})`);
+    }
+  }
   try {
     return await jupiterPriceInSol(mint);
   } catch (err1) {
     if (!isTransientPriceError(err1)) {
-      // Non-transient (e.g. mint not on Jupiter). Skip retry, try DexScreener.
       try {
         const dex = await dexscreenerPriceInSol(mint);
         console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter: ${err1.message})`);
@@ -64,12 +126,21 @@ export async function getPriceInSol(mint) {
       }
     }
 
-    // Transient — wait 200-700ms with jitter, retry Jupiter once.
+    // Transient — wait 200-700ms with jitter, retry Jupiter once IF budget allows.
     await new Promise((r) => setTimeout(r, 200 + Math.random() * 500));
+    if (!tryAcquireJupiterToken()) {
+      // No budget for retry. Skip to Dex.
+      try {
+        const dex = await dexscreenerPriceInSol(mint);
+        console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (no budget for Jupiter retry)`);
+        return dex;
+      } catch (err2) {
+        throw new Error(`No price data for ${mint} (Jupiter: ${err1.message}; Dex: ${err2.message})`);
+      }
+    }
     try {
       return await jupiterPriceInSol(mint);
     } catch (err2) {
-      // Retry failed too. Fall back to DexScreener.
       try {
         const dex = await dexscreenerPriceInSol(mint);
         console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter still failing after retry: ${err2.message})`);
@@ -94,18 +165,45 @@ export async function getPricesInSolBatch(mints) {
 
   for (let i = 0; i < unique.length; i += JUP_BATCH_SIZE) {
     const chunk = unique.slice(i, i + JUP_BATCH_SIZE);
-    const ids = chunk.concat(solUsd ? [] : [SOL_MINT]).join(",");
-    const resp = await axios.get(JUPITER_API, {
-      params: { ids },
-      timeout: 15_000,
-    });
-    if (!solUsd) {
-      solUsd = resp.data?.[SOL_MINT]?.usdPrice;
-      if (!solUsd) throw new Error("No SOL price from Jupiter");
+    // Each batch HTTP call costs 1 token even though it covers up to
+    // JUP_BATCH_SIZE mints. If we can't afford it, return what we have
+    // so far and the per-mint fallback in callers will pick up the rest
+    // via DexScreener.
+    if (!tryAcquireJupiterToken()) {
+      recordBudgetDefer();
+      break;
     }
-    for (const mint of chunk) {
-      const usd = resp.data?.[mint]?.usdPrice;
-      if (usd) result.set(mint, usd / solUsd);
+    const ids = chunk.concat(solUsd ? [] : [SOL_MINT]).join(",");
+    try {
+      const resp = await axios.get(JUPITER_API, {
+        params: { ids },
+        timeout: 15_000,
+      });
+      recordJupiterOk();
+      if (!solUsd) {
+        solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+        if (!solUsd) throw new Error("No SOL price from Jupiter");
+      }
+      for (const mint of chunk) {
+        const usd = resp.data?.[mint]?.usdPrice;
+        if (usd) {
+          result.set(mint, usd / solUsd);
+          // A successful price clears any prior backoff for this mint —
+          // Jupiter is healthy for it again.
+          clearMintJupiterBackoff(mint);
+        }
+      }
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 429) {
+        // Bump backoff for ALL mints in this chunk so we don't waste the
+        // next batch hammering the same set.
+        for (const mint of chunk) recordJupiter429(mint);
+      } else {
+        recordJupiterErr();
+      }
+      // Don't throw — let the caller's per-mint fallback fill in via Dex.
+      break;
     }
   }
   return result;
