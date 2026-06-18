@@ -776,9 +776,9 @@ export async function handleCommunityAudit(ctx) {
   // and the community will eventually find out. Instead: explain
   // what compensates for the missing audit + what's planned.
   const text = [
-    `🔍 *Audit status — honest answer*`,
+    `*Audit status — honest answer*`,
     ``,
-    `Magpie has *not* yet undergone a formal third-party audit. The community deserves transparency on this rather than a misleading "audited" claim.`,
+    `Magpie has *not* yet shipped a formal third-party audit. The team is *actively researching and vetting auditors* right now — that's the current posture. No public timeline yet; the operator will announce when scope + firm are locked.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -788,7 +788,7 @@ export async function handleCommunityAudit(ctx) {
     `• *No admin override* — there's no privileged key that can drain user collateral.`,
     `• *Bug bounty* — see /security to report findings.`,
     ``,
-    `Treat Magpie as you would any unaudited protocol: deposit only what you can afford to lose, and verify everything on-chain.`,
+    `Treat Magpie as you would any pre-audit protocol: deposit only what you can afford to lose, and verify everything on-chain.`,
   ].join("\n");
   await ctx.reply(text, {
     parse_mode: "Markdown",
@@ -819,7 +819,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `Magpie is *not yet formally audited* (see /audit). Source is open. A bug anywhere in the program could result in loss of funds.`,
+    `A formal third-party audit hasn't shipped yet — team is *researching and vetting auditors* (see /audit for the current posture). Source is open. Until an audit lands, a bug anywhere in the program could result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,

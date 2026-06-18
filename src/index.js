@@ -594,13 +594,11 @@ bot.catch(async (err) => {
       await ctx.api.sendMessage(
         ctx.chat.id,
         [
-          "⚠️ *Something unexpected happened*",
+          "*That didn't go through.*",
           "",
-          "We hit a snag handling that. The team has been logged.",
+          "Server-side hiccup — logged and routed to ops.",
           "",
-          "*What to do:*",
-          "• Try the command again",
-          "• Or /support → Chat with agent and describe what you were doing",
+          "Try the same command again. If it sticks, use /support to chat with a human.",
         ].join("\n"),
         { parse_mode: "Markdown" },
       );
