@@ -55,6 +55,11 @@ import bs58 from "bs58";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { getAdminId } from "./admin-notify.js";
+import { assertAllowedDestination } from "./privileged-destinations.js";
+import {
+  runPrivilegedSign,
+  recordPrivilegedSignResult,
+} from "./privileged-sign-guard.js";
 
 // ─── Constants ────────────────────────────────────────────────────
 
@@ -282,6 +287,27 @@ async function tickInner(bot) {
     return;
   }
 
+  // Hard allowlist check — the destination MUST be on the source-
+  // level allowlist for this service. An attacker who flips
+  // TREASURY_SWEEP_DEST_PUBKEY on Railway can only redirect to a
+  // pre-approved cold-storage vault.
+  try {
+    assertAllowedDestination("treasury-sweeper", destPk);
+  } catch (allowlistErr) {
+    await recordSweep({
+      outcome: "sim_reject",
+      lender_balance_lamports_before: lenderBal,
+      reserve_lamports: reserveLamports,
+      swept_lamports: 0,
+      destination_pubkey: destPk.toBase58(),
+      error_message: allowlistErr.message?.slice(0, 200),
+      notes: "destination not on source-level allowlist — refusing to build tx",
+    });
+    consecutiveFailures++;
+    await maybeAlertConsecutive(bot, allowlistErr.message?.slice(0, 200));
+    return;
+  }
+
   const ix = SystemProgram.transfer({
     fromPubkey: lenderPk,
     toPubkey: destPk,
@@ -295,25 +321,44 @@ async function tickInner(bot) {
     lastValidBlockHeight,
   });
   tx.add(ix);
-  tx.sign(lenderKp);
 
-  // 4. Pre-flight simulate
-  const sim = await connection.simulateTransaction(tx);
-  if (sim.value.err) {
-    const errStr = JSON.stringify(sim.value.err);
+  // Sign + simulate + audit-log through the centralised guard. The
+  // guard verifies the lender's SOL balance decreases by <= the swept
+  // amount + a tx-fee budget, and rejects on any other balance change
+  // (e.g. an undeclared token decrease on a lender ATA).
+  // Operator-mandated 2026-06-18 PM — see
+  // feedback_cosign_borrow_token_drain_exploit_2026_06_18.
+  let guard;
+  try {
+    guard = await runPrivilegedSign({
+      service: "treasury-sweeper",
+      tx,
+      signers: [lenderKp],
+      allowedDeltas: [
+        {
+          pubkey: lenderPk,
+          kind: "sol",
+          // Allow up to sweepAmount + tx-fee headroom + 5000 lamports of
+          // priority-fee slack. Any deviation is suspicious.
+          maxDecrease: BigInt(sweepAmount + TX_FEE_HEADROOM + 5_000),
+        },
+      ],
+    });
+  } catch (guardErr) {
+    const errStr = guardErr.message?.slice(0, 200) || "guard rejected";
     await recordSweep({
       outcome: "sim_reject",
       lender_balance_lamports_before: lenderBal,
       reserve_lamports: reserveLamports,
       swept_lamports: 0,
       destination_pubkey: destPk.toBase58(),
-      error_message: `simulate err: ${errStr}`,
-      notes: (sim.value.logs || []).slice(-5).join(" | ").slice(0, 500),
+      error_message: errStr,
     });
     consecutiveFailures++;
-    await maybeAlertConsecutive(bot, `Sweep sim rejected: ${errStr}`);
+    await maybeAlertConsecutive(bot, `Sweep guard rejected: ${errStr}`);
     return;
   }
+  const auditId = guard.auditId;
 
   // 5. Broadcast
   let sig;
@@ -331,10 +376,16 @@ async function tickInner(bot) {
       destination_pubkey: destPk.toBase58(),
       error_message: err.message?.slice(0, 200),
     });
+    await recordPrivilegedSignResult({
+      auditId,
+      status: "failed",
+      error: `broadcast: ${err.message?.slice(0, 200)}`,
+    });
     consecutiveFailures++;
     await maybeAlertConsecutive(bot, `Sweep send failed: ${err.message?.slice(0, 120)}`);
     return;
   }
+  await recordPrivilegedSignResult({ auditId, status: "broadcast", txSig: sig });
 
   // 6. Confirm
   try {
@@ -352,10 +403,16 @@ async function tickInner(bot) {
       tx_signature: sig,
       error_message: `confirm timeout: ${err.message?.slice(0, 120)}`,
     });
+    await recordPrivilegedSignResult({
+      auditId,
+      status: "failed",
+      error: `confirm: ${err.message?.slice(0, 200)}`,
+    });
     consecutiveFailures++;
     await maybeAlertConsecutive(bot, `Sweep confirm timeout: ${sig}`);
     return;
   }
+  await recordPrivilegedSignResult({ auditId, status: "confirmed", txSig: sig });
 
   // 7. Success
   consecutiveFailures = 0;
