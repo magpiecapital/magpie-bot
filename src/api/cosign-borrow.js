@@ -1035,25 +1035,33 @@ export async function handleCosignBorrow(req) {
         // PDA was never initialized — bot's category routing never
         // reaches V4.
         const borrowProgramId = magpieIxForAttest.programId;
-        const isV4Borrow =
-          process.env.PROGRAM_ID_V4 &&
-          borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4;
+        // V3 AND V4 both use the price_v3 PriceHistory layout with the
+        // same TWAP gate (>= 8 samples in 300s). Originally I only
+        // JIT-warmed V4, which left SPCX (RWA, defaults to V3 borrow
+        // routing) exposed. Operator hit TwapInsufficientHistory on an
+        // SPCX V3 borrow 2026-06-18 PM — see
+        // [[feedback_twap_insufficient_history_never_again]] for the
+        // mandate that this MUST cover every program with TWAP.
+        const usesTwapGate =
+          (process.env.PROGRAM_ID_V4 &&
+            borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4) ||
+          (process.env.PROGRAM_ID_V3 &&
+            borrowProgramId.toBase58() === process.env.PROGRAM_ID_V3);
 
-        if (isV4Borrow) {
-          // V4 path: program's TWAP gate needs >= 8 samples within 300s
-          // OR `TwapInsufficientHistory` (Anchor 6016 / 0x1780) rejects
+        if (usesTwapGate) {
+          // Program's TWAP gate needs >= 8 samples within 300s OR
+          // `TwapInsufficientHistory` (Anchor 6016 / 0x1780) rejects
           // the borrow. The single-shot freshness attest below is
           // necessary but not sufficient — we MUST loop until the
-          // PriceHistory PDA has the count it needs. Operator-mandated
-          // 2026-06-18 PM, see
-          // [[feedback_twap_insufficient_history_never_again]].
+          // PriceHistory PDA has the count it needs.
           const warm = await ensureV4TwapReady(
             mintStr,
             Number(mintRow.decimals),
+            { programIdOverride: borrowProgramId },
           );
           if (!warm.ok) {
             console.warn(
-              `[cosign-borrow] V4 TWAP warming TIMED OUT mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
+              `[cosign-borrow] TWAP warming TIMED OUT prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
             );
             return {
               status: 503,
@@ -1068,7 +1076,7 @@ export async function handleCosignBorrow(req) {
             };
           }
           console.log(
-            `[cosign-borrow] V4 TWAP ready mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests}`,
+            `[cosign-borrow] TWAP ready prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests}`,
           );
         } else {
           // V1/V3 path: single-shot freshness check (PR was already
