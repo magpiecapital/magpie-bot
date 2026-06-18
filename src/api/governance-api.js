@@ -64,18 +64,22 @@ const ACTIVE_PROPOSALS = {
     questions: {},
   },
   "MGP-003": {
-    // Pre-armed activation. The vote endpoint's time-gate already
-    // rejects any payload signed before activated_at_iso, so by
-    // setting both timestamps now (a few days before activation)
-    // the proposal flips itself live at 2026-06-12T00:00:00Z without
-    // requiring an operator-issued config push at activation time.
-    // status: "active" is the UI-facing label; the on-vote gate is
-    // the load-bearing piece, not this string.
+    // Rescoped + rescheduled 2026-06-18 by operator decision:
+    //   - Original 5-option ballot (A=burn, B=re-lock 12mo, C=holders
+    //     30d, D=users 30d, E=hybrid) consolidated to 4 options (no
+    //     instant releases, burn appears in only one option as a hybrid)
+    //   - Voting window pushed to 5 days (Jun 24 → Jun 29 ET)
+    // The vote endpoint's time-gate rejects any payload signed before
+    // activated_at_iso. Pre-armed: flips itself live at the activation
+    // timestamp without an operator-issued config push at that time.
+    // status:"active" is the UI label; the on-vote time-gate is the
+    // load-bearing piece. See feedback_governance_voting_window_5d.md +
+    // feedback_voting_ux_must_feel_solid.md.
     status: "active",
-    activated_at_iso: "2026-06-12T00:00:00Z",
-    closes_at_iso: "2026-06-15T00:00:00Z",
+    activated_at_iso: "2026-06-25T00:00:00Z",
+    closes_at_iso: "2026-06-30T00:00:00Z",
     questions: {
-      Vote: { choices: ["A", "B", "C", "D", "E", "ABSTAIN"] },
+      Vote: { choices: ["A", "B", "C", "D", "ABSTAIN"] },
     },
   },
 };
