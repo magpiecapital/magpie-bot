@@ -47,12 +47,19 @@ const PROACTIVE_DISABLED = process.env.PIP_PROACTIVE_DISABLED === "1";
 // Cumulative tuning: faster sweep cadence (1min), shorter wait before
 // Pip jumps in (45s), higher daily cap (20), shorter per-chat gap
 // (5min). Cost at the new ceiling: ~20 × $0.005 = $0.10/day/chat worst-case.
-const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 20);
+const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 40);
 const QUESTION_PICKUP_INTERVAL_MS = 60 * 1000;       // sweep every minute
 const MILESTONE_INTERVAL_MS = 30 * 60 * 1000;
-const QUESTION_MIN_AGE_MS = 45 * 1000;               // 45s — fast enough to feel responsive
+// Wait briefly so a human in the chat has a chance to answer first,
+// but jump in fast enough that the asker doesn't feel ignored.
+// Operator-mandated tightening 2026-06-18: was effectively 10 min in the
+// SQL query (the constant said 45s but the WHERE clause hard-coded 10 min,
+// so questions sat for 10 min before Pip ever looked at them). Now
+// genuinely 60s end-to-end via QUESTION_MIN_AGE_INTERVAL below.
+const QUESTION_MIN_AGE_MS = 60 * 1000;
+const QUESTION_MIN_AGE_INTERVAL = "1 minute"; // mirrors QUESTION_MIN_AGE_MS for the SQL clause
 const QUESTION_MAX_AGE_MS = 60 * 60 * 1000;          // ignore older than 1h
-const PICKUP_GAP_MS = 5 * 60 * 1000;                 // 5min between Pip pickups in a chat
+const PICKUP_GAP_MS = 2 * 60 * 1000;                 // 2min between Pip pickups in a chat
 const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;
 
 // Command-cheatsheet reminder cadence.
@@ -258,13 +265,15 @@ async function lastPickupAt(chatId) {
 
 async function pickQuestionForChat(chatId) {
   // Oldest unanswered candidate within the eligible window.
+  // Min-age via the constant so the SQL stays in sync with QUESTION_MIN_AGE_MS.
+  // Previously hardcoded to 10 min — the comment said 45s but the SQL won.
   const { rows } = await query(
     `SELECT message_id, sender_id, text
        FROM community_pending_questions
       WHERE chat_id = $1
         AND pip_picked_up_at IS NULL
         AND answered_in_chat_at IS NULL
-        AND created_at < NOW() - INTERVAL '10 minutes'
+        AND created_at < NOW() - INTERVAL '${QUESTION_MIN_AGE_INTERVAL}'
         AND created_at > NOW() - INTERVAL '60 minutes'
       ORDER BY created_at ASC
       LIMIT 1`,
