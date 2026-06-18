@@ -422,9 +422,12 @@ export function startPriceAttestor(intervalMs = 30_000) {
 
   const lastPrices = new Map();
   const lastAttestAt = new Map();
-  // V4-specific tracking. Without separate timing, a legacy attest
-  // would refresh `lastAttestAt` and the V4 pre-warm would think the
-  // V4 feed is fresh too — leaving the V4 PDA stale.
+  // V3 + V4 each have their own PriceHistory PDA with the price_v3
+  // layout + TWAP gate, so each needs independent last-attest tracking
+  // to ensure neither gets starved. Without these, the legacy attest
+  // would refresh `lastAttestAt` and the V3/V4 pre-warms would think
+  // their feeds were fresh too — leaving the V3/V4 PDAs stale.
+  const lastAttestAtV3 = new Map();
   const lastAttestAtV4 = new Map();
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
   // feed timestamp never crosses the contract's 120s staleness limit AND
