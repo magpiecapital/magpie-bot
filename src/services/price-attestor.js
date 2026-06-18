@@ -119,6 +119,160 @@ export async function getPriceFeedAgeSeconds(mintStr, programIdOverride = null) 
 }
 
 /**
+ * Read the V4/V3 PriceHistory PDA and return how many samples sit within
+ * `windowSec` of `now`, plus diagnostic counters.
+ *
+ * Background: the V4 program's TWAP check requires
+ *   MIN_SAMPLES_FOR_TWAP=8 within MIN_HISTORY_SECONDS=300
+ * so a borrow that lands while the window is still warming hits
+ * `TwapInsufficientHistory` (Anchor error 6016 / 0x1780). Cosign-borrow
+ * uses this function to know if it needs to JIT-warm the feed BEFORE
+ * returning the cosigned tx to the user — see ensureV4TwapReady below.
+ *
+ * Returns null if the PDA doesn't exist OR isn't a PriceHistory layout
+ * (so callers can distinguish "needs init" from "needs warming").
+ *
+ * Layout reference (from priceFeedAgeSeconds above):
+ *   offset 104 → head_index (u8) — next-write slot
+ *   offset 105 → count (u8) — total samples ever written (0–32)
+ *   offset 112 → samples[32] × 16 bytes (price u64 + timestamp i64)
+ *
+ * IMPORTANT: `count` is the cumulative population, not the in-window
+ * population. Once the buffer fills (count=32) every fresh tick rolls
+ * the head and overwrites the oldest sample. So we ALWAYS iterate every
+ * populated slot and count by timestamp rather than trusting `count`.
+ */
+export async function getV4TwapSampleCount(mintStr, windowSec = 300) {
+  try {
+    const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+    if (!PROGRAM_ID_V4) return null;
+    const mintPk = new PublicKey(mintStr);
+    const [pool] = lendingPoolPda(LENDER_PUBKEY, PROGRAM_ID_V4);
+    const [priceFeed] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
+    const info = await connection.getAccountInfo(priceFeed);
+    if (!info || info.data.length < 120) return null;
+    const totalCount = info.data.readUInt8(105);
+    const SAMPLES_OFFSET = 112;
+    const STRIDE = 16; // price(8) + timestamp(8)
+    const SLOTS = 32;
+    const slotsPopulated = Math.min(totalCount, SLOTS);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cutoff = nowSec - windowSec;
+    let inWindow = 0;
+    let newestTs = -Infinity;
+    let oldestInWindowTs = Infinity;
+    for (let i = 0; i < slotsPopulated; i++) {
+      const tsStart = SAMPLES_OFFSET + i * STRIDE + 8;
+      const ts = Number(info.data.readBigInt64LE(tsStart));
+      if (ts > newestTs) newestTs = ts;
+      if (ts >= cutoff) {
+        inWindow++;
+        if (ts < oldestInWindowTs) oldestInWindowTs = ts;
+      }
+    }
+    return {
+      inWindow,
+      totalCount,
+      slotsPopulated,
+      newestTs: newestTs === -Infinity ? null : newestTs,
+      oldestInWindowTs: oldestInWindowTs === Infinity ? null : oldestInWindowTs,
+      windowSec,
+    };
+  } catch (err) {
+    console.warn(`[getV4TwapSampleCount] ${mintStr.slice(0, 8)}: ${err.message?.slice(0, 100)}`);
+    return null;
+  }
+}
+
+/**
+ * Synchronously warm the V4 PriceHistory PDA so a borrow lands without
+ * hitting `TwapInsufficientHistory`. Returns:
+ *   { ok: true,  inWindow, waitedMs, attests }   on success
+ *   { ok: false, inWindow, waitedMs, attests, reason } on timeout/error
+ *
+ * The caller (cosign-borrow.js, commands/borrow.js) MUST treat
+ * `ok === false` as a soft 503 — return a clean "feed warming, retry in
+ * N seconds" message to the user, NEVER let the chain reject.
+ *
+ * Operator-mandated 2026-06-18 PM after the
+ * `only_0_samples_in_window_need_8` borrow failure. See
+ * [[feedback_twap_insufficient_history_never_again]].
+ *
+ * Defaults are conservative — 45s max wait + 4s spacing → up to 11 attest
+ * attempts which is more than the 8 we need even if 2-3 confirmations lag.
+ * For non-V4 callers this is a no-op (returns ok:true immediately).
+ */
+export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
+  const REQUIRED_IN_WINDOW = 8;
+  const WINDOW_SEC = 300;
+  const MAX_WAIT_MS = Number(opts.maxWaitMs ?? process.env.V4_TWAP_WARM_MAX_MS ?? 45_000);
+  const SPACING_MS = Number(opts.spacingMs ?? process.env.V4_TWAP_WARM_SPACING_MS ?? 4_000);
+  const START = Date.now();
+  let attests = 0;
+  let lastErr = null;
+
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4) {
+    // V4 not configured — nothing to warm. Treat as ok so V1/V3 callers
+    // can call this unconditionally without branching.
+    return { ok: true, inWindow: null, waitedMs: 0, attests: 0, reason: "v4_not_configured" };
+  }
+
+  while (Date.now() - START < MAX_WAIT_MS) {
+    let status = await getV4TwapSampleCount(mintStr, WINDOW_SEC);
+    if (status === null) {
+      // Feed PDA not initialized yet. Init then continue — the next
+      // iteration will see the empty PriceHistory and start filling it.
+      try {
+        await initializePriceFeed(mintStr, PROGRAM_ID_V4);
+      } catch (e) {
+        lastErr = `init failed: ${e.message?.slice(0, 100)}`;
+        // Don't hard-fail — maybe a race with the background attestor
+        // initialized it; sleep + retry.
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    if (status.inWindow >= REQUIRED_IN_WINDOW) {
+      return {
+        ok: true,
+        inWindow: status.inWindow,
+        waitedMs: Date.now() - START,
+        attests,
+      };
+    }
+    // Need more samples — fire one attest and wait briefly so the
+    // tx finalizes (confirmed) before the next iteration measures.
+    try {
+      await attestPrice(mintStr, decimals, undefined, PROGRAM_ID_V4);
+      attests++;
+    } catch (e) {
+      lastErr = e.message?.slice(0, 100);
+      // If this fails because the feed PDA wasn't actually initialized,
+      // re-init and try again. AccountNotInitialized → 3012/0xbc4.
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(lastErr)) {
+        try {
+          await initializePriceFeed(mintStr, PROGRAM_ID_V4);
+        } catch (e2) {
+          lastErr = `init-then-attest failed: ${e2.message?.slice(0, 80)}`;
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, SPACING_MS));
+  }
+
+  // Timed out — return current state so caller can surface a good message.
+  const final = await getV4TwapSampleCount(mintStr, WINDOW_SEC);
+  return {
+    ok: false,
+    inWindow: final?.inWindow ?? 0,
+    waitedMs: Date.now() - START,
+    attests,
+    reason: lastErr || "timeout",
+  };
+}
+
+/**
  * Initialize a price feed PDA for a given mint. Idempotent — returns
  * { alreadyExists: true } if the PDA is already on chain.
  *
