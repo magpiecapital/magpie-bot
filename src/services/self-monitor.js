@@ -483,41 +483,45 @@ async function probeCreditCoverage(bot) {
  */
 async function probeV4TwapHealth(bot) {
   const KIND = "v4_twap_health";
-  if (!process.env.PROGRAM_ID_V4) {
+  if (!process.env.PROGRAM_ID_V4 && !process.env.PROGRAM_ID_V3) {
     recordOutcome(KIND, false);
     return;
   }
   try {
     const { getV4TwapSampleCount } = await import("./price-attestor.js");
-    // Look at enabled mints — those are the ones users can borrow on.
-    // Skip non-V4 categories (e.g. tokens that route purely to V1/V3).
-    // We probe ALL enabled mints because exit-armed loans on memecoins
-    // also use V4 regardless of category.
+    const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+    // Probe V3 + V4 — both use the price_v3 PriceHistory layout with
+    // the same >=8-samples-in-300s TWAP rule. The V4-only probe missed
+    // SPCX V3 borrows (RWA defaults to V3) — operator hit
+    // TwapInsufficientHistory on SPCX 2026-06-18 PM.
+    const programsToProbe = [];
+    if (PROGRAM_ID_V4) programsToProbe.push({ id: PROGRAM_ID_V4, label: "V4" });
+    if (PROGRAM_ID_V3) programsToProbe.push({ id: PROGRAM_ID_V3, label: "V3" });
+
     const { rows } = await query(
       `SELECT mint, symbol, decimals FROM supported_mints
         WHERE enabled = TRUE
         ORDER BY symbol`,
     );
     const REQUIRED = 8;
-    const GAP_TOLERANCE_SEC = 60; // freshly-enabled mints get 60s grace
+    const GAP_TOLERANCE_SEC = 60;
     const warming = [];
     const cold = [];
     for (const m of rows) {
-      const status = await getV4TwapSampleCount(m.mint, 300);
-      if (status === null) {
-        cold.push(`${m.symbol}(no feed)`);
-        continue;
-      }
-      if (status.inWindow >= REQUIRED) continue;
-      // Newest timestamp tells us if the attestor is moving on this
-      // mint at all. If newest is fresh (< 60s ago), it's warming —
-      // tolerable. If newest is stale, attestor is BROKEN for this mint.
-      const now = Math.floor(Date.now() / 1000);
-      const ageSec = status.newestTs ? now - status.newestTs : Infinity;
-      if (ageSec > GAP_TOLERANCE_SEC) {
-        cold.push(`${m.symbol}(${status.inWindow}/8, last attest ${Math.round(ageSec)}s ago)`);
-      } else {
-        warming.push(`${m.symbol}(${status.inWindow}/8)`);
+      for (const prog of programsToProbe) {
+        const status = await getV4TwapSampleCount(m.mint, 300, prog.id);
+        if (status === null) {
+          cold.push(`${m.symbol}(${prog.label} no feed)`);
+          continue;
+        }
+        if (status.inWindow >= REQUIRED) continue;
+        const now = Math.floor(Date.now() / 1000);
+        const ageSec = status.newestTs ? now - status.newestTs : Infinity;
+        if (ageSec > GAP_TOLERANCE_SEC) {
+          cold.push(`${m.symbol}(${prog.label} ${status.inWindow}/8, last attest ${Math.round(ageSec)}s ago)`);
+        } else {
+          warming.push(`${m.symbol}(${prog.label} ${status.inWindow}/8)`);
+        }
       }
     }
     const isBad = cold.length > 0;

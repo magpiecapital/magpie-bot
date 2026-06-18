@@ -142,13 +142,16 @@ export async function getPriceFeedAgeSeconds(mintStr, programIdOverride = null) 
  * the head and overwrites the oldest sample. So we ALWAYS iterate every
  * populated slot and count by timestamp rather than trusting `count`.
  */
-export async function getV4TwapSampleCount(mintStr, windowSec = 300) {
+export async function getV4TwapSampleCount(mintStr, windowSec = 300, programIdOverride = null) {
   try {
-    const { PROGRAM_ID_V4 } = await import("../solana/program.js");
-    if (!PROGRAM_ID_V4) return null;
+    const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+    // Default to V4 for backward compatibility, but accept V3 too — both
+    // use the price_v3 PriceHistory layout with the same TWAP semantics.
+    const programId = programIdOverride || PROGRAM_ID_V4 || PROGRAM_ID_V3;
+    if (!programId) return null;
     const mintPk = new PublicKey(mintStr);
-    const [pool] = lendingPoolPda(LENDER_PUBKEY, PROGRAM_ID_V4);
-    const [priceFeed] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
+    const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+    const [priceFeed] = priceFeedPda(mintPk, pool, programId);
     const info = await connection.getAccountInfo(priceFeed);
     if (!info || info.data.length < 120) return null;
     const totalCount = info.data.readUInt8(105);
@@ -211,20 +214,27 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
   let attests = 0;
   let lastErr = null;
 
-  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
-  if (!PROGRAM_ID_V4) {
-    // V4 not configured — nothing to warm. Treat as ok so V1/V3 callers
-    // can call this unconditionally without branching.
-    return { ok: true, inWindow: null, waitedMs: 0, attests: 0, reason: "v4_not_configured" };
+  const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+  // Generalized to V3 + V4 (operator hit TwapInsufficientHistory on an
+  // SPCX V3 borrow 2026-06-18 PM — the V4-only JIT warmer didn't catch
+  // it). Both programs use the price_v3 PriceHistory layout. Caller can
+  // pin a specific program via opts.programIdOverride; otherwise we
+  // prefer the program the caller specified via opts.programIdOverride,
+  // falling back to V4 then V3. See
+  // [[feedback_twap_insufficient_history_never_again]].
+  const programId =
+    opts.programIdOverride || PROGRAM_ID_V4 || PROGRAM_ID_V3;
+  if (!programId) {
+    return { ok: true, inWindow: null, waitedMs: 0, attests: 0, reason: "no_program_configured" };
   }
 
   while (Date.now() - START < MAX_WAIT_MS) {
-    let status = await getV4TwapSampleCount(mintStr, WINDOW_SEC);
+    let status = await getV4TwapSampleCount(mintStr, WINDOW_SEC, programId);
     if (status === null) {
       // Feed PDA not initialized yet. Init then continue — the next
       // iteration will see the empty PriceHistory and start filling it.
       try {
-        await initializePriceFeed(mintStr, PROGRAM_ID_V4);
+        await initializePriceFeed(mintStr, programId);
       } catch (e) {
         lastErr = `init failed: ${e.message?.slice(0, 100)}`;
         // Don't hard-fail — maybe a race with the background attestor
@@ -239,12 +249,13 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
         inWindow: status.inWindow,
         waitedMs: Date.now() - START,
         attests,
+        programId: programId.toBase58().slice(0, 8),
       };
     }
     // Need more samples — fire one attest and wait briefly so the
     // tx finalizes (confirmed) before the next iteration measures.
     try {
-      await attestPrice(mintStr, decimals, undefined, PROGRAM_ID_V4);
+      await attestPrice(mintStr, decimals, undefined, programId);
       attests++;
     } catch (e) {
       lastErr = e.message?.slice(0, 100);
@@ -252,7 +263,7 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
       // re-init and try again. AccountNotInitialized → 3012/0xbc4.
       if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(lastErr)) {
         try {
-          await initializePriceFeed(mintStr, PROGRAM_ID_V4);
+          await initializePriceFeed(mintStr, programId);
         } catch (e2) {
           lastErr = `init-then-attest failed: ${e2.message?.slice(0, 80)}`;
         }
@@ -262,7 +273,7 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
   }
 
   // Timed out — return current state so caller can surface a good message.
-  const final = await getV4TwapSampleCount(mintStr, WINDOW_SEC);
+  const final = await getV4TwapSampleCount(mintStr, WINDOW_SEC, programId);
   return {
     ok: false,
     inWindow: final?.inWindow ?? 0,
