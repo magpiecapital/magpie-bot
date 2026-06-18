@@ -1134,12 +1134,70 @@ export async function handleCosignBorrow(req) {
   // failure we fail CLOSED — refuse to broadcast — because the cost of
   // a missed drain is much higher than a transient unavailability.
   try {
-    const drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    let drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    // Sim-time TWAP retry: when the simulation rejects specifically
+    // because TwapInsufficientHistory is in the logs (sim err contains
+    // 0x1780 / "TwapInsufficientHistory"), the on-chain PriceHistory
+    // PDA hasn't ripened despite the JIT warmer thinking it had. Re-warm
+    // up to 3 times before giving up. This closes the race condition
+    // where samples fall out of the rolling 300s window between the
+    // ensureV4TwapReady measurement and the broadcast moment. Operator
+    // hit this on SPCX 2026-06-18 PM.
+    let twapRetries = 0;
+    while (
+      !drainCheck.ok &&
+      typeof drainCheck.detail === "string" &&
+      /TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail) &&
+      twapRetries < 3
+    ) {
+      twapRetries++;
+      console.warn(
+        `[cosign-borrow] Layer 2 sim hit TwapInsufficient — re-warming (retry ${twapRetries}/3)`,
+      );
+      try {
+        const { ensureV4TwapReady } = await import("../services/price-attestor.js");
+        const magpieIxForRetry = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
+        const retryProgramId = magpieIxForRetry?.programId;
+        const collateralMintForRetry = magpieIxForRetry?.keys?.[4]?.pubkey?.toBase58();
+        if (collateralMintForRetry && retryProgramId) {
+          const { rows: [mr] } = await query(
+            `SELECT decimals FROM supported_mints WHERE mint = $1`,
+            [collateralMintForRetry],
+          );
+          if (mr) {
+            await ensureV4TwapReady(collateralMintForRetry, Number(mr.decimals), {
+              programIdOverride: retryProgramId,
+              requiredInWindow: 12,
+              spacingMs: 1_000,
+              maxWaitMs: 30_000,
+            });
+          }
+        }
+      } catch (warmErr) {
+        console.warn(
+          `[cosign-borrow] re-warm retry ${twapRetries} threw: ${warmErr.message?.slice(0, 120)}`,
+        );
+      }
+      drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    }
     if (!drainCheck.ok) {
       // tx is now signed but we never broadcast — the lender signature
       // is wasted but the funds stay safe. The attacker learned nothing
       // they couldn't have learned from any other failed tx.
       console.error(`[cosign-borrow] LAYER-2 BLOCK: ${drainCheck.error}. detail=${drainCheck.detail}`);
+      // Surface TWAP-specific failures as a clean retry hint instead of
+      // the generic drain-block message — the user just needs to wait
+      // for warming and tap Borrow again.
+      if (/TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail || "")) {
+        return {
+          status: 503,
+          body: {
+            error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+            oracle_warming: true,
+            retry_after_seconds: 25,
+          },
+        };
+      }
       return {
         status: 403,
         body: {
