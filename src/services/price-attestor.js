@@ -499,10 +499,33 @@ export function startPriceAttestor(intervalMs = 30_000) {
       console.warn(`[PriceAttestor] Per-mint fallback recovered ${priceMap.size}/${tokens.length} prices`);
     }
 
+    // Per-mint backfill for mints the batch didn't cover. Jupiter's
+    // batch endpoint can silently omit Token-2022 / xStock mints that
+    // require Dex-first routing (e.g., SPCX). The per-mint getPriceInSol
+    // has DexScreener + Pyth fallbacks baked in, so it covers what the
+    // batch misses. Without this, stocks went 11+ hours without
+    // attestation while the bot happily ticked through every other mint
+    // (operator hit it on SPCX V3+V4 borrow 2026-06-18 PM).
+    const missing = tokens.filter((t) => !priceMap.has(t.mint));
+    if (missing.length > 0) {
+      for (const t of missing) {
+        try {
+          const p = await getPriceInSol(t.mint);
+          if (p) priceMap.set(t.mint, p);
+        } catch {
+          // skip silently — this mint will retry next tick
+        }
+      }
+      const recovered = missing.filter((t) => priceMap.has(t.mint)).length;
+      if (recovered > 0) {
+        console.log(`[PriceAttestor] per-mint backfill recovered ${recovered}/${missing.length} mints not covered by Jupiter batch`);
+      }
+    }
+
     let initsThisTick = 0;
     for (const { mint, decimals, needsLegacyAttest } of tokens) {
       const priceSol = priceMap.get(mint);
-      if (!priceSol) continue; // no Jupiter coverage — skip silently
+      if (!priceSol) continue; // no source had a price — skip silently
 
       try {
         const priceLamports = Math.floor(priceSol * 1e9);
