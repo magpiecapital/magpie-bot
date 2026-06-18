@@ -206,10 +206,18 @@ export async function getV4TwapSampleCount(mintStr, windowSec = 300, programIdOv
  * For non-V4 callers this is a no-op (returns ok:true immediately).
  */
 export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
-  const REQUIRED_IN_WINDOW = 8;
+  // Safety margin above the on-chain MIN_SAMPLES_FOR_TWAP=8 — sample can
+  // age out between the moment we measure and the moment the cosigned
+  // tx lands on-chain. Targeting 10 gives 2 samples of headroom.
+  const REQUIRED_IN_WINDOW = Number(opts.requiredInWindow ?? 10);
   const WINDOW_SEC = 300;
-  const MAX_WAIT_MS = Number(opts.maxWaitMs ?? process.env.V4_TWAP_WARM_MAX_MS ?? 45_000);
-  const SPACING_MS = Number(opts.spacingMs ?? process.env.V4_TWAP_WARM_SPACING_MS ?? 4_000);
+  // 90s budget, 1.5s spacing — comfortably fits 10 samples even from a
+  // cold-start PDA that needs init first. Previous 45s/4s budget was too
+  // tight: init took ~1s, then 8 attests × 4s = 32s, plus ~2s/attest
+  // confirmation latency pushed us past the deadline. Operator hit this
+  // on SPCX 2026-06-18 PM after three earlier fixes.
+  const MAX_WAIT_MS = Number(opts.maxWaitMs ?? process.env.V4_TWAP_WARM_MAX_MS ?? 90_000);
+  const SPACING_MS = Number(opts.spacingMs ?? process.env.V4_TWAP_WARM_SPACING_MS ?? 1_500);
   const START = Date.now();
   let attests = 0;
   let lastErr = null;
@@ -588,6 +596,64 @@ export function startPriceAttestor(intervalMs = 30_000) {
       }
     }
   }
+
+  // Startup pre-warm pass — initialize V3 + V4 PriceHistory PDAs for
+  // every enabled mint in parallel, IMMEDIATELY, bypassing the per-tick
+  // init cap. Operator-mandated 2026-06-18 PM after SPCX V3 borrow
+  // failed because its V3 PDA had never been initialized — the regular
+  // tick's drip-feed (MAX_INITS_PER_TICK=5) would've taken many ticks
+  // to get to SPCX. This eager init means the FIRST tick already finds
+  // initialized PDAs and just attests them, instead of having to
+  // bootstrap from scratch.
+  //
+  // Bounded concurrency = 4 so we don't burst the RPC.
+  (async function startupPrewarm() {
+    try {
+      const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+      const programs = [
+        PROGRAM_ID_V4 ? { id: PROGRAM_ID_V4, label: "V4" } : null,
+        PROGRAM_ID_V3 ? { id: PROGRAM_ID_V3, label: "V3" } : null,
+      ].filter(Boolean);
+      if (programs.length === 0) return;
+      const tokens = await fetchMintsToAttest();
+      console.log(
+        `[PriceAttestor] startup pre-warm: ${tokens.length} mint(s) × ${programs.length} program(s) — initializing missing PriceHistory PDAs in parallel (4-wide)`,
+      );
+      const queue = [];
+      for (const t of tokens) {
+        for (const prog of programs) {
+          queue.push({ mint: t.mint, decimals: t.decimals, prog });
+        }
+      }
+      let initialized = 0;
+      let alreadyExisted = 0;
+      let errored = 0;
+      const CONCURRENCY = 4;
+      let idx = 0;
+      async function worker() {
+        while (idx < queue.length) {
+          const task = queue[idx++];
+          try {
+            const result = await initializePriceFeed(task.mint, task.prog.id);
+            if (result.alreadyExists) alreadyExisted++;
+            else { initialized++;
+              console.log(`[PriceAttestor] startup init ${task.prog.label} for ${task.mint.slice(0, 8)}... sig=${result.signature?.slice(0, 16) || "(skip)"}`);
+            }
+          } catch (err) {
+            errored++;
+            console.warn(`[PriceAttestor] startup init ${task.prog.label} for ${task.mint.slice(0, 8)} failed: ${err.message?.slice(0, 100)}`);
+          }
+        }
+      }
+      const workers = Array.from({ length: CONCURRENCY }, () => worker());
+      await Promise.all(workers);
+      console.log(
+        `[PriceAttestor] startup pre-warm DONE — initialized=${initialized}, alreadyExisted=${alreadyExisted}, errored=${errored}`,
+      );
+    } catch (err) {
+      console.warn(`[PriceAttestor] startup pre-warm threw: ${err.message?.slice(0, 200)}`);
+    }
+  })();
 
   // Run immediately, then on interval
   tick();
