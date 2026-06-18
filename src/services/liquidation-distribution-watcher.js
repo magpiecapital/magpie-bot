@@ -386,6 +386,13 @@ async function distributeRecoveryCredit(row) {
     return { ok: false, reason: "claim_lost_race" };
   }
 
+  // Holder + LP direct-credit are pure UPDATEs with no event-ledger
+  // (no ON CONFLICT, no idempotency key). If we ever retry a row whose
+  // holder credit already succeeded, the pool will double-credit.
+  // Therefore: the recovery_credits row is the SINGLE idempotency
+  // anchor. Mark it 'distributed' on the first claim regardless of
+  // per-pool failures, log+alert on any partial failure, and rely on
+  // a manual operator patch for the missing pool rather than retrying.
   const errors = [];
   try {
     const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
@@ -404,8 +411,8 @@ async function distributeRecoveryCredit(row) {
     if (reserveShare > 0n) {
       await creditProtocolReserveDirect({
         loanDbId: null,
-        amountLamports: reserveShare,
-        eventType: `recovery_${row.kind}`,
+        lamports: reserveShare,
+        eventType: `recovery_${row.kind}_${row.id}`,
       });
     }
   } catch (err) {
@@ -414,23 +421,24 @@ async function distributeRecoveryCredit(row) {
 
   await query(
     `UPDATE recovery_credits
-        SET distribution_status = $2,
-            holder_share_lamports = $3,
-            lp_loyalty_share_lamports = $4,
-            protocol_reserve_share_lamports = $5,
-            distributed_at = CASE WHEN $2 = 'distributed' THEN NOW() ELSE NULL END,
+        SET distribution_status = 'distributed',
+            holder_share_lamports = $2,
+            lp_loyalty_share_lamports = $3,
+            protocol_reserve_share_lamports = $4,
+            distributed_at = NOW(),
             updated_at = NOW()
       WHERE id = $1`,
     [
       row.id,
-      errors.length === 0 ? "distributed" : "awaiting_distribution",
       holderShare.toString(),
       lpShare.toString(),
       reserveShare.toString(),
     ],
   );
   if (errors.length > 0) {
-    console.warn(`[liq-distribute] recovery_credit #${row.id} partial fail: ${errors.join("; ")}`);
+    console.error(
+      `[liq-distribute] CRIT recovery_credit #${row.id} marked DISTRIBUTED with partial-credit failures (no retry — pool ledgers are not idempotent, retrying would double-credit): ${errors.join("; ")}. Manual operator patch required for failed slices.`,
+    );
     return { ok: false, reason: errors.join("; ") };
   }
   console.log(
