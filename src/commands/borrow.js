@@ -848,6 +848,40 @@ export function registerBorrowCallbacks(bot) {
     const feedAge = await getPriceFeedAgeSeconds(state.selected.mint, attestProgramId);
     const needsAttest = feedAge === null || feedAge > FRESH_THRESHOLD_SEC;
 
+    // V4 TWAP warming gate (operator-mandated 2026-06-18 PM, see
+    // [[feedback_twap_insufficient_history_never_again]]). If this borrow
+    // routes to V4, the on-chain TWAP check needs >= 8 samples in 300s;
+    // a single attest below doesn't get us there from a cold start. Loop
+    // until the PriceHistory PDA has the count it needs, or surface a
+    // clean "feed warming" prompt to the user with state preserved.
+    {
+      const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+      const isV4Borrow = !!(PROGRAM_ID_V4 && attestProgramId && attestProgramId.equals(PROGRAM_ID_V4));
+      if (isV4Borrow) {
+        const { ensureV4TwapReady } = await import("../services/price-attestor.js");
+        const warm = await ensureV4TwapReady(state.selected.mint, state.selected.decimals);
+        if (!warm.ok) {
+          // Preserve state so the user just taps Retry — no need to
+          // re-pick collateral/tier/exits.
+          pending.set(ctx.chat.id, state);
+          const kb = new InlineKeyboard()
+            .text("Retry borrow", "borrow:retry_submit").row()
+            .text("Cancel", "borrow:cancel");
+          await say(
+            `*Price oracle is warming up for ${state.selected.symbol}.*\n\n` +
+            `V4 needs ${warm.inWindow}/8 samples within the rolling 5-min window. ` +
+            `It usually finishes in 30–45 seconds. Your collateral + tier + exits are saved — tap to retry.`,
+            { parse_mode: "Markdown", reply_markup: kb },
+          );
+          return;
+        }
+        // V4 path also writes a fresh sample as side effect of
+        // ensureV4TwapReady, so the freshness check below would no-op.
+        // Fall through anyway — the single-shot attest path stays
+        // available for V1/V3 callers and is cheap when feed is fresh.
+      }
+    }
+
     if (needsAttest) {
       try {
         await attestPrice(state.selected.mint, state.selected.decimals, undefined, attestProgramId);

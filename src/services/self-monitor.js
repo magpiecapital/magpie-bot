@@ -468,6 +468,198 @@ async function probeCreditCoverage(bot) {
   }
 }
 
+/**
+ * V4 TWAP sample-count health. Every enabled V4 mint must have
+ * >= 8 samples within the rolling 5-min window — otherwise a borrow
+ * lands on `TwapInsufficientHistory`. Background attestor SHOULD keep
+ * this satisfied at the 35s cadence shipped in PR #348, but this probe
+ * is the trip-wire if the attestor stalls (RPC blip, Jupiter outage,
+ * service restart) or a freshly-enabled mint hasn't warmed yet.
+ *
+ * Operator-mandated 2026-06-18 PM after a "0 samples in window" borrow
+ * rejection. See [[feedback_twap_insufficient_history_never_again]] for
+ * the full defense; this is Layer 3 (Layer 1 is the cosign-borrow JIT
+ * warmer that catches it before the user signs anything).
+ */
+async function probeV4TwapHealth(bot) {
+  const KIND = "v4_twap_health";
+  if (!process.env.PROGRAM_ID_V4) {
+    recordOutcome(KIND, false);
+    return;
+  }
+  try {
+    const { getV4TwapSampleCount } = await import("./price-attestor.js");
+    // Look at enabled mints — those are the ones users can borrow on.
+    // Skip non-V4 categories (e.g. tokens that route purely to V1/V3).
+    // We probe ALL enabled mints because exit-armed loans on memecoins
+    // also use V4 regardless of category.
+    const { rows } = await query(
+      `SELECT mint, symbol, decimals FROM supported_mints
+        WHERE enabled = TRUE
+        ORDER BY symbol`,
+    );
+    const REQUIRED = 8;
+    const GAP_TOLERANCE_SEC = 60; // freshly-enabled mints get 60s grace
+    const warming = [];
+    const cold = [];
+    for (const m of rows) {
+      const status = await getV4TwapSampleCount(m.mint, 300);
+      if (status === null) {
+        cold.push(`${m.symbol}(no feed)`);
+        continue;
+      }
+      if (status.inWindow >= REQUIRED) continue;
+      // Newest timestamp tells us if the attestor is moving on this
+      // mint at all. If newest is fresh (< 60s ago), it's warming —
+      // tolerable. If newest is stale, attestor is BROKEN for this mint.
+      const now = Math.floor(Date.now() / 1000);
+      const ageSec = status.newestTs ? now - status.newestTs : Infinity;
+      if (ageSec > GAP_TOLERANCE_SEC) {
+        cold.push(`${m.symbol}(${status.inWindow}/8, last attest ${Math.round(ageSec)}s ago)`);
+      } else {
+        warming.push(`${m.symbol}(${status.inWindow}/8)`);
+      }
+    }
+    const isBad = cold.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND,
+        `V4 TWAP health: ${cold.length} mint(s) cold (attestor stalled OR not running for them): ${cold.slice(0, 8).join(", ")}` +
+        (warming.length > 0 ? `. Warming but tolerable: ${warming.slice(0, 5).join(", ")}` : "") +
+        `. Cosign-borrow JIT warmer is Layer 1, but if it's tripping for users RIGHT NOW, investigate attestor logs.`,
+        cold.length >= 3 ? "crit" : "warn",
+      );
+    } else if (warming.length > 0) {
+      // Warming-only is not a fail — just log so /lc-perf can show it.
+      console.log(`[self-monitor] v4_twap warming: ${warming.join(", ")}`);
+    } else {
+      await alertRecovery(bot, KIND, `V4 TWAP health: all ${rows.length} enabled mint(s) have 8+ samples in window.`);
+    }
+  } catch (err) {
+    console.warn("[self-monitor] v4_twap_health probe threw:", err.message?.slice(0, 160));
+  }
+}
+
+/**
+ * Lender-wallet drain detector. Snapshots the lender wallet's SOL +
+ * every token balance (SPL + Token-2022) on each tick, compares to the
+ * previous snapshot, and CRIT-alerts on ANY decrease that isn't
+ * accounted for by an expected outflow.
+ *
+ * This is the Layer 4 defense for the 2026-06-18 cosign-borrow
+ * Token-2022 drain exploit (see
+ * [[feedback_cosign_borrow_token_drain_exploit_2026_06_18]]). Even if
+ * a future allowlisted program lets some new state-mutating
+ * instruction shape slip past the Gate 0b enumeration in
+ * cosign-borrow.js, this probe catches it within 60 seconds and pages
+ * the operator.
+ *
+ * Expected-outflow filter: legitimate decreases happen when
+ *   - treasury-sweeper moves SOL to the cold treasury vault
+ *   - the holder-rewards distributor pays $MAGPIE holders
+ *   - the lender voluntarily distributes liquidation proceeds
+ * For the MVP we DO NOT pre-filter these — over-alerting is FAR safer
+ * than missing a drain. Operator gets the tx signature in the alert
+ * and can mark expected ones as such. Follow-up will subtract a
+ * pre-registered allowlist of expected tx hashes.
+ */
+const lenderBalanceState = {
+  lastSolLamports: null,
+  lastTokenBalances: new Map(), // ata pubkey → { mint, owner, amount: bigint, decimals }
+  initialized: false,
+};
+async function probeLenderWalletBalance(bot) {
+  const KIND = "lender_wallet_balance_decrease";
+  let LENDER_PUBKEY;
+  try {
+    LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
+  } catch {
+    return; // not configured
+  }
+  let solLamports;
+  let snapshot;
+  try {
+    solLamports = await connection.getBalance(LENDER_PUBKEY, "confirmed");
+    const [sslTokens, t22Tokens] = await Promise.all([
+      connection.getParsedTokenAccountsByOwner(
+        LENDER_PUBKEY,
+        { programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") },
+        "confirmed",
+      ),
+      connection.getParsedTokenAccountsByOwner(
+        LENDER_PUBKEY,
+        { programId: new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb") },
+        "confirmed",
+      ),
+    ]);
+    snapshot = new Map();
+    for (const accts of [sslTokens.value, t22Tokens.value]) {
+      for (const a of accts) {
+        const info = a.account.data.parsed.info;
+        const amt = BigInt(info.tokenAmount.amount);
+        if (amt === 0n) continue; // skip empty ATAs
+        snapshot.set(a.pubkey.toBase58(), {
+          mint: info.mint,
+          owner: info.owner,
+          amount: amt,
+          decimals: info.tokenAmount.decimals,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("[self-monitor] lender_wallet_balance probe RPC error:", err.message?.slice(0, 120));
+    return;
+  }
+
+  if (!lenderBalanceState.initialized) {
+    lenderBalanceState.lastSolLamports = solLamports;
+    lenderBalanceState.lastTokenBalances = snapshot;
+    lenderBalanceState.initialized = true;
+    return; // first run baselines, doesn't alert
+  }
+
+  const decreases = [];
+  // Threshold: ignore tiny SOL deltas that come from price-attestor tx
+  // fees (the lender pays ~5000 lamports per attest, ~70 per minute).
+  // 0.01 SOL is well above the per-hour fee budget but small enough to
+  // catch real drains.
+  const SOL_DECREASE_THRESHOLD_LAMPORTS = 10_000_000n; // 0.01 SOL
+  const solDelta = BigInt(lenderBalanceState.lastSolLamports) - BigInt(solLamports);
+  if (solDelta > SOL_DECREASE_THRESHOLD_LAMPORTS) {
+    decreases.push(`SOL: -${(Number(solDelta) / 1e9).toFixed(4)} SOL (was ${(lenderBalanceState.lastSolLamports / 1e9).toFixed(4)}, now ${(solLamports / 1e9).toFixed(4)})`);
+  }
+  for (const [ata, last] of lenderBalanceState.lastTokenBalances) {
+    const current = snapshot.get(ata);
+    if (!current) {
+      // ATA was closed — full balance vanished. Mint info from last snapshot.
+      decreases.push(`token ${last.mint.slice(0, 8)}… ATA ${ata.slice(0, 8)}… DRAINED+CLOSED (was ${Number(last.amount) / 10 ** last.decimals})`);
+      continue;
+    }
+    if (current.amount < last.amount) {
+      const delta = last.amount - current.amount;
+      decreases.push(
+        `token ${last.mint.slice(0, 8)}… ATA ${ata.slice(0, 8)}… -${Number(delta) / 10 ** last.decimals} (${Number(last.amount) / 10 ** last.decimals} → ${Number(current.amount) / 10 ** current.decimals})`,
+      );
+    }
+  }
+
+  const isBad = decreases.length > 0;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    await alertIfNew(bot, KIND,
+      `LENDER WALLET BALANCE DECREASED — investigate immediately. Changes: ${decreases.join(" | ")}. ` +
+      `If you didn't initiate a sweep/distribution/sale in the last 60s, treat as a potential drain.`,
+      "crit",
+    );
+  } else {
+    await alertRecovery(bot, KIND, `Lender wallet balance stable across tick.`);
+  }
+
+  // Update baseline AFTER alerting so the next tick sees the new "stable" state.
+  lenderBalanceState.lastSolLamports = solLamports;
+  lenderBalanceState.lastTokenBalances = snapshot;
+}
+
 /* ─── Tick loop ──────────────────────────────────────────────── */
 
 let _timer = null;
@@ -484,6 +676,8 @@ async function tick(bot) {
       probeLoanProgramIdDrift(bot).catch((e) => console.warn("[self-monitor] program_drift probe threw:", e.message)),
       probeStaleSupport(bot).catch((e) => console.warn("[self-monitor] stale_support probe threw:", e.message)),
       probeCreditCoverage(bot).catch((e) => console.warn("[self-monitor] credit_coverage probe threw:", e.message)),
+      probeV4TwapHealth(bot).catch((e) => console.warn("[self-monitor] v4_twap_health probe threw:", e.message)),
+      probeLenderWalletBalance(bot).catch((e) => console.warn("[self-monitor] lender_wallet_balance probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
