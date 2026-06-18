@@ -733,7 +733,7 @@ export async function recordLoan({
   try {
     const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
     if (feeLamports > 0n) {
-      await accrueToHolderPool(feeLamports);
+      await accrueToHolderPool(feeLamports, { sourceType: "borrow_fee", sourceId: `loan_${rows[0].id}` });
     }
   } catch (err) {
     console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
@@ -743,7 +743,7 @@ export async function recordLoan({
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
     if (feeLamports > 0n) {
-      await accrueToLpLoyaltyPool(feeLamports);
+      await accrueToLpLoyaltyPool(feeLamports, { sourceType: "borrow_fee", sourceId: `loan_${rows[0].id}` });
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on borrow failed (continuing):", err.message);
@@ -1067,7 +1067,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   try {
     const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
     if (feeLamports > 0n) {
-      await accrueToHolderPool(feeLamports);
+      await accrueToHolderPool(feeLamports, { sourceType: "extend_fee", sourceId: `loan_${loanDbRow.id}_extend_${loanDbRow.duration_days || "n"}` });
     }
   } catch (err) {
     console.error("[loans] holder pool accrual on extend failed (continuing):", err.message);
@@ -1077,7 +1077,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
     if (feeLamports > 0n) {
-      await accrueToLpLoyaltyPool(feeLamports);
+      await accrueToLpLoyaltyPool(feeLamports, { sourceType: "extend_fee", sourceId: `loan_${loanDbRow.id}_extend_${loanDbRow.duration_days || "n"}` });
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on extend failed (continuing):", err.message);
