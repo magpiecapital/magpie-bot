@@ -887,6 +887,7 @@ export async function handleTicket(ctx) {
             s.admin_reply, s.admin_replied_at,
             s.auto_resolved_at, s.last_user_followup_at, s.followup_count,
             s.closed_at, s.created_at,
+            s.pip_pre_analysis, s.pip_pre_analyzed_at,
             u.telegram_id, u.telegram_username, u.current_streak, u.created_at AS user_created_at,
             (SELECT COUNT(*) FROM loans WHERE user_id = u.id)::int AS total_loans,
             (SELECT COUNT(*) FROM loans WHERE user_id = u.id AND status = 'active')::int AS active_loans
@@ -919,6 +920,20 @@ export async function handleTicket(ctx) {
 
   if (t.followup_count > 0) {
     lines.push("", `_${t.followup_count} follow-up(s) — see message above for full thread._`);
+  }
+
+  // Pip pre-analysis — what Pip looked at + what she thinks is going on.
+  // Surfaced prominently so the operator can /reply in seconds without
+  // having to repeat the investigation.
+  if (t.pip_pre_analysis) {
+    const ageMin = t.pip_pre_analyzed_at
+      ? Math.floor((Date.now() - new Date(t.pip_pre_analyzed_at).getTime()) / 60_000)
+      : null;
+    const ageLabel = ageMin == null
+      ? ""
+      : ageMin < 60 ? ` (${ageMin}m ago)` : ` (${Math.floor(ageMin / 60)}h ago)`;
+    lines.push("", `*Pip pre-analysis${ageLabel}:*`);
+    lines.push("```", t.pip_pre_analysis.slice(0, 2000), "```");
   }
 
   if (t.admin_reply) {
