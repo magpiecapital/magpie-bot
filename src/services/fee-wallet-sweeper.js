@@ -225,14 +225,61 @@ async function runOnce(bot) {
   tx.add(createSyncNativeInstruction(distributionAta));
 
   let sig;
+  let guardAuditId = null;
   try {
+    // Hard allowlist + universal sign guard. Operator-mandated
+    // 2026-06-18 PM follow-up to the cosign-borrow exploit defense —
+    // every privileged-keypair signing path must go through the guard
+    // so a misconfigured env var can't redirect funds and an unauth'd
+    // balance decrease on the lender wallet fails sim before broadcast.
+    // See feedback_cosign_borrow_token_drain_exploit_2026_06_18.md.
+    const { assertAllowedDestination } = await import("./privileged-destinations.js");
+    const { runPrivilegedSign, recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
+    assertAllowedDestination("fee-wallet-sweeper", distributionPk);
+
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
     tx.feePayer = lenderKp.publicKey;
-    tx.sign(lenderKp);
+
+    const guard = await runPrivilegedSign({
+      service: "fee-wallet-sweeper",
+      tx,
+      signers: [lenderKp],
+      allowedDeltas: [
+        // Lender's wSOL ATA (the fee_wallet) decreases by sweepable.
+        // No other lender-owned balance may change.
+        {
+          pubkey: feeWalletAta,
+          kind: "token",
+          mint: NATIVE_MINT,
+          maxDecrease: BigInt(sweepable),
+        },
+        // Lender pays the SOL tx fee (~5000 lamports) + may pay ATA
+        // creation rent (~2M lamports) if dest ATA didn't exist yet.
+        // Budget generously to avoid false rejects.
+        {
+          pubkey: lenderKp.publicKey,
+          kind: "sol",
+          maxDecrease: 10_000_000n, // 0.01 SOL
+        },
+      ],
+    });
+    guardAuditId = guard.auditId;
+
     sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
     await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
   } catch (err) {
+    if (guardAuditId) {
+      try {
+        const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
+        await recordPrivilegedSignResult({
+          auditId: guardAuditId,
+          status: "failed",
+          error: err.message?.slice(0, 200),
+        });
+      } catch { /* best-effort */ }
+    }
     // Phase 2 failure — mark audit row 'failed', alert operator. The
     // next tick will try again from clean state.
     const msg = err?.message?.slice(0, 240) || String(err).slice(0, 240);
