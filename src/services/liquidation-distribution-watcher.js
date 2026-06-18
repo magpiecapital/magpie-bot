@@ -270,15 +270,35 @@ async function distributeOne(row) {
   // pool ledgers now. Partial failures here are unlikely (DB writes
   // very reliable) but if any occur, mark distribute_error so the
   // operator can manually reconcile.
+  // All three pool credits now route through pool_credit_events
+  // (ledger-gated, UNIQUE per source). Repeat calls with the same
+  // (sourceType, sourceId) are no-ops at the DB level. The recovery_credits
+  // and liquidation_economics rows are the canonical sourceId.
+  const liqSourceType = "liquidation_default_profit";
+  const liqSourceId = `liq_econ_${row.id}`;
   try {
     const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
-    if (holderShare > 0n) await creditHolderPoolDirect(holderShare);
+    if (holderShare > 0n) {
+      await creditHolderPoolDirect({
+        sourceType: liqSourceType,
+        sourceId: liqSourceId,
+        lamports: holderShare,
+        metadata: { loan_id: row.loan_id, collateral_symbol: row.collateral_symbol },
+      });
+    }
   } catch (err) {
     errors.push(`holder: ${err.message?.slice(0, 80)}`);
   }
   try {
     const { creditLpLoyaltyPoolDirect } = await import("./lp-loyalty.js");
-    if (lpShare > 0n) await creditLpLoyaltyPoolDirect(lpShare);
+    if (lpShare > 0n) {
+      await creditLpLoyaltyPoolDirect({
+        sourceType: liqSourceType,
+        sourceId: liqSourceId,
+        lamports: lpShare,
+        metadata: { loan_id: row.loan_id },
+      });
+    }
   } catch (err) {
     errors.push(`lp: ${err.message?.slice(0, 80)}`);
   }
@@ -286,9 +306,10 @@ async function distributeOne(row) {
     const { creditProtocolReserveDirect } = await import("./protocol-reserve.js");
     if (reserveShare > 0n) {
       await creditProtocolReserveDirect({
-        loanDbId: row.loan_id,
+        sourceType: liqSourceType,
+        sourceId: liqSourceId,
         lamports: reserveShare,
-        eventType: DEFAULT_PROFIT_EVENT_TYPE,
+        metadata: { loan_id: row.loan_id, event_type: DEFAULT_PROFIT_EVENT_TYPE },
       });
     }
   } catch (err) {
@@ -386,23 +407,36 @@ async function distributeRecoveryCredit(row) {
     return { ok: false, reason: "claim_lost_race" };
   }
 
-  // Holder + LP direct-credit are pure UPDATEs with no event-ledger
-  // (no ON CONFLICT, no idempotency key). If we ever retry a row whose
-  // holder credit already succeeded, the pool will double-credit.
-  // Therefore: the recovery_credits row is the SINGLE idempotency
-  // anchor. Mark it 'distributed' on the first claim regardless of
-  // per-pool failures, log+alert on any partial failure, and rely on
-  // a manual operator patch for the missing pool rather than retrying.
+  // Per-pool credits now go through pool_credit_events with
+  // UNIQUE(source_type, source_id, pool_kind), so retries are no-ops at
+  // the DB level. We still mark the row 'distributed' on first claim
+  // (forward-only state) for fast catalog reads.
+  const recSourceType = `recovery_${row.kind}`;
+  const recSourceId = `recovery_credit_${row.id}`;
   const errors = [];
   try {
     const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
-    if (holderShare > 0n) await creditHolderPoolDirect(holderShare);
+    if (holderShare > 0n) {
+      await creditHolderPoolDirect({
+        sourceType: recSourceType,
+        sourceId: recSourceId,
+        lamports: holderShare,
+        metadata: { recovery_credit_id: row.id },
+      });
+    }
   } catch (err) {
     errors.push(`holder: ${err.message?.slice(0, 80)}`);
   }
   try {
     const { creditLpLoyaltyPoolDirect } = await import("./lp-loyalty.js");
-    if (lpShare > 0n) await creditLpLoyaltyPoolDirect(lpShare);
+    if (lpShare > 0n) {
+      await creditLpLoyaltyPoolDirect({
+        sourceType: recSourceType,
+        sourceId: recSourceId,
+        lamports: lpShare,
+        metadata: { recovery_credit_id: row.id },
+      });
+    }
   } catch (err) {
     errors.push(`lp: ${err.message?.slice(0, 80)}`);
   }
@@ -410,9 +444,10 @@ async function distributeRecoveryCredit(row) {
     const { creditProtocolReserveDirect } = await import("./protocol-reserve.js");
     if (reserveShare > 0n) {
       await creditProtocolReserveDirect({
-        loanDbId: null,
+        sourceType: recSourceType,
+        sourceId: recSourceId,
         lamports: reserveShare,
-        eventType: `recovery_${row.kind}_${row.id}`,
+        metadata: { recovery_credit_id: row.id },
       });
     }
   } catch (err) {

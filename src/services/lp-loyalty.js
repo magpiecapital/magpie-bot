@@ -78,50 +78,61 @@ function loadLenderKeypair() {
 }
 
 /**
- * Hook called on every loan fee event. Accrues 2% of the fee to the
- * loyalty pool. Idempotent NOT guaranteed — caller must ensure they
- * call once per fee event (recordLoan + executeExtendLoan handle this).
+ * Hook called on every loan fee event. Accrues the loyalty bps share
+ * via the pool_credit_events ledger (UNIQUE per source). Repeat calls
+ * with the same (sourceType, sourceId) are no-ops.
+ *
+ * REQUIRED: sourceType + sourceId. See
+ * feedback_pool_credits_must_be_idempotent_at_db_level.md.
  */
-export async function accrueToLpLoyaltyPool(feeLamports) {
+export async function accrueToLpLoyaltyPool(feeLamports, { sourceType, sourceId } = {}) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[lp-loyalty] CRIT accrueToLpLoyaltyPool called WITHOUT sourceType/sourceId — refusing. fee=${fee}`);
+    return null;
+  }
   const liveBps = await getLpLoyaltyRewardBps();
   const reward = (fee * BigInt(liveBps)) / 10_000n;
   if (reward <= 0n) return null;
-  try {
-    await query(
-      `UPDATE lp_loyalty_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
-              updated_at = NOW()
-        WHERE id = 1`,
-      [reward.toString()],
-    );
-    return reward;
-  } catch (err) {
-    console.error("[lp-loyalty] accrual failed:", err.message);
-    return null;
-  }
+  return await creditLpLoyaltyPoolDirect({
+    sourceType,
+    sourceId,
+    lamports: reward,
+    metadata: { fee_lamports: fee.toString(), bps: liveBps },
+  });
 }
 
 /**
  * Credit a pre-computed lamport amount directly to the LP loyalty
- * pool. Mirror of magpie-holder-rewards.creditHolderPoolDirect — for
- * callers (like the Phase 2 liquidation-distribution-watcher) that
- * already computed the exact share and don't want fee*bps math
- * applied again. Idempotency is the caller's job.
+ * pool. Idempotency enforced by pool_credit_events.UNIQUE(source_type,
+ * source_id, pool_kind='lp_loyalty'). Repeat calls are no-ops.
+ *
+ * REQUIRED: sourceType + sourceId.
  */
-export async function creditLpLoyaltyPoolDirect(lamports) {
-  const amt = BigInt(lamports);
+export async function creditLpLoyaltyPoolDirect({ sourceType, sourceId, lamports, metadata } = {}) {
+  const amt = BigInt(lamports || 0);
   if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[lp-loyalty] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
   try {
-    await query(
-      `UPDATE lp_loyalty_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'lp_loyalty', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE lp_loyalty_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
               updated_at = NOW()
-        WHERE id = 1`,
-      [amt.toString()],
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
     );
-    return amt;
+    return rows.length > 0 ? amt : null;
   } catch (err) {
     console.error("[lp-loyalty] direct credit failed:", err.message);
     return null;

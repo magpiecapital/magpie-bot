@@ -142,39 +142,52 @@ function loadLenderKeypair() {
 /**
  * Credit a pre-computed lamport amount directly to the holder pool.
  *
- * Unlike accrueToHolderPool which interprets its input as a loan-fee
- * and applies the live bps fraction, this is for callers that have
- * already done the fraction math and want the EXACT amount credited.
+ * Idempotency is enforced at the DB level via the pool_credit_events
+ * ledger UNIQUE(source_type, source_id, pool_kind='holder'). A repeat
+ * call with the same (sourceType, sourceId) is a no-op — the UPDATE
+ * only fires when the INSERT actually inserts a row.
  *
- * Used by the Phase 2 liquidation-distribution-watcher to route the
- * pre-computed holder share of a defaulted-loan's net profit (which
- * may be 70% of the profit, or 80% when the borrower has no referrer
- * and the referrer slice rolls back to holders).
- *
- * Idempotency must be enforced by the caller — this primitive just
- * does the UPDATE.
+ * REQUIRED: sourceType + sourceId. Callers without a stable
+ * identity must mint one (e.g. tx_sig + slice index) — bare credits
+ * without ledger gating are forbidden after the 2026-06-18 PM P0.
+ * See feedback_pool_credits_must_be_idempotent_at_db_level.md.
  */
-export async function creditHolderPoolDirect(lamports) {
-  const amt = BigInt(lamports);
+export async function creditHolderPoolDirect({ sourceType, sourceId, lamports, metadata } = {}) {
+  const amt = BigInt(lamports || 0);
   if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[holder-rewards] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
   try {
-    await query(
-      `UPDATE magpie_holder_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'holder', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE magpie_holder_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
               updated_at = NOW()
-        WHERE id = 1`,
-      [amt.toString()],
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
     );
-    return amt;
+    return rows.length > 0 ? amt : null;
   } catch (err) {
     console.error("[holder-rewards] direct credit failed:", err.message);
     return null;
   }
 }
 
-export async function accrueToHolderPool(feeLamports) {
+export async function accrueToHolderPool(feeLamports, { sourceType, sourceId } = {}) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[holder-rewards] CRIT accrueToHolderPool called WITHOUT sourceType/sourceId — refusing. fee=${fee}`);
+    return null;
+  }
   // Read the LIVE bps from governance_config (autopilot will flip
   // this from 10% to 70% the moment MGP-001 ratifies — accrual on
   // every subsequent fee event picks up the new rate without a
@@ -182,19 +195,12 @@ export async function accrueToHolderPool(feeLamports) {
   const liveBps = await getHolderRewardBps();
   const reward = (fee * BigInt(Math.round(liveBps))) / 10_000n;
   if (reward <= 0n) return null;
-  try {
-    await query(
-      `UPDATE magpie_holder_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
-              updated_at = NOW()
-        WHERE id = 1`,
-      [reward.toString()],
-    );
-    return reward;
-  } catch (err) {
-    console.error("[holder-rewards] accrual failed:", err.message);
-    return null;
-  }
+  return await creditHolderPoolDirect({
+    sourceType,
+    sourceId,
+    lamports: reward,
+    metadata: { fee_lamports: fee.toString(), bps: liveBps },
+  });
 }
 
 /**
