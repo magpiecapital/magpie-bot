@@ -542,6 +542,18 @@ async function tick(bot) {
           );
           if (!u?.telegram_id) {
             lastError = `user_has_no_telegram_id`;
+          } else if (Number(u.telegram_id) < 0) {
+            // Anonymous-wallet placeholder. Per operator rule
+            // [[feedback_anonymous_wallets_full_feature_parity_v4]],
+            // anonymous wallets get every V4 capability EXCEPT TG DMs.
+            // Mark terminal-failed immediately (no 5 retries) so we
+            // don't pump the TG API with chat-not-found 400s for every
+            // armed/fired/downside notification. The audit row stays
+            // for visibility; the row.attempt_count bump below
+            // (forced to MAX_ATTEMPTS) flips to status='failed'
+            // on the same tick.
+            lastError = `anonymous_wallet_no_dm`;
+            row.attempt_count = MAX_ATTEMPTS;
           } else {
             // Layer 3 — limit-close intervention needs an inline
             // keyboard so the borrower can tap a response. Keyboard
@@ -637,12 +649,31 @@ async function tick(bot) {
               kb.row().url("Open loan", "https://www.magpie.capital/dashboard");
               extra = { reply_markup: kb };
             }
-            await bot.api.sendMessage(Number(u.telegram_id), text, {
-              parse_mode: "Markdown",
-              disable_web_page_preview: true,
-              ...extra,
-            });
-            success = true;
+            try {
+              await bot.api.sendMessage(Number(u.telegram_id), text, {
+                parse_mode: "Markdown",
+                disable_web_page_preview: true,
+                ...extra,
+              });
+              success = true;
+            } catch (sendErr) {
+              // Markdown parse error fallback: TG occasionally rejects
+              // bodies that look fine to us because of stray underscores
+              // in addresses / mints / loan IDs. The user is better off
+              // getting raw text (with literal asterisks) than losing
+              // the notification entirely.
+              if (
+                String(sendErr?.message || "").includes("can't parse entities")
+              ) {
+                await bot.api.sendMessage(Number(u.telegram_id), text, {
+                  disable_web_page_preview: true,
+                  ...extra,
+                });
+                success = true;
+              } else {
+                throw sendErr;
+              }
+            }
           }
         }
       }
