@@ -873,7 +873,36 @@ export async function handleCosignBorrow(req) {
       const borrowerAccountKey = magpieIx.keys[8]?.pubkey;
       if (loanAccountKey && borrowerAccountKey) {
         recordedLoanPda = loanAccountKey.toBase58();
-        const onChainLoan = await program.account.loan.fetch(loanAccountKey);
+        // RPC propagation race: the tx confirmed but our read RPC
+        // may still return null for ~1-3s. Single-shot was responsible
+        // for the 2026-06-18 V4 SPCX silent-loan loss (operator's
+        // wallet 3LfT7WLc — loan_id 116769228150579532, loan_pda
+        // 3FkFJ91i...). Retry 4× with exponential backoff (0.5s, 1s,
+        // 2s, 4s = ~7.5s total) before falling back to the warn path.
+        // See feedback_no_loan_slips_through.md.
+        let onChainLoan = null;
+        let fetchErr = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            onChainLoan = await program.account.loan.fetch(loanAccountKey);
+            break;
+          } catch (e) {
+            fetchErr = e;
+            const delayMs = 500 * Math.pow(2, attempt);
+            console.warn(
+              `[cosign-borrow] loan.fetch attempt ${attempt + 1}/4 for ${recordedLoanPda.slice(0, 8)}… failed (${e.message?.slice(0, 60)}) — retrying in ${delayMs}ms`,
+            );
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
+        }
+        if (!onChainLoan) {
+          // Final failure. Throw so the outer catch surfaces the
+          // sig + loan_pda LOUDLY in logs — invisible loans must be
+          // diagnosable in retrospect.
+          throw new Error(
+            `loan.fetch failed after 4 retries for loan_pda=${recordedLoanPda} sig=${signature}: ${fetchErr?.message?.slice(0, 120)}`,
+          );
+        }
         const borrowerStr = borrowerAccountKey.toBase58();
         // Same TG-preferring resolver as the proposed-loan-lamports gate
         // above. Both must agree or recordLoan attributes to a different
@@ -914,9 +943,14 @@ export async function handleCosignBorrow(req) {
     }
   } catch (err) {
     // Don't fail the request — the on-chain tx already succeeded.
-    // sync-loan from the site (or the every-5-min reconciler) will
-    // fold this into DB shortly.
-    console.warn("[cosign-borrow] post-submit recordLoan failed (sync-loan will catch up):", err.message);
+    // sync-loan from the site (or the wallet-backfill safety net)
+    // will fold this into DB shortly. Log LOUDLY with sig + loan_pda
+    // + chosenProgramId so the next operator search ("why didn't my
+    // loan land?") can find this in logs. See
+    // feedback_no_loan_slips_through.md.
+    console.error(
+      `[cosign-borrow] CRITICAL post-submit recordLoan failed — silent-loan risk. sig=${signature} loan_pda=${recordedLoanPda} program=${chosenProgramId.toBase58()} err=${err.message?.slice(0, 200)}\nstack=${err.stack?.slice(0, 400)}`,
+    );
   }
 
   return {
