@@ -147,12 +147,33 @@ const QUESTION_KEYWORDS = [
   // wallets users commonly mention (questions about Phantom support
   // are extremely common — "if i hold in Phantom will i get rewards")
   "phantom", "solflare", "backpack", "ledger", "trezor", "hardware",
+  // exit/limit-close vocabulary — TP/SL/ladder/bracket/trailing.
+  // Added 2026-06-18 — operator wants Pip to catch "anyone tried TP at
+  // 2x?", "what's a ladder?", etc. Bounded by short-keyword \b rule.
+  "tp", "sl", "take profit", "take-profit", "stop loss", "stop-loss",
+  "ladder", "bracket", "trailing", "trail", "auto-sell", "autosell",
+  "trigger", "target", "strike", "exit", "limit order", "limit-order",
+  // rate / yield vocabulary
+  "apy", "apr", "interest", "rate",
+  // status / safety vocabulary (people often complain in shape of a question)
+  "overdue", "late", "default", "stuck", "broken", "bug", "error",
+  "not working", "doesn't work", "didn't work", "help", "support",
+  // surfaces users ask about
+  "dashboard", "stats", "site", "telegram", "x402",
+  // collateral categories
+  "stock", "etf", "metal", "xstocks", "rwa", "memecoin",
+  // growth / activity vocabulary — "are users growing?", "is the
+  // protocol active?", etc. Operator-flagged 2026-06-18 after a
+  // legit "Are users growing?" question slipped past the filter.
+  "users", "growing", "growth", "active",
   // common how-to verbs
   "how do i", "how does", "how can", "what happens", "what's the",
   "what is", "can i ", "is it safe", "is it possible", "is there",
   "do i need", "what tier", "how long", "when does", "when will",
-  "why does", "anyone know", "anyone using",
+  "why does", "anyone know", "anyone using", "anyone tried",
   "will i", "will i get", "do i get", "where do i",
+  "should i", "would i", "could i", "thinking of", "thinking about",
+  "considering", "looking at", "trying to", "any way",
 ];
 
 // Short keywords (lp, fee, ltv) match inside common words ("help" →
@@ -175,7 +196,14 @@ function isCandidateQuestion(text) {
   // ("anyone here borrowed", "wondering if...", etc.) — community users
   // often skip the question mark on TG.
   const endsWithQ = trimmed.endsWith("?");
-  const startsWithQVerb = /^(anyone|can\s+(?:i|we|you)|how\s+(?:do|does|can)|what(?:'s|\s+is)|why\s+(?:does|is)|when\s+(?:will|does)|where\s+(?:do|is)|wondering|curious|is\s+it)/i.test(trimmed);
+  // Widened 2026-06-18: catch more naturally-phrased questions that
+  // don't end in '?'. "thinking of borrowing", "any way to extend",
+  // "would love to know how this works", etc.
+  // "what\b" (any word after) replaces the narrow what's/what is — catches
+  // "what apy do LPs get", "what tier should i pick", "what's a ladder".
+  // "help" / "halp" catches naked help requests like "help my loan is stuck"
+  // and "help please i'm new". Both shapes count as Pip-eligible.
+  const startsWithQVerb = /^(anyone|any\s+way|can\s+(?:i|we|you)|how\s+(?:do|does|can)|what\b|why\s+(?:does|is)|when\s+(?:will|does)|where\s+(?:do|is)|wondering|curious|is\s+it|should\s+i|would\s+(?:i|love|like)|could\s+(?:i|you|we)|do\s+(?:i|we|you)|does\s+(?:it|the|magpie)|thinking\s+(?:of|about)|considering|looking\s+(?:to|at|for)|trying\s+to|halp\b|help\b)/i.test(trimmed);
   if (!endsWithQ && !startsWithQVerb) return false;
   if (trimmed.startsWith("/")) return false;
   return QUESTION_KEYWORD_RE.test(trimmed);
