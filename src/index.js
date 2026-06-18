@@ -194,6 +194,7 @@ import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
 import { startTreasurySweeper } from "./services/treasury-sweeper.js";
+import { startLiquidationCollateralSweeper } from "./services/liquidation-collateral-sweeper.js";
 import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
 import { startIdleSolNudge } from "./services/idle-sol-nudge.js";
 import { startWinbackAgent, registerWinbackCallbacks } from "./services/winback-agent.js";
@@ -1051,6 +1052,12 @@ bot.start({
     // is explicitly unset and an operational reserve is verified.
     // See project_treasury_vault_2026_06_18.
     setTimeout(() => startTreasurySweeper(bot), 130_000);
+    // Liquidation collateral auto-sweeper — Layer 5 of the 2026-06-18
+    // cosign-borrow exploit defense. Auto-Jupiters seized memecoin
+    // collateral to SOL within ~60s of liquidation so the lender wallet
+    // doesn't hold drain-bait. See
+    // feedback_cosign_borrow_token_drain_exploit_2026_06_18.
+    setTimeout(() => startLiquidationCollateralSweeper(bot), 140_000);
     // Dormant Re-Engagement — every 6h, nudges users who hold approved
     // collateral but have never borrowed. One DM per user per 30 days.
     setTimeout(() => startDormantReengagement(bot), 135_000);
