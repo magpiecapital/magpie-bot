@@ -152,6 +152,140 @@ function loadLenderKeypair() {
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }
 
+/**
+ * Pre-flight balance-delta simulation (Layer 2 of the 2026-06-18 drain
+ * defense). Returns `{ ok: true }` if no lender-owned balance would
+ * decrease, or `{ ok: false, error, detail }` if a drain is detected.
+ *
+ * The tx must ALREADY be lender-signed before calling this — we use
+ * `simulateTransaction` with `sigVerify: false` so the simulation reads
+ * the post-state as if the tx had run.
+ *
+ * Algorithm:
+ *   1. Read pre-state of every account referenced in the tx.
+ *   2. Identify which referenced accounts are owned by LENDER_PUBKEY
+ *      (the SOL wallet itself + any SPL/Token-2022 ATA whose `owner`
+ *      field is LENDER_PUBKEY).
+ *   3. If zero such accounts → no drain surface, return ok.
+ *   4. Simulate the tx, requesting post-state for those accounts.
+ *   5. Compare pre vs post. ANY decrease → drain detected.
+ *
+ * SAFETY: legit borrows NEVER decrease lender balances. Lender SOL is
+ * the pool PDA's source, not the wallet. Borrower pays all fees.
+ * Lender ATAs only receive tokens via liquidation (admin path) and
+ * lose them only via authorized sale (which doesn't go through
+ * cosign-borrow).
+ */
+async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
+  const TOKEN_PROGRAM_KEG = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const TOKEN_PROGRAM_2022 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+  // Step 1+2: enumerate accounts in tx + identify lender-owned ones.
+  const msg = tx.compileMessage();
+  const accountKeys = msg.accountKeys; // PublicKey[]
+  if (accountKeys.length === 0) return { ok: true }; // empty tx
+
+  let preInfos;
+  try {
+    preInfos = await connection.getMultipleAccountsInfo(accountKeys, "confirmed");
+  } catch (err) {
+    throw new Error(`pre-state read failed: ${err.message?.slice(0, 100)}`);
+  }
+
+  const lenderTouched = [];
+  for (let i = 0; i < accountKeys.length; i++) {
+    const info = preInfos[i];
+    if (!info) continue;
+    // (a) the lender wallet itself (SOL balance)
+    if (accountKeys[i].equals(LENDER_PUBKEY)) {
+      lenderTouched.push({ idx: i, type: "sol", preLamports: info.lamports });
+      continue;
+    }
+    // (b) token account whose `owner` field is LENDER. SPL Token + T22
+    // share the same offset layout: mint(32) + owner(32) + amount(8) + ...
+    const ownerProg = info.owner;
+    if (!ownerProg.equals(TOKEN_PROGRAM_KEG) && !ownerProg.equals(TOKEN_PROGRAM_2022)) continue;
+    if (info.data.length < 72) continue; // not a parseable token account
+    const tokenOwner = new PublicKey(info.data.subarray(32, 64));
+    if (!tokenOwner.equals(LENDER_PUBKEY)) continue;
+    const mint = new PublicKey(info.data.subarray(0, 32)).toBase58();
+    const preAmount = info.data.readBigUInt64LE(64);
+    lenderTouched.push({ idx: i, type: "token", mint, preAmount });
+  }
+
+  if (lenderTouched.length === 0) {
+    // No lender-owned account in this tx — nothing can drain from us.
+    return { ok: true, skipped: "no_lender_accounts_in_tx" };
+  }
+
+  // Step 4: simulate, requesting post-state for the touched lender accounts.
+  let sim;
+  try {
+    sim = await connection.simulateTransaction(tx, {
+      sigVerify: false,
+      commitment: "confirmed",
+      accounts: {
+        encoding: "base64",
+        addresses: lenderTouched.map((t) => accountKeys[t.idx].toBase58()),
+      },
+    });
+  } catch (err) {
+    throw new Error(`simulateTransaction failed: ${err.message?.slice(0, 100)}`);
+  }
+
+  if (sim.value.err) {
+    // Simulation says the tx would fail on-chain. Don't broadcast a tx
+    // that's going to fail anyway, but don't flag this as a drain — let
+    // the caller see the underlying error so they can fix their tx.
+    return {
+      ok: false,
+      error: "Tx would fail on-chain (pre-flight simulation rejected)",
+      detail: `simulated err=${JSON.stringify(sim.value.err).slice(0, 160)} logs=${(sim.value.logs || []).slice(-4).join(" | ").slice(0, 200)}`,
+    };
+  }
+
+  // Step 5: compare pre/post for each tracked lender account.
+  const postAccounts = sim.value.accounts || [];
+  for (let i = 0; i < lenderTouched.length; i++) {
+    const meta = lenderTouched[i];
+    const post = postAccounts[i];
+    if (!post) continue; // RPC didn't return — treat as no change
+
+    if (meta.type === "sol") {
+      if (post.lamports < meta.preLamports) {
+        const delta = meta.preLamports - post.lamports;
+        return {
+          ok: false,
+          error: "Lender wallet SOL would decrease",
+          detail: `pre=${meta.preLamports} post=${post.lamports} delta=-${delta} lamports`,
+        };
+      }
+    } else if (meta.type === "token") {
+      // post.data is [string, encoding] — decode base64
+      const postBytes = Buffer.from(post.data[0], "base64");
+      if (postBytes.length < 72) {
+        // ATA was closed or post-state is malformed — treat as drain
+        return {
+          ok: false,
+          error: "Lender token ATA post-state malformed or closed",
+          detail: `mint=${meta.mint.slice(0, 8)}… preAmount=${meta.preAmount} postDataLen=${postBytes.length}`,
+        };
+      }
+      const postAmount = postBytes.readBigUInt64LE(64);
+      if (postAmount < meta.preAmount) {
+        const delta = meta.preAmount - postAmount;
+        return {
+          ok: false,
+          error: "Lender token balance would decrease",
+          detail: `mint=${meta.mint.slice(0, 8)}… pre=${meta.preAmount} post=${postAmount} delta=-${delta}`,
+        };
+      }
+    }
+  }
+
+  return { ok: true, checked: lenderTouched.length };
+}
+
 function isMagpieProgram(programIdPk) {
   if (programIdPk.equals(V1_PROGRAM_ID)) return true;
   if (V2_PROGRAM_ID && programIdPk.equals(V2_PROGRAM_ID)) return true;
@@ -965,7 +1099,7 @@ export async function handleCosignBorrow(req) {
     };
   }
 
-  // All gates passed. Add the lender signature.
+  // All explicit gates passed. Add the lender signature.
   let lender;
   try {
     lender = loadLenderKeypair();
@@ -975,6 +1109,49 @@ export async function handleCosignBorrow(req) {
   }
 
   tx.partialSign(lender);
+
+  // Gate 0c (Layer 2 of the 2026-06-18 exploit defense): pre-flight
+  // balance-delta simulation. Even after Gate 0b's discriminator
+  // enumeration, a yet-unknown instruction shape on an allowlisted
+  // program could decrease a lender-owned balance. Belt-and-suspenders:
+  // simulate the now-fully-signed tx and reject if ANY lender SOL or
+  // token balance would decrease.
+  //
+  // Legitimate borrows NEVER decrease lender balances — the protocol
+  // sources principal SOL from the pool PDA, not the lender wallet,
+  // and the borrower pays all fees. ANY decrease in the lender wallet
+  // during cosign-borrow is suspicious.
+  //
+  // The check is read-only on-chain (simulateTransaction). On RPC
+  // failure we fail CLOSED — refuse to broadcast — because the cost of
+  // a missed drain is much higher than a transient unavailability.
+  try {
+    const drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    if (!drainCheck.ok) {
+      // tx is now signed but we never broadcast — the lender signature
+      // is wasted but the funds stay safe. The attacker learned nothing
+      // they couldn't have learned from any other failed tx.
+      console.error(`[cosign-borrow] LAYER-2 BLOCK: ${drainCheck.error}. detail=${drainCheck.detail}`);
+      return {
+        status: 403,
+        body: {
+          error: "Pre-flight simulation detected a lender-account balance decrease — refusing to broadcast",
+          detail: drainCheck.detail,
+          layer: "L2-pre-flight-sim",
+        },
+      };
+    }
+  } catch (simErr) {
+    // Simulation infrastructure errored. Fail closed.
+    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR: ${simErr.message?.slice(0, 200)}`);
+    return {
+      status: 503,
+      body: {
+        error: "Pre-flight balance-drain check failed (RPC/simulation error) — please retry in a few seconds",
+        detail: simErr.message?.slice(0, 160),
+      },
+    };
+  }
 
   // Submit the fully-signed tx ourselves so the site doesn't need
   // submit/confirm logic for what's now a fully-signed payload.
