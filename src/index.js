@@ -193,6 +193,7 @@ import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
+import { startTreasurySweeper } from "./services/treasury-sweeper.js";
 import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
 import { startIdleSolNudge } from "./services/idle-sol-nudge.js";
 import { startWinbackAgent, registerWinbackCallbacks } from "./services/winback-agent.js";
@@ -293,6 +294,12 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
   // tail + arm-attempt audit). Read-only diagnostic.
   const v4Status = await import("./commands/v4-status.js");
   bot.command(["v4-status", "v4status", "v4_status"], v4Status.handleV4Status);
+  // Treasury sweeper observability (operator-facing). Read-only.
+  const treasuryStatus = await import("./commands/treasury-status.js");
+  bot.command(
+    ["treasury-status", "treasurystatus", "treasury_status", "treasury"],
+    treasuryStatus.handleTreasuryStatus,
+  );
   const scanImp = await import("./commands/scan-impersonators.js");
   bot.command(
     ["scan-impersonators", "scanimpersonators", "scan_impersonators"],
@@ -1039,6 +1046,13 @@ bot.start({
     // autonomously instead of pinging admin. Critical-reason tickets
     // (security/bug) skipped — those go to admin as designed.
     setTimeout(() => startAutoTicketResolver(bot), 120_000);
+    // Treasury sweeper — periodically moves accumulated fees from the
+    // lender wallet to the hardware-key-controlled treasury vault so a
+    // compromise of the hot key bounds the lifetime-fee-drain loss to
+    // a single sweep window. Disabled until TREASURY_SWEEP_DISABLED
+    // is explicitly unset and an operational reserve is verified.
+    // See project_treasury_vault_2026_06_18.
+    setTimeout(() => startTreasurySweeper(bot), 130_000);
     // Dormant Re-Engagement — every 6h, nudges users who hold approved
     // collateral but have never borrowed. One DM per user per 30 days.
     setTimeout(() => startDormantReengagement(bot), 135_000);
