@@ -51,7 +51,7 @@ import {
   Keypair,
 } from "@solana/web3.js";
 import fs from "node:fs";
-import path from "node:path";
+import bs58 from "bs58";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { getAdminId } from "./admin-notify.js";
@@ -102,24 +102,27 @@ let consecutiveFailures = 0;
 let lenderKeypairCache = null;
 function loadLenderKeypair() {
   if (lenderKeypairCache) return lenderKeypairCache;
-  // Prefer the env var pointing at the JSON file; fall back to local
-  // dev path. NEVER read the file path from a user-controlled source.
-  const candidatePaths = [
-    process.env.LENDER_KEYPAIR_PATH,
-    "lender-keypair.json",
-    "./lender-keypair.json",
-  ].filter(Boolean);
-  for (const p of candidatePaths) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-      const kp = Keypair.fromSecretKey(Uint8Array.from(raw));
-      lenderKeypairCache = kp;
-      return kp;
-    } catch { /* try next */ }
+  // Match the loader pattern used by src/services/price-attestor.js:
+  // prefer the env-var-encoded private key (production / Railway has
+  // no on-disk keypair file), fall back to LENDER_KEYPAIR_PATH for
+  // local dev. EXPLICITLY refuses the CWD-relative fallback so an
+  // attacker who can plant a file in cwd can't trick the sweeper into
+  // using it.
+  const b58 = process.env.LENDER_PRIVATE_KEY;
+  if (b58) {
+    const decode = bs58.decode || (bs58.default && bs58.default.decode);
+    lenderKeypairCache = Keypair.fromSecretKey(decode(b58));
+    return lenderKeypairCache;
   }
-  throw new Error(
-    "treasury-sweeper: lender keypair file not found. Set LENDER_KEYPAIR_PATH or place lender-keypair.json in cwd.",
-  );
+  const kpPath = process.env.LENDER_KEYPAIR_PATH;
+  if (!kpPath) {
+    throw new Error(
+      "treasury-sweeper: LENDER_PRIVATE_KEY or LENDER_KEYPAIR_PATH must be set — refusing the CWD-relative fallback. Set the env var.",
+    );
+  }
+  const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
+  lenderKeypairCache = Keypair.fromSecretKey(new Uint8Array(raw));
+  return lenderKeypairCache;
 }
 
 // ─── DB helpers ───────────────────────────────────────────────────
