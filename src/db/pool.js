@@ -962,6 +962,63 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS pending_arms_pending_idx ON pending_arms(status, envelope_issued_at) WHERE status = 'pending'`,
     `CREATE INDEX IF NOT EXISTS pending_arms_wallet_idx ON pending_arms(wallet, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS pending_arms_loan_id_idx ON pending_arms(loan_id_chain) WHERE status IN ('pending', 'armed')`,
+
+    // ─────────── UNIFIED DISTRIBUTION ACCOUNTING (2026-06-18) ───────────
+    // Operator-mandated 2026-06-18: every SOL distribution Magpie makes
+    // to stakeholders — holder rewards, governance ratifications, LP
+    // loyalty, yield, loan remediation — gets one row here. This is the
+    // canonical investor-facing roll-up sitting OVER the per-kind detail
+    // tables (which remain the source of truth for per-wallet payouts).
+    //
+    // Why a new table instead of extending magpie_holder_distributions:
+    // that table has a 6-field schema tightly coupled to holder-reward
+    // mechanics. A unified table needs to cover governance (weight-based
+    // denominator), LP-loyalty (share-seconds), yield (LP pro-rata), etc.
+    // Cleaner to ship a new layer than to retrofit.
+    //
+    // The per-kind tables stay as the source of truth for per-wallet
+    // detail (governance_distributions, lp_loyalty_rewards,
+    // magpie_holder_rewards, etc.). This table is the joinable summary.
+    //
+    // See feedback_unified_distribution_accounting.md.
+    `CREATE TABLE IF NOT EXISTS distribution_events (
+       id                              BIGSERIAL PRIMARY KEY,
+       kind                            TEXT NOT NULL CHECK (kind IN (
+                                         'holder_reward','governance','lp_loyalty','yield','loan_remediation'
+                                       )),
+       external_ref                    TEXT NOT NULL,
+       snapshot_at                     TIMESTAMPTZ NOT NULL,
+       paid_first_at                   TIMESTAMPTZ,
+       paid_last_at                    TIMESTAMPTZ,
+       pool_lamports                   NUMERIC(30,0),
+       distributed_lamports            NUMERIC(30,0) NOT NULL DEFAULT 0,
+       unpaid_lamports                 NUMERIC(30,0) NOT NULL DEFAULT 0,
+       eligible_wallet_count           INTEGER       NOT NULL DEFAULT 0,
+       paid_wallet_count               INTEGER       NOT NULL DEFAULT 0,
+       unpayable_wallet_count          INTEGER       NOT NULL DEFAULT 0,
+       denominator_kind                TEXT,
+       denominator_value               NUMERIC(40,0),
+       min_payout_lamports             NUMERIC(30,0),
+       max_payout_lamports             NUMERIC(30,0),
+       median_payout_lamports          NUMERIC(30,0),
+       source_borrow_fees_lamports     NUMERIC(30,0) NOT NULL DEFAULT 0,
+       source_liquidation_lamports     NUMERIC(30,0) NOT NULL DEFAULT 0,
+       source_other_lamports           NUMERIC(30,0) NOT NULL DEFAULT 0,
+       plan_hash                       TEXT,
+       snapshot_hash                   TEXT,
+       sample_tx_signatures            TEXT[],
+       notes                           TEXT,
+       status                          TEXT NOT NULL DEFAULT 'planned'
+                                         CHECK (status IN ('planned','partial','complete','verified')),
+       metadata                        JSONB,
+       created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (kind, external_ref)
+     )`,
+    `CREATE INDEX IF NOT EXISTS distribution_events_kind_at_idx
+       ON distribution_events(kind, snapshot_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS distribution_events_at_idx
+       ON distribution_events(snapshot_at DESC)`,
   ];
   for (const sql of patches) {
     try {

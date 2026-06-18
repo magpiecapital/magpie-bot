@@ -1622,6 +1622,7 @@ const PUBLIC_ROUTES = new Set([
   // short-forms only, pure aggregates on protocol-pulse.
   "/api/v1/public/activity",
   "/api/v1/public/protocol-pulse",
+  "/api/v1/public/distributions",
   // Live x402 revenue + adoption — pure aggregates over the
   // x402_paid_calls log. No payer pubkeys surfaced, only counts +
   // SOL totals + per-endpoint breakdown.
@@ -1923,6 +1924,15 @@ async function router(req, res) {
       case "/api/v1/public/x402-metrics": {
         const { handleX402Metrics } = await import("./x402-metrics.js");
         result = await handleX402Metrics();
+        break;
+      }
+      case "/api/v1/public/distributions": {
+        // Unified investor-facing distribution roll-up.
+        // See feedback_unified_distribution_accounting.md.
+        const { listDistributionEventsPublic } = await import("../services/distribution-events.js");
+        const limit = url.searchParams.get("limit");
+        const { events, totals } = await listDistributionEventsPublic({ limit });
+        result = { status: 200, body: { ok: true, events, totals } };
         break;
       }
       case "/api/v1/internal/x402/record": {
