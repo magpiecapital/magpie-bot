@@ -293,6 +293,120 @@ export async function handleCosignBorrow(req) {
     }
   }
 
+  // Gate 0b (NEW, post-2026-06-18 exploit): generalized token-drain check.
+  //
+  // The 2026-06-18 PUMP-drain exploit bundled a `Token-2022 TransferChecked`
+  // with a legit-looking V1 RequestAndFundLoan in the same tx. Token
+  // programs were on the allowlist for legitimate collateral movement,
+  // but no check ensured the SOURCE wasn't a lender-owned ATA. The lender
+  // signature added by tx.partialSign(lender) below would have authorized
+  // both the borrow AND the drain in the same atomic op.
+  //
+  // Fix: for every outer Tokenkeg or Token-2022 transfer/transferChecked,
+  // resolve the source account on-chain and reject if it's owned by
+  // LENDER_PUBKEY. Burn / Approve / SetAuthority / CloseAccount also count
+  // because they all let the authority drain or relinquish control. We
+  // reject them by instruction discriminator too.
+  //
+  // See feedback_cosign_borrow_token_drain_exploit_2026_06_18.md
+  // (also Layer 2 below: pre-flight balance-delta simulation).
+  const TOKEN_PROGRAM_STRS = new Set([
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  ]);
+  // Instruction discriminators (first byte of data) that touch the source
+  // account's balance/authority. SPL Token + Token-2022 share these codes.
+  //   3  Transfer            (legacy — deprecated but still works)
+  //   4  Approve             (delegates authority)
+  //   5  Revoke
+  //   6  SetAuthority
+  //   7  MintTo              (skipping — source is mint, not an ATA)
+  //   8  Burn
+  //   9  CloseAccount
+  //  12  TransferChecked
+  //  13  ApproveChecked
+  //  14  MintToChecked       (skipping for same reason)
+  //  15  BurnChecked
+  // Token-2022 adds:
+  //  27  TransferCheckedWithFee
+  // Approve / Revoke / SetAuthority give a future drain capability even
+  // if no immediate balance change — we treat them as if they drained.
+  const DRAIN_CAPABLE_OPS = new Set([3, 4, 5, 6, 8, 9, 12, 13, 15, 27]);
+  const lenderSourceIxs = [];
+  for (let i = 0; i < tx.instructions.length; i++) {
+    const ix = tx.instructions[i];
+    const programIdStr = ix.programId.toBase58();
+    if (!TOKEN_PROGRAM_STRS.has(programIdStr)) continue;
+    if (!ix.data || ix.data.length < 1) continue;
+    const code = ix.data[0];
+    if (!DRAIN_CAPABLE_OPS.has(code)) continue;
+    const sourceAccount = ix.keys?.[0]?.pubkey;
+    if (!sourceAccount) continue;
+    lenderSourceIxs.push({ index: i, source: sourceAccount, code, program: programIdStr });
+  }
+
+  if (lenderSourceIxs.length > 0) {
+    let infos;
+    try {
+      infos = await connection.getMultipleAccountsInfo(
+        lenderSourceIxs.map((t) => t.source),
+        "confirmed",
+      );
+    } catch (rpcErr) {
+      // Fail CLOSED — if we can't verify the sources, refuse the cosign.
+      // Operator can retry; an RPC blip is preferable to a drain.
+      console.error("[cosign-borrow] DRAIN-CHECK RPC failure — failing closed:", rpcErr.message);
+      return {
+        status: 503,
+        body: {
+          error: "Couldn't verify token-source ownership (RPC blip) — please retry in a few seconds",
+          detail: rpcErr.message?.slice(0, 160),
+        },
+      };
+    }
+    for (let i = 0; i < lenderSourceIxs.length; i++) {
+      const t = lenderSourceIxs[i];
+      const info = infos[i];
+      if (!info) {
+        // Source ATA doesn't exist on-chain yet. Either it's being
+        // created in this same tx (CreateATA earlier in the ix list) or
+        // the tx will fail when the program tries to read from a missing
+        // account. Either way it can't drain anything that isn't there.
+        continue;
+      }
+      // SPL Token and Token-2022 token-account layouts both have:
+      //   mint  (32 bytes, offset 0)
+      //   owner (32 bytes, offset 32)
+      // The minimum token account size is 165 bytes; T22 with extensions
+      // can be larger. Anything smaller isn't a token account at all.
+      if (info.data.length < 165) {
+        console.error(`[cosign-borrow] DRAIN-CHECK: ix[${t.index}] source ${t.source.toBase58().slice(0, 8)}… data too small (${info.data.length} bytes) — not a token account, rejecting`);
+        return {
+          status: 403,
+          body: {
+            error: "Token instruction with non-token-account source is not allowed",
+            detail: `outer ix[${t.index}] source account is not a parseable token account (size ${info.data.length} < 165)`,
+            rejected_index: t.index,
+          },
+        };
+      }
+      const sourceOwner = new PublicKey(info.data.subarray(32, 64));
+      if (sourceOwner.equals(LENDER_PUBKEY)) {
+        console.error(`[cosign-borrow] DRAIN-ATTEMPT BLOCKED: outer token ix[${t.index}] code=${t.code} sources from lender-owned ATA ${t.source.toBase58()}`);
+        return {
+          status: 403,
+          body: {
+            error: "Token instruction sourcing from lender-owned account is not allowed",
+            detail: `outer instruction ${t.index} (program=${t.program.slice(0, 8)}… code=${t.code}) targets a token account owned by the lender authority — would drain tokens (same exploit class as the 2026-06-07 SystemProgram drain and the 2026-06-18 Token-2022 drain)`,
+            rejected_index: t.index,
+            rejected_source: t.source.toBase58(),
+            rejected_op_code: t.code,
+          },
+        };
+      }
+    }
+  }
+
   // Gate 1: at least one magpie-program instruction must be present,
   //          and ALL magpie-program instructions must be allowed.
   //          Additionally: if the program is v2 (RWA pool), the
@@ -777,7 +891,7 @@ export async function handleCosignBorrow(req) {
         [mintStr],
       );
       if (mintRow) {
-        const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } =
+        const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds, ensureV4TwapReady } =
           await import("../services/price-attestor.js");
         const FRESH_THRESHOLD_SEC = 60;
         // V4-aware JIT attestation (2026-06-15): use the borrow tx's
@@ -787,16 +901,55 @@ export async function handleCosignBorrow(req) {
         // PDA was never initialized — bot's category routing never
         // reaches V4.
         const borrowProgramId = magpieIxForAttest.programId;
-        const age = await getPriceFeedAgeSeconds(mintStr, borrowProgramId);
-        if (age === null || age > FRESH_THRESHOLD_SEC) {
-          try {
-            await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
-          } catch (attestErr) {
-            if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-              await initializePriceFeed(mintStr, borrowProgramId);
+        const isV4Borrow =
+          process.env.PROGRAM_ID_V4 &&
+          borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4;
+
+        if (isV4Borrow) {
+          // V4 path: program's TWAP gate needs >= 8 samples within 300s
+          // OR `TwapInsufficientHistory` (Anchor 6016 / 0x1780) rejects
+          // the borrow. The single-shot freshness attest below is
+          // necessary but not sufficient — we MUST loop until the
+          // PriceHistory PDA has the count it needs. Operator-mandated
+          // 2026-06-18 PM, see
+          // [[feedback_twap_insufficient_history_never_again]].
+          const warm = await ensureV4TwapReady(
+            mintStr,
+            Number(mintRow.decimals),
+          );
+          if (!warm.ok) {
+            console.warn(
+              `[cosign-borrow] V4 TWAP warming TIMED OUT mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
+            );
+            return {
+              status: 503,
+              body: {
+                error:
+                  "Price oracle is warming up for this token (we need a few more samples in the rolling 5-min window). This usually clears in 30–45 seconds — please tap Borrow again.",
+                oracle_warming: true,
+                in_window: warm.inWindow,
+                required_in_window: 8,
+                retry_after_seconds: 30,
+              },
+            };
+          }
+          console.log(
+            `[cosign-borrow] V4 TWAP ready mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests}`,
+          );
+        } else {
+          // V1/V3 path: single-shot freshness check (PR was already
+          // adequate — no TWAP gate on legacy programs).
+          const age = await getPriceFeedAgeSeconds(mintStr, borrowProgramId);
+          if (age === null || age > FRESH_THRESHOLD_SEC) {
+            try {
               await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
-            } else {
-              throw attestErr;
+            } catch (attestErr) {
+              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+                await initializePriceFeed(mintStr, borrowProgramId);
+                await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
+              } else {
+                throw attestErr;
+              }
             }
           }
         }
