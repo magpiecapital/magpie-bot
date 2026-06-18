@@ -79,28 +79,45 @@ export async function accrueToProtocolReserve({ loanDbId, feeLamports, eventType
  * event_type like 'default_profit' so it doesn't collide with
  * the regular fee-side accrual.
  */
-export async function creditProtocolReserveDirect({ loanDbId, lamports, eventType }) {
-  const amt = BigInt(lamports);
+export async function creditProtocolReserveDirect(opts) {
+  // Accept either the new ledger-style ({sourceType, sourceId, lamports})
+  // OR the legacy ({loanDbId, eventType, lamports}) shape. New callers
+  // should use sourceType+sourceId; legacy callers are auto-mapped to
+  // sourceType='legacy_'+eventType, sourceId=String(loanDbId).
+  const lamports = opts?.lamports;
+  let { sourceType, sourceId, metadata } = opts || {};
+  if (!sourceType) {
+    const { loanDbId, eventType } = opts || {};
+    if (eventType) {
+      sourceType = `legacy_${eventType}`;
+      sourceId = String(loanDbId ?? "null");
+    }
+  }
+  const amt = BigInt(lamports || 0);
   if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[protocol-reserve] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
   try {
-    const ins = await query(
-      `INSERT INTO protocol_reserve_events
-         (loan_db_id, event_type, fee_lamports, reward_lamports, reward_bps)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (loan_db_id, event_type) DO NOTHING
-       RETURNING id`,
-      [loanDbId, eventType, amt.toString(), amt.toString(), 10000],
-    );
-    if (ins.rows.length === 0) return null; // duplicate — already accrued
-    await query(
-      `UPDATE protocol_reserve_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
+    // Dual-write: pool_credit_events is the canonical idempotency ledger,
+    // protocol_reserve_events stays for backward-compat readers.
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'protocol_reserve', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE protocol_reserve_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
               last_accrual_at = NOW(),
               updated_at = NOW()
-        WHERE id = 1`,
-      [amt.toString()],
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
     );
-    return amt;
+    return rows.length > 0 ? amt : null;
   } catch (err) {
     console.error("[protocol-reserve] direct credit failed:", err.message);
     return null;

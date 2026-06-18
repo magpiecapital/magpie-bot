@@ -108,12 +108,12 @@ async function tick() {
         console.warn(`[limit-close-accrual] referral accrual failed for order ${row.id}:`, err.message);
       }
       try {
-        await accrueToHolderPool(feeLamports);
+        await accrueToHolderPool(feeLamports, { sourceType: "limit_close_fee", sourceId: `lc_order_${row.id}` });
       } catch (err) {
         console.warn(`[limit-close-accrual] holder accrual failed for order ${row.id}:`, err.message);
       }
       try {
-        await accrueToLpLoyaltyPool(feeLamports);
+        await accrueToLpLoyaltyPool(feeLamports, { sourceType: "limit_close_fee", sourceId: `lc_order_${row.id}` });
       } catch (err) {
         console.warn(`[limit-close-accrual] LP accrual failed for order ${row.id}:`, err.message);
       }

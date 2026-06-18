@@ -668,6 +668,63 @@ async function probeLenderWalletBalance(bot) {
 
 let _timer = null;
 
+/**
+ * Pool credit drift probe. Detects when pool.accrued_lamports grows
+ * faster than pool_credit_events.lamports would predict — the signature
+ * of any future regression of the 2026-06-18 PM holder over-credit bug.
+ *
+ * Tracks each tick: for each pool kind, compute
+ *   ledger_total = SUM(pool_credit_events.lamports WHERE pool_kind=X)
+ *   pool_actual  = pool.accrued_lamports
+ *   drift        = pool_actual - (last_tick_pool_actual + (ledger_total - last_tick_ledger_total))
+ *
+ * If drift is positive and exceeds the dust threshold for 2 consecutive
+ * ticks, CRIT alert — the pool is being credited from outside the
+ * ledger. If drift is negative, that's a distribution payout (expected).
+ */
+const _poolDriftState = new Map(); // pool_kind -> {lastPool, lastLedger}
+async function probePoolCreditDrift(bot) {
+  const KIND = "pool_credit_drift";
+  const DUST_TOLERANCE = 1_000_000n; // 0.001 SOL — covers floor-division rounding
+  try {
+    const pools = [
+      { kind: "holder", table: "magpie_holder_pool" },
+      { kind: "lp_loyalty", table: "lp_loyalty_pool" },
+      { kind: "protocol_reserve", table: "protocol_reserve_pool" },
+    ];
+    const offenders = [];
+    for (const p of pools) {
+      const pr = await query(`SELECT accrued_lamports::text v FROM ${p.table} WHERE id=1`).catch(() => null);
+      if (!pr || pr.rows.length === 0) continue;
+      const pool = BigInt(pr.rows[0].v);
+      const lr = await query(
+        `SELECT COALESCE(SUM(lamports), 0)::text v FROM pool_credit_events WHERE pool_kind = $1`,
+        [p.kind],
+      ).catch(() => ({ rows: [{ v: "0" }] }));
+      const ledger = BigInt(lr.rows[0].v);
+      const prev = _poolDriftState.get(p.kind);
+      _poolDriftState.set(p.kind, { lastPool: pool, lastLedger: ledger });
+      if (!prev) continue; // first tick — no delta yet
+      const poolDelta = pool - prev.lastPool;
+      const ledgerDelta = ledger - prev.lastLedger;
+      // Positive drift = pool grew more than the ledger says. That's the bug class.
+      const drift = poolDelta - ledgerDelta;
+      if (drift > DUST_TOLERANCE) {
+        offenders.push(`${p.kind} drifted +${(Number(drift) / 1e9).toFixed(4)} SOL beyond ledger (pool +${(Number(poolDelta) / 1e9).toFixed(4)} vs ledger +${(Number(ledgerDelta) / 1e9).toFixed(4)})`);
+      }
+    }
+    const isBad = offenders.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND, `pool credit drift detected: ${offenders.join("; ")}`, "crit");
+    } else {
+      await alertRecovery(bot, KIND, "pool credit drift cleared");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] pool_credit_drift probe error:", err.message?.slice(0, 160));
+  }
+}
+
 async function tick(bot) {
   try {
     await Promise.all([
@@ -682,6 +739,7 @@ async function tick(bot) {
       probeCreditCoverage(bot).catch((e) => console.warn("[self-monitor] credit_coverage probe threw:", e.message)),
       probeV4TwapHealth(bot).catch((e) => console.warn("[self-monitor] v4_twap_health probe threw:", e.message)),
       probeLenderWalletBalance(bot).catch((e) => console.warn("[self-monitor] lender_wallet_balance probe threw:", e.message)),
+      probePoolCreditDrift(bot).catch((e) => console.warn("[self-monitor] pool_credit_drift probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
