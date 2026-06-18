@@ -20,12 +20,14 @@
  *   - Operator-stated mandate: "make sure we have parameters in place
  *     for this to NEVER happen again." This is the parameter.
  *
- * Cadence: every 6 hours. Audit query is two LEFT JOINs over loans +
- * credit_events; both tables are indexed. Cheap.
+ * Cadence: every 1 hour (tightened from 6h on 2026-06-18 PM per
+ * operator request — once-a-shift was too slow when the self-monitor
+ * already surfaces the gap proactively, and the audit query is cheap
+ * enough to run hourly without measurable cost).
  *
- * Self-monitor probe (in self-monitor.js) reads the same query at every
- * 60s tick and DMs the operator if gap > 0, so the operator finds out
- * within a minute rather than waiting for the healer's 6h cadence.
+ * Self-monitor probe (in self-monitor.js) reads the same query every
+ * tick and DMs the operator if gap > 0, so the operator finds out
+ * within a minute rather than waiting for the healer's cadence.
  *
  * Security:
  *   - Read-only audit query + INSERT into credit_events + UPDATE on
@@ -36,7 +38,7 @@
  */
 import { query } from "../db/pool.js";
 
-const TICK_MS = 6 * 60 * 60_000; // 6h
+const TICK_MS = 60 * 60_000; // 1h (tightened 2026-06-18 PM)
 
 let _timer = null;
 
