@@ -542,30 +542,46 @@ export function startPriceAttestor(intervalMs = 30_000) {
         // legacy MAX_GAP_MS. With ~50 enabled mints + 1 write/mint/min,
         // that's ~1.4 SOL/day at current priority fees — acceptable for
         // the UX win.
+        // V3 + V4 background pre-warm for EVERY enabled mint. Both
+        // programs share the price_v3 PriceHistory layout + TWAP gate.
+        // Background continuous warming is the structural fix for
+        // TwapInsufficientHistory ever reaching a user — per the
+        // operator's north-star mandate ("borrow conversion rate is the
+        // north star, MAJOR tech improvements only"). The JIT warmer in
+        // cosign-borrow + commands/borrow remains as the safety net for
+        // brand-new mints; background pre-warm eliminates cold-start
+        // entirely for everything that's been enabled for >5 min.
+        //
+        // Cost: ~50 enabled mints × 2 programs × ~1 write/35s = ~3
+        // attests/sec = ~260k attests/day at ~5000 lamports each =
+        // ~1.3 SOL/day. Negligible vs conversion-rate impact.
         try {
-          const { PROGRAM_ID_V4 } = await import("../solana/program.js");
-          if (PROGRAM_ID_V4) {
-            const sinceV4 = Date.now() - (lastAttestAtV4.get(mint) || 0);
-            if (sinceV4 >= MAX_GAP_MS_V4) {
-              try {
-                await attestPrice(mint, decimals, priceSol, PROGRAM_ID_V4);
-                lastAttestAtV4.set(mint, Date.now());
-              } catch (v4Err) {
-                if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(v4Err.message || "")) {
-                  if (initsThisTick < MAX_INITS_PER_TICK) {
-                    await initializePriceFeed(mint, PROGRAM_ID_V4);
-                    initsThisTick++;
-                    console.log(`[PriceAttestor] Auto-initialized V4 feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
-                  }
-                } else {
-                  console.warn(`[PriceAttestor] V4 attest failed for ${mint.slice(0, 8)}...: ${v4Err.message?.slice(0, 100)}`);
+          const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+          const targets = [
+            PROGRAM_ID_V4 ? { id: PROGRAM_ID_V4, label: "V4", lastMap: lastAttestAtV4 } : null,
+            PROGRAM_ID_V3 ? { id: PROGRAM_ID_V3, label: "V3", lastMap: lastAttestAtV3 } : null,
+          ].filter(Boolean);
+          for (const target of targets) {
+            const sinceLast = Date.now() - (target.lastMap.get(mint) || 0);
+            if (sinceLast < MAX_GAP_MS_V4) continue;
+            try {
+              await attestPrice(mint, decimals, priceSol, target.id);
+              target.lastMap.set(mint, Date.now());
+            } catch (twapErr) {
+              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(twapErr.message || "")) {
+                if (initsThisTick < MAX_INITS_PER_TICK) {
+                  await initializePriceFeed(mint, target.id);
+                  initsThisTick++;
+                  console.log(`[PriceAttestor] Auto-initialized ${target.label} feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
                 }
+              } else {
+                console.warn(`[PriceAttestor] ${target.label} attest failed for ${mint.slice(0, 8)}...: ${twapErr.message?.slice(0, 100)}`);
               }
             }
           }
         } catch {
-          // Swallow — V4 pre-warm is best-effort, never block the
-          // primary V1/V3 attestation flow.
+          // Swallow — pre-warm is best-effort, never block the primary
+          // V1/V3 (legacy) attestation flow.
         }
       } catch (err) {
         console.error(`[PriceAttestor] Failed for ${mint.slice(0, 8)}...: ${err.message}`);
