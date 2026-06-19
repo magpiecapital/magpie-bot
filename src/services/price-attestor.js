@@ -778,34 +778,55 @@ export function startPriceAttestor(intervalMs = 30_000) {
     _lastTickError = null;
   }
 
-  // Startup pre-warm pass — initialize V3 + V4 PriceHistory PDAs for
-  // every enabled mint in parallel, IMMEDIATELY, bypassing the per-tick
-  // init cap. Operator-mandated 2026-06-18 PM after SPCX V3 borrow
-  // failed because its V3 PDA had never been initialized — the regular
-  // tick's drip-feed (MAX_INITS_PER_TICK=5) would've taken many ticks
-  // to get to SPCX. This eager init means the FIRST tick already finds
-  // initialized PDAs and just attests them, instead of having to
-  // bootstrap from scratch.
+  // Startup + periodic pre-warm pass — initialize V1 + V3 + V4 price-feed
+  // PDAs for EVERY enabled mint, bypassing the per-tick init cap.
   //
-  // Bounded concurrency = 4 so we don't burst the RPC.
-  (async function startupPrewarm() {
+  // Operator-mandated 2026-06-19 PM (escalated multiple times after FARM V1
+  // borrow failed with AccountNotInitialized): when a token gets added to
+  // the approved list, EVERY pool it could borrow on must have its price
+  // feed PDA pre-initialized — borrowers must never be the ones triggering
+  // the first init. Previously this only covered V3+V4 and only for mints
+  // already backing an active loan, leaving V1 first-borrows exposed.
+  //
+  // Per-mint program selection (matches chooseProgramId in program.js):
+  //   - memecoin → V1 (plain) + V4 (with-exits)
+  //   - RWA (stock/etf/metal) → V3 (plain) + V4 (with-exits)
+  // V2 is purged — never include it.
+  //
+  // Runs on boot AND every 30 min thereafter so newly-approved mints get
+  // covered without a bot restart. `initializePriceFeed` short-circuits
+  // on already-initialized PDAs (cheap read), so steady-state cost is
+  // ~177 mints × 2 programs × 1 RPC read each = ~360 reads / 30 min.
+  async function preWarmAllEnabledMintFeeds(reason = "startup") {
     try {
-      const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
-      const programs = [
-        PROGRAM_ID_V4 ? { id: PROGRAM_ID_V4, label: "V4" } : null,
-        PROGRAM_ID_V3 ? { id: PROGRAM_ID_V3, label: "V3" } : null,
-      ].filter(Boolean);
-      if (programs.length === 0) return;
-      const tokens = await fetchMintsToAttest();
-      console.log(
-        `[PriceAttestor] startup pre-warm: ${tokens.length} mint(s) × ${programs.length} program(s) — initializing missing PriceHistory PDAs in parallel (4-wide)`,
+      const { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+      // Pull EVERY enabled mint, regardless of active loans / armed orders.
+      // The mandate is to keep first-borrow on a freshly-approved token
+      // clean — that means PDAs must exist BEFORE any borrower arrives.
+      const r = await query(
+        `SELECT mint, decimals, category
+           FROM supported_mints
+          WHERE enabled = TRUE`,
       );
+      const tokens = r.rows;
+      const RWA = new Set(["stock", "etf", "metal"]);
       const queue = [];
       for (const t of tokens) {
-        for (const prog of programs) {
-          queue.push({ mint: t.mint, decimals: t.decimals, prog });
+        const isRWA = RWA.has(t.category);
+        // Plain-borrow program (V1 for memecoin, V3 for RWA)
+        if (isRWA) {
+          if (PROGRAM_ID_V3) queue.push({ mint: t.mint, decimals: t.decimals, prog: { id: PROGRAM_ID_V3, label: "V3" } });
+        } else {
+          queue.push({ mint: t.mint, decimals: t.decimals, prog: { id: PROGRAM_ID, label: "V1" } });
+        }
+        // Exit-armed program (V4 — covers BOTH memecoin and RWA)
+        if (PROGRAM_ID_V4) {
+          queue.push({ mint: t.mint, decimals: t.decimals, prog: { id: PROGRAM_ID_V4, label: "V4" } });
         }
       }
+      console.log(
+        `[PriceAttestor] ${reason} pre-warm: ${tokens.length} mint(s), ${queue.length} (mint × program) PDA(s) to ensure — concurrency 4`,
+      );
       let initialized = 0;
       let alreadyExisted = 0;
       let errored = 0;
@@ -817,24 +838,33 @@ export function startPriceAttestor(intervalMs = 30_000) {
           try {
             const result = await initializePriceFeed(task.mint, task.prog.id);
             if (result.alreadyExists) alreadyExisted++;
-            else { initialized++;
-              console.log(`[PriceAttestor] startup init ${task.prog.label} for ${task.mint.slice(0, 8)}... sig=${result.signature?.slice(0, 16) || "(skip)"}`);
+            else {
+              initialized++;
+              console.log(`[PriceAttestor] ${reason} init ${task.prog.label} for ${task.mint.slice(0, 8)}... sig=${result.signature?.slice(0, 16) || "(skip)"}`);
             }
           } catch (err) {
             errored++;
-            console.warn(`[PriceAttestor] startup init ${task.prog.label} for ${task.mint.slice(0, 8)} failed: ${err.message?.slice(0, 100)}`);
+            console.warn(`[PriceAttestor] ${reason} init ${task.prog.label} for ${task.mint.slice(0, 8)} failed: ${err.message?.slice(0, 100)}`);
           }
         }
       }
-      const workers = Array.from({ length: CONCURRENCY }, () => worker());
-      await Promise.all(workers);
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
       console.log(
-        `[PriceAttestor] startup pre-warm DONE — initialized=${initialized}, alreadyExisted=${alreadyExisted}, errored=${errored}`,
+        `[PriceAttestor] ${reason} pre-warm DONE — initialized=${initialized}, alreadyExisted=${alreadyExisted}, errored=${errored}`,
       );
+      return { initialized, alreadyExisted, errored };
     } catch (err) {
-      console.warn(`[PriceAttestor] startup pre-warm threw: ${err.message?.slice(0, 200)}`);
+      console.warn(`[PriceAttestor] ${reason} pre-warm threw: ${err.message?.slice(0, 200)}`);
+      return { initialized: 0, alreadyExisted: 0, errored: 1, error: err.message };
     }
-  })();
+  }
+
+  // Run immediately at boot (does not block tick — fire-and-forget so the
+  // first attest tick can start in parallel).
+  preWarmAllEnabledMintFeeds("startup");
+  // Re-run every 30 min so newly-added mints get covered without restart.
+  const PREWARM_INTERVAL_MS = Number(process.env.PRICE_FEED_PREWARM_INTERVAL_MS) || 30 * 60 * 1000;
+  setInterval(() => preWarmAllEnabledMintFeeds("periodic"), PREWARM_INTERVAL_MS);
 
   // Run immediately, then on interval
   tick();
