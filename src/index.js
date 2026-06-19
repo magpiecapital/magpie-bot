@@ -1,6 +1,13 @@
 import { Bot } from "grammy";
 import "dotenv/config";
 
+// Sentry — env-gated stub. No-op when SENTRY_DSN unset. Initialized
+// before installDbQuotaGuard so it can capture any startup-phase
+// exceptions. Operator pays $26/mo when ready to flip; until then
+// this is dormant. See src/services/sentry.js.
+import { initSentry } from "./services/sentry.js";
+initSentry();
+
 // DB-quota guard — installs global unhandledRejection /
 // uncaughtException handlers that detect DB-quota / DB-dead errors
 // and switch the bot to degraded mode INSTEAD of crashing. Closes the
