@@ -51,8 +51,15 @@ const DISTRIBUTION_WALLET_PUBKEY =
   process.env.REWARDS_DISTRIBUTOR_PUBKEY || "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac";
 const SAFETY_RESERVE_LAMPORTS = 100_000_000n; // 0.1 SOL — matches MIN_LENDER_RESERVE_LAMPORTS in magpie-holder-rewards.js
 
-const ALERT_THROTTLE_MS = 60 * 60 * 1000; // 1h per level
+// Operator-mandated 2026-06-19: P0 alerts must NEVER throttle. Operator's
+// rule is the gap should never persist long enough to be throttled — if it
+// ever does, DM every tick until closed. WARN/ALERT keep their 1h throttle
+// to avoid spam in the small-gap accrual band.
+// [[feedback_distribution_wallet_must_be_auto_funded]]
+const ALERT_THROTTLE_MS = 60 * 60 * 1000; // 1h for warn/alert levels
+const P0_THROTTLE_MS = 0;                  // P0: every tick, no throttle
 let _lastAlert = { warn: 0, alert: 0, p0: 0 };
+let _lastP0DeficitLamports = 0n;
 let _timer = null;
 
 export function startDistributionGapMonitor(bot) {

@@ -431,15 +431,53 @@ async function fetchMintsToAttest() {
   //   - needsLegacyAttest=true → write V1/V3 (category default) feed
   //   - all rows → write V4 feed (caller iterates V4 inside its own
   //                              gate based on PROGRAM_ID_V4 presence)
+  // 2026-06-19: scope-reduction. Continuously attesting every enabled
+  // mint × 2 programs = ~360 attestations per sweep takes 30-60s per
+  // sweep, longer than the tick interval. Result: most tokens fall
+  // below the 8-samples-in-300s threshold. Operator hit "257 mints
+  // cold" CRIT at 02:17Z. The fix is to ONLY continuously warm mints
+  // that genuinely need it; new borrows rely on cosign-borrow's JIT
+  // warmer (which already exists and works).
+  //
+  // Continuously-warmed set:
+  //   1. Protected mints (MAGPIE etc) — protocol's own, always-fresh
+  //   2. Any mint backing an active loan (any program)
+  //   3. Any mint with an armed/firing V4 limit-close order
+  //   4. Any mint with a pending arm intent (last 15 min)
+  //
+  // Everything else → JIT warm at cosign-borrow time. The cosign retry
+  // loop has up to 90s budget which is plenty for a cold-start mint.
   const r = await query(
-    `SELECT sm.mint, sm.decimals,
-            (sm.protected = TRUE OR EXISTS(
-              SELECT 1 FROM loans l
-               WHERE l.collateral_mint = sm.mint
-                 AND l.status = 'active'
-            )) AS needs_legacy_attest
+    `WITH active_loan_mints AS (
+       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+     ),
+     armed_exit_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM limit_close_orders lc
+         JOIN loans l ON l.id = lc.loan_id
+        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+     ),
+     recent_intent_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM arm_intents ai
+         JOIN loans l ON l.loan_id = ai.loan_id_chain
+        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+     )
+     SELECT sm.mint, sm.decimals,
+            (sm.protected = TRUE OR alm.collateral_mint IS NOT NULL) AS needs_legacy_attest,
+            (sm.protected = TRUE
+              OR alm.collateral_mint IS NOT NULL
+              OR aem.collateral_mint IS NOT NULL
+              OR rim.collateral_mint IS NOT NULL) AS needs_continuous
        FROM supported_mints sm
-      WHERE sm.enabled = TRUE`,
+       LEFT JOIN active_loan_mints alm USING (mint)
+       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+      WHERE sm.enabled = TRUE
+        AND (sm.protected = TRUE
+          OR alm.collateral_mint IS NOT NULL
+          OR aem.collateral_mint IS NOT NULL
+          OR rim.collateral_mint IS NOT NULL)`,
   );
   return r.rows.map((row) => ({
     mint: row.mint,
