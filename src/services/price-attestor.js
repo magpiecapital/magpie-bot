@@ -447,48 +447,31 @@ async function fetchMintsToAttest() {
   //
   // Everything else → JIT warm at cosign-borrow time. The cosign retry
   // loop has up to 90s budget which is plenty for a cold-start mint.
+  // 2026-06-19 PM (operator-mandated, FARM V1 borrow incident):
+  //
+  // The previous filter ONLY returned mints that were protected OR backed
+  // an active loan OR had an armed exit OR had a recent arm intent. A
+  // freshly-approved memecoin with no borrowers yet (like FARM) was
+  // skipped entirely → V1 PDA was initialized by the boot pre-warm but
+  // NEVER attested → first borrower hit `StalePriceAttestation` (>120s
+  // wall) the moment they tried to borrow.
+  //
+  // The cost-saving rationale of the old filter ("don't burn attestation
+  // SOL on mints that won't be borrowed") is wrong: ANY enabled mint can
+  // be borrowed at any moment, and the first borrower MUST find a fresh
+  // attestation. At 30s tick × ~5000 lamports/attest × 177 enabled mints
+  // = ~0.03 SOL/day (~$5/day at current SOL prices). Negligible vs the
+  // user-experience cost of a failed first borrow.
+  //
+  // Return EVERY enabled mint with needs_legacy_attest=TRUE. The continuous
+  // V4 sweep already runs for every enabled mint per the
+  // EVERY-MINT-EVERY-SAMPLE-ALWAYS mandate.
   const r = await query(
-    `WITH active_loan_mints AS (
-       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
-     ),
-     armed_exit_mints AS (
-       SELECT DISTINCT l.collateral_mint
-         FROM limit_close_orders lc
-         JOIN loans l ON l.id = lc.loan_id
-        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
-     ),
-     recent_intent_mints AS (
-       -- loans.loan_id is numeric (slot-derived bigint) but
-       -- arm_intents.loan_id_chain is stored as TEXT (so we can hold
-       -- chain IDs larger than bigint safely). Cast one side; otherwise
-       -- Postgres throws "operator does not exist: numeric = text" and
-       -- the WHOLE attestor tick aborts before attesting anything. That
-       -- was the silent root cause of the 2026-06-19 PM tokenized-stock
-       -- TwapInsufficientHistory P0. [[feedback_borrow_conversion_must_be_world_class]]
-       SELECT DISTINCT l.collateral_mint
-         FROM arm_intents ai
-         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
-        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
-     )
-     SELECT sm.mint, sm.decimals,
-            (sm.protected = TRUE OR alm.collateral_mint IS NOT NULL) AS needs_legacy_attest,
-            (sm.protected = TRUE
-              OR alm.collateral_mint IS NOT NULL
-              OR aem.collateral_mint IS NOT NULL
-              OR rim.collateral_mint IS NOT NULL) AS needs_continuous
+    `SELECT sm.mint, sm.decimals,
+            TRUE AS needs_legacy_attest,
+            TRUE AS needs_continuous
        FROM supported_mints sm
-       -- USING (mint) was wrong: active_loan_mints exposes
-       -- collateral_mint, not mint. That mismatch threw and the boot
-       -- sanity check caught it on the first deploy of the loan_id cast
-       -- fix. Match the explicit-ON pattern used by the other two CTEs.
-       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
-       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
-       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
-      WHERE sm.enabled = TRUE
-        AND (sm.protected = TRUE
-          OR alm.collateral_mint IS NOT NULL
-          OR aem.collateral_mint IS NOT NULL
-          OR rim.collateral_mint IS NOT NULL)`,
+      WHERE sm.enabled = TRUE`,
   );
   return r.rows.map((row) => ({
     mint: row.mint,
