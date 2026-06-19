@@ -15,7 +15,25 @@ import {
 
 // Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
 // prices are derived as token_usd / sol_usd.
-const JUPITER_API = process.env.JUPITER_API_URL || "https://lite-api.jup.ag/price/v3";
+//
+// Paid-tier support (operator-mandated 2026-06-19 PM after free lite-api
+// 429 storms starved the V4 continuous loop):
+//   - When JUPITER_API_KEY is set, route to api.jup.ag (paid Pro tier) and
+//     send x-api-key header on every request.
+//   - When unset, fall back to lite-api.jup.ag (free, aggressive 429s).
+// The env var can be flipped on/off at runtime without a code change.
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || null;
+const JUPITER_API =
+  process.env.JUPITER_API_URL ||
+  (JUPITER_API_KEY
+    ? "https://api.jup.ag/price/v3"
+    : "https://lite-api.jup.ag/price/v3");
+const JUPITER_HEADERS = JUPITER_API_KEY ? { "x-api-key": JUPITER_API_KEY } : {};
+if (JUPITER_API_KEY) {
+  console.log("[price] Jupiter Pro tier active (api.jup.ag with x-api-key)");
+} else {
+  console.log("[price] Jupiter lite-api active (no JUPITER_API_KEY set — 429s expected under load)");
+}
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 // Jupiter v3 accepts up to ~100 ids per call, but we chunk at 50 for headroom.
 const JUP_BATCH_SIZE = 50;
@@ -41,6 +59,7 @@ async function jupiterPriceInSol(mint) {
   try {
     const resp = await axios.get(JUPITER_API, {
       params: { ids: `${mint},${SOL_MINT}` },
+      headers: JUPITER_HEADERS,
       timeout: 10_000,
     });
     const tokenUsd = resp.data?.[mint]?.usdPrice;
@@ -177,6 +196,7 @@ export async function getPricesInSolBatch(mints) {
     try {
       const resp = await axios.get(JUPITER_API, {
         params: { ids },
+        headers: JUPITER_HEADERS,
         timeout: 15_000,
       });
       recordJupiterOk();
@@ -476,6 +496,7 @@ export function warmPriceCache(mint) {
 async function jupiterPriceInUsd(mint) {
   const resp = await axios.get(JUPITER_API, {
     params: { ids: mint },
+    headers: JUPITER_HEADERS,
     timeout: 10_000,
   });
   const tokenUsd = resp.data?.[mint]?.usdPrice;
