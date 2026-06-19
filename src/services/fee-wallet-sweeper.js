@@ -76,6 +76,7 @@ import {
 import bs58 from "bs58";
 import { query } from "../db/pool.js";
 import { notifyAdmin } from "./admin-notify.js";
+import { withFailover } from "../solana/connection.js";
 
 const SWEEP_INTERVAL_MS = Number(
   process.env.FEE_WALLET_SWEEP_INTERVAL_MS || 60 * 60 * 1000, // 1 hour
@@ -237,38 +238,84 @@ async function runOnce(bot) {
     const { runPrivilegedSign, recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
     assertAllowedDestination("fee-wallet-sweeper", distributionPk);
 
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = lenderKp.publicKey;
+    // Use withFailover for all on-chain RPC calls so a 429 / 5xx on the
+    // primary endpoint automatically falls through to the backup RPC
+    // instead of failing the sweep. The bot's V4 continuous loop +
+    // boot pre-warm spike RPC traffic, and Helius can throttle even paid
+    // tier under bursts. Operator-mandated 2026-06-19 PM after sweep #8
+    // failed with 429.
+    //
+    // Wrapped in an outer retry-with-backoff loop (3 attempts: 0s, 5s, 15s)
+    // so transient throttling across BOTH primary + backup is survivable
+    // without operator intervention.
+    const RETRY_DELAYS_MS = [0, 5_000, 15_000];
+    let lastSweepErr = null;
+    let sweepSucceeded = false;
+    for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
+      if (RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+      }
+      try {
+        const { blockhash, lastValidBlockHeight } = await withFailover((c) =>
+          c.getLatestBlockhash("confirmed"),
+        );
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = lenderKp.publicKey;
 
-    const guard = await runPrivilegedSign({
-      service: "fee-wallet-sweeper",
-      tx,
-      signers: [lenderKp],
-      allowedDeltas: [
-        // Lender's wSOL ATA (the fee_wallet) decreases by sweepable.
-        // No other lender-owned balance may change.
-        {
-          pubkey: feeWalletAta,
-          kind: "token",
-          mint: NATIVE_MINT,
-          maxDecrease: BigInt(sweepable),
-        },
-        // Lender pays the SOL tx fee (~5000 lamports) + may pay ATA
-        // creation rent (~2M lamports) if dest ATA didn't exist yet.
-        // Budget generously to avoid false rejects.
-        {
-          pubkey: lenderKp.publicKey,
-          kind: "sol",
-          maxDecrease: 10_000_000n, // 0.01 SOL
-        },
-      ],
-    });
-    guardAuditId = guard.auditId;
+        // runPrivilegedSign only validates + signs — no RPC inside.
+        // Only sign once (first attempt) to avoid re-signing on retry.
+        if (!guardAuditId) {
+          const guard = await runPrivilegedSign({
+            service: "fee-wallet-sweeper",
+            tx,
+            signers: [lenderKp],
+            allowedDeltas: [
+              {
+                pubkey: feeWalletAta,
+                kind: "token",
+                mint: NATIVE_MINT,
+                maxDecrease: BigInt(sweepable),
+              },
+              {
+                pubkey: lenderKp.publicKey,
+                kind: "sol",
+                maxDecrease: 10_000_000n,
+              },
+            ],
+          });
+          guardAuditId = guard.auditId;
+        }
 
-    sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-    await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
+        sig = await withFailover((c) =>
+          c.sendRawTransaction(tx.serialize(), { skipPreflight: false }),
+        );
+        await withFailover((c) =>
+          c.confirmTransaction(
+            { signature: sig, blockhash, lastValidBlockHeight },
+            "confirmed",
+          ),
+        );
+        await recordPrivilegedSignResult({
+          auditId: guardAuditId,
+          status: "confirmed",
+          txSig: sig,
+        });
+        sweepSucceeded = true;
+        break;
+      } catch (innerErr) {
+        lastSweepErr = innerErr;
+        const isRateLimited = /429|rate.?limit|-32429/i.test(innerErr?.message || "");
+        const isLastAttempt = attempt === RETRY_DELAYS_MS.length - 1;
+        console.warn(
+          `[fee-wallet-sweeper] sweep #${sweepId} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length} failed: ${innerErr?.message?.slice(0, 120)}${isRateLimited && !isLastAttempt ? " — retrying after backoff" : ""}`,
+        );
+        if (!isLastAttempt) continue;
+        throw innerErr;
+      }
+    }
+    if (!sweepSucceeded) {
+      throw lastSweepErr || new Error("Sweep failed after all retries");
+    }
   } catch (err) {
     if (guardAuditId) {
       try {
