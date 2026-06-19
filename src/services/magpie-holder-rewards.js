@@ -632,6 +632,7 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
   const { rows: snapRows } = await query(
     `SELECT mhd.pool_lamports, mhd.total_balance, mhd.holder_count,
             mhd.eligible_count, mhd.snapshot_at,
+            COUNT(mhr.*)                                                   AS reward_row_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status = 'paid')                AS paid_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
@@ -679,7 +680,11 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
     pool_lamports: s.pool_lamports,
     distributed_lamports: s.paid_lamports,
     unpaid_lamports: s.unpaid_lamports,
-    eligible_wallet_count: Number(s.eligible_count) || Number(s.holder_count) || 0,
+    // Eligible count = rows captured for payout, NOT enumerated holders.
+    // magpie_holder_distributions.eligible_count is currently miswritten
+    // (snapshotAndDistribute passes holders.length twice — same value as
+    // holder_count). The reward_row_count from the JOIN is the truth.
+    eligible_wallet_count: Number(s.reward_row_count) || Number(s.eligible_count) || Number(s.holder_count) || 0,
     paid_wallet_count: Number(s.paid_count) || 0,
     unpayable_wallet_count: 0,
     denominator_kind: "magpie_balance_at_snapshot",
