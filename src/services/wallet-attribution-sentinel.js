@@ -86,30 +86,69 @@ async function runOneCycle(bot) {
     now - lastAlertedAt > ALERT_REPEAT_MS ||
     count > lastAlertedCount * 1.5;
 
-  if (shouldAlert) {
+  // LAYER 4 — auto-repair. Operator-mandated 2026-06-19 ("never misattribute").
+  // The sentinel used to alert and wait for manual repair. Now it repairs
+  // atomically and DMs the operator with what it fixed. Loans become
+  // visible to their rightful owners within ONE tick instead of waiting
+  // for human-in-the-loop. Each repair writes an audit row so the entire
+  // history of mutations is reconstructable. [[feedback_never_misattribute_loans]]
+  const repaired = [];
+  const repairErrors = [];
+  for (const r of rows) {
+    try {
+      await query("BEGIN");
+      await query(
+        `INSERT INTO loan_user_attribution_audit (loan_id, prev_user_id, new_user_id, reason, repaired_by, metadata)
+         VALUES ($1, $2, $3, 'sentinel_auto_repair', 'wallet_attribution_sentinel',
+                 jsonb_build_object('borrower_wallet', $4::text, 'program_id', $5::text))`,
+        [r.id, r.current_uid, r.correct_uid, r.borrower_wallet, r.program_id],
+      );
+      await query(
+        `UPDATE loans SET user_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+        [r.correct_uid, r.id, r.current_uid],
+      );
+      await query("COMMIT");
+      repaired.push(r);
+    } catch (err) {
+      await query("ROLLBACK").catch(() => {});
+      repairErrors.push({ id: r.id, err: err?.message?.slice(0, 100) });
+    }
+  }
+
+  if (shouldAlert || repaired.length > 0 || repairErrors.length > 0) {
     const sample = rows.slice(0, 12).map((r) => {
       const pool = r.program_id?.startsWith("B8AwYz") ? "V3"
                  : r.program_id?.startsWith("6wSpKA") ? "V2"
-                 : r.program_id?.startsWith("4FEFPe") ? "V1" : "?";
+                 : r.program_id?.startsWith("4FEFPe") ? "V1"
+                 : r.program_id?.startsWith("HA1hgv") ? "V4" : "?";
       const owed = (Number(r.owed_lamports) / 1e9).toFixed(2);
-      return `  loan.id=${r.id} ${pool} ${owed}SOL user ${r.current_uid} -> ${r.correct_uid}`;
+      const status = repaired.find((x) => x.id === r.id)
+        ? "REPAIRED"
+        : repairErrors.find((x) => x.id === r.id)
+        ? "REPAIR_FAILED"
+        : "DETECTED";
+      return `  ${status} loan.id=${r.id} ${pool} ${owed}SOL user ${r.current_uid} -> ${r.correct_uid}`;
     }).join("\n");
     const more = rows.length > 12 ? `\n  ... and ${rows.length - 12} more` : "";
+    const headline = repaired.length === count
+      ? `[wallet-attr-sentinel] AUTO-REPAIRED — ${count} mis-attributed loan(s) fixed atomically.`
+      : repaired.length > 0
+      ? `[wallet-attr-sentinel] PARTIAL REPAIR — ${repaired.length}/${count} fixed; ${repairErrors.length} failed. Inspect logs.`
+      : `[wallet-attr-sentinel] ALERT — ${count} active/overdue loan(s) attributed to the wrong user_id (auto-repair attempt failed).`;
     const msg = [
-      `[wallet-attr-sentinel] ALERT — ${count} active/overdue loan(s) attributed to the wrong user_id.`,
-      `These loans are invisible in their owner's /repay et al. until repaired.`,
+      headline,
       ``,
       `Affected:`,
       sample + more,
       ``,
-      `Likely root cause: a recent loan-recording path bypassed wallet-owner-resolver.js. Audit recent code changes that touch loans.user_id or wallets-to-user resolution.`,
-      `Manual repair pattern: UPDATE loans SET user_id = <correct_uid> WHERE id = <loan_id>;`,
+      `Audit trail: SELECT * FROM loan_user_attribution_audit WHERE repaired_at > NOW() - INTERVAL '5 min';`,
+      `Root-cause guidance: recent loan-recording path may have bypassed wallet-owner-resolver. Layer 3 (recordLoan pre-write guard) catches this at WRITE time; sentinel is Layer 4 (after-the-fact safety net).`,
     ].join("\n");
     await notifyAdmin(bot, msg, { parse_mode: undefined });
     lastAlertedAt = now;
     lastAlertedCount = count;
   }
-  return { count };
+  return { count, repaired: repaired.length, errors: repairErrors.length };
 }
 
 export function startWalletAttributionSentinel(bot) {

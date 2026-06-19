@@ -598,6 +598,33 @@ export async function recordLoan({
     );
   }
 
+  // LAYER 3 — pre-write user_id validation. Operator-mandated 2026-06-19
+  // after 22 loans were mis-attributed because callers passed a context-
+  // derived user_id that didn't match the wallet's true owner. Re-verify
+  // RIGHT BEFORE the INSERT that the userId arg matches what the wallets
+  // table says for borrowerWallet. If mismatch: log loudly + use the
+  // wallet's user_id (chain-of-trust: wallets row > caller's context).
+  //
+  // After migration 080 added UNIQUE on wallets.public_key, this check is
+  // unambiguous — exactly one wallets row exists per pubkey.
+  // [[feedback_never_misattribute_loans]]
+  if (borrowerWallet && userId) {
+    try {
+      const { rows: walletCheck } = await query(
+        `SELECT user_id::int AS uid FROM wallets WHERE public_key = $1`,
+        [borrowerWallet],
+      );
+      if (walletCheck.length > 0 && walletCheck[0].uid !== Number(userId)) {
+        console.warn(
+          `[loans.recordLoan] USER_ID DRIFT — caller passed user_id=${userId} but wallets.user_id for ${borrowerWallet.slice(0, 12)}... is ${walletCheck[0].uid}. Overriding with wallets row (the canonical owner) to prevent attribution bug.`,
+        );
+        userId = walletCheck[0].uid;
+      }
+    } catch (err) {
+      console.warn(`[loans.recordLoan] user_id pre-write check failed: ${err.message?.slice(0, 80)}`);
+    }
+  }
+
   const { rows } = await query(
     `INSERT INTO loans (
        user_id, loan_id, loan_pda, collateral_mint, collateral_amount,
