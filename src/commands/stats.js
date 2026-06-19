@@ -181,6 +181,7 @@ export async function handleStats(ctx) {
     let defaultedLoansWithProfit = 0;
     let defaultsAwaitingSale = 0;
     let defaultsAwaitingDistribution = 0n;
+    let defaultsAwaitingDistributionCount = 0;
     let magpieBurnedCount = 0, magpieBurnPendingCount = 0;
     // Mirror site /api/v1/stats — UNION recovery_credits so out-of-band
     // protocol contributions (operator-funded exploit recovery, etc.)
@@ -217,6 +218,7 @@ export async function handleStats(ctx) {
            COALESCE(SUM(net_profit_lamports) FILTER (
              WHERE distribution_status = 'awaiting_distribution'
            ), 0)::text AS awaiting_dist,
+           COUNT(*) FILTER (WHERE distribution_status = 'awaiting_distribution')::int AS awaiting_dist_count,
            COUNT(*) FILTER (WHERE distribution_status = 'magpie_burn_pending')::int AS magpie_pending,
            COUNT(*) FILTER (WHERE distribution_status = 'magpie_burned')::int AS magpie_burned
          FROM all_profit_events`,
@@ -241,6 +243,7 @@ export async function handleStats(ctx) {
              COALESCE(SUM(net_profit_lamports) FILTER (
                WHERE distribution_status = 'awaiting_distribution'
              ), 0)::text AS awaiting_dist,
+             COUNT(*) FILTER (WHERE distribution_status = 'awaiting_distribution')::int AS awaiting_dist_count,
              COUNT(*) FILTER (WHERE distribution_status = 'magpie_burn_pending')::int AS magpie_pending,
              COUNT(*) FILTER (WHERE distribution_status = 'magpie_burned')::int AS magpie_burned
            FROM liquidation_economics`,
@@ -252,6 +255,7 @@ export async function handleStats(ctx) {
         defaultedLoansWithProfit = Number(agg.profitable_count || 0);
         defaultsAwaitingSale = Number(agg.pending_sale_count || 0);
         defaultsAwaitingDistribution = BigInt(agg.awaiting_dist || "0");
+        defaultsAwaitingDistributionCount = Number(agg.awaiting_dist_count || 0);
         magpieBurnedCount = Number(agg.magpie_burned || 0);
         magpieBurnPendingCount = Number(agg.magpie_pending || 0);
       }
@@ -371,8 +375,8 @@ export async function handleStats(ctx) {
             row("Profitable defaults", String(defaultedLoansWithProfit)),
             ...(defaultsAwaitingSale > 0
               ? [row("Awaiting sale", String(defaultsAwaitingSale))] : []),
-            ...(defaultsAwaitingDistribution > 0n
-              ? [row("Pending distribute", `${fmtSol(defaultsAwaitingDistribution.toString())} SOL`)] : []),
+            ...(defaultsAwaitingDistribution > 0n || defaultsAwaitingDistributionCount > 0
+              ? [row("Pending distribute", `${defaultsAwaitingDistributionCount} (${fmtSol(defaultsAwaitingDistribution.toString())} SOL)`)] : []),
             ...(magpieBurnPendingCount > 0 || magpieBurnedCount > 0
               ? [row("$MAGPIE burns", `${magpieBurnedCount} done / ${magpieBurnPendingCount} pending`)] : []),
           ]
