@@ -125,6 +125,7 @@ export async function handleStats(ctx) {
     // shouldn't crash /stats. Each block catches and degrades to —.
     let holderAccrued = 0n, lpAccrued = 0n, reserveAccrued = 0n, refAccrued = 0n;
     let priorSnapshots = [];
+    let priorLpSnapshots = [];
     try {
       const { rows: [hp] } = await query(
         `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM magpie_holder_pool WHERE id = 1`,
@@ -163,6 +164,21 @@ export async function handleStats(ctx) {
       );
       priorSnapshots = rows;
     } catch { /* table absent */ }
+    // LP loyalty prior snapshots — uniform with the holders block above.
+    // Operator-mandated 2026-06-19 PM: every distribution surface must
+    // reflect a fired distribution within seconds of it landing.
+    try {
+      const { rows } = await query(
+        `SELECT id,
+                snapshot_at,
+                pool_lamports::text AS pool,
+                eligible_count
+           FROM lp_loyalty_distributions
+          ORDER BY snapshot_at DESC
+          LIMIT 5`,
+      );
+      priorLpSnapshots = rows;
+    } catch { /* table absent on fresh deploys */ }
     const totalAccrued = holderAccrued + lpAccrued + reserveAccrued + refAccrued;
     const r = counts[0];
 
@@ -324,6 +340,14 @@ export async function handleStats(ctx) {
             const amount = fmtSol(s.pool);
             return row(`#${idx + 1} ${date}`, `${amount} SOL → ${s.eligible_count} holders`);
           });
+    const lpSnapshotHistoryRows = priorLpSnapshots
+      .slice()
+      .reverse()
+      .map((s, idx) => {
+        const date = new Date(s.snapshot_at).toISOString().slice(0, 10);
+        const amount = fmtSol(s.pool);
+        return row(`#${idx + 1} ${date}`, `${amount} SOL → ${s.eligible_count} LPs`);
+      });
 
     const codeLines = [
       RULE,
@@ -361,6 +385,13 @@ export async function handleStats(ctx) {
         ? [
             `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
             ...snapshotHistoryRows,
+          ]
+        : []),
+      ...(priorLpSnapshots.length > 0
+        ? [
+            ``,
+            `REWARDS — PRIOR SNAPSHOTS (SOL LPs)`,
+            ...lpSnapshotHistoryRows,
           ]
         : []),
       // Defaulted-loan profit section. Only renders when ANY meaningful

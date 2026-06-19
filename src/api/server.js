@@ -486,11 +486,18 @@ async function handleTransparency() {
        (SELECT created_at FROM magpie_holder_distributions ORDER BY id DESC LIMIT 1)
          AS last_distribution_at`,
   );
-  // LP loyalty pool
+  // LP loyalty pool. Surface uniformity: same shape as holders block above
+  // so consumers (site /stats, TG /stats, dashboard) can render a
+  // "Last SOL LP distribution: X SOL — N ago" line that matches the
+  // $MAGPIE holders line. Operator-mandated 2026-06-19 PM.
   const { rows: [lpLoy] } = await query(
     `SELECT
        (SELECT accrued_lamports::text FROM lp_loyalty_pool WHERE id = 1) AS current_pool_lamports,
-       (SELECT COUNT(*)::int FROM lp_loyalty_distributions) AS lifetime_distributions`,
+       (SELECT COUNT(*)::int FROM lp_loyalty_distributions) AS lifetime_distributions,
+       (SELECT pool_lamports::text FROM lp_loyalty_distributions
+          ORDER BY id DESC LIMIT 1) AS last_distribution_lamports,
+       (SELECT created_at FROM lp_loyalty_distributions
+          ORDER BY id DESC LIMIT 1) AS last_distribution_at`,
   );
   // Referral payouts lifetime
   const { rows: [refs] } = await query(
@@ -533,9 +540,13 @@ async function handleTransparency() {
       },
       lp_loyalty: {
         // current_pool_sol is OPERATOR-PRIVATE (same reason as
-        // holder_rewards above). Only historical distribution count
-        // is public.
+        // holder_rewards above). Historical distribution count + last
+        // distribution amount/time are public so consumers can render a
+        // post-distribution "fired" signal symmetric with holders.
         lifetime_distributions: lpLoy.lifetime_distributions,
+        last_distribution_sol: lpLoy.last_distribution_lamports
+          ? Number(lpLoy.last_distribution_lamports) / 1e9 : null,
+        last_distribution_at: lpLoy.last_distribution_at,
       },
       referrals: {
         lifetime_accrued_sol: Number(refs.lifetime_accrued) / 1e9,
