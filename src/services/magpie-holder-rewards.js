@@ -620,14 +620,14 @@ const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana t
  * (see [[feedback_distributions_must_be_kept_organized_synced]]).
  *
  * Reads canonical state from magpie_holder_distributions +
- * magpie_holder_rewards and INSERT-or-UPDATEs the matching
- * distribution_events row keyed by (kind, external_ref). Idempotent —
- * safe to call from every transition point (Phase 1 commit, each Phase 2
- * batch, retry loop, /distribute admin command, and a reconciler).
+ * magpie_holder_rewards and routes through upsertDistributionEvent()
+ * (which has ON CONFLICT (kind, external_ref) baked in). Kind +
+ * external_ref convention match the existing dictionary in
+ * src/services/distribution-events.js. Idempotent — safe to call from
+ * every transition point.
  */
 export async function syncMagpieHolderDistributionEvent(distributionId) {
-  const KIND = "magpie_holder";
-  const externalRef = `magpie-holder-${distributionId}`;
+  const { upsertDistributionEvent } = await import("./distribution-events.js");
   // Pull the snapshot row + aggregated reward state in one round-trip.
   const { rows: snapRows } = await query(
     `SELECT mhd.pool_lamports, mhd.total_balance, mhd.holder_count,
@@ -636,7 +636,6 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
             COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')), 0)::numeric AS unpaid_lamports,
-            COALESCE(SUM(mhr.reward_lamports), 0)::numeric                 AS allocated_lamports,
             MIN(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS min_paid,
             MAX(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS max_paid,
             MIN(mhr.paid_at)                                               AS paid_first_at,
@@ -671,14 +670,11 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
   else if (Number(s.unpaid_count) === 0) status = "complete";
   else status = "partial";
 
-  const { rows: existing } = await query(
-    `SELECT id FROM distribution_events WHERE kind = $1 AND external_ref = $2`,
-    [KIND, externalRef],
-  );
-
-  const fields = {
-    kind: KIND,
-    external_ref: externalRef,
+  // kind='holder_reward' per the canonical dictionary enforced by the
+  // distribution_events.kind CHECK constraint.
+  return upsertDistributionEvent({
+    kind: "holder_reward",
+    external_ref: `holder-${distributionId}`,
     snapshot_at: s.snapshot_at,
     pool_lamports: s.pool_lamports,
     distributed_lamports: s.paid_lamports,
@@ -693,56 +689,11 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
     min_payout_lamports: s.min_paid,
     max_payout_lamports: s.max_paid,
     median_payout_lamports: medianPaid,
-    source_borrow_fees_lamports: s.pool_lamports, // pool source: 70% of borrow fees (MGP-001)
+    source_borrow_fees_lamports: s.pool_lamports, // 70% of borrow fees per MGP-001
     source_liquidation_lamports: 0,
     source_other_lamports: 0,
     status,
-  };
-
-  if (existing.length > 0) {
-    await query(
-      `UPDATE distribution_events SET
-         snapshot_at = $2, pool_lamports = $3, distributed_lamports = $4,
-         unpaid_lamports = $5, eligible_wallet_count = $6, paid_wallet_count = $7,
-         unpayable_wallet_count = $8, denominator_kind = $9, denominator_value = $10,
-         paid_first_at = $11, paid_last_at = $12,
-         min_payout_lamports = $13, max_payout_lamports = $14, median_payout_lamports = $15,
-         source_borrow_fees_lamports = $16, source_liquidation_lamports = $17, source_other_lamports = $18,
-         status = $19, updated_at = NOW()
-       WHERE id = $1`,
-      [
-        existing[0].id, fields.snapshot_at, fields.pool_lamports, fields.distributed_lamports,
-        fields.unpaid_lamports, fields.eligible_wallet_count, fields.paid_wallet_count,
-        fields.unpayable_wallet_count, fields.denominator_kind, fields.denominator_value,
-        fields.paid_first_at, fields.paid_last_at,
-        fields.min_payout_lamports, fields.max_payout_lamports, fields.median_payout_lamports,
-        fields.source_borrow_fees_lamports, fields.source_liquidation_lamports, fields.source_other_lamports,
-        fields.status,
-      ],
-    );
-    return existing[0].id;
-  }
-  const { rows: ins } = await query(
-    `INSERT INTO distribution_events (
-       kind, external_ref, snapshot_at, pool_lamports, distributed_lamports, unpaid_lamports,
-       eligible_wallet_count, paid_wallet_count, unpayable_wallet_count,
-       denominator_kind, denominator_value, paid_first_at, paid_last_at,
-       min_payout_lamports, max_payout_lamports, median_payout_lamports,
-       source_borrow_fees_lamports, source_liquidation_lamports, source_other_lamports,
-       status, created_at, updated_at
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, NOW(), NOW())
-     RETURNING id`,
-    [
-      fields.kind, fields.external_ref, fields.snapshot_at, fields.pool_lamports,
-      fields.distributed_lamports, fields.unpaid_lamports,
-      fields.eligible_wallet_count, fields.paid_wallet_count, fields.unpayable_wallet_count,
-      fields.denominator_kind, fields.denominator_value, fields.paid_first_at, fields.paid_last_at,
-      fields.min_payout_lamports, fields.max_payout_lamports, fields.median_payout_lamports,
-      fields.source_borrow_fees_lamports, fields.source_liquidation_lamports, fields.source_other_lamports,
-      fields.status,
-    ],
-  );
-  return ins[0].id;
+  });
 }
 
 export async function snapshotAndDistribute() {
