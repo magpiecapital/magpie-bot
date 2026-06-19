@@ -370,6 +370,15 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
   let lastErr = null;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {
+      // commitment="processed" + skipPreflight: ~3x faster than confirmed
+      // for TWAP samples. Preflight is unnecessary — this is a fixed,
+      // tested program call with a deterministic price update; nothing to
+      // simulate against. "processed" returns when the tx lands (vs
+      // "confirmed" waiting for 1/2 cluster vote). For TWAP samples
+      // (statistical aggregation over 300s), the tiny reorg risk at
+      // "processed" is acceptable; on-chain readers see the new sample
+      // immediately. Operator hit ~60s cadence at confirmed level
+      // 2026-06-18 PM, vs the 37.5s required for 8 samples in 300s.
       const sig = await program.methods
         .updatePrice(new BN(priceLamports), confidenceBps)
         .accounts({
@@ -377,7 +386,7 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
           priceFeed,
           authority: lender.publicKey,
         })
-        .rpc({ commitment: "confirmed" });
+        .rpc({ commitment: "processed", skipPreflight: true });
       return { signature: sig, priceLamports, priceSol };
     } catch (err) {
       lastErr = err;
