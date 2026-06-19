@@ -182,9 +182,26 @@ export async function handleStats(ctx) {
     let defaultsAwaitingSale = 0;
     let defaultsAwaitingDistribution = 0n;
     let magpieBurnedCount = 0, magpieBurnPendingCount = 0;
+    // Mirror site /api/v1/stats — UNION recovery_credits so out-of-band
+    // protocol contributions (operator-funded exploit recovery, etc.)
+    // count alongside profitable defaults from liquidation_economics.
+    // Both flow through the same 80/10/10 split via the distribution
+    // watcher. Protocol uniformity rule: site /stats and TG /stats must
+    // present identical numbers for identical metrics.
+    // [[feedback_protocol_uniformity_non_negotiable]]
     try {
       const { rows: [agg] } = await query(
-        `SELECT
+        `WITH all_profit_events AS (
+           SELECT net_profit_lamports, distribution_status, sale_detected_at
+             FROM liquidation_economics
+           UNION ALL
+           SELECT amount_lamports AS net_profit_lamports,
+                  distribution_status,
+                  created_at AS sale_detected_at
+             FROM recovery_credits
+             WHERE distribution_status IN ('awaiting_distribution', 'distributing', 'distributed')
+         )
+         SELECT
            COALESCE(SUM(net_profit_lamports) FILTER (
              WHERE net_profit_lamports > 0 AND distribution_status != 'loss'
            ), 0)::text AS profit_lifetime,
@@ -202,8 +219,33 @@ export async function handleStats(ctx) {
            ), 0)::text AS awaiting_dist,
            COUNT(*) FILTER (WHERE distribution_status = 'magpie_burn_pending')::int AS magpie_pending,
            COUNT(*) FILTER (WHERE distribution_status = 'magpie_burned')::int AS magpie_burned
-         FROM liquidation_economics`,
-      );
+         FROM all_profit_events`,
+      ).catch(async () => {
+        // Fallback when recovery_credits table doesn't exist yet
+        // (migration 078 not applied) — read liquidation_economics
+        // alone so TG /stats still works.
+        return await query(
+          `SELECT
+             COALESCE(SUM(net_profit_lamports) FILTER (
+               WHERE net_profit_lamports > 0 AND distribution_status != 'loss'
+             ), 0)::text AS profit_lifetime,
+             COALESCE(SUM(net_profit_lamports) FILTER (
+               WHERE net_profit_lamports > 0
+                 AND distribution_status != 'loss'
+                 AND sale_detected_at > NOW() - INTERVAL '24 hours'
+             ), 0)::text AS profit_24h,
+             COUNT(*) FILTER (
+               WHERE net_profit_lamports > 0 AND distribution_status != 'loss'
+             )::int AS profitable_count,
+             COUNT(*) FILTER (WHERE distribution_status = 'pending_sale')::int AS pending_sale_count,
+             COALESCE(SUM(net_profit_lamports) FILTER (
+               WHERE distribution_status = 'awaiting_distribution'
+             ), 0)::text AS awaiting_dist,
+             COUNT(*) FILTER (WHERE distribution_status = 'magpie_burn_pending')::int AS magpie_pending,
+             COUNT(*) FILTER (WHERE distribution_status = 'magpie_burned')::int AS magpie_burned
+           FROM liquidation_economics`,
+        );
+      });
       if (agg) {
         defaultProfitLifetime = BigInt(agg.profit_lifetime || "0");
         defaultProfitLast24h = BigInt(agg.profit_24h || "0");
