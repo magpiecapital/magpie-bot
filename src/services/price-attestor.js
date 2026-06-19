@@ -691,7 +691,21 @@ export function startPriceAttestor(intervalMs = 30_000) {
 
     if (queue.length === 0) return;
 
-    const CONCURRENCY = Number(process.env.PRICE_ATTESTOR_CONCURRENCY) || 12;
+    // Falsy-zero protection (operator-mandated 2026-06-19 PM after the V4
+    // continuous loop hit the same bug). Explicit-undefined check so
+    // PRICE_ATTESTOR_CONCURRENCY=0 actually pauses V1/V3 attestation
+    // instead of silently falling back to 12. If someone ever needs to
+    // throttle V1/V3 to stop hammering Helius RPC, this lets them.
+    const PA_CONC_RAW = process.env.PRICE_ATTESTOR_CONCURRENCY;
+    const CONCURRENCY =
+      PA_CONC_RAW != null && PA_CONC_RAW !== ""
+        ? Number(PA_CONC_RAW)
+        : 12;
+    if (CONCURRENCY <= 0) {
+      console.warn(`[PriceAttestor] PRICE_ATTESTOR_CONCURRENCY=${CONCURRENCY} — V1/V3 attestation PAUSED until env flipped to nonzero`);
+      _lastTickError = "paused_by_env";
+      return;
+    }
     let initsThisTick = 0;
     let attempted = 0, succeeded = 0, initialized = 0, failed = 0;
     let cursor = 0;
