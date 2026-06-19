@@ -1670,6 +1670,11 @@ const PUBLIC_ROUTES = new Set([
   // multiplying by the legacy 0.89. Drops the under-shoot from 11% to
   // ~0.3% — same precision as the on-chain TWAP attestation.
   "/api/v1/v4/twap",
+  // Per-mint readiness check + on-demand warmup request. Site calls
+  // this BEFORE asking the user to borrow a specific mint — it
+  // returns the on-chain sample-in-window count and bumps the mint
+  // into the high-priority warmup queue if not yet warm.
+  "/api/v1/v4/feed-ready",
   // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
   // POST + DELETE require an Ed25519-signed envelope. Security is
   // enforced internally by the handler (signature verification + linked
@@ -2021,6 +2026,24 @@ async function router(req, res) {
         // under-shoot) site value.
         const { handleV4Twap } = await import("./v4-twap.js");
         result = await handleV4Twap(req, url);
+        break;
+      }
+      case "/api/v1/v4/feed-ready": {
+        // Per-mint readiness check + on-demand warmup request.
+        // GET /api/v1/v4/feed-ready?mint=X — returns sample-in-window
+        // count and ETA. Side-effect: if not warm, bumps the mint
+        // into the high-priority on-demand warmup queue so the next
+        // attestor cycle prioritizes it. Operator-mandated 2026-06-19
+        // PM after the global-readiness gate was insufficient for
+        // mints outside the priority list.
+        const mintStr = url.searchParams.get("mint") || "";
+        if (!mintStr) {
+          result = { status: 400, body: { error: "missing_mint" } };
+          break;
+        }
+        const { requestMintWarm } = await import("../services/v4-feed-readiness.js");
+        const readiness = await requestMintWarm(mintStr);
+        result = { status: readiness.ok === false ? 404 : 200, body: readiness };
         break;
       }
       case "/api/v1/site/limit-close": {
