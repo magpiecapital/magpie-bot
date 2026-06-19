@@ -5,7 +5,7 @@ import { query } from "../db/pool.js";
 import { executeRepay, markLoanRepaid, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { ensureWallet } from "../services/wallet.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 import { formatLoanButtonLabel, totalOwedSol, countDueWithin } from "../services/loan-display.js";
@@ -163,7 +163,7 @@ export function registerRepayCallbacks(bot) {
     // actionable message. Check BEFORE we even build the tx.
     try {
       const { publicKey } = await ensureWallet(user.id);
-      const balanceLamports = BigInt(await connection.getBalance(new PublicKey(publicKey)));
+      const balanceLamports = BigInt(await withFailover((conn) => conn.getBalance(new PublicKey(publicKey))));
       const needed = owedNow + REPAY_GAS_BUFFER_LAMPORTS;
       if (balanceLamports < needed) {
         const short = needed - balanceLamports;
