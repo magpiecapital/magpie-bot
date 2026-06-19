@@ -242,10 +242,11 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
 
   if (sim.value.err) {
     // Simulation says the tx would fail on-chain. Don't broadcast a tx
-    // that's going to fail anyway, but don't flag this as a drain — let
-    // the caller see the underlying error so they can fix their tx.
+    // that's going to fail anyway. Mark kind="sim_failed" so the caller
+    // surfaces a tx-shape message to the user instead of the drain one.
     return {
       ok: false,
+      kind: "sim_failed",
       error: "Tx would fail on-chain (pre-flight simulation rejected)",
       detail: `simulated err=${JSON.stringify(sim.value.err).slice(0, 160)} logs=${(sim.value.logs || []).slice(-4).join(" | ").slice(0, 200)}`,
     };
@@ -1215,10 +1216,49 @@ export async function handleCosignBorrow(req) {
           },
         };
       }
+      // Humanize the two remaining drainCheck failure modes. Operator-mandated
+      // 2026-06-18 PM. [[feedback_loans_must_never_fail_no_regressions]]
+      if (drainCheck.kind === "sim_failed") {
+        // The user's tx itself would fail on-chain — usually a stale signing
+        // window, oracle blip, or insufficient collateral that slipped past
+        // the site's preflight. Friendly retry; the detail is for operator
+        // logs only.
+        // Insufficient-lamports translation — give the user actionable detail.
+        if (/insufficient lamports|InsufficientFunds.*Lamports|0x1$/i.test(drainCheck.detail || "")) {
+          return {
+            status: 400,
+            body: {
+              error: "Not quite enough SOL for fees — add a small amount of SOL to your wallet and try again.",
+              friendly: true,
+              detail: drainCheck.detail,
+            },
+          };
+        }
+        return {
+          status: 503,
+          body: {
+            error: "We're double-checking your borrow with the network — please tap Borrow again in 5–10 seconds.",
+            oracle_warming: true,
+            retry_after_seconds: 8,
+            detail: drainCheck.detail,
+          },
+        };
+      }
+      // drain_detected — real safety trip. Friendly UX for the user, but
+      // log + DM operator since this should never fire on a legitimate
+      // borrow. Either an attempted drain (attacker-side) OR a protocol
+      // bug we need to investigate.
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(null,
+          `CRIT [cosign-borrow] LAYER-2 drain trip on legitimate-shape request. detail=${(drainCheck.detail || "").slice(0,200)}`,
+        );
+      } catch {}
       return {
         status: 403,
         body: {
-          error: "Pre-flight simulation detected a lender-account balance decrease — refusing to broadcast",
+          error: "We couldn't process this borrow safely right now. Please refresh the page and try again. If this keeps happening, ping us in @magpietalk.",
+          friendly: true,
           detail: drainCheck.detail,
           layer: "L2-pre-flight-sim",
         },
