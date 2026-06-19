@@ -66,7 +66,14 @@ const ON_DEMAND_LOOP_SPACING_MS = Number(process.env.V4_ON_DEMAND_LOOP_SPACING_M
 // To bound spend further, the loop SKIPS mints that already have a healthy
 // sample buffer (current + 2 samples beyond MIN_SAMPLES_FOR_TWAP). The
 // loop only spends SOL on mints that actually need an attestation.
-const CONTINUOUS_CONCURRENCY = Number(process.env.V4_CONTINUOUS_CONCURRENCY) || 16;
+// Falsy-zero bug fix: `Number("0") || 16` evaluates to 16, so setting
+// V4_CONTINUOUS_CONCURRENCY=0 to throttle the loop didn't actually disable
+// it. Explicit-undefined check lets the operator set 0 to fully pause the
+// continuous sweep when Jupiter is in a 429 storm.
+const CONTINUOUS_CONCURRENCY =
+  process.env.V4_CONTINUOUS_CONCURRENCY != null && process.env.V4_CONTINUOUS_CONCURRENCY !== ""
+    ? Number(process.env.V4_CONTINUOUS_CONCURRENCY)
+    : 16;
 const CONTINUOUS_BATCH_SPACING_MS = Number(process.env.V4_CONTINUOUS_SPACING_MS) || 3_000;
 const CONTINUOUS_BUFFER_SAMPLES = Number(process.env.V4_CONTINUOUS_BUFFER_SAMPLES) || 2; // skip if mint has ≥ (MIN + buffer) samples
 const CONTINUOUS_LIST_REFRESH_INTERVAL_MS = 10 * 60_000; // re-read supported_mints every 10min in case new mints added
@@ -534,6 +541,16 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
 
   const list = state.continuousList;
   if (list.length === 0) {
+    setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+    ), 30_000);
+    return;
+  }
+
+  // Kill-switch: V4_CONTINUOUS_CONCURRENCY=0 pauses the sweep. Re-checks
+  // every 30s so flipping the env var back to nonzero resumes without
+  // a redeploy. Operator uses this when Jupiter is in a 429 storm.
+  if (CONTINUOUS_CONCURRENCY <= 0) {
     setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
       console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
     ), 30_000);
