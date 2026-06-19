@@ -73,11 +73,14 @@ export async function handleHealth(ctx) {
   let loan;
   if (arg) {
     // Specific loan by loan_id
+    // Layer 5 defense [[feedback_never_misattribute_loans]]
     const { rows } = await query(
       `SELECT l.*, sm.symbol, sm.decimals
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-       WHERE l.loan_id = $1 AND l.user_id = $2 AND l.status = 'active'
+       WHERE l.loan_id = $1 AND l.status = 'active'
+         AND (l.user_id = $2
+              OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $2))
        LIMIT 1`,
       [arg, user.id],
     );
@@ -96,7 +99,9 @@ export async function handleHealth(ctx) {
       `SELECT l.*, sm.symbol, sm.decimals
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-       WHERE l.user_id = $1 AND l.status = 'active'
+       WHERE l.status = 'active'
+         AND (l.user_id = $1
+              OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
        ORDER BY l.due_timestamp ASC`,
       [user.id],
     );

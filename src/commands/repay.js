@@ -24,11 +24,18 @@ export async function handleRepay(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
+  // Layer 5 defense — even if loans.user_id ever drifts (caught + repaired
+  // by wallet-attribution-sentinel + Layer 3 pre-write guard), the OR
+  // clause picks up any loan whose borrower_wallet is one of THIS user's
+  // wallets. The sentinel runs every 30 min; this closes the gap to ZERO
+  // for /repay. [[feedback_never_misattribute_loans]]
   const { rows } = await query(
     `SELECT l.*, sm.symbol
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-     WHERE l.user_id = $1 AND l.status = 'active'
+     WHERE l.status = 'active'
+       AND (l.user_id = $1
+            OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
@@ -118,7 +125,9 @@ export function registerRepayCallbacks(bot) {
       `SELECT l.*, sm.symbol
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-       WHERE l.id = $1 AND l.user_id = $2 AND l.status = 'active'`,
+       WHERE l.id = $1 AND l.status = 'active'
+         AND (l.user_id = $2
+              OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $2))`,
       [loanDbId, user.id],
     );
     const loan = rows[0];
