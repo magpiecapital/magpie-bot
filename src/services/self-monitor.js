@@ -801,6 +801,14 @@ async function probeBorrowFailures(bot) {
         return "sim_failed: tx would fail on-chain — check recent CRIT DMs for inner reason";
       if (k === "unclassified")
         return "unclassified: a new failure shape — pull recent CRIT DMs for the inner error";
+      if (k === "twap_warming_timeout")
+        return "twap_warming_timeout: JIT warmer couldn't deliver 8 samples in budget — check price-attestor logs + Jupiter health";
+      if (k === "twap_sim_reject")
+        return "twap_sim_reject: program rejected with TwapInsufficientHistory at sim — JIT warm + post-sim re-warm both insufficient; investigate attestor + PriceHistory PDA per mint";
+      if (k === "stale_price_attestation")
+        return "stale_price_attestation: PriceHistory age > MAX_PRICE_AGE_SEC at sim — attestor is falling behind for these mints";
+      if (k === "drain_check_rpc")
+        return "drain_check_rpc: primary + every backup RPC failed getMultipleAccountsInfo — provider status";
       return `${k}: investigate`;
     }).join(" | ");
     await alertIfNew(bot, KIND,
