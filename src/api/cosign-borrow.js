@@ -606,6 +606,7 @@ export async function handleCosignBorrow(req) {
       // Fail CLOSED across primary + every backup. User UX must not leak
       // the technical reason — friendly retry + DM operator with detail.
       console.error("[cosign-borrow] DRAIN-CHECK RPC failure (all RPCs failed) — failing closed:", rpcErr.message);
+      recordBorrowFailure("drain_check_rpc");
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
         await notifyAdmin(
@@ -1187,6 +1188,17 @@ export async function handleCosignBorrow(req) {
             console.warn(
               `[cosign-borrow] TWAP warming TIMED OUT prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
             );
+            recordBorrowFailure("twap_warming_timeout");
+            // CRIT-DM operator the FIRST time the JIT warmer can't deliver
+            // 8 samples in its budget — this is the symptom of an attestor
+            // stall, Jupiter outage, or unattested mint. The user-facing
+            // message is friendly; this DM is the trip wire.
+            try {
+              const { notifyAdmin } = await import("../services/admin-notify.js");
+              await notifyAdmin(
+                `CRIT [cosign-borrow] JIT TWAP warmer TIMED OUT — user hit TwapInsufficientHistory on borrow. prog=${borrowProgramId.toBase58().slice(0, 8)} mint=${mintStr.slice(0, 12)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
+              );
+            } catch {}
             return {
               status: 503,
               body: {
@@ -1313,6 +1325,7 @@ export async function handleCosignBorrow(req) {
       // the generic drain-block message — the user just needs to wait
       // for warming and tap Borrow again.
       if (/TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail || "")) {
+        recordBorrowFailure("twap_sim_reject");
         return {
           status: 503,
           body: {
@@ -1374,6 +1387,7 @@ export async function handleCosignBorrow(req) {
         }
         // StalePriceAttestation (price feed too old at broadcast time).
         if (/StalePriceAttestation|"Custom":\s*6019/i.test(detail)) {
+          recordBorrowFailure("stale_price_attestation");
           return {
             status: 503,
             body: {
