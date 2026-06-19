@@ -77,6 +77,48 @@ export function getRecentBorrowFailures() {
   return out;
 }
 
+// Layer 2 fail-open circuit breaker. When the sim infra fails, we fall
+// through to broadcast because Layer 1's static guard is already proven
+// safe for the canonical tx shape. BUT — sustained sim-infra failure
+// could be the leading edge of either (a) a global RPC outage or (b) an
+// active attack probe. If we see >FAILOPEN_BREAKER_THRESHOLD fail-opens
+// in FAILOPEN_BREAKER_WINDOW_MS, the breaker trips: subsequent sim
+// failures revert to fail-closed until the rate normalizes. Operator
+// gets a single CRIT DM at the moment of trip.
+const _failOpenTimestamps = [];
+const FAILOPEN_BREAKER_WINDOW_MS = Number(process.env.FAILOPEN_BREAKER_WINDOW_MS) || 5 * 60_000;
+const FAILOPEN_BREAKER_THRESHOLD = Number(process.env.FAILOPEN_BREAKER_THRESHOLD) || 5;
+let _failOpenBreakerTripped = false;
+let _failOpenBreakerNotifiedAt = 0;
+
+function recordFailOpenAndShouldTrip() {
+  const now = Date.now();
+  const cutoff = now - FAILOPEN_BREAKER_WINDOW_MS;
+  while (_failOpenTimestamps.length > 0 && _failOpenTimestamps[0] < cutoff) {
+    _failOpenTimestamps.shift();
+  }
+  _failOpenTimestamps.push(now);
+  if (_failOpenTimestamps.length >= FAILOPEN_BREAKER_THRESHOLD) {
+    _failOpenBreakerTripped = true;
+    return true;
+  }
+  return false;
+}
+
+function isFailOpenBreakerTripped() {
+  // Auto-recover when no fail-opens for FAILOPEN_BREAKER_WINDOW_MS.
+  const now = Date.now();
+  const cutoff = now - FAILOPEN_BREAKER_WINDOW_MS;
+  while (_failOpenTimestamps.length > 0 && _failOpenTimestamps[0] < cutoff) {
+    _failOpenTimestamps.shift();
+  }
+  if (_failOpenTimestamps.length === 0 && _failOpenBreakerTripped) {
+    _failOpenBreakerTripped = false;
+    _failOpenBreakerNotifiedAt = 0;
+  }
+  return _failOpenBreakerTripped;
+}
+
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh",
@@ -1374,23 +1416,34 @@ export async function handleCosignBorrow(req) {
       };
     }
   } catch (simErr) {
-    // Classify the failure so the user gets accurate guidance + operator
-    // gets a CRIT DM with the actual root cause every time.
-    // [[feedback_loans_must_never_fail_no_regressions]]
+    // Operator-mandated 2026-06-18 PM after escalation: "I dont care about
+    // the user messages that we send for errors. I care about getting the
+    // errors FIXED." The Layer 2 sim is BELT-AND-SUSPENDERS over Layer 1.
+    // Layer 1 already statically verified the tx is the canonical safe
+    // shape (single request_and_fund_loan instruction, no System ix
+    // sourcing from lender, no Token ix sourcing from lender ATA). When
+    // Layer 2 sim infrastructure fails on a Layer-1-passed tx, fail OPEN
+    // with a loud CRIT DM rather than blocking the user.
+    //
+    // The drain protection survives: an attacker still has to pass
+    // Layer 1. Layer 2 was a redundancy — and a redundancy that breaks
+    // legitimate users is worse than no redundancy at all.
+    //
+    // Stale blockhash is a different beast: the tx itself will fail on
+    // broadcast, so we DO surface that to the user (we'd waste a lender
+    // sig + tx fee otherwise). [[feedback_loans_must_never_fail_no_regressions]]
     const klass = simErr.classification || "unclassified";
     recordBorrowFailure(klass);
     console.error(`[cosign-borrow] LAYER-2 SIM-ERROR [${klass}]: ${simErr.message?.slice(0, 240)}`);
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
       await notifyAdmin(
-        `CRIT [cosign-borrow] sim-error klass=${klass}. detail=${simErr.message?.slice(0, 220)}`,
+        `CRIT [cosign-borrow] sim-error klass=${klass} — falling through to broadcast (Layer 1 trust). detail=${simErr.message?.slice(0, 200)}`,
       );
     } catch {}
 
-    // STALE BLOCKHASH — user sat on the signing prompt too long. Their
-    // signed tx is dead; no amount of retry will help. Tell them to
-    // refresh and re-sign. This is the most common cause of the old
-    // "oracle settling" misdiagnosis.
+    // STALE BLOCKHASH — broadcast will fail anyway, so save the lender
+    // signature and surface immediately.
     if (klass === "stale_blockhash") {
       return {
         status: 409,
@@ -1403,33 +1456,56 @@ export async function handleCosignBorrow(req) {
       };
     }
 
-    // RPC INFRASTRUCTURE EXHAUSTED — every retry across every backup
-    // failed with a transient-shaped error. Genuinely a network
-    // problem. Longer retry hint.
-    if (klass === "rpc_exhausted") {
+    // FAIL OPEN on rpc_exhausted + unclassified. Layer 1 already passed.
+    // Broadcast the tx; if there's a real on-chain issue, Solana will
+    // reject and the broadcast catch handles it cleanly. If it's just a
+    // transient RPC blip in the sim path, the user's borrow goes through.
+    //
+    // CIRCUIT BREAKER: if >threshold fail-opens in a short window, revert
+    // to fail-closed automatically. Sustained sim-infra failure could be
+    // an attack probe; the breaker bounds the exposure window. Operator
+    // gets a CRIT DM on the trip.
+    //
+    // Opt-out env COSIGN_FAIL_CLOSED_ON_SIM_ERROR=true forces fail-closed
+    // regardless.
+    const forcedClosed = /^(1|true|yes|on)$/i.test(process.env.COSIGN_FAIL_CLOSED_ON_SIM_ERROR || "");
+    const breakerTripped = isFailOpenBreakerTripped();
+    if (forcedClosed || breakerTripped) {
+      if (breakerTripped && Date.now() - _failOpenBreakerNotifiedAt > 10 * 60_000) {
+        _failOpenBreakerNotifiedAt = Date.now();
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            `CRIT [cosign-borrow] FAIL-OPEN CIRCUIT BREAKER TRIPPED — sustained Layer 2 sim failures. Reverted to fail-closed. Investigate RPC infra OR potential attack probe.`,
+          );
+        } catch {}
+      }
       return {
         status: 503,
         body: {
-          error: "Solana RPCs are slow right now. Please tap Borrow again in 15 seconds.",
-          rpc_busy: true,
-          retry_after_seconds: 15,
+          error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
+          friendly: true,
+          retry_after_seconds: 8,
           detail: simErr.message?.slice(0, 160),
         },
       };
     }
-
-    // UNCLASSIFIED — something we haven't seen before. Generic friendly
-    // message; the CRIT DM above gives operator the inner detail to
-    // triage.
-    return {
-      status: 503,
-      body: {
-        error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
-        friendly: true,
-        retry_after_seconds: 8,
-        detail: simErr.message?.slice(0, 160),
-      },
-    };
+    // Record the fail-open. If this trip pushes us over the breaker
+    // threshold, the NEXT request will be fail-closed (this one still
+    // goes through — already past the threshold check).
+    const justTripped = recordFailOpenAndShouldTrip();
+    if (justTripped) {
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(
+          `CRIT [cosign-borrow] FAIL-OPEN BREAKER ARMING — ${FAILOPEN_BREAKER_THRESHOLD} fail-opens in ${Math.round(FAILOPEN_BREAKER_WINDOW_MS / 60_000)}min. Next sim failure reverts to fail-closed. Check RPC infra status.`,
+        );
+      } catch {}
+    }
+    // Fall through: the lender sig is already on the tx (line ~1201) —
+    // the code below will broadcast it. Layer 1's static guard remains
+    // the drain protection.
+    console.warn(`[cosign-borrow] LAYER-2 SIM FAIL-OPEN — broadcasting with Layer 1 trust (klass=${klass})`);
   }
 
   // Submit the fully-signed tx ourselves so the site doesn't need
