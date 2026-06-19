@@ -361,16 +361,37 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
   // Confidence: use 200 bps (2%) as default since Jupiter doesn't provide confidence
   const confidenceBps = 200;
 
-  const sig = await program.methods
-    .updatePrice(new BN(priceLamports), confidenceBps)
-    .accounts({
-      pool,
-      priceFeed,
-      authority: lender.publicKey,
-    })
-    .rpc({ commitment: "confirmed" });
-
-  return { signature: sig, priceLamports, priceSol };
+  // Retry-on-429 with exponential backoff. Helius rate-limits aggressively
+  // under high concurrency (~25% of attests 429'd at 18-way parallelism
+  // 2026-06-18 PM). Retry catches transient 429s without losing the
+  // attestation. Blockhash-expired errors also retry — likely caused by
+  // RPC queue lag.
+  const RETRY_DELAYS_MS = [500, 1500, 3000];
+  let lastErr = null;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const sig = await program.methods
+        .updatePrice(new BN(priceLamports), confidenceBps)
+        .accounts({
+          pool,
+          priceFeed,
+          authority: lender.publicKey,
+        })
+        .rpc({ commitment: "confirmed" });
+      return { signature: sig, priceLamports, priceSol };
+    } catch (err) {
+      lastErr = err;
+      const msg = err.message || "";
+      const retriable =
+        /429|Too Many Requests|rate.?limit/i.test(msg) ||
+        /blockhash.*not.*found|block.*expired|TransactionExpiredBlockheightExceeded/i.test(msg);
+      if (!retriable || attempt >= RETRY_DELAYS_MS.length) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  throw lastErr;
 }
 
 /**
