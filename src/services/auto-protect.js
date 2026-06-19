@@ -316,8 +316,12 @@ async function tick(bot) {
   try {
     // Pull all active loans where the user has auto_protect ON
     const { rows } = await query(
+      // program_id MUST be selected — executePartialRepay routes the
+      // repay tx via chooseProgramIdForLoan(loanDbRow). Without it,
+      // V3/V4 loans get a V1-shape repay and AccountOwnedByWrongProgram
+      // fires every tick. [[feedback_cross_version_program_routing_required]]
       `SELECT l.id, l.loan_id, l.user_id, l.collateral_mint, l.collateral_amount,
-              l.original_loan_amount_lamports, l.loan_pda,
+              l.original_loan_amount_lamports, l.loan_pda, l.program_id,
               u.telegram_id, sm.decimals
        FROM loans l
        JOIN users u ON u.id = l.user_id
