@@ -61,7 +61,10 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   createCloseAccountInstruction,
 } from "@solana/spl-token";
-import { BN } from "@coral-xyz/anchor";
+// Named { BN } breaks on Node 22+ (strict ESM-from-CJS). Default-import
+// then destructure. [[feedback_anchor_cjs_node22_import_pattern]]
+import anchorPkg from "@coral-xyz/anchor";
+const { BN } = anchorPkg;
 import bs58 from "bs58";
 
 import { connection, withFailover } from "../solana/connection.js";
