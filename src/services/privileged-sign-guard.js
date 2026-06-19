@@ -32,7 +32,7 @@
  * exploits and put together the same safeguards"). See
  * feedback_cosign_borrow_token_drain_exploit_2026_06_18.md.
  */
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 
@@ -163,9 +163,36 @@ export async function runPrivilegedSign({ service, tx, signers, allowedDeltas })
 
   // 5. Simulate, requesting post-state of ALL accounts so we can verify
   //    no privileged-account decrease was hidden in an undeclared spot.
+  //
+  // web3.js@1.98+ overloads simulateTransaction: VersionedTransaction
+  // accepts the (tx, config) shape we want; LEGACY Transaction expects
+  // (tx, signers[], includeAccounts). Passing a config object to the
+  // legacy overload throws "Invalid arguments" — which is exactly the
+  // bug that broke fee-wallet-sweeper hourly starting 2026-06-19. Fix:
+  // promote any legacy Transaction to VersionedTransaction here so the
+  // modern (tx, config) call path is always valid.
+  let txForSim = tx;
+  if (tx instanceof Transaction && !(tx instanceof VersionedTransaction)) {
+    try {
+      const message = tx.compileMessage();
+      txForSim = new VersionedTransaction(message);
+      // Copy any signatures already on the legacy tx so sigVerify=false
+      // sim sees the right tx shape (we don't actually verify here but
+      // the wire encoding includes the sig slots).
+      for (let i = 0; i < tx.signatures.length && i < txForSim.signatures.length; i++) {
+        const sigPair = tx.signatures[i];
+        if (sigPair?.signature) {
+          txForSim.signatures[i] = sigPair.signature;
+        }
+      }
+    } catch (convErr) {
+      await markAuditRejected(auditId, `legacy->versioned conversion failed: ${convErr.message?.slice(0, 100)}`);
+      throw new Error(`privileged-sign-guard: legacy->versioned conversion failed: ${convErr.message}`);
+    }
+  }
   let sim;
   try {
-    sim = await connection.simulateTransaction(tx, {
+    sim = await connection.simulateTransaction(txForSim, {
       sigVerify: false,
       commitment: "confirmed",
       accounts: {
