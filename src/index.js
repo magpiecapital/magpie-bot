@@ -182,6 +182,7 @@ import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startBorrowCanary } from "./services/borrow-canary.js";
+import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
 import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
@@ -967,6 +968,12 @@ bot.start({
     // first success after a fail. Catches every "users would currently
     // see this class" degradation within 60s. Mandated 2026-06-19 PM.
     setTimeout(() => startBorrowCanary(bot), 110_000);
+    // Boot-time V4 PriceFeed sync — at +90s, walk every enabled
+    // supported_mints entry and ensure the V4 PriceFeed PDA exists.
+    // Eliminates the AccountNotInitialized class for never-borrowed-
+    // against mints. Per V4 loan lifecycle mandate NN1 (operator-
+    // mandated 2026-06-19 PM after user 948 incident).
+    startBootV4FeedSync(bot);
     // Loan program_id healer — every 10 min, scans non-closed loans
     // and auto-corrects any DB row whose stored program_id disagrees
     // with the on-chain owner of loan_pda. Defense-in-depth layer
