@@ -802,6 +802,12 @@ bot.start({
     // on-chain action. Foundation for the eventual auto-sweeper.
     // [[feedback_distribution_wallet_must_be_auto_funded]]
     import("./services/lp-excess-monitor.js").then((m) => m.startLpExcessMonitor(bot));
+    // LP-excess auto-sweeper (Phase 2) — every 24h, calls admin_withdraw
+    // on each pool with positive excess and routes the SOL directly to
+    // CHCAM via the closeAccount-with-arbitrary-destination pattern.
+    // Default: dry-run. Operator flips LP_EXCESS_AUTO_SWEEP_ENABLED=true
+    // on Railway to live-broadcast. [[feedback_distribution_wallet_must_be_auto_funded]]
+    import("./services/lp-excess-sweeper.js").then((m) => m.startLpExcessSweeper(bot));
     // Upside Watcher — every 15 min, scans active loans whose collateral
     // has appreciated and DMs the borrower a Pip nudge to arm a TP. Seeds
     // first take-profit fills by surfacing the opportunity the moment it
