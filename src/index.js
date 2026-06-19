@@ -112,6 +112,7 @@ import {
   handlePause,
   handleResume,
   handleAdminStatus,
+  handleConvStats,
   handleV4Status,
   handleEnableMint,
   handleDisableMint,
@@ -282,6 +283,7 @@ bot.command("mydistributions", handleDistributions); // alias
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
+bot.command("convstats", handleConvStats); // /convstats — per-path conversion success rates
 bot.command(["v4status", "v4-status", "v4"], handleV4Status);
 bot.command(["admincmds", "adminlog"], handleAdminCmds);
 // Limit-close engine observability (operator-facing). Read-only.

@@ -429,7 +429,78 @@ async function readJsonBody(req) {
   });
 }
 
+/**
+ * Wrapper that records every borrow attempt to conversion_events so
+ * /conv-stats + the success-rate self-monitor probe have full
+ * visibility. Phase 1 of the conversion-reliability mandate
+ * [[feedback_loan_conversions_must_execute_zero_50_50]].
+ *
+ * The wrapper classifies failures from the response body shape — same
+ * fields the existing UI already consumes (oracle_warming, sim_failed,
+ * stale_blockhash, ok). Per-mint context arrives in Phase 1B (wiring
+ * the tracker into the existing per-class failure callsites where
+ * mintStr is in scope).
+ */
+function classifyBorrowOutcome(result) {
+  if (result?.body?.ok === true) return { outcome: "success", klass: null };
+  const b = result?.body || {};
+  if (b.stale_blockhash) return { outcome: "failure", klass: "stale_blockhash" };
+  if (b.price_moved) return { outcome: "failure", klass: "price_moved" };
+  if (b.oracle_warming) return { outcome: "failure", klass: "oracle_warming" };
+  if (b.borrow_paused) return { outcome: "failure", klass: "borrow_paused" };
+  if (b.exits_require_v4_loan) return { outcome: "failure", klass: "exits_require_v4_loan" };
+  if (result.status === 405) return { outcome: "failure", klass: "method_not_allowed" };
+  if (result.status === 503 && /Site-borrow co-signing is temporarily disabled/i.test(b.error || "")) {
+    return { outcome: "failure", klass: "killswitch" };
+  }
+  if (result.status === 400) return { outcome: "failure", klass: "bad_request" };
+  if (result.status === 503) return { outcome: "failure", klass: "unavailable" };
+  if (result.status === 500) return { outcome: "failure", klass: "server_error" };
+  return { outcome: "failure", klass: "unclassified" };
+}
+
 export async function handleCosignBorrow(req) {
+  const _convCtx = { mint: null, programId: null, wallet: null, surface: "site", startedAt: Date.now() };
+  try {
+    const result = await _handleCosignBorrowImpl(req, _convCtx);
+    const { outcome, klass } = classifyBorrowOutcome(result);
+    // Fire-and-forget — never let telemetry block the response.
+    import("../services/conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "borrow",
+          outcome,
+          failureClass: klass,
+          mint: _convCtx.mint,
+          programId: _convCtx.programId,
+          wallet: _convCtx.wallet,
+          surface: _convCtx.surface,
+          latencyMs: Date.now() - _convCtx.startedAt,
+        }),
+      )
+      .catch(() => {});
+    return result;
+  } catch (err) {
+    import("../services/conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "borrow",
+          outcome: "failure",
+          failureClass: "thrown",
+          mint: _convCtx.mint,
+          programId: _convCtx.programId,
+          wallet: _convCtx.wallet,
+          surface: _convCtx.surface,
+          latencyMs: Date.now() - _convCtx.startedAt,
+          detail: { error: err?.message?.slice(0, 200) },
+        }),
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+async function _handleCosignBorrowImpl(req, _convCtx) {
   // Trace every hit so the operator can confirm in Railway logs whether
   // failed site borrows are even reaching the bot. The token after
   // COSIGN_HIT is the precise UTC timestamp — easy to grep.
