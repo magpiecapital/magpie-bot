@@ -441,6 +441,37 @@ async function readJsonBody(req) {
  * the tracker into the existing per-class failure callsites where
  * mintStr is in scope).
  */
+/**
+ * Per-class failure recorder. Called at each recordBorrowFailure
+ * callsite inside the impl so failures land in conversion_events with
+ * the FULL inner context (failure class, mint, program, wallet,
+ * latency, raw detail) instead of just the outer-wrapper's body-shape
+ * classification.
+ *
+ * Sets `_convCtx.recorded = true` so the outer wrapper skips its own
+ * write (no double-counting).
+ *
+ * Fire-and-forget so telemetry never blocks the response.
+ */
+function _recordBorrowConversionFailure(_convCtx, klass, detail) {
+  _convCtx.recorded = true;
+  import("../services/conversion-tracker.js")
+    .then(({ recordConversionEvent }) =>
+      recordConversionEvent({
+        path: "borrow",
+        outcome: "failure",
+        failureClass: klass,
+        mint: _convCtx.mint,
+        programId: _convCtx.programId,
+        wallet: _convCtx.wallet,
+        surface: _convCtx.surface,
+        latencyMs: Date.now() - _convCtx.startedAt,
+        detail: detail || null,
+      }),
+    )
+    .catch(() => {});
+}
+
 function classifyBorrowOutcome(result) {
   if (result?.body?.ok === true) return { outcome: "success", klass: null };
   const b = result?.body || {};
@@ -460,9 +491,24 @@ function classifyBorrowOutcome(result) {
 }
 
 export async function handleCosignBorrow(req) {
-  const _convCtx = { mint: null, programId: null, wallet: null, surface: "site", startedAt: Date.now() };
+  // _convCtx is mutated by _handleCosignBorrowImpl as it learns more
+  // about the request (mint, program, wallet). Per-class failure sites
+  // inside the impl can ALSO record their own conversion_events row
+  // with full inner context (e.g. inner-error detail); when they do,
+  // they set `recorded = true` so the outer wrapper skips its own write
+  // and we don't double-count. The wrapper still records SUCCESS and
+  // top-level unclassified failures. [[feedback_user_retention_via_flawless_conversion]]
+  const _convCtx = {
+    mint: null,
+    programId: null,
+    wallet: null,
+    surface: "site",
+    startedAt: Date.now(),
+    recorded: false,
+  };
   try {
     const result = await _handleCosignBorrowImpl(req, _convCtx);
+    if (_convCtx.recorded) return result; // per-class site already recorded — skip dup
     const { outcome, klass } = classifyBorrowOutcome(result);
     // Fire-and-forget — never let telemetry block the response.
     import("../services/conversion-tracker.js")
@@ -678,6 +724,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
       // the technical reason — friendly retry + DM operator with detail.
       console.error("[cosign-borrow] DRAIN-CHECK RPC failure (all RPCs failed) — failing closed:", rpcErr.message);
       recordBorrowFailure("drain_check_rpc");
+      _recordBorrowConversionFailure(_convCtx, "drain_check_rpc", { rpcErr: rpcErr.message?.slice(0, 200) });
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
         await notifyAdmin(
@@ -1216,6 +1263,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     const mintKey = magpieIxForAttest?.keys?.[4]?.pubkey;
     if (mintKey) {
       const mintStr = mintKey.toBase58();
+      _convCtx.mint = mintStr; // for conversion_events on every per-class failure
       const { rows: [mintRow] } = await query(
         `SELECT decimals FROM supported_mints WHERE mint = $1`,
         [mintStr],
@@ -1231,6 +1279,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
         // PDA was never initialized — bot's category routing never
         // reaches V4.
         const borrowProgramId = magpieIxForAttest.programId;
+        _convCtx.programId = borrowProgramId.toBase58(); // populate before any per-class failure
         // V3 AND V4 both use the price_v3 PriceHistory layout with the
         // same TWAP gate (>= 8 samples in 300s). Originally I only
         // JIT-warmed V4, which left SPCX (RWA, defaults to V3 borrow
@@ -1260,6 +1309,13 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
               `[cosign-borrow] TWAP warming TIMED OUT prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
             );
             recordBorrowFailure("twap_warming_timeout");
+            _recordBorrowConversionFailure(_convCtx, "twap_warming_timeout", {
+              inWindow: warm.inWindow,
+              required: 8,
+              waitedMs: warm.waitedMs,
+              attests: warm.attests,
+              reason: warm.reason,
+            });
             // CRIT-DM operator the FIRST time the JIT warmer can't deliver
             // 8 samples in its budget — this is the symptom of an attestor
             // stall, Jupiter outage, or unattested mint. The user-facing
@@ -1397,6 +1453,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
       // for warming and tap Borrow again.
       if (/TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail || "")) {
         recordBorrowFailure("twap_sim_reject");
+        _recordBorrowConversionFailure(_convCtx, "twap_sim_reject", { detail: drainCheck.detail?.slice(0, 220) });
         return {
           status: 503,
           body: {
@@ -1412,6 +1469,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
         // The user's tx itself would fail on-chain. Classify by inner code
         // so the user gets actionable guidance + operator gets a CRIT DM.
         recordBorrowFailure("sim_failed");
+        _recordBorrowConversionFailure(_convCtx, "sim_failed", { detail: drainCheck.detail?.slice(0, 220) });
         const detail = drainCheck.detail || "";
         try {
           const { notifyAdmin } = await import("../services/admin-notify.js");
@@ -1459,6 +1517,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
         // StalePriceAttestation (price feed too old at broadcast time).
         if (/StalePriceAttestation|"Custom":\s*6019/i.test(detail)) {
           recordBorrowFailure("stale_price_attestation");
+          _recordBorrowConversionFailure(_convCtx, "stale_price_attestation", { detail: detail?.slice(0, 220) });
           return {
             status: 503,
             body: {
@@ -1519,6 +1578,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     // sig + tx fee otherwise). [[feedback_loans_must_never_fail_no_regressions]]
     const klass = simErr.classification || "unclassified";
     recordBorrowFailure(klass);
+    _recordBorrowConversionFailure(_convCtx, klass, { sim_err: simErr.message?.slice(0, 200) });
     console.error(`[cosign-borrow] LAYER-2 SIM-ERROR [${klass}]: ${simErr.message?.slice(0, 240)}`);
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
