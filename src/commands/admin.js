@@ -247,6 +247,92 @@ export async function handleBorrowFailures(ctx) {
   }
 }
 
+/* ──────────────── /conv-stats — conversion success rates ──────────────── */
+
+/**
+ * /conv-stats — per-path / per-mint / per-version success rates over
+ * 1h, 24h, 7d windows. Phase 1 of the conversion-reliability mandate
+ * [[feedback_user_retention_via_flawless_conversion]]. Reads from
+ * conversion_events table written by the path wrappers in
+ * cosign-borrow.js and (soon) the arm/repay paths.
+ *
+ * Without this, the operator only learns about failures from user
+ * complaints — too late. With it, any path / mint with degraded
+ * success rate is visible at a glance and the self-monitor probe
+ * pages the operator the moment a mint drops below 95%.
+ */
+export async function handleConvStats(ctx) {
+  if (!(await requireAdmin(ctx, "conv-stats"))) return;
+  try {
+    const { getConversionStats, getConversionFailureClasses, findDegradedConversionTargets } =
+      await import("../services/conversion-tracker.js");
+
+    const windows = [
+      { label: "1h", sec: 3600 },
+      { label: "24h", sec: 86400 },
+      { label: "7d", sec: 7 * 86400 },
+    ];
+
+    const lines = ["*Conversion success rates — by path*", ""];
+    for (const w of windows) {
+      const stats = await getConversionStats({ windowSec: w.sec, groupBy: "path" });
+      lines.push(`*Last ${w.label}*`);
+      if (stats.length === 0) {
+        lines.push("  no attempts");
+      } else {
+        for (const s of stats) {
+          const rate = s.success_rate === null ? "—" : (s.success_rate * 100).toFixed(2) + "%";
+          const marker = s.success_rate !== null && s.success_rate < 0.95 ? " *DEGRADED*" : "";
+          lines.push(`  \`${s.group_key}\` n=${s.attempts} ok=${s.successes} fail=${s.failures} rate=${rate}${marker}`);
+        }
+      }
+      lines.push("");
+    }
+
+    // Per-mint detail in last 1h (might be sparse during quiet hours)
+    const mintStats = await getConversionStats({ windowSec: 3600, groupBy: "path_mint" });
+    if (mintStats.length > 0) {
+      lines.push("*Last 1h — per path|mint (with ≥1 attempt)*");
+      for (const s of mintStats.slice(0, 12)) {
+        const rate = s.success_rate === null ? "—" : (s.success_rate * 100).toFixed(2) + "%";
+        const marker = s.success_rate !== null && s.success_rate < 0.95 && s.attempts >= 5 ? " *DEGRADED*" : "";
+        const [path, mint] = s.group_key.split("|");
+        const mintShort = mint && mint !== "<no-mint>" ? `${mint.slice(0, 8)}…` : "(no-mint)";
+        lines.push(`  ${path} ${mintShort} n=${s.attempts} ${rate}${marker}`);
+      }
+      lines.push("");
+    }
+
+    // Failure-class breakdown (all paths, last 1h)
+    const classes = await getConversionFailureClasses({ windowSec: 3600 });
+    if (classes.length > 0) {
+      lines.push("*Last 1h — failure classes*");
+      for (const c of classes.slice(0, 10)) {
+        lines.push(`  \`${c.klass}\` × ${c.n}`);
+      }
+      lines.push("");
+    }
+
+    // Degraded targets that should trigger probe alerts
+    const degraded = await findDegradedConversionTargets({ windowSec: 3600, minAttempts: 5, minSuccessRate: 0.95 });
+    if (degraded.length > 0) {
+      lines.push("*DEGRADED (last 1h, ≥5 attempts, <95% success)*");
+      for (const d of degraded) {
+        const mintShort = d.mint && d.mint !== "<no-mint>" ? `${d.mint.slice(0, 8)}…` : "(no-mint)";
+        const rate = (d.success_rate * 100).toFixed(2) + "%";
+        lines.push(`  ${d.path} ${mintShort} attempts=${d.attempts} rate=${rate}`);
+      }
+    } else {
+      lines.push("_No degraded mint/path pairs (last 1h)._");
+    }
+
+    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("[/conv-stats]:", err.message);
+    return ctx.reply(`Failed to read conv-stats: ${err.message?.slice(0, 160)}`);
+  }
+}
+
 export async function handleAdminStatus(ctx) {
   if (!(await requireAdmin(ctx, "admin"))) return;
   const { getGlobalSiteState } = await import("../services/site-global.js");
