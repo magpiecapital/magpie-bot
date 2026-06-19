@@ -200,6 +200,53 @@ export async function handleV4Status(ctx) {
   }
 }
 
+/**
+ * /borrow-failures — show the rolling 1h snapshot of cosign-borrow
+ * failure classifications. The same in-memory counter the self-monitor
+ * probe reads, but on-demand for fast triage. Pairs with the CRIT DMs
+ * that fire when any class crosses the per-hour threshold.
+ *
+ * Per-klass guidance is included so operator gets the next-step in
+ * the same message.
+ */
+export async function handleBorrowFailures(ctx) {
+  if (!(await requireAdmin(ctx, "borrow-failures"))) return;
+  try {
+    const { getRecentBorrowFailures } = await import("../api/cosign-borrow.js");
+    const failures = getRecentBorrowFailures();
+    const klasses = Object.keys(failures);
+    if (klasses.length === 0) {
+      return ctx.reply("*cosign-borrow failures — last 1h*\n\nZero. Every borrow that reached cosign succeeded.", { parse_mode: "Markdown" });
+    }
+    const sorted = klasses.sort((a, b) => failures[b] - failures[a]);
+    const guidance = {
+      stale_blockhash: "users signing too late — site should refresh blockhash if signing >30s",
+      rpc_exhausted: "Helius + every backup failing simulateTransaction — check provider status",
+      sim_failed: "tx would fail on-chain — pull recent CRIT DMs for the inner reason",
+      unclassified: "new failure shape — pull recent CRIT DMs for the inner error",
+    };
+    const total = sorted.reduce((acc, k) => acc + failures[k], 0);
+    const lines = [
+      "*cosign-borrow failures — last 1h*",
+      "",
+      `Total: *${total}*`,
+      "",
+      "By classification:",
+    ];
+    for (const k of sorted) {
+      lines.push(`  \`${k}\` × ${failures[k]}`);
+      const hint = guidance[k];
+      if (hint) lines.push(`    -> ${hint}`);
+    }
+    lines.push("");
+    lines.push("Per-occurrence detail arrives via CRIT DMs as each failure fires.");
+    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("[/borrow-failures]:", err.message);
+    return ctx.reply(`Failed to read snapshot: ${err.message?.slice(0, 160)}`);
+  }
+}
+
 export async function handleAdminStatus(ctx) {
   if (!(await requireAdmin(ctx, "admin"))) return;
   const { getGlobalSiteState } = await import("../services/site-global.js");
