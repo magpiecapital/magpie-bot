@@ -71,11 +71,16 @@ export async function handlePositions(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
+  // Layer 5 defense — OR-clause picks up loans whose borrower_wallet
+  // is one of THIS user's wallets, even if loans.user_id has drifted.
+  // [[feedback_never_misattribute_loans]]
   const { rows: rawRows } = await query(
     `SELECT l.*, sm.symbol, sm.decimals
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-     WHERE l.user_id = $1 AND l.status = 'active'
+     WHERE l.status = 'active'
+       AND (l.user_id = $1
+            OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
