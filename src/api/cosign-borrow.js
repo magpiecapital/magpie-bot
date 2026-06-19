@@ -48,6 +48,35 @@ import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { getTierByOption } from "../services/loan-tier-resolver.js";
 
+// Rolling counter of borrow failure classifications. self-monitor reads
+// this via getRecentBorrowFailures() and CRIT-alerts the operator when
+// the rate of any class exceeds the threshold. Lets us see in real time
+// whether the problem is stale-blockhash (signing-window issue), rpc-
+// exhausted (infrastructure issue), or sim-failed (program-side reject).
+const _borrowFailureCounts = new Map(); // klass -> array of timestamps (ms)
+const FAILURE_RETENTION_MS = 60 * 60 * 1000; // 1h rolling
+
+function recordBorrowFailure(klass) {
+  const now = Date.now();
+  const arr = _borrowFailureCounts.get(klass) || [];
+  arr.push(now);
+  // Trim entries older than retention window
+  const cutoff = now - FAILURE_RETENTION_MS;
+  while (arr.length > 0 && arr[0] < cutoff) arr.shift();
+  _borrowFailureCounts.set(klass, arr);
+}
+
+/** Snapshot for self-monitor — returns { klass: count_last_hour, ... } */
+export function getRecentBorrowFailures() {
+  const out = {};
+  const cutoff = Date.now() - FAILURE_RETENTION_MS;
+  for (const [klass, arr] of _borrowFailureCounts.entries()) {
+    const recent = arr.filter((ts) => ts >= cutoff).length;
+    if (recent > 0) out[klass] = recent;
+  }
+  return out;
+}
+
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh",
@@ -1256,6 +1285,7 @@ export async function handleCosignBorrow(req) {
       if (drainCheck.kind === "sim_failed") {
         // The user's tx itself would fail on-chain. Classify by inner code
         // so the user gets actionable guidance + operator gets a CRIT DM.
+        recordBorrowFailure("sim_failed");
         const detail = drainCheck.detail || "";
         try {
           const { notifyAdmin } = await import("../services/admin-notify.js");
@@ -1348,6 +1378,7 @@ export async function handleCosignBorrow(req) {
     // gets a CRIT DM with the actual root cause every time.
     // [[feedback_loans_must_never_fail_no_regressions]]
     const klass = simErr.classification || "unclassified";
+    recordBorrowFailure(klass);
     console.error(`[cosign-borrow] LAYER-2 SIM-ERROR [${klass}]: ${simErr.message?.slice(0, 240)}`);
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
