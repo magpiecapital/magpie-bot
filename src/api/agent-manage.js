@@ -36,7 +36,7 @@ import {
 } from "@solana/spl-token";
 import BN from "bn.js";
 import { query } from "../db/pool.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { chooseProgramIdForLoan, getProgramForSigner } from "../solana/program.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
@@ -64,7 +64,7 @@ async function readJsonBody(req) {
 }
 
 async function getMintTokenProgram(mintStr) {
-  const info = await connection.getAccountInfo(new PublicKey(mintStr));
+  const info = await withFailover((conn) => conn.getAccountInfo(new PublicKey(mintStr)));
   if (!info) throw new Error(`Mint ${mintStr} not found on-chain`);
   return info.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
 }
