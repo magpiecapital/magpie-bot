@@ -849,6 +849,82 @@ export function startPriceAttestor(intervalMs = 30_000) {
   const PREWARM_INTERVAL_MS = Number(process.env.PRICE_FEED_PREWARM_INTERVAL_MS) || 30 * 60 * 1000;
   setInterval(() => preWarmAllEnabledMintFeeds("periodic"), PREWARM_INTERVAL_MS);
 
+  // ============================================================
+  // STALE-FEED CRIT ALARM
+  // ============================================================
+  // Operator-mandated 2026-06-19 PM after StalePriceAttestation surfaced
+  // to the user: we should KNOW about staleness before the borrower
+  // does. Every 60s, sample 8 random enabled mints and check their
+  // V1/V3/V4 feed ages. If ANY age > STALE_THRESHOLD_SEC, CRIT-DM
+  // operator immediately with the list.
+  //
+  // Sampling rather than full sweep keeps the RPC cost bounded
+  // (~24 reads per minute vs 540 if we walked all 174×3). At steady
+  // state every mint × every program is sampled within ~22 minutes,
+  // which is well below the operator-visible window for a stale-feed
+  // incident.
+  //
+  // Suppressed for 5 min after the first CRIT for a given mint to
+  // avoid spamming during a sustained Jupiter outage. The dedup-by-mint
+  // means we still see distinct problems even if one mint is on fire.
+  const STALE_THRESHOLD_SEC = Number(process.env.STALE_FEED_ALARM_THRESHOLD_SEC) || 90;
+  const STALE_ALARM_INTERVAL_MS = Number(process.env.STALE_FEED_ALARM_INTERVAL_MS) || 60_000;
+  const STALE_ALARM_SAMPLE_SIZE = Number(process.env.STALE_FEED_ALARM_SAMPLE_SIZE) || 8;
+  const lastAlertedAt = new Map(); // key: `${mint}_${programLabel}`, val: Date.now()
+  const ALARM_SUPPRESS_MS = 5 * 60_000;
+  async function staleFeedAlarmTick() {
+    try {
+      const { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+      const r = await query(
+        `SELECT mint, decimals, category
+           FROM supported_mints
+          WHERE enabled = TRUE`,
+      );
+      const tokens = r.rows;
+      if (tokens.length === 0) return;
+      // Sample without replacement.
+      const sample = tokens
+        .map((t) => ({ t, k: Math.random() }))
+        .sort((a, b) => a.k - b.k)
+        .slice(0, STALE_ALARM_SAMPLE_SIZE)
+        .map((s) => s.t);
+      const RWA = new Set(["stock", "etf", "metal"]);
+      const stale = [];
+      for (const t of sample) {
+        const isRWA = RWA.has(t.category);
+        const targets = [];
+        if (isRWA && PROGRAM_ID_V3) targets.push({ prog: PROGRAM_ID_V3, label: "V3" });
+        if (!isRWA) targets.push({ prog: PROGRAM_ID, label: "V1" });
+        if (PROGRAM_ID_V4) targets.push({ prog: PROGRAM_ID_V4, label: "V4" });
+        for (const tgt of targets) {
+          let age = null;
+          try { age = await getPriceFeedAgeSeconds(t.mint, tgt.prog); } catch {}
+          if (age !== null && age > STALE_THRESHOLD_SEC) {
+            const key = `${t.mint}_${tgt.label}`;
+            const last = lastAlertedAt.get(key);
+            if (!last || Date.now() - last > ALARM_SUPPRESS_MS) {
+              stale.push({ mint: t.mint, label: tgt.label, age });
+              lastAlertedAt.set(key, Date.now());
+            }
+          }
+        }
+      }
+      if (stale.length > 0) {
+        const lines = stale.map((s) => `  ${s.label} ${s.mint.slice(0, 8)}… age=${s.age}s`).join("\n");
+        try {
+          const { notifyAdmin } = await import("./admin-notify.js");
+          await notifyAdmin(
+            `CRIT [stale-feed-alarm] ${stale.length} feed(s) > ${STALE_THRESHOLD_SEC}s old (sampled ${sample.length}/${tokens.length} mints):\n${lines}`,
+          );
+        } catch {}
+        console.warn(`[stale-feed-alarm] ${stale.length} stale feed(s) detected`);
+      }
+    } catch (err) {
+      console.warn(`[stale-feed-alarm] tick threw: ${err.message?.slice(0, 200)}`);
+    }
+  }
+  setInterval(staleFeedAlarmTick, STALE_ALARM_INTERVAL_MS);
+
   // Run immediately, then on interval
   tick();
   return setInterval(tick, intervalMs);
