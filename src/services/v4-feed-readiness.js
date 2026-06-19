@@ -43,15 +43,28 @@ const WARMUP_BATCH_SPACING_MS = Number(process.env.V4_WARMUP_BATCH_SPACING_MS) |
 const PRIORITY_MINT_LOOKBACK_DAYS = Number(process.env.V4_WARMUP_LOOKBACK_DAYS) || 7;
 const READINESS_THRESHOLD_PCT = Number(process.env.V4_READINESS_THRESHOLD_PCT) || 80;
 
+// Per-mint on-demand warmup — how long a mint stays "hot" after a user
+// shows interest. Re-requested mints stay in the burst queue; mints
+// unrequested for this window drop back to the normal attestor cadence
+// to keep SOL spend bounded.
+const ON_DEMAND_HOT_WINDOW_MS = Number(process.env.V4_ON_DEMAND_HOT_WINDOW_MS) || 5 * 60_000;
+const ON_DEMAND_LOOP_SPACING_MS = Number(process.env.V4_ON_DEMAND_LOOP_SPACING_MS) || 3_000;
+
 // Shared module state — read by /api/v1/health.
 const state = {
   startedAt: null,
   completedAt: null,
   priorityMints: [],         // Array<{ mint, symbol, category }>
-  warmMints: new Set(),      // mint string
+  warmMints: new Set(),      // mint string — currently warm (sample-in-window check)
   inFlight: new Set(),       // currently being attested
   lastError: null,
   lastErrorAt: null,
+  // On-demand state. Site calls requestMintWarm() for any mint a user
+  // is showing interest in (rendering CTA, clicking borrow). Each
+  // requested mint is tracked with its last-requested timestamp and
+  // gets aggressive attestation until it goes cold (unrequested >
+  // ON_DEMAND_HOT_WINDOW_MS).
+  onDemand: new Map(),       // mint → { lastRequestedAt, requestedCount, decimals }
 };
 
 /**
@@ -243,4 +256,130 @@ export async function startFeedReadinessWarmup() {
   warmupLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
     console.warn("[v4-readiness] initial loop threw:", e.message?.slice(0, 120)),
   );
+
+  // Per-mint on-demand loop. Runs continuously in the background and
+  // aggressively warms any mint a user has shown interest in within
+  // the last ON_DEMAND_HOT_WINDOW_MS. Solves the "user picks a non-
+  // priority mint" gap operator-mandated 2026-06-19 PM after the
+  // global readiness gate was insufficient.
+  onDemandLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
+  );
+}
+
+/**
+ * Read-only per-mint readiness check. Returns the current sample-in-
+ * window count without firing attestation. Cheap; site can poll.
+ *
+ * Used by the /api/v1/v4/feed-ready endpoint and as the source of
+ * truth in requestMintWarm.
+ */
+export async function checkMintReadiness(mintStr) {
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4 || !process.env.LENDER_PUBKEY) {
+    return { ready: false, reason: "v4_not_configured", samples_in_window: 0 };
+  }
+  const lenderPk = new PublicKey(process.env.LENDER_PUBKEY);
+  const { lendingPoolPda, priceFeedPda } = await import("../solana/pdas.js");
+  const mintPk = new PublicKey(mintStr);
+  const [pool] = lendingPoolPda(lenderPk, PROGRAM_ID_V4);
+  const [pf] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
+
+  let info;
+  try {
+    info = await withFailover((conn) => conn.getAccountInfo(pf, "confirmed"));
+  } catch {
+    return { ready: false, reason: "rpc_unavailable", samples_in_window: 0 };
+  }
+  if (!info || info.data.length < 120) {
+    return { ready: false, reason: "uninitialized", samples_in_window: 0 };
+  }
+  const head = info.data.readUInt8(104);
+  const count = info.data.readUInt8(105);
+  if (count < MIN_SAMPLES_FOR_TWAP) {
+    return { ready: false, reason: "no_samples_yet", samples_in_window: count };
+  }
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const windowStart = now - BigInt(TWAP_WINDOW_SECONDS);
+  let inWindow = 0;
+  for (let i = 0; i < Math.min(count, 32); i++) {
+    const idx = (head - 1 - i + 32) % 32;
+    const start = 112 + idx * 16;
+    if (start + 16 > info.data.length) break;
+    const ts = info.data.readBigInt64LE(start + 8);
+    if (ts >= windowStart) inWindow++;
+  }
+  if (inWindow >= MIN_SAMPLES_FOR_TWAP) {
+    return { ready: true, samples_in_window: inWindow };
+  }
+  // Estimate ETA: at 3s on-demand spacing per round + ~2s per attest
+  // confirmation, each missing sample costs ~5s.
+  const missing = MIN_SAMPLES_FOR_TWAP - inWindow;
+  const etaSeconds = missing * 5;
+  return {
+    ready: false,
+    reason: "insufficient_samples_in_window",
+    samples_in_window: inWindow,
+    samples_needed: MIN_SAMPLES_FOR_TWAP,
+    eta_seconds: etaSeconds,
+  };
+}
+
+/**
+ * Record user interest in a mint. The on-demand loop reads from this
+ * map and aggressively warms any mint requested in the last
+ * ON_DEMAND_HOT_WINDOW_MS. Idempotent and cheap.
+ *
+ * Validates the mint is supported + enabled to prevent random callers
+ * draining lender SOL on garbage mints.
+ */
+export async function requestMintWarm(mintStr) {
+  const { rows: [row] } = await query(
+    `SELECT mint, decimals, enabled, category
+       FROM supported_mints WHERE mint = $1`,
+    [mintStr],
+  );
+  if (!row) {
+    return { ok: false, error: "mint_not_supported" };
+  }
+  if (!row.enabled) {
+    return { ok: false, error: "mint_disabled" };
+  }
+  const existing = state.onDemand.get(mintStr) || { requestedCount: 0 };
+  state.onDemand.set(mintStr, {
+    lastRequestedAt: Date.now(),
+    requestedCount: existing.requestedCount + 1,
+    decimals: Number(row.decimals),
+    category: row.category,
+  });
+  const readiness = await checkMintReadiness(mintStr);
+  return { ok: true, ...readiness };
+}
+
+async function onDemandLoop(lenderPk, programIdV4) {
+  // Pull mints requested in the last hot window. Drop expired entries
+  // so the map stays small.
+  const now = Date.now();
+  const cutoff = now - ON_DEMAND_HOT_WINDOW_MS;
+  for (const [mint, entry] of state.onDemand.entries()) {
+    if (entry.lastRequestedAt < cutoff) state.onDemand.delete(mint);
+  }
+  const hot = Array.from(state.onDemand.entries()).map(([mint, entry]) => ({
+    mint, decimals: entry.decimals, category: entry.category,
+  }));
+
+  if (hot.length > 0) {
+    // Batch process — same concurrency as priority warmup.
+    const batch = hot.slice(0, WARMUP_CONCURRENCY);
+    const results = await Promise.all(batch.map((m) => ensureMintWarm(m, lenderPk, programIdV4)));
+    const initialized = results.filter((r) => r.action === "now_warm").length;
+    if (initialized > 0) {
+      console.log(`[v4-readiness] on-demand round warmed ${initialized}/${batch.length} hot mints`);
+    }
+  }
+  setTimeout(() => {
+    onDemandLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
+    );
+  }, ON_DEMAND_LOOP_SPACING_MS);
 }
