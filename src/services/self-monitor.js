@@ -851,6 +851,45 @@ async function probeAttestorLiveness(bot) {
   }
 }
 
+// Conversion success-rate probe — Phase 1 of the conversion-reliability
+// mandate [[feedback_user_retention_via_flawless_conversion]]. Reads
+// conversion_events and pages the operator the moment any path/mint
+// pair drops below 95% with ≥5 attempts in the last hour. Without this,
+// the first signal we get is a user complaint — too late to prevent
+// the churn this rule is meant to stop.
+const CONV_MIN_SUCCESS_RATE = Number(process.env.CONV_MIN_SUCCESS_RATE) || 0.95;
+const CONV_MIN_ATTEMPTS_TO_ALERT = Number(process.env.CONV_MIN_ATTEMPTS_TO_ALERT) || 5;
+async function probeConversionRate(bot) {
+  const KIND = "conversion_rate_low";
+  try {
+    const { findDegradedConversionTargets } = await import("../services/conversion-tracker.js");
+    const degraded = await findDegradedConversionTargets({
+      windowSec: 3600,
+      minAttempts: CONV_MIN_ATTEMPTS_TO_ALERT,
+      minSuccessRate: CONV_MIN_SUCCESS_RATE,
+    });
+    const isBad = degraded.length > 0;
+    recordOutcome(KIND, isBad);
+    if (!isBad) {
+      await alertRecovery(bot, KIND, "all conversion paths back to ≥95% success");
+      return;
+    }
+    const lines = degraded.slice(0, 8).map((d) => {
+      const mintShort = d.mint && d.mint !== "<no-mint>" ? `${d.mint.slice(0, 8)}…` : "(no-mint)";
+      const rate = (d.success_rate * 100).toFixed(1) + "%";
+      return `${d.path} ${mintShort} attempts=${d.attempts} success_rate=${rate}`;
+    });
+    await alertIfNew(bot, KIND,
+      `CRIT conversion rate degraded (last 1h, ≥${CONV_MIN_ATTEMPTS_TO_ALERT} attempts, <${(CONV_MIN_SUCCESS_RATE * 100).toFixed(0)}% success):\n` +
+      lines.join("\n") +
+      "\n\nRun /convstats for the full breakdown + failure classes. Each affected user just hit an error — investigate which class is firing.",
+      "crit",
+    );
+  } catch (err) {
+    console.warn("[self-monitor] conversion_rate probe error:", err.message?.slice(0, 160));
+  }
+}
+
 async function probeKillSwitches(bot) {
   const KIND = "killswitch_stale";
   try {
@@ -901,6 +940,7 @@ async function tick(bot) {
       probeKillSwitches(bot).catch((e) => console.warn("[self-monitor] killswitch_stale probe threw:", e.message)),
       probeBorrowFailures(bot).catch((e) => console.warn("[self-monitor] borrow_failures probe threw:", e.message)),
       probeAttestorLiveness(bot).catch((e) => console.warn("[self-monitor] attestor_stuck probe threw:", e.message)),
+      probeConversionRate(bot).catch((e) => console.warn("[self-monitor] conversion_rate probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
