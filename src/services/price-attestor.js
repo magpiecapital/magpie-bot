@@ -522,101 +522,106 @@ export function startPriceAttestor(intervalMs = 30_000) {
       }
     }
 
-    let initsThisTick = 0;
+    // Build a flat task queue of every (mint × target-program) attest
+    // that needs to fire this tick. Sequential per-mint loops over
+    // ~200 enabled mints × 2 programs took 2-3 minutes — longer than
+    // the tick interval itself, so most tokens fell behind threshold.
+    // Operator hit it 2026-06-18 PM: 8 of 9 sampled tokens were below
+    // the 8-samples-in-300s gate at the same moment.
+    //
+    // Worker-pool fix: build the queue first (with all gate checks),
+    // then process with bounded concurrency. Per-worker error handling
+    // mirrors the prior sequential logic so init fallback + drift skip
+    // still apply.
+    const { PROGRAM_ID_V3: V3PID_LIVE, PROGRAM_ID_V4: V4PID_LIVE } = await import("../solana/program.js");
+    const v3v4Targets = [
+      V4PID_LIVE ? { id: V4PID_LIVE, label: "V4", lastMap: lastAttestAtV4 } : null,
+      V3PID_LIVE ? { id: V3PID_LIVE, label: "V3", lastMap: lastAttestAtV3 } : null,
+    ].filter(Boolean);
+
+    const queue = [];
     for (const { mint, decimals, needsLegacyAttest } of tokens) {
       const priceSol = priceMap.get(mint);
-      if (!priceSol) continue; // no source had a price — skip silently
+      if (!priceSol) continue;
+      const priceLamports = Math.floor(priceSol * 1e9);
+      const lastPrice = lastPrices.get(mint) || 0;
+      const since = Date.now() - (lastAttestAt.get(mint) || 0);
+      const drift = lastPrice > 0 ? Math.abs(priceLamports - lastPrice) / lastPrice : 1;
+      const driftSkip = drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS;
 
-      try {
-        const priceLamports = Math.floor(priceSol * 1e9);
-        const lastPrice = lastPrices.get(mint) || 0;
-        const since = Date.now() - (lastAttestAt.get(mint) || 0);
+      if (needsLegacyAttest && !driftSkip) {
+        queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports });
+      }
+      for (const target of v3v4Targets) {
+        const sinceLast = Date.now() - (target.lastMap.get(mint) || 0);
+        if (sinceLast < MAX_GAP_MS_V4) continue;
+        queue.push({ kind: "twap", mint, decimals, priceSol, target });
+      }
+    }
 
-        // Skip ONLY if drift is small AND we attested recently enough
-        // to keep the on-chain feed fresh.
-        const drift = lastPrice > 0 ? Math.abs(priceLamports - lastPrice) / lastPrice : 1;
-        const driftSkip = drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS;
+    if (queue.length === 0) return;
 
-        // Legacy V1/V3 attest — only for mints that need it (active loan
-        // or protected). Skip otherwise to save SOL on tx fees.
-        if (needsLegacyAttest && !driftSkip) try {
-          const result = await attestPrice(mint, decimals, priceSol);
-          lastPrices.set(mint, priceLamports);
-          lastAttestAt.set(mint, Date.now());
-          console.log(`[PriceAttestor] ${mint.slice(0, 8)}... = ${result.priceSol.toFixed(9)} SOL (${priceLamports} lamports)`);
-        } catch (attestErr) {
-          // Feed PDA may not exist yet for newly-approved tokens —
-          // auto-init it so the next tick succeeds. Drip-feed inits to
-          // avoid hammering Helius.
-          if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-            if (initsThisTick >= MAX_INITS_PER_TICK) {
-              continue; // backfill the rest on subsequent ticks
-            }
-            const init = await initializePriceFeed(mint);
-            if (init.alreadyExists) {
-              throw attestErr; // not the issue we expected — rethrow
-            }
-            initsThisTick++;
-            console.log(`[PriceAttestor] Auto-initialized feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
-          } else {
-            throw attestErr;
-          }
-        }
-
-        // 2026-06-15: V4 pre-warm — runs for EVERY enabled mint (not
-        // just active-loan ones). V4's price_feed PDA is distinct, V4
-        // borrows hit a TWAP gate requiring 5 min of continuous price
-        // history. Keeping every enabled mint's V4 feed fresh means
-        // any V4 borrow can land instantly without a JIT warmup wait.
-        //
-        // Cost-aware: only writes when sample is > 60s old, mirroring
-        // legacy MAX_GAP_MS. With ~50 enabled mints + 1 write/mint/min,
-        // that's ~1.4 SOL/day at current priority fees — acceptable for
-        // the UX win.
-        // V3 + V4 background pre-warm for EVERY enabled mint. Both
-        // programs share the price_v3 PriceHistory layout + TWAP gate.
-        // Background continuous warming is the structural fix for
-        // TwapInsufficientHistory ever reaching a user — per the
-        // operator's north-star mandate ("borrow conversion rate is the
-        // north star, MAJOR tech improvements only"). The JIT warmer in
-        // cosign-borrow + commands/borrow remains as the safety net for
-        // brand-new mints; background pre-warm eliminates cold-start
-        // entirely for everything that's been enabled for >5 min.
-        //
-        // Cost: ~50 enabled mints × 2 programs × ~1 write/35s = ~3
-        // attests/sec = ~260k attests/day at ~5000 lamports each =
-        // ~1.3 SOL/day. Negligible vs conversion-rate impact.
+    const CONCURRENCY = Number(process.env.PRICE_ATTESTOR_CONCURRENCY) || 12;
+    let initsThisTick = 0;
+    let attempted = 0, succeeded = 0, initialized = 0, failed = 0;
+    let cursor = 0;
+    async function attestWorker() {
+      while (cursor < queue.length) {
+        const task = queue[cursor++];
+        attempted++;
         try {
-          const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
-          const targets = [
-            PROGRAM_ID_V4 ? { id: PROGRAM_ID_V4, label: "V4", lastMap: lastAttestAtV4 } : null,
-            PROGRAM_ID_V3 ? { id: PROGRAM_ID_V3, label: "V3", lastMap: lastAttestAtV3 } : null,
-          ].filter(Boolean);
-          for (const target of targets) {
-            const sinceLast = Date.now() - (target.lastMap.get(mint) || 0);
-            if (sinceLast < MAX_GAP_MS_V4) continue;
+          if (task.kind === "legacy") {
             try {
-              await attestPrice(mint, decimals, priceSol, target.id);
-              target.lastMap.set(mint, Date.now());
+              const result = await attestPrice(task.mint, task.decimals, task.priceSol);
+              lastPrices.set(task.mint, task.priceLamports);
+              lastAttestAt.set(task.mint, Date.now());
+              succeeded++;
+            } catch (attestErr) {
+              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message || "")) {
+                if (initsThisTick < MAX_INITS_PER_TICK) {
+                  initsThisTick++; // claim slot before async to avoid race
+                  const init = await initializePriceFeed(task.mint);
+                  if (!init.alreadyExists) {
+                    initialized++;
+                    console.log(`[PriceAttestor] Auto-initialized feed for ${task.mint.slice(0, 8)} (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
+                  }
+                }
+              } else {
+                failed++;
+                console.warn(`[PriceAttestor] legacy attest failed for ${task.mint.slice(0, 8)}: ${attestErr.message?.slice(0, 100)}`);
+              }
+            }
+          } else {
+            // twap (V3 or V4)
+            try {
+              await attestPrice(task.mint, task.decimals, task.priceSol, task.target.id);
+              task.target.lastMap.set(task.mint, Date.now());
+              succeeded++;
             } catch (twapErr) {
               if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(twapErr.message || "")) {
                 if (initsThisTick < MAX_INITS_PER_TICK) {
-                  await initializePriceFeed(mint, target.id);
                   initsThisTick++;
-                  console.log(`[PriceAttestor] Auto-initialized ${target.label} feed for ${mint.slice(0, 8)}... (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
+                  await initializePriceFeed(task.mint, task.target.id);
+                  initialized++;
+                  console.log(`[PriceAttestor] Auto-initialized ${task.target.label} feed for ${task.mint.slice(0, 8)} (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
                 }
               } else {
-                console.warn(`[PriceAttestor] ${target.label} attest failed for ${mint.slice(0, 8)}...: ${twapErr.message?.slice(0, 100)}`);
+                failed++;
+                console.warn(`[PriceAttestor] ${task.target.label} attest failed for ${task.mint.slice(0, 8)}: ${twapErr.message?.slice(0, 100)}`);
               }
             }
           }
-        } catch {
-          // Swallow — pre-warm is best-effort, never block the primary
-          // V1/V3 (legacy) attestation flow.
+        } catch (err) {
+          failed++;
+          console.error(`[PriceAttestor] worker exception for ${task.mint?.slice(0, 8)}: ${err.message?.slice(0, 120)}`);
         }
-      } catch (err) {
-        console.error(`[PriceAttestor] Failed for ${mint.slice(0, 8)}...: ${err.message}`);
       }
+    }
+    const startedAt = Date.now();
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, () => attestWorker()));
+    const elapsedMs = Date.now() - startedAt;
+    if (succeeded > 0 || failed > 0 || initialized > 0) {
+      console.log(`[PriceAttestor] tick: queue=${queue.length} attempted=${attempted} ok=${succeeded} init=${initialized} fail=${failed} elapsed=${elapsedMs}ms concurrency=${CONCURRENCY}`);
     }
   }
 
