@@ -39,7 +39,7 @@ import {
 import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
@@ -185,9 +185,14 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
   const accountKeys = msg.accountKeys; // PublicKey[]
   if (accountKeys.length === 0) return { ok: true }; // empty tx
 
+  // World-class reliability — RPC blip on Helius (429 / timeout) used
+  // to leak through as "Pre-flight balance-drain check failed (RPC/
+  // simulation error)" to the borrower. Now: primary + every backup
+  // RPC gets a chance before we surface anything to the user.
+  // [[feedback_loans_must_never_fail_no_regressions]]
   let preInfos;
   try {
-    preInfos = await connection.getMultipleAccountsInfo(accountKeys, "confirmed");
+    preInfos = await withFailover((conn) => conn.getMultipleAccountsInfo(accountKeys, "confirmed"));
   } catch (err) {
     throw new Error(`pre-state read failed: ${err.message?.slice(0, 100)}`);
   }
@@ -219,16 +224,18 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
   }
 
   // Step 4: simulate, requesting post-state for the touched lender accounts.
+  // Wrapped in withFailover so a Helius 429 / timeout doesn't leak through
+  // as "Pre-flight balance-drain check failed" to the borrower.
   let sim;
   try {
-    sim = await connection.simulateTransaction(tx, {
+    sim = await withFailover((conn) => conn.simulateTransaction(tx, {
       sigVerify: false,
       commitment: "confirmed",
       accounts: {
         encoding: "base64",
         addresses: lenderTouched.map((t) => accountKeys[t.idx].toBase58()),
       },
-    });
+    }));
   } catch (err) {
     throw new Error(`simulateTransaction failed: ${err.message?.slice(0, 100)}`);
   }
@@ -1208,12 +1215,25 @@ export async function handleCosignBorrow(req) {
       };
     }
   } catch (simErr) {
-    // Simulation infrastructure errored. Fail closed.
-    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR: ${simErr.message?.slice(0, 200)}`);
+    // Simulation infrastructure errored across primary AND every backup RPC.
+    // Fail closed (we don't broadcast without verified drain protection),
+    // but the user UX must NOT leak "RPC/simulation error" — that's
+    // protocol-internal jargon that violates the world-class-conversion
+    // rule. Surface a friendly retry message; DM operator so it's never
+    // silent. [[feedback_loans_must_never_fail_no_regressions]]
+    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR (all RPCs failed): ${simErr.message?.slice(0, 200)}`);
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(null,
+        `CRIT [cosign-borrow] balance-drain pre-flight FAILED across primary + every backup RPC. A borrow request just bounced. detail=${simErr.message?.slice(0, 200)}`,
+      );
+    } catch {}
     return {
       status: 503,
       body: {
-        error: "Pre-flight balance-drain check failed (RPC/simulation error) — please retry in a few seconds",
+        error: "Our oracle is taking a beat to settle — please tap Borrow again in 5 seconds.",
+        oracle_warming: true,
+        retry_after_seconds: 5,
         detail: simErr.message?.slice(0, 160),
       },
     };
