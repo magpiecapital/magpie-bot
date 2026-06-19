@@ -47,7 +47,7 @@ import {
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { loadKeypair } from "../services/wallet.js";
 import { alertWithdraw } from "../services/security-alerts.js";
@@ -125,7 +125,7 @@ async function readJsonBody(req) {
 }
 
 async function getMintTokenProgram(mint) {
-  const info = await connection.getAccountInfo(new PublicKey(mint));
+  const info = await withFailover((conn) => conn.getAccountInfo(new PublicKey(mint)));
   if (!info) throw new Error(`Mint ${mint} not found`);
   if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
   return TOKEN_PROGRAM_ID;
@@ -311,7 +311,7 @@ export async function handleSiteWithdraw(req) {
   // pattern as src/commands/withdraw.js. Float displays never enter.
   if (Asset === "SOL") {
     decimals = 9;
-    const bal = BigInt(await connection.getBalance(signer.publicKey));
+    const bal = BigInt(await withFailover((conn) => conn.getBalance(signer.publicKey)));
     maxLamports = bal > SOL_GAS_RESERVE_LAMPORTS ? bal - SOL_GAS_RESERVE_LAMPORTS : 0n;
   } else {
     let mintPk;
@@ -321,10 +321,10 @@ export async function handleSiteWithdraw(req) {
       return { status: 400, body: { error: "Asset must be SOL or a valid mint pubkey" } };
     }
     const tokenProgram = await getMintTokenProgram(Asset);
-    const mintInfo = await connection.getParsedAccountInfo(mintPk);
+    const mintInfo = await withFailover((conn) => conn.getParsedAccountInfo(mintPk));
     decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     const ata = getAssociatedTokenAddressSync(mintPk, signer.publicKey, false, tokenProgram);
-    const ataInfo = await connection.getTokenAccountBalance(ata).catch(() => null);
+    const ataInfo = await withFailover((conn) => conn.getTokenAccountBalance(ata)).catch(() => null);
     maxLamports = ataInfo ? BigInt(ataInfo.value.amount) : 0n;
   }
   if (rawAmount > maxLamports) {
