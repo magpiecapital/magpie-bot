@@ -224,20 +224,55 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
   }
 
   // Step 4: simulate, requesting post-state for the touched lender accounts.
-  // Wrapped in withFailover so a Helius 429 / timeout doesn't leak through
-  // as "Pre-flight balance-drain check failed" to the borrower.
+  // Retry-with-backoff inside withFailover so a transient Helius blip OR a
+  // brief simulator hiccup self-heals. We classify the FINAL error so the
+  // caller can surface accurate guidance to the user (stale signing window
+  // vs. RPC infrastructure issue vs. unexpected) instead of a generic
+  // "oracle settling" message that masks the actual cause.
+  // [[feedback_loans_must_never_fail_no_regressions]]
   let sim;
-  try {
-    sim = await withFailover((conn) => conn.simulateTransaction(tx, {
-      sigVerify: false,
-      commitment: "confirmed",
-      accounts: {
-        encoding: "base64",
-        addresses: lenderTouched.map((t) => accountKeys[t.idx].toBase58()),
-      },
-    }));
-  } catch (err) {
-    throw new Error(`simulateTransaction failed: ${err.message?.slice(0, 100)}`);
+  let lastSimErr = null;
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      sim = await withFailover((conn) => conn.simulateTransaction(tx, {
+        sigVerify: false,
+        commitment: "confirmed",
+        accounts: {
+          encoding: "base64",
+          addresses: lenderTouched.map((t) => accountKeys[t.idx].toBase58()),
+        },
+      }));
+      lastSimErr = null;
+      break;
+    } catch (err) {
+      lastSimErr = err;
+      const msg = (err?.message || "").toLowerCase();
+      // Stale blockhash: no point retrying — the user's signed tx is dead.
+      // Surface a specific signal so the caller can return a "refresh and
+      // re-sign" message instead of an "oracle settling" retry hint.
+      if (/blockhash.*not.*found|block height exceeded/i.test(msg)) {
+        const e = new Error(`simulateTransaction failed: ${err.message?.slice(0, 140)}`);
+        e.classification = "stale_blockhash";
+        throw e;
+      }
+      // Other non-retryable error classes — fail fast, classify.
+      if (!/429|timeout|fetch|network|503|502|connection|etimedout|econn/i.test(msg)) {
+        const e = new Error(`simulateTransaction failed: ${err.message?.slice(0, 140)}`);
+        e.classification = "unclassified";
+        throw e;
+      }
+      if (attempt < MAX_ATTEMPTS) {
+        // Exponential backoff: 200ms, 500ms, 1000ms
+        const delay = [200, 500, 1000][attempt - 1] ?? 1000;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  if (lastSimErr) {
+    const e = new Error(`simulateTransaction failed after ${MAX_ATTEMPTS} attempts: ${lastSimErr.message?.slice(0, 140)}`);
+    e.classification = "rpc_exhausted";
+    throw e;
   }
 
   if (sim.value.err) {
@@ -502,7 +537,7 @@ export async function handleCosignBorrow(req) {
       console.error("[cosign-borrow] DRAIN-CHECK RPC failure (all RPCs failed) — failing closed:", rpcErr.message);
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
-        await notifyAdmin(null,
+        await notifyAdmin(
           `CRIT [cosign-borrow] token-source verification FAILED across primary + every backup RPC. A borrow request just bounced. detail=${rpcErr.message?.slice(0, 200)}`,
         );
       } catch {}
@@ -1219,28 +1254,72 @@ export async function handleCosignBorrow(req) {
       // Humanize the two remaining drainCheck failure modes. Operator-mandated
       // 2026-06-18 PM. [[feedback_loans_must_never_fail_no_regressions]]
       if (drainCheck.kind === "sim_failed") {
-        // The user's tx itself would fail on-chain — usually a stale signing
-        // window, oracle blip, or insufficient collateral that slipped past
-        // the site's preflight. Friendly retry; the detail is for operator
-        // logs only.
-        // Insufficient-lamports translation — give the user actionable detail.
-        if (/insufficient lamports|InsufficientFunds.*Lamports|0x1$/i.test(drainCheck.detail || "")) {
+        // The user's tx itself would fail on-chain. Classify by inner code
+        // so the user gets actionable guidance + operator gets a CRIT DM.
+        const detail = drainCheck.detail || "";
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            `CRIT [cosign-borrow] sim_failed — tx would fail on-chain. detail=${detail.slice(0, 220)}`,
+          );
+        } catch {}
+
+        // Stale blockhash inside the sim envelope (rare but possible).
+        if (/BlockhashNotFound|block height exceeded/i.test(detail)) {
+          return {
+            status: 409,
+            body: {
+              error: "Your signing window expired before we could broadcast. Please tap Borrow again to refresh and re-sign.",
+              friendly: true,
+              stale_blockhash: true,
+              detail,
+            },
+          };
+        }
+        // Insufficient lamports — actionable user fix.
+        if (/insufficient lamports|InsufficientFunds.*Lamports|0x1$/i.test(detail)) {
           return {
             status: 400,
             body: {
               error: "Not quite enough SOL for fees — add a small amount of SOL to your wallet and try again.",
               friendly: true,
-              detail: drainCheck.detail,
+              detail,
             },
           };
         }
+        // CollateralValueExceedsAttestation (V4 custom 6018 / V3 custom 6018).
+        // Price moved between site quote and broadcast.
+        if (/CollateralValueExceedsAttestation|"Custom":\s*601[68]/i.test(detail)) {
+          return {
+            status: 503,
+            body: {
+              error: "Price moved while you were signing. Please tap Borrow again to get a fresh quote.",
+              price_moved: true,
+              retry_after_seconds: 3,
+              detail,
+            },
+          };
+        }
+        // StalePriceAttestation (price feed too old at broadcast time).
+        if (/StalePriceAttestation|"Custom":\s*6019/i.test(detail)) {
+          return {
+            status: 503,
+            body: {
+              error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+              oracle_warming: true,
+              retry_after_seconds: 25,
+              detail,
+            },
+          };
+        }
+        // Unclassified sim-fail — generic friendly + operator was already DM'd above.
         return {
           status: 503,
           body: {
-            error: "We're double-checking your borrow with the network — please tap Borrow again in 5–10 seconds.",
-            oracle_warming: true,
+            error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
+            friendly: true,
             retry_after_seconds: 8,
-            detail: drainCheck.detail,
+            detail,
           },
         };
       }
@@ -1250,7 +1329,7 @@ export async function handleCosignBorrow(req) {
       // bug we need to investigate.
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
-        await notifyAdmin(null,
+        await notifyAdmin(
           `CRIT [cosign-borrow] LAYER-2 drain trip on legitimate-shape request. detail=${(drainCheck.detail || "").slice(0,200)}`,
         );
       } catch {}
@@ -1265,25 +1344,58 @@ export async function handleCosignBorrow(req) {
       };
     }
   } catch (simErr) {
-    // Simulation infrastructure errored across primary AND every backup RPC.
-    // Fail closed (we don't broadcast without verified drain protection),
-    // but the user UX must NOT leak "RPC/simulation error" — that's
-    // protocol-internal jargon that violates the world-class-conversion
-    // rule. Surface a friendly retry message; DM operator so it's never
-    // silent. [[feedback_loans_must_never_fail_no_regressions]]
-    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR (all RPCs failed): ${simErr.message?.slice(0, 200)}`);
+    // Classify the failure so the user gets accurate guidance + operator
+    // gets a CRIT DM with the actual root cause every time.
+    // [[feedback_loans_must_never_fail_no_regressions]]
+    const klass = simErr.classification || "unclassified";
+    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR [${klass}]: ${simErr.message?.slice(0, 240)}`);
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
-      await notifyAdmin(null,
-        `CRIT [cosign-borrow] balance-drain pre-flight FAILED across primary + every backup RPC. A borrow request just bounced. detail=${simErr.message?.slice(0, 200)}`,
+      await notifyAdmin(
+        `CRIT [cosign-borrow] sim-error klass=${klass}. detail=${simErr.message?.slice(0, 220)}`,
       );
     } catch {}
+
+    // STALE BLOCKHASH — user sat on the signing prompt too long. Their
+    // signed tx is dead; no amount of retry will help. Tell them to
+    // refresh and re-sign. This is the most common cause of the old
+    // "oracle settling" misdiagnosis.
+    if (klass === "stale_blockhash") {
+      return {
+        status: 409,
+        body: {
+          error: "Your signing window expired before we could broadcast. Please tap Borrow again to refresh and re-sign.",
+          friendly: true,
+          stale_blockhash: true,
+          detail: simErr.message?.slice(0, 160),
+        },
+      };
+    }
+
+    // RPC INFRASTRUCTURE EXHAUSTED — every retry across every backup
+    // failed with a transient-shaped error. Genuinely a network
+    // problem. Longer retry hint.
+    if (klass === "rpc_exhausted") {
+      return {
+        status: 503,
+        body: {
+          error: "Solana RPCs are slow right now. Please tap Borrow again in 15 seconds.",
+          rpc_busy: true,
+          retry_after_seconds: 15,
+          detail: simErr.message?.slice(0, 160),
+        },
+      };
+    }
+
+    // UNCLASSIFIED — something we haven't seen before. Generic friendly
+    // message; the CRIT DM above gives operator the inner detail to
+    // triage.
     return {
       status: 503,
       body: {
-        error: "Our oracle is taking a beat to settle — please tap Borrow again in 5 seconds.",
-        oracle_warming: true,
-        retry_after_seconds: 5,
+        error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
+        friendly: true,
+        retry_after_seconds: 8,
         detail: simErr.message?.slice(0, 160),
       },
     };
