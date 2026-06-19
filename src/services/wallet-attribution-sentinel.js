@@ -30,7 +30,12 @@
 import { query } from "../db/pool.js";
 import { getAdminId, notifyAdmin } from "./admin-notify.js";
 
-const POLL_INTERVAL_MS = Number(process.env.WALLET_ATTR_SENTINEL_MS) || 30 * 60_000;
+// Cadence tightened from 30min -> 5min 2026-06-18 PM. With Layer 4
+// auto-repair (PR #393), the sentinel now FIXES drift inline, so a
+// faster tick = tighter window before the user sees "no active loans"
+// on /repay after a fresh borrow. 5min is still cheap (one indexed
+// SQL per tick). Operator-mandated. [[feedback_never_misattribute_loans]]
+const POLL_INTERVAL_MS = Number(process.env.WALLET_ATTR_SENTINEL_MS) || 5 * 60_000;
 const ALERT_REPEAT_MS = 6 * 60 * 60 * 1000;
 
 let lastAlertedAt = 0;
