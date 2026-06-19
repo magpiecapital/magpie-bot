@@ -1880,6 +1880,16 @@ async function router(req, res) {
       checks[name] = "ok";
     }
 
+    // V4 feed readiness — surface separately from overall status. Bot
+    // can be "ok" overall (TG, DB, attestor all working) but feeds
+    // still warming, which the site uses to gate the borrow CTA.
+    // Operator-mandated 2026-06-19 PM per V4 loan lifecycle mandate.
+    let v4Feeds = null;
+    try {
+      const { getFeedReadinessSnapshot } = await import("../services/v4-feed-readiness.js");
+      v4Feeds = getFeedReadinessSnapshot();
+    } catch { /* module not loaded yet — safe to omit */ }
+
     const failing = reasons.length > 0;
     res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -1890,6 +1900,7 @@ async function router(req, res) {
       uptimeMs: hb.uptimeMs,
       startedAt: hb.startedAt,
       heartbeats: hb.services,
+      v4_feeds: v4Feeds,
     }));
   }
 

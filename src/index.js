@@ -190,6 +190,7 @@ import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startBorrowCanary } from "./services/borrow-canary.js";
 import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
+import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
 import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
@@ -981,6 +982,15 @@ bot.start({
     // against mints. Per V4 loan lifecycle mandate NN1 (operator-
     // mandated 2026-06-19 PM after user 948 incident).
     startBootV4FeedSync(bot);
+    // V4 feed readiness — priority-mint burst warmup on boot. After
+    // a 30s settle window so DB pool + attestor are alive. State
+    // surfaces on /api/v1/health.v4_feeds; the site reads it to gate
+    // the borrow CTA so users never see wait_for_warmup. THE
+    // architectural class-elimination fix for the redeploy-cold-feed
+    // class. Operator-mandated 2026-06-19 PM.
+    setTimeout(() => startFeedReadinessWarmup().catch((e) =>
+      console.warn("[v4-readiness] start threw:", e.message)
+    ), 30_000);
     // Loan program_id healer — every 10 min, scans non-closed loans
     // and auto-corrects any DB row whose stored program_id disagrees
     // with the on-chain owner of loan_pda. Defense-in-depth layer
