@@ -1342,19 +1342,31 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
             `[cosign-borrow] TWAP ready prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests}`,
           );
         } else {
-          // V1/V3 path: single-shot freshness check (PR was already
-          // adequate — no TWAP gate on legacy programs).
-          const age = await getPriceFeedAgeSeconds(mintStr, borrowProgramId);
-          if (age === null || age > FRESH_THRESHOLD_SEC) {
-            try {
+          // V1/V3 path: ALWAYS force-attest immediately before signing.
+          //
+          // Operator-mandated 2026-06-19 PM after V1 FARM borrow failed
+          // with StalePriceAttestation: even when the per-tick attestor
+          // is running, the sample on-chain can be 30-60s old when the
+          // user clicks Borrow. They then take 30-60s to review the
+          // wallet prompt. By submit time the sample could be 60-120s
+          // old — racing the program's 120s stale wall. Wallet sim
+          // rejects, user sees "Transaction rejected: StalePriceAttestation."
+          //
+          // Force-attesting RIGHT BEFORE returning the cosigned tx means
+          // the sample is <2s old when the bot returns. Even with a 60s
+          // user-review delay, submit time is 62s — well under 120s.
+          // Cost: 1 extra attest per borrow = ~5000 lamports = negligible.
+          //
+          // This is the "real-time price" guarantee the operator asked
+          // for, enforced at the cosign step where it actually matters.
+          try {
+            await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
+          } catch (attestErr) {
+            if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
+              await initializePriceFeed(mintStr, borrowProgramId);
               await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
-            } catch (attestErr) {
-              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-                await initializePriceFeed(mintStr, borrowProgramId);
-                await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
-              } else {
-                throw attestErr;
-              }
+            } else {
+              throw attestErr;
             }
           }
         }
