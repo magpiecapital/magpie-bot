@@ -489,18 +489,28 @@ export async function handleCosignBorrow(req) {
   if (lenderSourceIxs.length > 0) {
     let infos;
     try {
-      infos = await connection.getMultipleAccountsInfo(
+      // withFailover so a single Helius blip doesn't fail the borrow —
+      // primary + every backup RPC gets a chance. [[feedback_loans_must_never_fail_no_regressions]]
+      infos = await withFailover((conn) => conn.getMultipleAccountsInfo(
         lenderSourceIxs.map((t) => t.source),
         "confirmed",
-      );
+      ));
     } catch (rpcErr) {
-      // Fail CLOSED — if we can't verify the sources, refuse the cosign.
-      // Operator can retry; an RPC blip is preferable to a drain.
-      console.error("[cosign-borrow] DRAIN-CHECK RPC failure — failing closed:", rpcErr.message);
+      // Fail CLOSED across primary + every backup. User UX must not leak
+      // the technical reason — friendly retry + DM operator with detail.
+      console.error("[cosign-borrow] DRAIN-CHECK RPC failure (all RPCs failed) — failing closed:", rpcErr.message);
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(null,
+          `CRIT [cosign-borrow] token-source verification FAILED across primary + every backup RPC. A borrow request just bounced. detail=${rpcErr.message?.slice(0, 200)}`,
+        );
+      } catch {}
       return {
         status: 503,
         body: {
-          error: "Couldn't verify token-source ownership (RPC blip) — please retry in a few seconds",
+          error: "Our oracle is taking a beat to settle — please tap Borrow again in 5 seconds.",
+          oracle_warming: true,
+          retry_after_seconds: 5,
           detail: rpcErr.message?.slice(0, 160),
         },
       };
