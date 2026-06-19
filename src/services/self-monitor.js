@@ -812,6 +812,37 @@ async function probeBorrowFailures(bot) {
   }
 }
 
+// Attestor liveness probe — the price-attestor MUST tick continuously
+// or every V4 borrow will fail with TwapInsufficientHistory. A silent
+// stall (e.g. SQL type-cast bug killing every tick) is catastrophic
+// because the symptoms only surface when a user tries to borrow.
+// [[feedback_borrow_conversion_must_be_world_class]]
+const ATTESTOR_STUCK_THRESHOLD_MS = Number(process.env.ATTESTOR_STUCK_MS) || 90_000;
+async function probeAttestorLiveness(bot) {
+  const KIND = "attestor_stuck";
+  try {
+    const { getAttestorHeartbeat } = await import("../services/price-attestor.js");
+    const hb = getAttestorHeartbeat();
+    // If we've never ticked yet, give it a couple of minutes from boot.
+    if (hb.lastSuccessfulTickAt === 0) {
+      recordOutcome(KIND, false);
+      return;
+    }
+    const isBad = hb.msSinceLast > ATTESTOR_STUCK_THRESHOLD_MS;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND,
+        `price-attestor STUCK — last successful tick ${Math.round(hb.msSinceLast / 1000)}s ago (threshold ${ATTESTOR_STUCK_THRESHOLD_MS / 1000}s). V4 TWAPs will cool off and every borrow will hit TwapInsufficientHistory. Check logs for SQL/Jupiter errors.`,
+        "crit",
+      );
+    } else {
+      await alertRecovery(bot, KIND, "price-attestor recovered — ticking normally");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] attestor_liveness probe error:", err.message?.slice(0, 160));
+  }
+}
+
 async function probeKillSwitches(bot) {
   const KIND = "killswitch_stale";
   try {
@@ -861,6 +892,7 @@ async function tick(bot) {
       probePoolCreditDrift(bot).catch((e) => console.warn("[self-monitor] pool_credit_drift probe threw:", e.message)),
       probeKillSwitches(bot).catch((e) => console.warn("[self-monitor] killswitch_stale probe threw:", e.message)),
       probeBorrowFailures(bot).catch((e) => console.warn("[self-monitor] borrow_failures probe threw:", e.message)),
+      probeAttestorLiveness(bot).catch((e) => console.warn("[self-monitor] attestor_stuck probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because

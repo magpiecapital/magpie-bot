@@ -458,9 +458,16 @@ async function fetchMintsToAttest() {
         WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
      ),
      recent_intent_mints AS (
+       -- loans.loan_id is numeric (slot-derived bigint) but
+       -- arm_intents.loan_id_chain is stored as TEXT (so we can hold
+       -- chain IDs larger than bigint safely). Cast one side; otherwise
+       -- Postgres throws "operator does not exist: numeric = text" and
+       -- the WHOLE attestor tick aborts before attesting anything. That
+       -- was the silent root cause of the 2026-06-19 PM tokenized-stock
+       -- TwapInsufficientHistory P0. [[feedback_borrow_conversion_must_be_world_class]]
        SELECT DISTINCT l.collateral_mint
          FROM arm_intents ai
-         JOIN loans l ON l.loan_id = ai.loan_id_chain
+         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
         WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
      )
      SELECT sm.mint, sm.decimals,
@@ -493,8 +500,43 @@ async function fetchMintsToAttest() {
  *
  * @param {number} intervalMs - default 30 seconds
  */
+// Heartbeat — the last time tick() finished WITHOUT skipping. Used by
+// the self-monitor probe to detect a dead-stuck attestor. Exported so
+// other services can read it. [[feedback_borrow_conversion_must_be_world_class]]
+let _lastSuccessfulTickAt = 0;
+let _lastTickAttestCount = 0;
+let _lastTickError = null;
+export function getAttestorHeartbeat() {
+  return {
+    lastSuccessfulTickAt: _lastSuccessfulTickAt,
+    msSinceLast: Date.now() - _lastSuccessfulTickAt,
+    lastTickAttestCount: _lastTickAttestCount,
+    lastTickError: _lastTickError,
+  };
+}
+
 export function startPriceAttestor(intervalMs = 30_000) {
   console.log(`[PriceAttestor] Starting (DB-driven), interval=${intervalMs}ms`);
+
+  // BOOT-TIME SANITY CHECK. Catch SQL type-cast bugs (like the
+  // 2026-06-19 numeric=text P0) IMMEDIATELY at start instead of
+  // letting them silently kill every tick. If the primary query
+  // throws on boot, fall back AND CRIT-DM operator so they know to
+  // investigate. [[feedback_borrow_conversion_must_be_world_class]]
+  (async () => {
+    try {
+      await fetchMintsToAttest();
+      console.log("[PriceAttestor] Boot sanity check: primary mint query OK");
+    } catch (err) {
+      console.error(`[PriceAttestor] BOOT SANITY CHECK FAILED: ${err.message?.slice(0, 200)}`);
+      try {
+        const { notifyAdmin } = await import("./admin-notify.js");
+        await notifyAdmin(
+          `CRIT [price-attestor] Boot sanity check FAILED — fetchMintsToAttest threw: ${err.message?.slice(0, 200)}. Tick will fall back to active-loan + protected only until fixed. V4 TWAPs for non-active mints will go cold.`,
+        );
+      } catch {}
+    }
+  })();
 
   const lastPrices = new Map();
   const lastAttestAt = new Map();
@@ -534,8 +576,41 @@ export function startPriceAttestor(intervalMs = 30_000) {
     try {
       tokens = await fetchMintsToAttest();
     } catch (err) {
-      console.error(`[PriceAttestor] Failed to load active-loan mints: ${err.message}`);
-      return;
+      // Belt-and-suspenders: if the complex CTE-joined query fails (e.g.
+      // type-cast bug like the 2026-06-19 numeric=text P0), fall back to
+      // a SIMPLE query that attests every protected mint + any mint
+      // backing an active loan. Better to over-attest than to silently
+      // stall the entire attestor → V4 TwapInsufficientHistory.
+      // [[feedback_borrow_conversion_must_be_world_class]]
+      console.error(`[PriceAttestor] Primary mint query failed (${err.message?.slice(0, 120)}) — falling back to active-loan + protected set`);
+      try {
+        const fb = await query(
+          `SELECT DISTINCT sm.mint, sm.decimals, TRUE AS needs_legacy_attest
+             FROM supported_mints sm
+            WHERE sm.enabled = TRUE
+              AND (sm.protected = TRUE
+                OR sm.mint IN (SELECT collateral_mint FROM loans WHERE status='active'))`,
+        );
+        tokens = fb.rows.map((row) => ({
+          mint: row.mint,
+          decimals: row.decimals,
+          needsLegacyAttest: true,
+        }));
+        if (tokens.length === 0) {
+          console.warn("[PriceAttestor] Fallback returned 0 mints — nothing to attest this tick");
+          return;
+        }
+        console.warn(`[PriceAttestor] Fallback attesting ${tokens.length} mints`);
+      } catch (fbErr) {
+        console.error(`[PriceAttestor] Fallback ALSO failed: ${fbErr.message?.slice(0, 120)} — DM operator`);
+        try {
+          const { notifyAdmin } = await import("./admin-notify.js");
+          await notifyAdmin(
+            `CRIT [price-attestor] Both primary AND fallback mint queries failed. V4 TWAPs will starve until resolved. detail=${(err.message || "").slice(0, 100)} / fb=${(fbErr.message || "").slice(0, 100)}`,
+          );
+        } catch {}
+        return;
+      }
     }
     if (tokens.length === 0) return; // idle — nothing to keep fresh
 
@@ -691,6 +766,12 @@ export function startPriceAttestor(intervalMs = 30_000) {
     if (succeeded > 0 || failed > 0 || initialized > 0) {
       console.log(`[PriceAttestor] tick: queue=${queue.length} attempted=${attempted} ok=${succeeded} init=${initialized} fail=${failed} elapsed=${elapsedMs}ms concurrency=${CONCURRENCY}`);
     }
+    // Heartbeat — self-monitor probe reads this to detect a stuck
+    // attestor (e.g. SQL type-cast bug killing every tick). Updated
+    // ONLY at clean tick completion; skipped/failed ticks don't bump it.
+    _lastSuccessfulTickAt = Date.now();
+    _lastTickAttestCount = succeeded + initialized;
+    _lastTickError = null;
   }
 
   // Startup pre-warm pass — initialize V3 + V4 PriceHistory PDAs for
