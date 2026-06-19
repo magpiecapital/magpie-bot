@@ -796,6 +796,12 @@ bot.start({
     // external watchdogs can't see (queue backlog, DB pool exhaustion,
     // stuck orders, lingering TWAPs, migration ledger drift).
     import("./services/self-monitor.js").then((m) => m.startSelfMonitor(bot));
+    // LP-excess monitor — every 6h, reads each program's pool +
+    // loan_token_vault and DMs operator with the per-pool excess
+    // (vault_balance - total_deposits). Read-only telemetry; no
+    // on-chain action. Foundation for the eventual auto-sweeper.
+    // [[feedback_distribution_wallet_must_be_auto_funded]]
+    import("./services/lp-excess-monitor.js").then((m) => m.startLpExcessMonitor(bot));
     // Upside Watcher — every 15 min, scans active loans whose collateral
     // has appreciated and DMs the borrower a Pip nudge to arm a TP. Seeds
     // first take-profit fills by surfacing the opportunity the moment it
