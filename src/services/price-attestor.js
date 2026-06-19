@@ -477,7 +477,11 @@ async function fetchMintsToAttest() {
               OR aem.collateral_mint IS NOT NULL
               OR rim.collateral_mint IS NOT NULL) AS needs_continuous
        FROM supported_mints sm
-       LEFT JOIN active_loan_mints alm USING (mint)
+       -- USING (mint) was wrong: active_loan_mints exposes
+       -- collateral_mint, not mint. That mismatch threw and the boot
+       -- sanity check caught it on the first deploy of the loan_id cast
+       -- fix. Match the explicit-ON pattern used by the other two CTEs.
+       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
        LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
        LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
       WHERE sm.enabled = TRUE
