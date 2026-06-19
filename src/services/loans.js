@@ -340,6 +340,54 @@ export async function executeBorrow({
  *   3. Close wSOL ATA (recover rent, convert leftover wSOL back to SOL).
  */
 export async function executeRepay({ userId, loanDbRow }) {
+  // Conversion telemetry wrapper. Phase 1D of the conversion-reliability
+  // mandate [[feedback_user_retention_via_flawless_conversion]]. Fire-
+  // and-forget — telemetry can NEVER block the repay. Captures mint,
+  // program, wallet, latency, signature on success; error message on
+  // failure. Records to conversion_events so /convstats shows repay
+  // success rate alongside borrow/arm/fire.
+  const _convStart = Date.now();
+  try {
+    const result = await _executeRepayImpl({ userId, loanDbRow });
+    import("./conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "repay",
+          outcome: "success",
+          mint: loanDbRow?.collateral_mint || null,
+          programId: loanDbRow?.program_id || null,
+          wallet: loanDbRow?.borrower_wallet || null,
+          userId,
+          surface: "tg",
+          latencyMs: Date.now() - _convStart,
+          detail: { signature: result?.signature?.slice(0, 88) },
+        }),
+      )
+      .catch(() => {});
+    return result;
+  } catch (err) {
+    const failureClass = err?.classification || err?.errorCode || (err?.message ? err.message.slice(0, 60) : "thrown");
+    import("./conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "repay",
+          outcome: "failure",
+          failureClass,
+          mint: loanDbRow?.collateral_mint || null,
+          programId: loanDbRow?.program_id || null,
+          wallet: loanDbRow?.borrower_wallet || null,
+          userId,
+          surface: "tg",
+          latencyMs: Date.now() - _convStart,
+          detail: { error: err?.message?.slice(0, 200) },
+        }),
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+async function _executeRepayImpl({ userId, loanDbRow }) {
   // Use the program the loan was originally created on (v1 for everything
   // pre-v2-launch, populated via the program_id column at borrow time).
   const programId = chooseProgramIdForLoan(loanDbRow);

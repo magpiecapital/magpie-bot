@@ -660,7 +660,76 @@ export async function handleSiteLimitCloseList(req, url) {
  *   Nonce: <random_base58_or_uuid>
  *   IssuedAt: <ISO timestamp>
  * ───────────────────────────────────────────────────────────────── */
+/**
+ * Classify an arm response into success/failure + failure class for
+ * conversion telemetry. Used by the wrapper around the single-arm and
+ * batch-arm handlers. [[feedback_user_retention_via_flawless_conversion]]
+ */
+function _classifyArmOutcome(result) {
+  if (result?.body?.ok === true) return { outcome: "success", klass: null };
+  const b = result?.body || {};
+  if (b.error) return { outcome: "failure", klass: String(b.error).slice(0, 60) };
+  if (result?.status >= 400) return { outcome: "failure", klass: `http_${result.status}` };
+  return { outcome: "failure", klass: "unclassified" };
+}
+
+/**
+ * Record an arm-path conversion event. Pulls the mint via loan_id when
+ * possible so /convstats can show per-mint arm success rates. Fire-and-
+ * forget so telemetry never blocks the response.
+ */
+function _recordArmConversion({ result, loanIdChain, userId, startedAt }) {
+  const { outcome, klass } = _classifyArmOutcome(result);
+  import("../services/conversion-tracker.js")
+    .then(async ({ recordConversionEvent }) => {
+      let mint = null;
+      let programId = null;
+      if (loanIdChain) {
+        try {
+          const { rows } = await query(
+            `SELECT collateral_mint, program_id FROM loans WHERE loan_id = $1 LIMIT 1`,
+            [loanIdChain],
+          );
+          if (rows.length > 0) {
+            mint = rows[0].collateral_mint;
+            programId = rows[0].program_id;
+          }
+        } catch { /* don't let lookup failure block the record */ }
+      }
+      await recordConversionEvent({
+        path: "arm",
+        outcome,
+        failureClass: klass,
+        mint,
+        programId,
+        userId,
+        surface: "site",
+        latencyMs: Date.now() - startedAt,
+        detail: loanIdChain ? { loan_id_chain: String(loanIdChain) } : null,
+      });
+    })
+    .catch(() => {});
+}
+
 export async function handleSiteLimitCloseArm(req) {
+  const _convStart = Date.now();
+  try {
+    const result = await _handleSiteLimitCloseArmImpl(req);
+    const loanIdChain = result?.body?.loan_id ?? null;
+    _recordArmConversion({ result, loanIdChain, userId: null, startedAt: _convStart });
+    return result;
+  } catch (err) {
+    _recordArmConversion({
+      result: { status: 500, body: { error: "thrown" } },
+      loanIdChain: null,
+      userId: null,
+      startedAt: _convStart,
+    });
+    throw err;
+  }
+}
+
+async function _handleSiteLimitCloseArmImpl(req) {
   // V4 Hardening T1 (2026-06-15 PM): structured entry log so every arm
   // POST is visible in Railway, including those rejected by auth or
   // parsing. Operator hit a class of bug where dashboard arms produced
@@ -1344,6 +1413,24 @@ export async function handleSiteLimitCloseIntent(req) {
  *   409 + { ok: false, error, failed_leg_index, detail }
  * ───────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseArmBatch(req) {
+  const _convStart = Date.now();
+  try {
+    const result = await _handleSiteLimitCloseArmBatchImpl(req);
+    const loanIdChain = result?.body?.loan_id_chain ?? null;
+    _recordArmConversion({ result, loanIdChain, userId: null, startedAt: _convStart });
+    return result;
+  } catch (err) {
+    _recordArmConversion({
+      result: { status: 500, body: { error: "thrown" } },
+      loanIdChain: null,
+      userId: null,
+      startedAt: _convStart,
+    });
+    throw err;
+  }
+}
+
+async function _handleSiteLimitCloseArmBatchImpl(req) {
   // Kill switches (audit HIGH#3): gate batch-arm same as single arm.
   const globalReject = await rejectIfSiteDisabled();
   if (globalReject) return globalReject;
