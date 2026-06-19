@@ -725,6 +725,64 @@ async function probePoolCreditDrift(bot) {
   }
 }
 
+// Kill-switch probe — operator-mandated 2026-06-18 PM.
+// Any *_DISABLED=true or *_PAUSED=true env var that blocks a USER-FACING flow
+// must alert CRIT once it has been on for > KILLSWITCH_STALE_MS. Catches cases
+// like COSIGN_BORROW_DISABLED being flipped by an alarm and never cleared.
+// [[feedback_loans_must_never_fail_no_regressions]]
+const KILLSWITCH_STALE_MS = Number(process.env.KILLSWITCH_STALE_MS) || 10 * 60_000;
+// User-facing switches. Background-only switches (FEE_WALLET_SWEEPER_DISABLED,
+// TREASURY_SWEEP_DISABLED, DIST_GAP_MONITOR_DISABLED, EXPLOIT_DETECTOR_DISABLED,
+// PRICE_SNAPSHOTTER_DISABLED, RAID_MONITOR_DISABLED, FUNDING_GRAPH_DISABLED,
+// PIP_PROACTIVE_DISABLED, PENDING_ARM_WATCHER_DISABLED) are intentionally
+// EXCLUDED — they don't block users from borrowing/repaying. Add to this list
+// any future env var that, when set, would surface as a user-visible error.
+const USER_FACING_KILL_SWITCHES = [
+  "COSIGN_BORROW_DISABLED",
+  "V4_BORROWS_PAUSED",
+  "LIQUIDATION_DISTRIBUTION_DISABLED",
+  "AGENT_API_DISABLED",
+  "LIMIT_CLOSE_AGENT_DISABLED",
+  "PIP_ASK_DISABLED",
+];
+const _killswitchFirstSeen = new Map(); // name -> timestamp ms
+
+function isSwitchOn(v) {
+  return /^(1|true|yes|on)$/i.test(String(v || "").trim());
+}
+
+async function probeKillSwitches(bot) {
+  const KIND = "killswitch_stale";
+  try {
+    const now = Date.now();
+    const active = [];
+    const stale = [];
+    for (const name of USER_FACING_KILL_SWITCHES) {
+      if (isSwitchOn(process.env[name])) {
+        if (!_killswitchFirstSeen.has(name)) _killswitchFirstSeen.set(name, now);
+        const age = now - _killswitchFirstSeen.get(name);
+        active.push({ name, ageMin: Math.round(age / 60_000) });
+        if (age > KILLSWITCH_STALE_MS) stale.push({ name, ageMin: Math.round(age / 60_000) });
+      } else {
+        _killswitchFirstSeen.delete(name);
+      }
+    }
+    const isBad = stale.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      const list = stale.map((s) => `${s.name} (~${s.ageMin}min)`).join(", ");
+      await alertIfNew(bot, KIND,
+        `user-facing kill switch(es) stale: ${list}. Users may be hitting borrow/repay errors. Flip OFF on Railway if no longer needed.`,
+        "crit",
+      );
+    } else if (active.length === 0) {
+      await alertRecovery(bot, KIND, "all user-facing kill switches are OFF");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] killswitch_stale probe error:", err.message?.slice(0, 160));
+  }
+}
+
 async function tick(bot) {
   try {
     await Promise.all([
@@ -740,6 +798,7 @@ async function tick(bot) {
       probeV4TwapHealth(bot).catch((e) => console.warn("[self-monitor] v4_twap_health probe threw:", e.message)),
       probeLenderWalletBalance(bot).catch((e) => console.warn("[self-monitor] lender_wallet_balance probe threw:", e.message)),
       probePoolCreditDrift(bot).catch((e) => console.warn("[self-monitor] pool_credit_drift probe threw:", e.message)),
+      probeKillSwitches(bot).catch((e) => console.warn("[self-monitor] killswitch_stale probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
