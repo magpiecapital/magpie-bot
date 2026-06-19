@@ -751,6 +751,67 @@ function isSwitchOn(v) {
   return /^(1|true|yes|on)$/i.test(String(v || "").trim());
 }
 
+// Borrow failure rate probe — reads the rolling in-memory counter in
+// cosign-borrow.js and CRIT-alerts if any classification exceeds the
+// per-hour threshold. Real-time visibility into how often each failure
+// mode fires so operator can act on patterns (e.g. high stale_blockhash
+// rate means site signing window needs widening).
+// [[feedback_loans_must_never_fail_no_regressions]]
+const BORROW_FAILURE_THRESHOLD_PER_HOUR = Number(process.env.BORROW_FAILURE_THRESHOLD_PER_HOUR) || 5;
+const BORROW_FAILURE_COOLDOWN_MS = Number(process.env.BORROW_FAILURE_COOLDOWN_MS) || 30 * 60_000;
+let _lastBorrowFailureAlertAt = 0;
+let _lastBorrowFailureSnapshot = "";
+
+async function probeBorrowFailures(bot) {
+  const KIND = "borrow_failures_high";
+  try {
+    const { getRecentBorrowFailures } = await import("../api/cosign-borrow.js");
+    const failures = getRecentBorrowFailures();
+    const klasses = Object.keys(failures);
+    if (klasses.length === 0) {
+      recordOutcome(KIND, false);
+      await alertRecovery(bot, KIND, "borrow failure rate back to zero");
+      return;
+    }
+    const overThreshold = klasses.filter((k) => failures[k] >= BORROW_FAILURE_THRESHOLD_PER_HOUR);
+    const isBad = overThreshold.length > 0;
+    recordOutcome(KIND, isBad);
+    if (!isBad) {
+      // Below threshold but non-zero — fine, no alert.
+      await alertRecovery(bot, KIND, "borrow failure rate normalized");
+      return;
+    }
+    const snapshot = klasses
+      .sort((a, b) => failures[b] - failures[a])
+      .map((k) => `${k}=${failures[k]}`)
+      .join(" ");
+    // Throttle — don't re-DM if snapshot hasn't materially changed.
+    if (snapshot === _lastBorrowFailureSnapshot
+        && Date.now() - _lastBorrowFailureAlertAt < BORROW_FAILURE_COOLDOWN_MS) {
+      return;
+    }
+    _lastBorrowFailureAlertAt = Date.now();
+    _lastBorrowFailureSnapshot = snapshot;
+    const guidance = overThreshold.map((k) => {
+      if (k === "stale_blockhash")
+        return "stale_blockhash: users signing too late — site should refresh the blockhash if signing takes >30s";
+      if (k === "rpc_exhausted")
+        return "rpc_exhausted: Helius + every backup failing simulateTransaction — check provider status";
+      if (k === "sim_failed")
+        return "sim_failed: tx would fail on-chain — check recent CRIT DMs for inner reason";
+      if (k === "unclassified")
+        return "unclassified: a new failure shape — pull recent CRIT DMs for the inner error";
+      return `${k}: investigate`;
+    }).join(" | ");
+    await alertIfNew(bot, KIND,
+      `cosign-borrow failures over threshold in last 1h: ${snapshot}. Guidance: ${guidance}`,
+      "crit",
+    );
+  } catch (err) {
+    console.warn("[self-monitor] borrow_failures probe error:", err.message?.slice(0, 160));
+  }
+}
+
 async function probeKillSwitches(bot) {
   const KIND = "killswitch_stale";
   try {
@@ -799,6 +860,7 @@ async function tick(bot) {
       probeLenderWalletBalance(bot).catch((e) => console.warn("[self-monitor] lender_wallet_balance probe threw:", e.message)),
       probePoolCreditDrift(bot).catch((e) => console.warn("[self-monitor] pool_credit_drift probe threw:", e.message)),
       probeKillSwitches(bot).catch((e) => console.warn("[self-monitor] killswitch_stale probe threw:", e.message)),
+      probeBorrowFailures(bot).catch((e) => console.warn("[self-monitor] borrow_failures probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because
