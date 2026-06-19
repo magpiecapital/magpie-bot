@@ -50,6 +50,27 @@ const READINESS_THRESHOLD_PCT = Number(process.env.V4_READINESS_THRESHOLD_PCT) |
 const ON_DEMAND_HOT_WINDOW_MS = Number(process.env.V4_ON_DEMAND_HOT_WINDOW_MS) || 5 * 60_000;
 const ON_DEMAND_LOOP_SPACING_MS = Number(process.env.V4_ON_DEMAND_LOOP_SPACING_MS) || 3_000;
 
+// CONTINUOUS ALL-MINTS LOOP — the architecture that makes EVERY enabled
+// V4 mint stay warm 24/7. Operator-mandated 2026-06-19 PM:
+// "every single token... needs to pass every single sample and execute."
+//
+// Math:
+//   174 mints (currently) × every CONTINUOUS_BATCH_SPACING_MS / CONTINUOUS_CONCURRENCY
+//   = 174 / 16 = 11 batches × 3000ms = ~33s per full cycle of all mints
+//   → each mint attested every ~33s, which is well within the 300s TWAP
+//     window, guaranteeing ≥8 samples per mint at steady state.
+//
+// SOL cost: ~5.3 attestations/sec × 5000 lamports × 86400s/day ≈ 2.3 SOL/day.
+// Pre-authorized by operator (see feedback_every_mint_must_pass_every_sample).
+//
+// To bound spend further, the loop SKIPS mints that already have a healthy
+// sample buffer (current + 2 samples beyond MIN_SAMPLES_FOR_TWAP). The
+// loop only spends SOL on mints that actually need an attestation.
+const CONTINUOUS_CONCURRENCY = Number(process.env.V4_CONTINUOUS_CONCURRENCY) || 16;
+const CONTINUOUS_BATCH_SPACING_MS = Number(process.env.V4_CONTINUOUS_SPACING_MS) || 3_000;
+const CONTINUOUS_BUFFER_SAMPLES = Number(process.env.V4_CONTINUOUS_BUFFER_SAMPLES) || 2; // skip if mint has ≥ (MIN + buffer) samples
+const CONTINUOUS_LIST_REFRESH_INTERVAL_MS = 10 * 60_000; // re-read supported_mints every 10min in case new mints added
+
 // Shared module state — read by /api/v1/health.
 const state = {
   startedAt: null,
@@ -65,6 +86,14 @@ const state = {
   // gets aggressive attestation until it goes cold (unrequested >
   // ON_DEMAND_HOT_WINDOW_MS).
   onDemand: new Map(),       // mint → { lastRequestedAt, requestedCount, decimals }
+  // Continuous all-mints loop state — list of every enabled V4 mint
+  // + round-robin cursor + last-refresh time + counters.
+  continuousList: [],        // Array<{ mint, decimals, symbol, category }>
+  continuousCursor: 0,
+  continuousListRefreshedAt: 0,
+  continuousAttestations: 0, // lifetime counter for /v4-status visibility
+  continuousSkipped: 0,      // skipped because already healthy
+  continuousErrors: 0,
 };
 
 /**
@@ -92,6 +121,18 @@ export function getFeedReadinessSnapshot() {
     total_count: total,
     percent_warm: percentWarm,
     threshold_pct: READINESS_THRESHOLD_PCT,
+    // Continuous all-mints loop telemetry — operator-facing
+    // visibility into what the continuous attestor is doing.
+    continuous: {
+      mint_count: state.continuousList.length,
+      cursor: state.continuousCursor,
+      list_refreshed_at: state.continuousListRefreshedAt
+        ? new Date(state.continuousListRefreshedAt).toISOString()
+        : null,
+      attestations_total: state.continuousAttestations,
+      skipped_total: state.continuousSkipped,
+      errors_total: state.continuousErrors,
+    },
     in_flight: state.inFlight.size,
     started_at: state.startedAt,
     completed_at: state.completedAt,
@@ -265,6 +306,16 @@ export async function startFeedReadinessWarmup() {
   onDemandLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
     console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
   );
+
+  // CONTINUOUS ALL-MINTS LOOP — every enabled V4 mint stays warm 24/7.
+  // Operator-mandated 2026-06-19 PM (feedback_every_mint_must_pass_every_sample).
+  // This is THE architectural layer that makes the protocol non-negotiable
+  // for any approved token. Round-robin attests every enabled mint at
+  // CONTINUOUS_CONCURRENCY × CONTINUOUS_BATCH_SPACING_MS cadence.
+  // Skip-if-buffered logic keeps SOL spend bounded.
+  continuousAllMintsLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+  );
 }
 
 /**
@@ -382,4 +433,130 @@ async function onDemandLoop(lenderPk, programIdV4) {
       console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
     );
   }, ON_DEMAND_LOOP_SPACING_MS);
+}
+
+/**
+ * CONTINUOUS ALL-MINTS LOOP — the architecture that fulfills the
+ * operator's 2026-06-19 PM mandate: every enabled V4 mint must
+ * continuously have ≥8 fresh TWAP samples on-chain at all times.
+ *
+ * On each tick, picks the next CONTINUOUS_CONCURRENCY mints from a
+ * round-robin cursor over ALL enabled V4 mints. For each picked mint:
+ *   1. Reads the on-chain ring buffer.
+ *   2. If samples_in_window ≥ MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES,
+ *      skip — already healthy.
+ *   3. Otherwise fire one attestation. Init the feed PDA first if needed.
+ *
+ * After a tick, waits CONTINUOUS_BATCH_SPACING_MS, then advances the
+ * cursor and repeats.
+ *
+ * Net behavior at steady state:
+ *   174 mints, concurrency 16, 3s spacing → full cycle every ~33s
+ *   Each mint attested every ~33s
+ *   TWAP window is 300s → ~9 samples per mint per window
+ *   ≥ MIN_SAMPLES_FOR_TWAP = 8 always met
+ *
+ * Skip-if-buffered logic means steady-state SOL spend is BELOW the
+ * worst-case 5.3 attestations/sec. Mints sitting at 10 samples don't
+ * get attested until they drift to 9, then 8.
+ */
+async function refreshContinuousList() {
+  const { rows } = await query(
+    `SELECT mint, decimals, symbol, category
+       FROM supported_mints
+      WHERE enabled = true
+        AND category IN ('memecoin', 'stock')`,
+  );
+  state.continuousList = rows.map((r) => ({
+    mint: r.mint,
+    decimals: Number(r.decimals),
+    symbol: r.symbol,
+    category: r.category,
+  }));
+  state.continuousListRefreshedAt = Date.now();
+  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints`);
+}
+
+async function processContinuousMint(target, lenderPk, programIdV4) {
+  if (state.inFlight.has(target.mint)) {
+    return { mint: target.mint, action: "in_flight_skip" };
+  }
+  state.inFlight.add(target.mint);
+  try {
+    const readiness = await checkMintReadiness(target.mint);
+    const buffered =
+      readiness.ready &&
+      typeof readiness.samples_in_window === "number" &&
+      readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
+    if (buffered) {
+      state.continuousSkipped++;
+      return { mint: target.mint, action: "buffered_skip" };
+    }
+    // Fire one attestation. If feed PDA missing, init then attest.
+    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
+    try {
+      await attestPrice(target.mint, target.decimals, undefined, programIdV4);
+    } catch (err) {
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
+        try {
+          await initializePriceFeed(target.mint, programIdV4);
+          await attestPrice(target.mint, target.decimals, undefined, programIdV4);
+        } catch (initErr) {
+          state.continuousErrors++;
+          state.lastError = `init+attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${initErr.message?.slice(0, 120)}`;
+          state.lastErrorAt = new Date().toISOString();
+          return { mint: target.mint, action: "init_failed" };
+        }
+      } else {
+        state.continuousErrors++;
+        state.lastError = `attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`;
+        state.lastErrorAt = new Date().toISOString();
+        return { mint: target.mint, action: "attest_failed" };
+      }
+    }
+    state.continuousAttestations++;
+    return { mint: target.mint, action: "attested" };
+  } finally {
+    state.inFlight.delete(target.mint);
+  }
+}
+
+async function continuousAllMintsLoop(lenderPk, programIdV4) {
+  // Refresh mint list periodically — handles new mints added at runtime.
+  const sinceRefresh = Date.now() - state.continuousListRefreshedAt;
+  if (state.continuousList.length === 0 || sinceRefresh > CONTINUOUS_LIST_REFRESH_INTERVAL_MS) {
+    try {
+      await refreshContinuousList();
+    } catch (err) {
+      console.warn("[v4-readiness] continuous-loop: refresh failed:", err.message?.slice(0, 120));
+    }
+  }
+
+  const list = state.continuousList;
+  if (list.length === 0) {
+    setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+    ), 30_000);
+    return;
+  }
+
+  // Round-robin slice of CONTINUOUS_CONCURRENCY mints. Wrap at end.
+  const batch = [];
+  for (let i = 0; i < CONTINUOUS_CONCURRENCY && i < list.length; i++) {
+    batch.push(list[(state.continuousCursor + i) % list.length]);
+  }
+  state.continuousCursor = (state.continuousCursor + CONTINUOUS_CONCURRENCY) % list.length;
+
+  // Fire in parallel — each mint independently goes through readiness
+  // check + attestation.
+  await Promise.all(batch.map((m) =>
+    processContinuousMint(m, lenderPk, programIdV4).catch((e) => {
+      state.continuousErrors++;
+      return { mint: m.mint, action: "error", error: e.message?.slice(0, 120) };
+    }),
+  ));
+
+  setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+    console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+  ), CONTINUOUS_BATCH_SPACING_MS);
 }
