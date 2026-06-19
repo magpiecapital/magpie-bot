@@ -557,12 +557,29 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
     return;
   }
 
-  // Round-robin slice of CONTINUOUS_CONCURRENCY mints. Wrap at end.
+  // Build batch:
+  // 1. ALL stocks always — every tick, guaranteed.
+  //    xStocks (Token-2022, transfer hooks) attest slower and tend to fall
+  //    below the 8-sample threshold first because they're a small subset
+  //    of the round-robin (~5-10 mints out of 172). Putting them in every
+  //    batch guarantees each stock gets attested every 3s — way under the
+  //    37.5s required cadence, so samples never drift below 8 even with
+  //    occasional Token-2022 attestation failures.
+  //    Operator-mandated 2026-06-19 PM after xStock SPCX oscillated at 7/8
+  //    while every memecoin sat at 8+. Per-stock extra cost: ~0.005 SOL/day.
+  // 2. Round-robin memecoins fill the remaining slots — same logic as before.
+  const stocks = list.filter((m) => m.category === 'stock');
+  const memecoins = list.filter((m) => m.category !== 'stock');
   const batch = [];
-  for (let i = 0; i < CONTINUOUS_CONCURRENCY && i < list.length; i++) {
-    batch.push(list[(state.continuousCursor + i) % list.length]);
+  for (const s of stocks) {
+    if (batch.length >= CONTINUOUS_CONCURRENCY) break;
+    batch.push(s);
   }
-  state.continuousCursor = (state.continuousCursor + CONTINUOUS_CONCURRENCY) % list.length;
+  const memeSlots = CONTINUOUS_CONCURRENCY - batch.length;
+  for (let i = 0; i < memeSlots && i < memecoins.length; i++) {
+    batch.push(memecoins[(state.continuousCursor + i) % memecoins.length]);
+  }
+  state.continuousCursor = (state.continuousCursor + memeSlots) % Math.max(memecoins.length, 1);
 
   // Fire in parallel — each mint independently goes through readiness
   // check + attestation.
