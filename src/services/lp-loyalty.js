@@ -408,10 +408,31 @@ export async function snapshotAndDistributeLpLoyalty() {
   );
   if (rows.length === 0) return null;
 
+  // Operator-curated exempt list (migration 084). The operator's
+  // lender wallet is excluded permanently so the auto-cron doesn't
+  // pay 95% of every cycle back to the wallet that funded LP in the
+  // first place — that would be a wasteful operator-to-operator
+  // round-trip. See [[feedback_lender_wallet_exempt_from_lp_loyalty]].
+  // Empty table = no exemptions, behavior identical to pre-migration.
+  let exempt = new Set();
+  try {
+    const { rows: exemptRows } = await query(
+      `SELECT wallet_address FROM lp_loyalty_exempt_wallets`,
+    );
+    exempt = new Set(exemptRows.map((r) => r.wallet_address));
+    if (exempt.size > 0) {
+      console.log(`[lp-loyalty] honoring ${exempt.size} exempt wallet(s)`);
+    }
+  } catch (err) {
+    // Table missing (pre-migration deploy) — fall back to no exemptions.
+    console.warn("[lp-loyalty] lp_loyalty_exempt_wallets read failed (using empty exemption set):", err.message);
+  }
+
   // Compute weights
   let totalWeight = 0n;
   const items = [];
   for (const r of rows) {
+    if (exempt.has(r.wallet_address)) continue;
     const shares = BigInt(r.shares);
     const seconds = BigInt(r.seconds_held ?? 0);
     if (seconds <= 0n) continue; // brand-new deposits get no loyalty this round
