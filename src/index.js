@@ -181,6 +181,7 @@ import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.
 import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
+import { startBorrowCanary } from "./services/borrow-canary.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
 import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
@@ -960,6 +961,12 @@ bot.start({
     // The actual canary RUNS in the magpie-limitclose engine; this
     // is the bot-side observation surface.
     setTimeout(() => startCanaryWatcher(bot), 105_000);
+    // Borrow canary — every 60s, probes the 4 critical predictors of a
+    // successful V4 borrow. Logs to conversion_events.borrow_canary;
+    // DMs operator on 2 consecutive fails per check, recovery DM on
+    // first success after a fail. Catches every "users would currently
+    // see this class" degradation within 60s. Mandated 2026-06-19 PM.
+    setTimeout(() => startBorrowCanary(bot), 110_000);
     // Loan program_id healer — every 10 min, scans non-closed loans
     // and auto-corrects any DB row whose stored program_id disagrees
     // with the on-chain owner of loan_pda. Defense-in-depth layer
