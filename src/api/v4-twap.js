@@ -53,13 +53,9 @@
  * Read-only. No keypair, no tx. Allowlisted to enabled supported_mints.
  * Cheap (1 RPC + 1 Jupiter request, both cached).
  */
-import { PublicKey, Connection } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
-
-const RPC_URL =
-  process.env.SOLANA_RPC_URL ||
-  process.env.RPC_URL ||
-  "https://api.mainnet-beta.solana.com";
+import { withFailover } from "../solana/connection.js";
 
 const MIN_SAMPLES_FOR_TWAP = 8;
 const TWAP_WINDOW_SECONDS = 300; // V4: MIN_HISTORY_SECONDS = 300
@@ -124,16 +120,23 @@ export async function handleV4Twap(req, url) {
   const [pool] = lendingPoolPda(lenderPk, PROGRAM_ID_V4);
   const [priceFeed] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
 
-  const connection = new Connection(RPC_URL, "confirmed");
+  // withFailover so a Helius blip doesn't cascade to the site as a
+  // borrow failure. Site already handles 'wait_for_warmup' soft-fail;
+  // we use the same soft-fail shape on RPC-down instead of HTTP 500.
+  // [[feedback_loans_must_never_fail_no_regressions]]
   let info;
   try {
-    info = await connection.getAccountInfo(priceFeed, "confirmed");
+    info = await withFailover((conn) => conn.getAccountInfo(priceFeed, "confirmed"));
   } catch (err) {
+    console.error(`[v4-twap] all-RPCs-failed for ${mintStr.slice(0, 12)}: ${err.message?.slice(0, 200)}`);
     return {
-      status: 500,
+      status: 200,
       body: {
-        error: "rpc_error",
-        detail: `getAccountInfo: ${err.message?.slice(0, 160) || err}`,
+        ok: true,
+        mint: mintStr,
+        recommendation: "wait_for_warmup",
+        reason: "rpc_unavailable",
+        fallback_multiplier: 0.89,
       },
     };
   }
