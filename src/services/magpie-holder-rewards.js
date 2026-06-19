@@ -612,6 +612,90 @@ export async function snapshotMagpieHolders() {
  */
 const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana tx limit)
 
+/**
+ * Mirror a $MAGPIE-holder distribution cycle into the protocol-wide
+ * `distribution_events` analytics ledger so it sits alongside lp_loyalty
+ * and governance distributions. Operator-mandated 2026-06-19 — every
+ * distribution must be kept, organized, and synced across the protocol
+ * (see [[feedback_distributions_must_be_kept_organized_synced]]).
+ *
+ * Reads canonical state from magpie_holder_distributions +
+ * magpie_holder_rewards and routes through upsertDistributionEvent()
+ * (which has ON CONFLICT (kind, external_ref) baked in). Kind +
+ * external_ref convention match the existing dictionary in
+ * src/services/distribution-events.js. Idempotent — safe to call from
+ * every transition point.
+ */
+export async function syncMagpieHolderDistributionEvent(distributionId) {
+  const { upsertDistributionEvent } = await import("./distribution-events.js");
+  // Pull the snapshot row + aggregated reward state in one round-trip.
+  const { rows: snapRows } = await query(
+    `SELECT mhd.pool_lamports, mhd.total_balance, mhd.holder_count,
+            mhd.eligible_count, mhd.snapshot_at,
+            COUNT(mhr.*) FILTER (WHERE mhr.status = 'paid')                AS paid_count,
+            COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')), 0)::numeric AS unpaid_lamports,
+            MIN(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS min_paid,
+            MAX(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS max_paid,
+            MIN(mhr.paid_at)                                               AS paid_first_at,
+            MAX(mhr.paid_at)                                               AS paid_last_at
+       FROM magpie_holder_distributions mhd
+       LEFT JOIN magpie_holder_rewards mhr ON mhr.distribution_id = mhd.id
+      WHERE mhd.id = $1
+      GROUP BY mhd.id`,
+    [distributionId],
+  );
+  if (snapRows.length === 0) {
+    console.warn(`[holder-rewards] syncMagpieHolderDistributionEvent: distribution ${distributionId} not found`);
+    return null;
+  }
+  const s = snapRows[0];
+  // Median paid payout — second round-trip; ok at ~1k rows for the
+  // holder set, batches scale linearly.
+  let medianPaid = null;
+  if (Number(s.paid_count) > 0) {
+    const { rows: medRows } = await query(
+      `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY reward_lamports::numeric) AS median
+         FROM magpie_holder_rewards
+        WHERE distribution_id = $1 AND status = 'paid'`,
+      [distributionId],
+    );
+    medianPaid = medRows[0]?.median ?? null;
+  }
+  // status: planned (no payouts yet) | partial (some paid, some unpaid)
+  //       | complete (all eligible paid). CHECK constraint enforces these.
+  let status;
+  if (Number(s.paid_count) === 0) status = "planned";
+  else if (Number(s.unpaid_count) === 0) status = "complete";
+  else status = "partial";
+
+  // kind='holder_reward' per the canonical dictionary enforced by the
+  // distribution_events.kind CHECK constraint.
+  return upsertDistributionEvent({
+    kind: "holder_reward",
+    external_ref: `holder-${distributionId}`,
+    snapshot_at: s.snapshot_at,
+    pool_lamports: s.pool_lamports,
+    distributed_lamports: s.paid_lamports,
+    unpaid_lamports: s.unpaid_lamports,
+    eligible_wallet_count: Number(s.eligible_count) || Number(s.holder_count) || 0,
+    paid_wallet_count: Number(s.paid_count) || 0,
+    unpayable_wallet_count: 0,
+    denominator_kind: "magpie_balance_at_snapshot",
+    denominator_value: s.total_balance,
+    paid_first_at: s.paid_first_at,
+    paid_last_at: s.paid_last_at,
+    min_payout_lamports: s.min_paid,
+    max_payout_lamports: s.max_paid,
+    median_payout_lamports: medianPaid,
+    source_borrow_fees_lamports: s.pool_lamports, // 70% of borrow fees per MGP-001
+    source_liquidation_lamports: 0,
+    source_other_lamports: 0,
+    status,
+  });
+}
+
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
@@ -745,6 +829,15 @@ export async function snapshotAndDistribute() {
   }
   client.release();
 
+  // Mirror into distribution_events so this cycle sits next to lp_loyalty
+  // + governance in the protocol-wide ledger. Idempotent — re-callable.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    await syncMagpieHolderDistributionEvent(distributionId);
+  } catch (syncErr) {
+    console.error(`[holder-rewards] distribution_events sync (Phase 1) failed for dist ${distributionId}:`, syncErr.message);
+  }
+
   // Snapshot-only: bail out before any SOL transfers. Return the
   // captured allocation summary so the caller can DM admin.
   if (snapshotOnly) {
@@ -788,6 +881,14 @@ export async function snapshotAndDistribute() {
       );
       paidCount += batch.length;
       paidLamports += batch.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
+      // Keep distribution_events fresh after every successful batch so
+      // it never lags behind the canonical reward rows even if the
+      // process dies mid-cycle. [[feedback_distributions_must_be_kept_organized_synced]]
+      try {
+        await syncMagpieHolderDistributionEvent(distributionId);
+      } catch (syncErr) {
+        console.warn(`[holder-rewards] distribution_events sync (mid-batch) failed for dist ${distributionId}:`, syncErr.message);
+      }
     } catch (err) {
       console.error(
         `[holder-rewards] Batch payout failed (rows remain 'accrued' for retry):`,
@@ -795,6 +896,14 @@ export async function snapshotAndDistribute() {
       );
       // Leave 'accrued' — a manual /payaccrued admin command or next cycle can clean up.
     }
+  }
+
+  // Final sync — guarantees the row reflects final paid/unpaid state
+  // even if a mid-batch sync failed transiently.
+  try {
+    await syncMagpieHolderDistributionEvent(distributionId);
+  } catch (syncErr) {
+    console.error(`[holder-rewards] distribution_events sync (final) failed for dist ${distributionId}:`, syncErr.message);
   }
 
   return {
@@ -859,6 +968,22 @@ export async function retryAccruedPayouts() {
     } catch (err) {
       console.error("[holder-rewards] retry batch failed:", err.message);
     }
+  }
+  // Sync every touched distribution into distribution_events so the
+  // ledger never lags after a retry sweep.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    const { rows: touched } = await query(
+      `SELECT DISTINCT distribution_id FROM magpie_holder_rewards
+        WHERE id = ANY($1::bigint[])`,
+      [rows.map((r) => r.id)],
+    );
+    for (const t of touched) {
+      try { await syncMagpieHolderDistributionEvent(t.distribution_id); }
+      catch (e) { console.warn(`[holder-rewards] retry-sync dist ${t.distribution_id}:`, e.message); }
+    }
+  } catch (syncErr) {
+    console.warn("[holder-rewards] retry-sweep distribution_events sync failed:", syncErr.message);
   }
   return { retried: rows.length, paid };
 }

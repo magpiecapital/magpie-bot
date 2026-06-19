@@ -1546,6 +1546,16 @@ export async function handleDistribute(ctx) {
   }
   client.release();
 
+  // Sync to distribution_events ledger — every status transition must
+  // propagate so the protocol-wide ledger stays current.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    const { syncMagpieHolderDistributionEvent } = await import("../services/magpie-holder-rewards.js");
+    await syncMagpieHolderDistributionEvent(distId);
+  } catch (syncErr) {
+    console.warn(`[admin /distribute] distribution_events sync failed for dist ${distId}:`, syncErr.message);
+  }
+
   const allocSol = (Number(totalAllocated) / 1e9).toFixed(6);
   await ctx.reply(
     [
