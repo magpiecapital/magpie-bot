@@ -20,7 +20,20 @@
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
-import { getReadOnlyProgram } from "../solana/program.js";
+import { getReadOnlyProgram, PROGRAM_ID } from "../solana/program.js";
+
+/**
+ * Route a Pip on-chain loan lookup to the program that actually owns it.
+ * Without this, fetches against V3/V4 loans return null under V1's program
+ * and Pip falsely reports rpc_blip. Same bug class as PR #407's reconciler
+ * fix, applied to read-only Pip handlers. [[feedback_no_breakage_to_existing_users]]
+ */
+function programForLoan(loan) {
+  try {
+    if (loan?.program_id) return getReadOnlyProgram(new PublicKey(loan.program_id));
+  } catch { /* fall through to default */ }
+  return getReadOnlyProgram(PROGRAM_ID);
+}
 import { getLiveOwedLamports } from "./loans.js";
 import { scopeLoansToActiveWallet, filterLoansForWallet } from "./wallet-scoped-loans.js";
 
@@ -2607,7 +2620,7 @@ const TOOL_HANDLERS = {
     );
     if (!rows[0]) return toolError("loan_not_found", null, "That loan ID was not found for this user. Tell them to double-check the ID (it's the long number from /positions), or call list_my_loans to see what they have.");
     const loan = rows[0];
-    const program = getReadOnlyProgram();
+    const program = programForLoan(loan);
     let onChain;
     try {
       onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
@@ -2894,7 +2907,7 @@ const TOOL_HANDLERS = {
     const decimals = loan.decimals ?? 0;
     const extraRaw = BigInt(Math.floor(uiAmount * Math.pow(10, decimals))).toString();
 
-    const program = getReadOnlyProgram();
+    const program = programForLoan(loan);
     let onChain;
     try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
     catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
@@ -2934,7 +2947,7 @@ const TOOL_HANDLERS = {
     );
     if (!rows[0]) return toolError("loan_not_found", null, "That loan ID wasn't found for this user.");
     const loan = rows[0];
-    const program = getReadOnlyProgram();
+    const program = programForLoan(loan);
     let onChain;
     try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
     catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
@@ -2987,7 +3000,7 @@ const TOOL_HANDLERS = {
     const sol = parseFloat(String(repay_sol));
     if (!Number.isFinite(sol) || sol <= 0) return toolError("bad_amount", null, "Repay amount must be > 0 SOL.");
 
-    const program = getReadOnlyProgram();
+    const program = programForLoan(loan);
     let onChain;
     try { onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda)); }
     catch (err) { return toolError("rpc_blip", err.message, HINT_RPC_BLIP); }
@@ -4078,7 +4091,7 @@ const TOOL_HANDLERS = {
     );
     if (!rows[0]) return toolError("loan_not_found", null, "That loan ID was not found for this user. Tell them to double-check the ID or call list_my_loans.");
     const loan = rows[0];
-    const program = getReadOnlyProgram();
+    const program = programForLoan(loan);
     let onChain;
     try {
       onChain = await program.account.loan.fetch(new PublicKey(loan.loan_pda));
