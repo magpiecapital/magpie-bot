@@ -496,16 +496,17 @@ async function fetchMintsToAttest() {
        LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
       WHERE sm.enabled = TRUE
         AND (
+          -- hot tier: always continuous
           sm.attestation_tier = 'hot'
-          OR (
-            sm.attestation_tier = 'warm'
-            AND (
-              sm.protected = TRUE
-              OR alm.collateral_mint IS NOT NULL
-              OR aem.collateral_mint IS NOT NULL
-              OR rim.collateral_mint IS NOT NULL
-            )
-          )
+          -- ANY tier (warm/cold) with borrower activity gets auto-attested.
+          -- Safety net: a 'cold' mint with an active loan or armed exit
+          -- MUST keep its feed warm or the engine can't fire exits and
+          -- repay flows go stale. Operator's tier setting is respected
+          -- ONLY when there's no borrower interest.
+          OR sm.protected = TRUE
+          OR alm.collateral_mint IS NOT NULL
+          OR aem.collateral_mint IS NOT NULL
+          OR rim.collateral_mint IS NOT NULL
         )`,
   );
   return r.rows.map((row) => ({

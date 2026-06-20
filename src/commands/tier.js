@@ -35,7 +35,7 @@ import { isAdmin } from "../services/admin.js";
 const VALID_TIERS = new Set(["hot", "warm", "cold"]);
 
 export async function handleTier(ctx) {
-  if (!isAdmin(ctx)) {
+  if (!isAdmin(ctx.from?.id)) {
     return ctx.reply("Admin only.");
   }
 
@@ -106,6 +106,35 @@ export async function handleTier(ctx) {
     );
   }
 
+  // Safety check: demoting a mint with active borrower activity is
+  // potentially risky. The Phase 2 SQL auto-includes any mint with
+  // borrower activity (regardless of tier), but the operator should
+  // still know they're demoting a mint that's currently in use.
+  if (newTier === "cold" || newTier === "warm") {
+    const { rows: activity } = await query(
+      `SELECT
+         (SELECT COUNT(*) FROM loans WHERE collateral_mint = $1 AND status = 'active') AS active_loans,
+         (SELECT COUNT(*) FROM limit_close_orders lc
+            JOIN loans l ON l.id = lc.loan_id
+           WHERE l.collateral_mint = $1
+             AND lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+         ) AS armed_orders`,
+      [row.mint],
+    );
+    const al = Number(activity[0]?.active_loans || 0);
+    const ao = Number(activity[0]?.armed_orders || 0);
+    if (al > 0 || ao > 0) {
+      // Don't refuse — just warn. The SQL auto-includes anyway.
+      // (Bot side: the attestor loops include any mint with activity
+      //  regardless of tier setting, so this is safe even if demoted.)
+      // But the operator should KNOW so they can make an informed call.
+      // ... continue and log the warning in the response below.
+      row._activity_warning = `⚠ ${al} active loan(s) + ${ao} armed order(s) on this mint. ` +
+        `Continuous attestation will still happen automatically for them — ` +
+        `the tier change only affects mints with NO borrower activity. Safe to proceed.`;
+    }
+  }
+
   // Atomic update + audit trail
   const changedBy =
     ctx.from?.username || ctx.from?.id?.toString() || "unknown";
@@ -127,10 +156,11 @@ export async function handleTier(ctx) {
     throw err;
   }
 
+  const warning = row._activity_warning ? `\n\n${row._activity_warning}` : "";
   return ctx.reply(
     `✓ \`${symbol}\` (${row.category}): ${fromTier} → **${newTier}**\n` +
       `mint: \`${row.mint.slice(0, 12)}...\`\n` +
-      `Audit row inserted. Takes effect next attestor tick.`,
+      `Audit row inserted. Takes effect next attestor tick.${warning}`,
     { parse_mode: "Markdown" },
   );
 }

@@ -498,15 +498,13 @@ async function refreshContinuousList() {
         AND sm.category IN ('memecoin', 'stock')
         AND (
           sm.attestation_tier = 'hot'
-          OR (
-            sm.attestation_tier = 'warm'
-            AND (
-              sm.protected = TRUE
-              OR alm.collateral_mint IS NOT NULL
-              OR aem.collateral_mint IS NOT NULL
-              OR rim.collateral_mint IS NOT NULL
-            )
-          )
+          -- Safety net: ANY tier (incl. cold) with borrower activity
+          -- gets auto-attested. A cold mint with active loan/arm MUST
+          -- keep its V4 feed warm or the engine can't fire exits.
+          OR sm.protected = TRUE
+          OR alm.collateral_mint IS NOT NULL
+          OR aem.collateral_mint IS NOT NULL
+          OR rim.collateral_mint IS NOT NULL
         )`,
   );
   state.continuousList = rows.map((r) => ({
