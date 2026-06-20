@@ -447,31 +447,66 @@ async function fetchMintsToAttest() {
   //
   // Everything else → JIT warm at cosign-borrow time. The cosign retry
   // loop has up to 90s budget which is plenty for a cold-start mint.
-  // 2026-06-19 PM (operator-mandated, FARM V1 borrow incident):
+  // Tiered attestation Phase 2 (2026-06-19 PM, operator-mandated cost
+  // control). Supersedes the "every enabled mint always" filter from
+  // earlier today after burn rate hit ~$11k/mo.
   //
-  // The previous filter ONLY returned mints that were protected OR backed
-  // an active loan OR had an armed exit OR had a recent arm intent. A
-  // freshly-approved memecoin with no borrowers yet (like FARM) was
-  // skipped entirely → V1 PDA was initialized by the boot pre-warm but
-  // NEVER attested → first borrower hit `StalePriceAttestation` (>120s
-  // wall) the moment they tried to borrow.
+  // attestation_tier semantics:
+  //   hot  → always include (continuously attested every tick)
+  //   warm → include only when there's borrower interest (active loan,
+  //          armed exit, recent arm intent, OR protected mint)
+  //   cold → never include in continuous loops. Cosign-borrow's JIT
+  //          warmer handles the first borrow.
   //
-  // The cost-saving rationale of the old filter ("don't burn attestation
-  // SOL on mints that won't be borrowed") is wrong: ANY enabled mint can
-  // be borrowed at any moment, and the first borrower MUST find a fresh
-  // attestation. At 30s tick × ~5000 lamports/attest × 177 enabled mints
-  // = ~0.03 SOL/day (~$5/day at current SOL prices). Negligible vs the
-  // user-experience cost of a failed first borrow.
+  // Safety guarantees that REMAIN in force:
+  // - Boot pre-init in preWarmAllEnabledMintFeeds still creates PDAs
+  //   for ALL enabled mints regardless of tier → no AccountNotInitialized
+  //   class even for cold tier.
+  // - Cosign-borrow's JIT warmer is the proven safety net (hardened
+  //   earlier today). Cold tier first-borrow waits 60-90s for V4 TWAP
+  //   warmup (acceptable per operator), <2s for V1/V3.
+  // - 'warm' AUTO-includes when there's borrower interest, so no
+  //   in-flight loan exposure.
+  // - Stale-feed CRIT alarm still catches drift on hot mints.
   //
-  // Return EVERY enabled mint with needs_legacy_attest=TRUE. The continuous
-  // V4 sweep already runs for every enabled mint per the
-  // EVERY-MINT-EVERY-SAMPLE-ALWAYS mandate.
+  // See [[feedback_tiered_attestation_cost_conscious]] for rollout +
+  // cost projections.
   const r = await query(
-    `SELECT sm.mint, sm.decimals,
+    `WITH active_loan_mints AS (
+       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+     ),
+     armed_exit_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM limit_close_orders lc
+         JOIN loans l ON l.id = lc.loan_id
+        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+     ),
+     recent_intent_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM arm_intents ai
+         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
+        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+     )
+     SELECT sm.mint, sm.decimals,
             TRUE AS needs_legacy_attest,
             TRUE AS needs_continuous
        FROM supported_mints sm
-      WHERE sm.enabled = TRUE`,
+       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
+       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+      WHERE sm.enabled = TRUE
+        AND (
+          sm.attestation_tier = 'hot'
+          OR (
+            sm.attestation_tier = 'warm'
+            AND (
+              sm.protected = TRUE
+              OR alm.collateral_mint IS NOT NULL
+              OR aem.collateral_mint IS NOT NULL
+              OR rim.collateral_mint IS NOT NULL
+            )
+          )
+        )`,
   );
   return r.rows.map((row) => ({
     mint: row.mint,
