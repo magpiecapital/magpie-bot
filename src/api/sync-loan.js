@@ -43,7 +43,7 @@ import {
   recordExtendLoan,
   recordLoan,
 } from "../services/loans.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 
 /**
  * Verify the provided `signature` is a real on-chain tx, recent, and the
@@ -68,10 +68,15 @@ async function verifyBorrowerSignedTx(signature, borrowerPubkey) {
     return { ok: false, reason: "signature_shape" };
   }
   try {
-    const tx = await connection.getTransaction(signature, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
+    // Wrapped in withFailover (audit 2026-06-19) so a Helius blip during
+    // borrower-signature verification doesn't cause legitimate sync attempts
+    // to fail. Falls through to backup RPCs automatically.
+    const tx = await withFailover((conn) =>
+      conn.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      }),
+    );
     if (!tx) return { ok: false, reason: "tx_not_found" };
     // Reject ancient txs — a fresh sync-loan from the site happens within
     // seconds of confirm; tightening the window bounds the replay surface.

@@ -72,6 +72,7 @@ import {
   handleAgentListIntents,
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
+import { handleWarmMint } from "./warm-mint.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
@@ -1782,6 +1783,13 @@ const PUBLIC_ROUTES = new Set([
   // or write anything that isn't already true on-chain — so it's safe
   // to expose without auth.
   "/api/v1/sync-loan",
+  // Hot-on-Select warm-mint beacon — pings continuous-attestation
+  // loop to include a mint for the next 10 min so V4 borrows on
+  // cold mints can fill their TWAP window during user review time.
+  // No auth — pure intent beacon, validates mint via PublicKey +
+  // supported_mints check. Operator-mandated 2026-06-19 PM after
+  // $TROLL V4 borrow hit "Markets warming up."
+  "/api/v1/v4/warm-mint",
   // Live-debug ring buffer of recent console.error/warn output. No
   // PII; bounded in-memory; cleared on restart.
   "/api/v1/debug/recent-errors",
@@ -2178,6 +2186,13 @@ async function router(req, res) {
         break;
       case "/api/v1/sync-loan":
         result = await handleSyncLoan(req);
+        break;
+      case "/api/v1/v4/warm-mint":
+        // Hot-on-Select beacon — site pings this when user opens V4
+        // exit picker. Bot adds mint to mint_warming_intents (10-min
+        // TTL) so the continuous attestation loop picks it up. By the
+        // time the user signs the borrow tx, samples are in window.
+        result = await handleWarmMint(req);
         break;
       case "/api/v1/debug/recent-errors":
         // Live tail of console.error/warn. Safe to expose — no PII,
