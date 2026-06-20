@@ -907,6 +907,34 @@ export async function applyStartupPatches() {
     // there's no upside in arbitrarily capping borrows against it).
     `ALTER TABLE supported_mints ADD COLUMN IF NOT EXISTS max_open_lamports NUMERIC(20,0)`,
 
+    // 2026-06-19 PM — Tiered attestation (mirrors migrations/085_supported_mints_attestation_tier.sql).
+    // Inlined here because this codebase doesn't have an automatic
+    // migration runner — the migrations/ folder is applied manually.
+    // Putting the schema change in pool.js's init list makes it
+    // self-healing on boot.
+    //
+    // attestation_tier: hot (always attested) / warm (active-loan-only) /
+    //   cold (JIT only at cosign-borrow).
+    // Default 'hot' preserves prior behavior for every existing mint.
+    // See [[feedback_tiered_attestation_cost_conscious]].
+    `ALTER TABLE supported_mints
+       ADD COLUMN IF NOT EXISTS attestation_tier TEXT NOT NULL DEFAULT 'hot'
+       CHECK (attestation_tier IN ('hot', 'warm', 'cold'))`,
+    `CREATE INDEX IF NOT EXISTS idx_supported_mints_tier_enabled
+       ON supported_mints (attestation_tier, enabled)
+       WHERE enabled = TRUE`,
+    `CREATE TABLE IF NOT EXISTS supported_mints_tier_changes (
+       id BIGSERIAL PRIMARY KEY,
+       mint TEXT NOT NULL,
+       from_tier TEXT,
+       to_tier TEXT NOT NULL,
+       changed_by TEXT,
+       reason TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_smtc_mint_created
+       ON supported_mints_tier_changes (mint, created_at DESC)`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
