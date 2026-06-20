@@ -106,6 +106,28 @@ export async function handleTier(ctx) {
     );
   }
 
+  // Category-level invariant: stocks/RWAs cannot be demoted to warm or
+  // cold. The cosign-borrow JIT attestation path cannot reliably fill
+  // the 8-sample/5-min V4 TWAP window for low-liquidity xStocks within
+  // the borrow envelope. TSLAx StalePriceAttestation incident 2026-06-19
+  // proved this. Memecoins are fine cold (deep Jupiter routes), stocks
+  // and RWAs are not. The stocks-rwa-protection-sentinel would auto-
+  // revert this on the next sweep anyway — refusing here gives the
+  // operator immediate feedback instead of silent drift.
+  if (
+    (newTier === "cold" || newTier === "warm") &&
+    (row.category === "stock" || row.category === "rwa")
+  ) {
+    return ctx.reply(
+      `❌ Cannot demote \`${symbol}\` (${row.category}) to \`${newTier}\`. ` +
+        `Stocks and RWAs MUST stay on \`hot\` tier — JIT attestation cannot ` +
+        `fill the 8-sample TWAP window for low-liquidity tokenized assets. ` +
+        `The stocks-rwa-protection-sentinel would auto-revert this in <5min. ` +
+        `Reference: TSLAx StalePriceAttestation incident 2026-06-19.`,
+      { parse_mode: "Markdown" },
+    );
+  }
+
   // Safety check: demoting a mint with active borrower activity is
   // potentially risky. The Phase 2 SQL auto-includes any mint with
   // borrower activity (regardless of tier), but the operator should
