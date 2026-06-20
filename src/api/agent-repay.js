@@ -38,6 +38,7 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   Keypair,
+  SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -54,6 +55,7 @@ import { connection, withFailover } from "../solana/connection.js";
 import {
   chooseProgramIdForLoan,
   getProgramForSigner,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import {
   lendingPoolPda,
@@ -236,6 +238,27 @@ export async function handleAgentBuildRepay(req) {
       ),
     ];
 
+    // V4's repayLoan requires sol_proceeds_vault + wsol_mint + system_program
+    // + rent so it can init_if_needed the vault for loans whose auto-sell
+    // never fired. Without these the V4 repay tx fails AccountNotEnoughKeys.
+    // V1/V3 paths unchanged. Mirrors the TG repay pattern in loans.js (task
+    // #267). Audit-mandated 2026-06-19 PM after full-protocol audit revealed
+    // agent-repay diverged from TG repay on V4 accounts.
+    const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+    let v4ExtraAccounts = {};
+    if (isV4) {
+      const [solProceedsVault] = PublicKey.findProgramAddressSync(
+        [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+        programId,
+      );
+      v4ExtraAccounts = {
+        solProceedsVault,
+        wsolMint: NATIVE_MINT,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY,
+      };
+    }
+
     const ix = await program.methods
       .repayLoan()
       .accounts({
@@ -249,6 +272,7 @@ export async function handleAgentBuildRepay(req) {
         borrower: borrowerPk,
         tokenProgram: collateralTokenProgram,
         loanTokenProgram,
+        ...v4ExtraAccounts,
       })
       .preInstructions(preIxs)
       .postInstructions(postIxs)
