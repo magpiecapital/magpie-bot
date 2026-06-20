@@ -488,12 +488,23 @@ async function refreshContinuousList() {
          FROM arm_intents ai
          JOIN loans l ON l.loan_id::text = ai.loan_id_chain
         WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+     ),
+     -- Hot-on-Select beacon: site POSTs /api/v1/v4/warm-mint when user
+     -- opens the V4 exit picker, even for cold mints. Bot UNIONs that
+     -- mint into continuous attestation for the 10-min TTL so samples
+     -- accumulate during user review time. Operator-mandated 2026-06-19
+     -- PM after $TROLL hit "Markets warming up." See migration 086.
+     warming_mints AS (
+       SELECT DISTINCT mint AS collateral_mint
+         FROM mint_warming_intents
+        WHERE expires_at > NOW()
      )
      SELECT sm.mint, sm.decimals, sm.symbol, sm.category
        FROM supported_mints sm
        LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
        LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
        LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+       LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
       WHERE sm.enabled = TRUE
         AND sm.category IN ('memecoin', 'stock')
         AND (
@@ -505,6 +516,9 @@ async function refreshContinuousList() {
           OR alm.collateral_mint IS NOT NULL
           OR aem.collateral_mint IS NOT NULL
           OR rim.collateral_mint IS NOT NULL
+          -- Hot-on-Select: user is staring at the V4 picker right now
+          -- for this mint; we have ~10 min to fill the TWAP window.
+          OR wm.collateral_mint IS NOT NULL
         )`,
   );
   state.continuousList = rows.map((r) => ({
