@@ -468,11 +468,46 @@ async function onDemandLoop(lenderPk, programIdV4) {
  * get attested until they drift to 9, then 8.
  */
 async function refreshContinuousList() {
+  // Tiered attestation Phase 2 (2026-06-19 PM): filter by attestation_tier.
+  // Hot mints always in list. Warm mints included when there's borrower
+  // interest. Cold mints excluded — cosign-borrow JIT warmer handles
+  // first-borrow on cold tier.
+  // See [[feedback_tiered_attestation_cost_conscious]].
   const { rows } = await query(
-    `SELECT mint, decimals, symbol, category
-       FROM supported_mints
-      WHERE enabled = true
-        AND category IN ('memecoin', 'stock')`,
+    `WITH active_loan_mints AS (
+       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+     ),
+     armed_exit_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM limit_close_orders lc
+         JOIN loans l ON l.id = lc.loan_id
+        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+     ),
+     recent_intent_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM arm_intents ai
+         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
+        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+     )
+     SELECT sm.mint, sm.decimals, sm.symbol, sm.category
+       FROM supported_mints sm
+       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
+       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+      WHERE sm.enabled = TRUE
+        AND sm.category IN ('memecoin', 'stock')
+        AND (
+          sm.attestation_tier = 'hot'
+          OR (
+            sm.attestation_tier = 'warm'
+            AND (
+              sm.protected = TRUE
+              OR alm.collateral_mint IS NOT NULL
+              OR aem.collateral_mint IS NOT NULL
+              OR rim.collateral_mint IS NOT NULL
+            )
+          )
+        )`,
   );
   state.continuousList = rows.map((r) => ({
     mint: r.mint,
