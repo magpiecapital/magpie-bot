@@ -882,7 +882,8 @@ bot.start({
     // (only 3-4 samples in window), which caused SPCX V3 borrows to fail
     // with PriceImpactPumpDetected when price moved during the long gap.
     // Operator hit it 2026-06-17 PM. Forensic: scripts/diagnose-spcx-twap-lag.mjs
-    setTimeout(() => startPriceAttestor(20_000), 35_000);
+    const PRICE_ATTESTOR_TICK_MS = Number(process.env.PRICE_ATTESTOR_TICK_MS) || 20_000;
+    setTimeout(() => startPriceAttestor(PRICE_ATTESTOR_TICK_MS), 35_000);
     // RWA screener — discovers Backed Finance xStocks + similar via DexScreener
     // search every 4h. Auto-adds new mints meeting liquidity/volume thresholds.
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
