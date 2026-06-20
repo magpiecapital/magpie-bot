@@ -318,6 +318,10 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
     ["scan-impersonators", "scanimpersonators", "scan_impersonators"],
     scanImp.handleScanImpersonators,
   );
+  // Attestation tier management (Phase 1: schema + admin tooling only,
+  // no behavior change in attestor loops yet).
+  const tierCmd = await import("./commands/tier.js");
+  bot.command(["tier", "tiers"], tierCmd.handleTier);
 }
 // F-4 multi-step approval — second-admin sign-off for sensitive commands.
 // Default gated commands: enablemint, disablemint, broadcast (tunable via
