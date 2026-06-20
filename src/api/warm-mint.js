@@ -28,6 +28,7 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
+import { requestMintWarm } from "../services/v4-feed-readiness.js";
 
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -98,8 +99,24 @@ export async function handleWarmMint(req) {
   const symbol = mintRows[0].symbol;
   const tier = mintRows[0].attestation_tier;
 
+  // CRITICAL: also push onto the in-memory on-demand queue. The V4
+  // continuous-list refresh runs every 10 min, which is too slow for
+  // the borrow-flow use case (user expands holding → needs samples in
+  // 30-60s). requestMintWarm adds to state.onDemand which is processed
+  // every 3s by onDemandLoop. So the DB row provides persistence + SQL
+  // visibility on next continuous refresh, AND the in-memory ping
+  // guarantees attestation starts within 3 seconds.
+  let onDemandResult = null;
+  try {
+    onDemandResult = await requestMintWarm(mint);
+  } catch (err) {
+    console.warn(
+      `[warm-mint] on-demand queue add failed: ${err.message?.slice(0, 80)}`,
+    );
+  }
+
   console.log(
-    `[warm-mint] ${symbol} (${tier}) warmed by ${source}, expires ${result.expires_at.toISOString()}, hit_count=${result.hit_count}`,
+    `[warm-mint] ${symbol} (${tier}) warmed by ${source}, expires ${result.expires_at.toISOString()}, hit_count=${result.hit_count}, on_demand_ready=${onDemandResult?.ready ?? "n/a"}`,
   );
 
   return {
@@ -111,6 +128,8 @@ export async function handleWarmMint(req) {
       tier,
       expires_at: result.expires_at,
       hit_count: result.hit_count,
+      samples_in_window: onDemandResult?.samples_in_window ?? null,
+      ready: onDemandResult?.ready ?? null,
     },
   };
 }
