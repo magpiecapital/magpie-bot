@@ -594,12 +594,41 @@ export async function getPriceInUsdCrossSourced(mint) {
  *
  * Verified live 2026-06-10 against real SPYx (multiplier 1.002561 →
  * 0.26% under-valuation if uncorrected) and NVDAx (multiplier 1.000103).
+ *
+ * ATTESTATION-SAFE MULTIPLIER CLAMP (2026-06-20, P0). The on-chain program
+ * values collateral at the ATTESTED price (price-attestor posts getPriceInSol
+ * × 1e9 — WITHOUT the scaled-UI multiplier) and rejects any submitted
+ * collateral_value more than MAX_VALUE_TOLERANCE_BPS (3%) above it
+ * (ErrorCode::CollateralValueExceedsAttestation, identical across V1/V2/V3/V4).
+ * Because the attestor omits the multiplier but this offer applies it, a
+ * scaled-UI multiplier above ~1.03 makes the offer exceed what the chain will
+ * ever accept — producing an inflated "dollar figure offered" AND an on-chain
+ * rejection on borrow. A normal Backed dividend multiplier is ~1.00x; a value
+ * far above 1.03 is a split/large-accrual/misread, never a routine dividend.
+ * We clamp the applied multiplier to the on-chain tolerance so the offer can
+ * NEVER exceed the attestation from the multiplier term — fixing the offer +
+ * the rejection in one shared chokepoint that every borrow path uses. Legit
+ * small multipliers (<= the clamp) pass through unchanged.
  */
+// 1.03 on-chain tolerance × 0.997 buffer for spot/TWAP drift between this
+// quote and the user signing. Mirrors the v4-twap endpoint's 30bps buffer.
+const MAX_SAFE_SCALED_UI_MULTIPLIER = 1.03 * 0.997; // ≈ 1.02691
+
 export async function collateralValueLamports(mint, rawAmount, decimals) {
-  const [priceSol, multiplier] = await Promise.all([
+  const [priceSol, rawMultiplier] = await Promise.all([
     getPriceInSolCrossSourced(mint),
     getScaledUiMultiplier(mint),
   ]);
+  // Clamp the scaled-UI multiplier so the offer can never exceed the on-chain
+  // attestation (which carries no multiplier) beyond its 3% tolerance.
+  const multiplier = Math.min(rawMultiplier, MAX_SAFE_SCALED_UI_MULTIPLIER);
+  if (rawMultiplier > MAX_SAFE_SCALED_UI_MULTIPLIER) {
+    console.warn(
+      `[price] scaled-UI multiplier ${rawMultiplier} for ${mint.slice(0, 8)}… exceeds the ` +
+        `on-chain attestation tolerance; clamped to ${multiplier.toFixed(5)} to prevent ` +
+        `CollateralValueExceedsAttestation + inflated offer. (attestor posts no multiplier.)`,
+    );
+  }
   // (rawAmount × multiplier) / 10^decimals = the UI amount users see in
   // their wallet, which is what Jupiter/DexScreener price quotes refer to.
   const humanAmount = (Number(rawAmount) * multiplier) / 10 ** decimals;
