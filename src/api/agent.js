@@ -83,6 +83,28 @@ import { Keypair } from "@solana/web3.js";
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
+// Throttled operator alerting for the V4 borrow kill switch. Mirrors the
+// cosign-borrow COSIGN_BORROW_DISABLED alert: a drain-safety pause that we
+// NEVER auto-re-enable must also never be silently left on. Re-alert at
+// most once per ~10 min (in-memory) so it stays visible until cleared.
+const KILL_SWITCH_ALERT_INTERVAL_MS = 10 * 60 * 1000; // ~10 min
+let _v4PausedLastAlertAt = 0;
+
+function alertV4PausedThrottled() {
+  const now = Date.now();
+  if (now - _v4PausedLastAlertAt < KILL_SWITCH_ALERT_INTERVAL_MS) return;
+  _v4PausedLastAlertAt = now;
+  // Fire-and-forget — the borrow response must not wait on a Telegram alert.
+  (async () => {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        "PAUSED [agent-borrow] V4_BORROWS_PAUSED is ON — a new auto-sell borrow just bounced. This will keep alerting ~every 10 min until you clear V4_BORROWS_PAUSED. (Drain-safety control — never auto-re-enabled.)",
+      );
+    } catch {}
+  })();
+}
+
 // Legacy memecoin tier map — kept for back-compat callers that still
 // import TIERS directly. NEW code should use the category-aware
 // resolveTierForAgent helper below, which picks the right schedule
@@ -259,7 +281,23 @@ export async function buildBorrowTx({
     //     or pick a different collateral, will lift after V4 patch)
     //   - generic V4 not configured (503 — operational issue)
     if (err.message?.startsWith("V4_BORROWS_PAUSED")) {
-      return { blocked: true, status: 503, body: { error: "v4_borrows_paused", detail: err.message } };
+      // Throttled recurring operator alert so the pause is never silently
+      // left on. We deliberately do NOT auto-re-enable the switch.
+      alertV4PausedThrottled();
+      return {
+        blocked: true,
+        status: 503,
+        body: {
+          error:
+            "We're holding new auto-sell borrows for a quick safety check — please try again in about a minute.",
+          retry_after_seconds: 60,
+          friendly: true,
+          paused: true,
+          // `detail` retains the V4_BORROWS_PAUSED-prefixed message for any
+          // caller that branches on it; not shown verbatim to end users.
+          detail: err.message,
+        },
+      };
     }
     if (err.message?.startsWith("TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED")) {
       return { blocked: true, status: 422, body: { error: "token2022_exit_blocked", detail: err.message } };
