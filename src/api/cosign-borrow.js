@@ -1513,9 +1513,12 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
             },
           };
         }
-        // CollateralValueExceedsAttestation (V4 custom 6018 / V3 custom 6018).
-        // Price moved between site quote and broadcast.
-        if (/CollateralValueExceedsAttestation|"Custom":\s*601[68]/i.test(detail)) {
+        // CollateralValueExceedsAttestation = custom 6014 (0x177e) on ALL
+        // versions (V1/V2/V3/V4 — verified against every IDL). The old regex
+        // matched 6016/6018 (TwapInsufficientHistory / PriceTimestampWentBackwards)
+        // and MISSED a bare-Custom 6014 (no program logs), dropping it to the
+        // generic "we hit a snag" instead of this retryable price-moved path.
+        if (/CollateralValueExceedsAttestation|"Custom":\s*6014\b|0x177e/i.test(detail)) {
           return {
             status: 503,
             body: {
@@ -1526,10 +1529,27 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
             },
           };
         }
-        // StalePriceAttestation (price feed too old at broadcast time).
-        if (/StalePriceAttestation|"Custom":\s*6019/i.test(detail)) {
+        // StalePriceAttestation = custom 6013 (0x177d). Price feed too old at
+        // broadcast time. (Old regex matched 6019, which is not a real code.)
+        if (/StalePriceAttestation|"Custom":\s*6013\b|0x177d/i.test(detail)) {
           recordBorrowFailure("stale_price_attestation");
           _recordBorrowConversionFailure(_convCtx, "stale_price_attestation", { detail: detail?.slice(0, 220) });
+          return {
+            status: 503,
+            body: {
+              error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+              oracle_warming: true,
+              retry_after_seconds: 25,
+              detail,
+            },
+          };
+        }
+        // TwapInsufficientHistory = custom 6016 (0x1780) — V3/V4 feed lacks
+        // enough TWAP samples yet. Same warming UX as a stale feed (was being
+        // mis-caught by the CollateralValueExceeds regex and shown "price moved").
+        if (/TwapInsufficientHistory|"Custom":\s*6016\b|0x1780/i.test(detail)) {
+          recordBorrowFailure("twap_insufficient_history");
+          _recordBorrowConversionFailure(_convCtx, "twap_insufficient_history", { detail: detail?.slice(0, 220) });
           return {
             status: 503,
             body: {
