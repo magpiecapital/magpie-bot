@@ -51,7 +51,7 @@ let lastAlertedCount = -1;
 function fmtRows(rows) {
   if (rows.length === 0) return "";
   const sample = rows.slice(0, 8).map((r) =>
-    `  • order_id=${r.id} loan_id=${r.loan_id} direction=${r.direction} status=${r.status} armed=${new Date(r.created_at).toISOString().slice(0, 16)}Z`,
+    `  • order_id=${r.id} loan_id=${r.loan_id} direction=${r.trigger_direction} status=${r.status} armed=${new Date(r.created_at).toISOString().slice(0, 16)}Z`,
   ).join("\n");
   const more = rows.length > 8 ? `\n  ... and ${rows.length - 8} more` : "";
   return sample + more;
@@ -59,7 +59,7 @@ function fmtRows(rows) {
 
 async function runOneCycle(bot) {
   const { rows } = await query(
-    `SELECT id, loan_id, direction, status, created_at
+    `SELECT id, loan_id, trigger_direction, status, created_at
        FROM limit_close_orders
       WHERE engine_program_id IS NULL
         AND created_at > $1::date
