@@ -403,6 +403,33 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
   throw lastErr;
 }
 
+// Detect the "price-feed PDA not initialized" failure across BOTH err.message
+// AND err.logs. updatePrice runs with skipPreflight:true, so the program's
+// AccountNotInitialized signature (3012 / 0xbc4) surfaces in the on-chain
+// program logs (err.logs / err.transactionLogs), not always in err.message —
+// a message-only check missed it, so a mint with an uninitialized feed never
+// hit the auto-init branch and stuck on fail++ forever (MERLIN, 2026-06-21).
+// initializePriceFeed is idempotent (alreadyExists guard) + tick-capped, so a
+// rare false-positive is harmless.
+function isUninitFeedError(err) {
+  const logs = Array.isArray(err?.logs)
+    ? err.logs.join(" ")
+    : Array.isArray(err?.transactionLogs)
+      ? err.transactionLogs.join(" ")
+      : "";
+  const text = `${err?.message || ""} ${logs}`;
+  return /AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(text);
+}
+
+// Fuller failure detail for diagnosing a genuinely-stuck mint — name + message
+// + the tail of the program logs — instead of a blank .slice(0,100) that hid
+// MERLIN's real cause for hours.
+function attestErrDetail(err) {
+  const logArr = Array.isArray(err?.logs) ? err.logs : Array.isArray(err?.transactionLogs) ? err.transactionLogs : null;
+  const logs = logArr && logArr.length ? ` logs=[${logArr.slice(-3).join(" | ").slice(0, 240)}]` : "";
+  return `${err?.name || "Error"}: ${(err?.message || "(no message)").slice(0, 160)}${logs}`;
+}
+
 /**
  * Mints we need to keep continuously fresh on-chain:
  *   1. Those backing any active loan (risk engine / health watcher / repay
@@ -769,7 +796,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
               lastAttestAt.set(task.mint, Date.now());
               succeeded++;
             } catch (attestErr) {
-              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message || "")) {
+              if (isUninitFeedError(attestErr)) {
                 if (initsThisTick < MAX_INITS_PER_TICK) {
                   initsThisTick++; // claim slot before async to avoid race
                   const init = await initializePriceFeed(task.mint);
@@ -780,7 +807,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
                 }
               } else {
                 failed++;
-                console.warn(`[PriceAttestor] legacy attest failed for ${task.mint.slice(0, 8)}: ${attestErr.message?.slice(0, 100)}`);
+                console.warn(`[PriceAttestor] legacy attest failed for ${task.mint.slice(0, 8)}: ${attestErrDetail(attestErr)}`);
               }
             }
           } else {
@@ -790,7 +817,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
               task.target.lastMap.set(task.mint, Date.now());
               succeeded++;
             } catch (twapErr) {
-              if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(twapErr.message || "")) {
+              if (isUninitFeedError(twapErr)) {
                 if (initsThisTick < MAX_INITS_PER_TICK) {
                   initsThisTick++;
                   await initializePriceFeed(task.mint, task.target.id);
@@ -799,7 +826,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
                 }
               } else {
                 failed++;
-                console.warn(`[PriceAttestor] ${task.target.label} attest failed for ${task.mint.slice(0, 8)}: ${twapErr.message?.slice(0, 100)}`);
+                console.warn(`[PriceAttestor] ${task.target.label} attest failed for ${task.mint.slice(0, 8)}: ${attestErrDetail(twapErr)}`);
               }
             }
           }
