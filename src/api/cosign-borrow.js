@@ -726,11 +726,24 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
   //  13  ApproveChecked
   //  14  MintToChecked       (skipping for same reason)
   //  15  BurnChecked
-  // Token-2022 adds:
-  //  27  TransferCheckedWithFee
+  // Token-2022 extension instructions (audit fix 2026-06-21): the OUTER
+  // discriminator selects the extension; the byte AFTER it selects the
+  // sub-op. The previous comment+set conflated these:
+  //  26  TransferFeeExtension       — sub-op 1 = TransferCheckedWithFee MOVES
+  //                                    tokens from account[0] (the source). The
+  //                                    old set was MISSING 26, so a real
+  //                                    fee-extension transfer FROM a lender ATA
+  //                                    skipped this static gate entirely.
+  //  27  ConfidentialTransferExtension — confidential transfers also move
+  //                                    tokens; keep it (it was mislabeled as
+  //                                    "TransferCheckedWithFee" before).
+  //  37  ConfidentialTransferFeeExtension — same family, also drain-capable.
+  // We match on the OUTER byte; the source-account == LENDER check below means
+  // benign sub-ops (e.g. InitializeTransferFeeConfig, whose account[0] is the
+  // mint, not a lender ATA) never false-positive a legitimate borrow.
   // Approve / Revoke / SetAuthority give a future drain capability even
   // if no immediate balance change — we treat them as if they drained.
-  const DRAIN_CAPABLE_OPS = new Set([3, 4, 5, 6, 8, 9, 12, 13, 15, 27]);
+  const DRAIN_CAPABLE_OPS = new Set([3, 4, 5, 6, 8, 9, 12, 13, 15, 26, 27, 37]);
   const lenderSourceIxs = [];
   for (let i = 0; i < tx.instructions.length; i++) {
     const ix = tx.instructions[i];
