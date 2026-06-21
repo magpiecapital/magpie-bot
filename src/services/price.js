@@ -247,6 +247,17 @@ export async function getPricesInSolBatch(mints) {
  * drift (different DEX paths, latency) doesn't false-positive.
  */
 const MAX_DIVERGENCE = Number(process.env.PRICE_MAX_DIVERGENCE) || 0.05;
+// Above this RATIO two sources aren't "disagreeing" — one is a mis-derived /
+// broken pair (e.g. a thin exotic-quote DEX pair). A believable price
+// manipulation stays well under this; $PUMP's only DexScreener pair (PUMP/MET
+// on Meteora) reported $7.32 vs Jupiter $0.00146 — ~5000x. When the gap is
+// this wild we trust JUPITER (the same source the on-chain price attestation
+// uses, so a Jupiter-based value is exactly what the program accepts) rather
+// than dead-ending a legit borrow in a "refreshing market data" loop. We only
+// override TOWARD Jupiter and corroborate with the recent agreed cache, so we
+// never over-value vs the lower source nor weaken the sub-ratio manipulation
+// defense. P0 2026-06-21.
+const WILD_OUTLIER_RATIO = Number(process.env.PRICE_WILD_OUTLIER_RATIO) || 3;
 
 // ─── Recent-agreement cache (reliability layer) ─────────────────────────
 //
@@ -464,6 +475,32 @@ export async function getPriceInSolCrossSourced(mint) {
   // 2 or 3 sources responded — delegate to the agreement helper.
   const agreed = agreeOnPrice({ mint, sources, maxDivergence: MAX_DIVERGENCE });
   if (!agreed) {
+    // WILD-OUTLIER TIE-BREAKER (P0 2026-06-21). A disagreement this large is a
+    // mis-derived/broken pair, not a believable manipulation. Trust Jupiter —
+    // it's the source the on-chain attestation uses, so a Jupiter-based value
+    // is exactly what the program accepts. Without this, $PUMP (DexScreener
+    // PUMP/MET $7.32 vs Jupiter $0.00146) dead-ends every borrow in a
+    // "refreshing market data" loop. Only overrides TOWARD Jupiter,
+    // corroborated by the recent agreed cache; never over-values.
+    if (jup != null && jup > 0) {
+      const others = sources.filter((s) => s.name !== "Jupiter" && s.price != null && s.price > 0);
+      const allWild =
+        others.length > 0 &&
+        others.every((s) => Math.max(s.price, jup) / Math.min(s.price, jup) >= WILD_OUTLIER_RATIO);
+      if (allWild) {
+        const cached = getCachedAgreedPriceIfFresh(mint);
+        const cacheOk = cached == null || Math.abs(jup - cached) / Math.min(jup, cached) <= MAX_DIVERGENCE;
+        if (cacheOk) {
+          console.warn(
+            `[price] WILD-OUTLIER for ${mint.slice(0, 8)}: ${others.map((s) => `${s.name}=${s.price.toFixed(9)}`).join(",")} ` +
+              `vs Jupiter=${jup.toFixed(9)} (>= ${WILD_OUTLIER_RATIO}x) — mis-derived pair; trusting Jupiter (the attestation source).`,
+          );
+          cacheAgreedPrice(mint, jup, ["Jupiter"]);
+          return jup;
+        }
+        console.warn(`[price] WILD-OUTLIER for ${mint.slice(0, 8)} but Jupiter diverges from recent cache — refusing.`);
+      }
+    }
     const detail = sources.filter((s) => s.price != null && s.price > 0)
       .map((s) => `${s.name}=${s.price.toFixed(9)}`).join(", ");
     throw new Error(
