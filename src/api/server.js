@@ -1671,6 +1671,11 @@ const PUBLIC_ROUTES = new Set([
   // multiplying by the legacy 0.89. Drops the under-shoot from 11% to
   // ~0.3% — same precision as the on-chain TWAP attestation.
   "/api/v1/v4/twap",
+  // Universal attestation-safe collateral value (V1/V2/V3/V4). Generalizes
+  // /v4/twap to every program version so EVERY borrow path can submit a
+  // collateral_value the on-chain program is guaranteed to accept — the
+  // class fix for CollateralValueExceedsAttestation. Read-only, allowlisted.
+  "/api/v1/safe-collateral-value",
   // Per-mint readiness check + on-demand warmup request. Site calls
   // this BEFORE asking the user to borrow a specific mint — it
   // returns the on-chain sample-in-window count and bumps the mint
@@ -2034,6 +2039,15 @@ async function router(req, res) {
         // under-shoot) site value.
         const { handleV4Twap } = await import("./v4-twap.js");
         result = await handleV4Twap(req, url);
+        break;
+      }
+      case "/api/v1/safe-collateral-value": {
+        // Universal attestation-safe collateral_value (V1/V2/V3/V4) — the
+        // class fix for CollateralValueExceedsAttestation. Read-only,
+        // allowlisted to enabled supported_mints; only ever under-quotes
+        // vs the on-chain attestation (fail-safe — can't inflate a loan).
+        const { handleSafeCollateralValue } = await import("./safe-collateral-value.js");
+        result = await handleSafeCollateralValue(req, url);
         break;
       }
       case "/api/v1/v4/feed-ready": {
