@@ -272,6 +272,21 @@ export async function buildBorrowTx({
     return { blocked: true, status: 500, body: { error: "program_routing", detail: err.message } };
   }
 
+  // P0 (2026-06-20): cap the collateral value to the on-chain attestation for
+  // the chosen program version so this x402 borrow can NEVER reject with
+  // CollateralValueExceedsAttestation. Fail-soft (returns unchanged on any
+  // error) — the multiplier clamp, cosign pre-flight sim, and the on-chain
+  // program remain as lower defense layers, so it never blocks a borrow.
+  {
+    const { capCollateralValueToAttestation } = await import("./safe-collateral-value.js");
+    collateralValLamports = await capCollateralValueToAttestation(collateralValLamports, {
+      mintStr: collateralMintStr,
+      decimals: Number(mintRow.decimals),
+      amountRaw: String(collateralAmountRaw),
+      programId,
+    });
+  }
+
   let txB64, loanIdStr, loanAccountStr;
   try {
     const dummySigner = Keypair.generate();

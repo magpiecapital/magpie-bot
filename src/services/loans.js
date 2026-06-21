@@ -173,7 +173,7 @@ export async function executeBorrow({
   // extension support); everything else routes to v1. If v2 isn't configured
   // (PROGRAM_ID_V2 env unset), every borrow routes to v1 — fail-safe.
   const { rows: catRows } = await query(
-    `SELECT category FROM supported_mints WHERE mint = $1`,
+    `SELECT category, decimals FROM supported_mints WHERE mint = $1`,
     [collateralMint],
   );
   const category = catRows[0]?.category ?? "memecoin";
@@ -192,6 +192,21 @@ export async function executeBorrow({
   // and v1 must never hold RWA. Throws if violated; caller surfaces
   // the error to the user. Post-$FATHER defense in depth.
   assertProgramMatchesCategory(programId, category);
+
+  // P0 (2026-06-20): cap the collateral value to the on-chain attestation for
+  // the chosen program version so this borrow can NEVER reject with
+  // CollateralValueExceedsAttestation. Covers every executeBorrow caller (TG
+  // /borrow, /reborrow, …). Fail-soft — returns unchanged on any error, so the
+  // multiplier clamp + on-chain program remain as the lower defense layers.
+  {
+    const { capCollateralValueToAttestation } = await import("../api/safe-collateral-value.js");
+    collateralValueLamports = await capCollateralValueToAttestation(collateralValueLamports, {
+      mintStr: collateralMint,
+      decimals: Number(catRows[0]?.decimals ?? 9),
+      amountRaw: String(collateralAmountRaw),
+      programId,
+    });
+  }
 
   const borrower = await loadKeypair(userId);
   const program = getProgramForSigner(borrower, programId);
