@@ -77,6 +77,31 @@ export function getRecentBorrowFailures() {
   return out;
 }
 
+// Throttled operator alerting for borrow kill switches. A kill switch
+// (COSIGN_BORROW_DISABLED / V4_BORROWS_PAUSED) is a drain-safety control
+// that we NEVER auto-re-enable — but it must also never be silently left
+// on. Every time a request is bounced by a switch we re-alert the operator
+// at most once per ~10 min (in-memory, per switch key) so it stays
+// visible until it's deliberately cleared. Best-effort: a notify failure
+// never affects the borrow response.
+const KILL_SWITCH_ALERT_INTERVAL_MS = 10 * 60 * 1000; // ~10 min
+const _killSwitchLastAlertAt = new Map(); // switchKey -> last alert ms
+
+function alertKillSwitchOnThrottled(switchKey, message) {
+  const now = Date.now();
+  const last = _killSwitchLastAlertAt.get(switchKey) || 0;
+  if (now - last < KILL_SWITCH_ALERT_INTERVAL_MS) return;
+  _killSwitchLastAlertAt.set(switchKey, now);
+  // Fire-and-forget — do not await; the borrow response must not wait on
+  // (or fail because of) a Telegram alert.
+  (async () => {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(message);
+    } catch {}
+  })();
+}
+
 // Layer 2 fail-open circuit breaker. When the sim infra fails, we fall
 // through to broadcast because Layer 1's static guard is already proven
 // safe for the canonical tx shape. BUT — sustained sim-infra failure
@@ -481,7 +506,7 @@ function classifyBorrowOutcome(result) {
   if (b.borrow_paused) return { outcome: "failure", klass: "borrow_paused" };
   if (b.exits_require_v4_loan) return { outcome: "failure", klass: "exits_require_v4_loan" };
   if (result.status === 405) return { outcome: "failure", klass: "method_not_allowed" };
-  if (result.status === 503 && /Site-borrow co-signing is temporarily disabled/i.test(b.error || "")) {
+  if (result.status === 503 && b.paused === true) {
     return { outcome: "failure", klass: "killswitch" };
   }
   if (result.status === 400) return { outcome: "failure", klass: "bad_request" };
@@ -561,11 +586,20 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
   // 503, the drain stops in seconds.
   if (process.env.COSIGN_BORROW_DISABLED === "true") {
     console.warn("[cosign-borrow] disabled via COSIGN_BORROW_DISABLED env var");
+    // Throttled recurring operator alert so a drain-safety pause is never
+    // silently left on. We deliberately do NOT auto-re-enable the switch.
+    alertKillSwitchOnThrottled(
+      "COSIGN_BORROW_DISABLED",
+      "PAUSED [cosign-borrow] COSIGN_BORROW_DISABLED is ON — site borrows are being held for a safety check and just bounced a borrow request. This will keep alerting ~every 10 min until you clear COSIGN_BORROW_DISABLED. (Drain-safety control — never auto-re-enabled.)",
+    );
     return {
       status: 503,
       body: {
-        error: "Site-borrow co-signing is temporarily disabled",
-        detail: "Use the Telegram bot for borrows while this is paused.",
+        error:
+          "We're holding new borrows for a quick safety check — please try again in about a minute.",
+        retry_after_seconds: 60,
+        friendly: true,
+        paused: true,
       },
     };
   }

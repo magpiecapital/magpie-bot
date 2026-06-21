@@ -14,6 +14,7 @@ import { gzip, brotliCompress } from "node:zlib";
 import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
+import { constantTimeEqual } from "./auth-utils.js";
 
 const gzipAsync = promisify(gzip);
 const brotliAsync = promisify(brotliCompress);
@@ -1100,7 +1101,10 @@ async function handleAdminPoolStats(req, url) {
   const provided = (req.headers["x-admin-token"] || "").toString().trim();
   const wallet = url.searchParams.get("wallet"); // still used downstream
   if (ADMIN_API_TOKEN) {
-    if (!provided || provided !== ADMIN_API_TOKEN) {
+    // Constant-time compare so an attacker can't time-probe the admin
+    // token byte-by-byte. constantTimeEqual guards type/empty/length
+    // before timingSafeEqual (which throws on unequal-length buffers).
+    if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
   } else {
@@ -1427,7 +1431,8 @@ async function handleAdminLifetimeStats(req, url) {
   const wallet = url.searchParams.get("wallet");
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
   if (ADMIN_API_TOKEN) {
-    if (!provided || provided !== ADMIN_API_TOKEN) {
+    // Constant-time compare (see handleAdminPoolStats for rationale).
+    if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
   } else {

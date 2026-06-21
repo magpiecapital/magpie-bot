@@ -180,6 +180,12 @@ export async function handleAgentBuildRepay(req) {
 
   // ── Build the tx (does NOT sign; agent signs with their wallet) ──
   let txB64, repayLamportsStr;
+  // Set by the pre-broadcast simulation below when the repay tx would
+  // definitively revert on-chain. We return a 4xx with the decoded reason
+  // instead of handing back a tx that's guaranteed to fail. An RPC/infra
+  // failure of the sim itself does NOT populate this (fail-open on infra —
+  // the lower defense layer is the on-chain program, which is authoritative).
+  let simRejection = null;
   try {
     const programId = chooseProgramIdForLoan(loan);
     const dummySigner = Keypair.generate();
@@ -284,11 +290,58 @@ export async function handleAgentBuildRepay(req) {
     const { blockhash } = await connection.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
 
+    // ── Pre-broadcast simulation (mirrors the TG executeRepay / site
+    // cosign-borrow pre-sim). REPAY MUST NEVER SIMULATE-FAIL: if the
+    // unsigned repay tx would revert on-chain, return a 4xx with the
+    // decoded reason rather than handing the agent a doomed tx.
+    // sigVerify:false so simulation reads the (still unsigned) tx.
+    // withFailover so a single-provider blip doesn't surface as an error.
+    // Fail-open on RPC/infra failure: only a definitive sim.value.err
+    // (i.e. the program itself rejected) blocks the response. The on-chain
+    // program is the authoritative lower defense layer.
+    try {
+      const sim = await withFailover((conn) =>
+        conn.simulateTransaction(tx, { sigVerify: false, commitment: "confirmed" }),
+      );
+      if (sim?.value?.err) {
+        const logs = (sim.value.logs || []).slice(-5).join(" | ").slice(0, 400);
+        const errStr = JSON.stringify(sim.value.err).slice(0, 200);
+        console.error(
+          "[agent/build-repay] pre-sim REVERT — loan_id=%s err=%s logs=%s",
+          loan?.loan_id,
+          errStr,
+          logs,
+        );
+        simRejection = {
+          status: 422,
+          body: {
+            error: "repay_would_fail",
+            detail: `Repay transaction would revert on-chain (pre-flight simulation rejected). err=${errStr}`,
+            sim_err: sim.value.err,
+            logs: sim.value.logs || [],
+          },
+        };
+      }
+    } catch (simErr) {
+      // RPC/infra failure of the simulation itself — do NOT block the repay.
+      // The on-chain program remains the final guard. Log loudly so the
+      // operator can see if sim infra is flaky, but proceed to serialize.
+      console.warn(
+        "[agent/build-repay] pre-sim RPC failed (failing open) — loan_id=%s detail=%s",
+        loan?.loan_id,
+        simErr?.message?.slice(0, 200),
+      );
+    }
+
     txB64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
   } catch (err) {
     console.error("[agent/build-repay] tx build failed:", err);
     return { status: 500, body: { error: "tx_build_failed", detail: err.message?.slice(0, 200) } };
   }
+
+  // A definitive pre-sim revert means we must not return a tx the agent
+  // would just waste a signature + fee on. Return the decoded reason.
+  if (simRejection) return simRejection;
 
   return {
     status: 200,
