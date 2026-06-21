@@ -206,6 +206,48 @@ export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw,
   };
 }
 
+/** Map a program id (PublicKey or base58) to its version key, or null. */
+export function versionForProgramId(programId) {
+  if (!programId) return null;
+  const s = programId.toBase58 ? programId.toBase58() : String(programId);
+  for (const [v, cfg] of Object.entries(VERSIONS)) {
+    if (cfg.programId && cfg.programId.toBase58() === s) return v;
+  }
+  return null;
+}
+
+/**
+ * Cap an off-chain-computed collateral value (lamports) to the on-chain
+ * attestation for the loan's program version, so a borrow can NEVER reject
+ * with CollateralValueExceedsAttestation. Returns min(value, safe). On any
+ * failure (RPC down, feed warming, unknown program) it returns the value
+ * UNCHANGED — the multiplier clamp, cosign pre-flight sim, and the on-chain
+ * program remain as the lower defense layers, so this never blocks a borrow.
+ *
+ * Used by every BOT borrow builder (TG /borrow, x402 agent) so they submit a
+ * value the program accepts up front, instead of failing the on-chain check.
+ */
+export async function capCollateralValueToAttestation(valueLamports, { mintStr, decimals, amountRaw, programId }) {
+  const version = versionForProgramId(programId);
+  if (!version) return valueLamports;
+  try {
+    const res = await computeSafeCollateralValue({ mintStr, decimals, amountRaw, version });
+    if (res?.body?.recommendation === "use_precise_value" && res.body.safe_collateral_value_lamports) {
+      const safe = Number(res.body.safe_collateral_value_lamports);
+      if (Number.isFinite(safe) && safe > 0 && safe < Number(valueLamports)) {
+        console.warn(
+          `[safe-value] capped collateral_value ${valueLamports} → ${safe} for ` +
+            `${String(mintStr).slice(0, 8)}… (${version}) to stay under the on-chain attestation`,
+        );
+        return safe;
+      }
+    }
+  } catch (err) {
+    console.warn(`[safe-value] cap failed for ${String(mintStr).slice(0, 8)}… (${version}): ${err.message?.slice(0, 120)}`);
+  }
+  return valueLamports;
+}
+
 /** HTTP handler. */
 export async function handleSafeCollateralValue(req, url) {
   if (req.method !== "GET") return { status: 405, body: { error: "GET only" } };
