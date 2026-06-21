@@ -31,11 +31,14 @@
  *      attestation never rejects a legitimate borrow).
  *   3. Fetch live spot via Jupiter (same source the attestor uses).
  *   4. Compute safe_lamports_per_whole_token =
- *        floor(min(spot, twap) * 1.03 * 0.997)
- *      0.997 = 30bps safety buffer for the brief window between this
- *      response and the user signing. Without it, a fast price move
- *      could re-create CollateralValueExceedsAttestation. 30bps is
- *      much tighter than the 1100bps the 0.89 multiplier costs.
+ *        floor(min(spot, twap) * 1.03 * (1 − headroom_bps/10000))
+ *      headroom_bps is CATEGORY-SIZED (memecoin 500 → ×0.95, RWA 200 →
+ *      ×0.98) so the value survives a realistic price downtick between
+ *      this response and the tx executing. The drift tolerated EQUALS
+ *      headroom_bps/100 %. A fixed 30bps (0.3%) used to re-create
+ *      CollateralValueExceedsAttestation on any volatile collateral
+ *      (e.g. $JOTCHUA, 2026-06-21). Single source of truth:
+ *      headroomBpsForCategory in safe-collateral-value.js (env-tunable).
  *   5. If amount_raw + decimals are supplied, also return
  *      safe_collateral_value_lamports = floor(
  *        safe_lamports_per_whole_token * amount_raw / 10^decimals
@@ -56,10 +59,14 @@
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { withFailover } from "../solana/connection.js";
+import { headroomBpsForCategory } from "./safe-collateral-value.js";
 
 const MIN_SAMPLES_FOR_TWAP = 8;
 const TWAP_WINDOW_SECONDS = 300; // V4: MIN_HISTORY_SECONDS = 300
-const ATTESTATION_HEADROOM_BPS = 30; // 0.3% — covers signing-window blip
+// Drift headroom is category-sized (see safe-collateral-value.js). The old fixed
+// 30bps (0.3%) tolerated almost no quote→execution movement → volatile V4
+// collateral failed with CollateralValueExceedsAttestation. Single source of
+// truth: headroomBpsForCategory (memecoin 5% / RWA 2%, env-tunable).
 const PROGRAM_ATTESTATION_TOLERANCE = 1.03; // matches program's 3% gate
 
 function isValidPubkey(s) {
@@ -85,7 +92,7 @@ export async function handleV4Twap(req, url) {
   // Allowlist — only enabled supported_mints. Same DOS posture as
   // /price/refresh and /v4/feed-health.
   const { rows: [mintRow] } = await query(
-    `SELECT mint, decimals, enabled FROM supported_mints WHERE mint = $1`,
+    `SELECT mint, decimals, enabled, category FROM supported_mints WHERE mint = $1`,
     [mintStr],
   );
   if (!mintRow) {
@@ -94,6 +101,10 @@ export async function handleV4Twap(req, url) {
   if (!mintRow.enabled) {
     return { status: 409, body: { error: "mint_disabled", mint: mintStr } };
   }
+
+  // Category-sized drift headroom (memecoin vs RWA) — same policy as
+  // /safe-collateral-value so every borrow path under-shoots identically.
+  const headroomBps = headroomBpsForCategory(mintRow.category);
 
   // Resolve decimals — prefer URL param (matches what site is about
   // to submit) but fall back to supported_mints if absent. The
@@ -244,14 +255,15 @@ export async function handleV4Twap(req, url) {
   // precision, then divide back out.
   //
   //   ceiling = ref × 1.03
-  //   safe    = ceiling × (1 − HEADROOM_BPS / 10_000)
+  //   safe    = ceiling × (1 − headroomBps / 10_000)
   //
-  // ATTESTATION_HEADROOM_BPS = 30 → 0.3%, so headroomScaled = 997_000.
+  // headroomBps is category-sized (memecoin 500 → ×0.95, RWA 200 → ×0.98).
+  // Drift tolerated == headroomBps/100 % downtick in the signing window.
   const SCALE = 1_000_000n;
   const tolerance6 = BigInt(Math.floor(PROGRAM_ATTESTATION_TOLERANCE * 1e6)); // 1_030_000
   const ceilingLamports = (refLamports * tolerance6) / SCALE;
   // 10_000 bps = 100 %, so 1bp at the 1e6 scale = 100.
-  const headroomScaled = SCALE - BigInt(ATTESTATION_HEADROOM_BPS * 100); // 1_000_000 - 3_000 = 997_000
+  const headroomScaled = SCALE - BigInt(headroomBps * 100); // 500bps → 950_000 (×0.95)
   const safeLamportsPerWholeToken = (ceilingLamports * headroomScaled) / SCALE;
 
   // Optionally compute the collateral_value the site should submit
@@ -296,8 +308,9 @@ export async function handleV4Twap(req, url) {
         twap_window_seconds: TWAP_WINDOW_SECONDS,
         min_samples_required: MIN_SAMPLES_FOR_TWAP,
         attestation_tolerance: PROGRAM_ATTESTATION_TOLERANCE,
-        headroom_bps: ATTESTATION_HEADROOM_BPS,
-        approx_under_shoot_pct: ATTESTATION_HEADROOM_BPS / 100, // 0.3%
+        headroom_bps: headroomBps,
+        category: mintRow.category || null,
+        drift_tolerance_pct: headroomBps / 100, // memecoin 5% / RWA 2%
         legacy_under_shoot_pct: 11, // what 0.89 multiplier cost
       },
       generated_at: new Date().toISOString(),
