@@ -45,13 +45,39 @@ import {
 
 const MIN_SAMPLES_FOR_TWAP = 8;
 const TWAP_WINDOW_SECONDS = 300;
-const ATTESTATION_HEADROOM_BPS = 30; // 0.3% buffer for the signing window
 const PROGRAM_ATTESTATION_TOLERANCE = 1.03; // matches the program's 3% gate
 const MAX_PRICE_STALENESS_SECONDS = 110; // under the program's 120s wall
 
+// ── DRIFT HEADROOM (P0, 2026-06-21) ──────────────────────────────────────────
+// The on-chain program rejects when submitted > attested_at_execution × 1.03.
+// The off-chain value is computed at QUOTE time; the price can move between
+// quote → sign → execute. The submitted value is attested × 1.03 × (1 −
+// headroom), so the drift tolerated EQUALS the headroom: a `headroom_bps` buffer
+// survives a `headroom_bps/100`% downtick in the signing window. The old fixed
+// 30bps (0.3%) tolerated almost no movement → volatile collateral kept failing
+// with CollateralValueExceedsAttestation even when the price was perfectly
+// correct (e.g. $JOTCHUA). We now size the buffer to the collateral's realistic
+// volatility, per asset class. The buffer ONLY ever LOWERS the submitted value
+// (strictly safer for the protocol — it can never over-value collateral); the
+// cost is a few % of borrowing power, which is the right trade for ZERO
+// rejections. Tune via env without a redeploy.
+const HEADROOM_MEMECOIN_BPS = Number(process.env.SAFE_HEADROOM_MEMECOIN_BPS) || 500; // 5% — memecoins are volatile
+const HEADROOM_RWA_BPS = Number(process.env.SAFE_HEADROOM_RWA_BPS) || 200; // 2% — RWAs/stocks (TWAP-smoothed, can still gap)
+const HEADROOM_DEFAULT_BPS = HEADROOM_MEMECOIN_BPS; // unknown category → widest (safest) buffer
+// Everything that isn't an RWA/stock/commodity class is treated as memecoin-volatile.
+const RWA_CATEGORIES = new Set([
+  "rwa", "stock", "etf", "index", "metal", "commodity", "forex", "bond", "equity",
+]);
+
+/** Pick the drift headroom (bps) for a collateral category. Fail-safe = widest. */
+export function headroomBpsForCategory(category) {
+  const c = String(category || "").toLowerCase().trim();
+  if (!c) return HEADROOM_DEFAULT_BPS;
+  return RWA_CATEGORIES.has(c) ? HEADROOM_RWA_BPS : HEADROOM_MEMECOIN_BPS;
+}
+
 const SCALE = 1_000_000n;
 const TOLERANCE6 = BigInt(Math.floor(PROGRAM_ATTESTATION_TOLERANCE * 1e6)); // 1_030_000
-const HEADROOM_SCALED = SCALE - BigInt(ATTESTATION_HEADROOM_BPS * 100); // 997_000
 
 const VERSIONS = {
   v1: { programId: PROGRAM_ID_V1, kind: "single" },
@@ -67,10 +93,13 @@ function isValidPubkey(s) {
 
 const lamportsToSol = (n) => Number(n) / 1e9;
 
-/** Apply the program tolerance + signing-window headroom to a per-token ref price. */
-function safePerTokenLamports(refLamports) {
-  const ceiling = (refLamports * TOLERANCE6) / SCALE; // ref × 1.03
-  return (ceiling * HEADROOM_SCALED) / SCALE; // × 0.997
+/** Apply the program tolerance + a category-sized drift headroom to a per-token ref price. */
+function safePerTokenLamports(refLamports, headroomBps) {
+  const ceiling = (refLamports * TOLERANCE6) / SCALE; // ref × 1.03 (the program's hard ceiling)
+  // headroomScaled = 1 − headroom_bps/10000, in 1e6 fixed point. 500bps → 950_000 (×0.95).
+  const hb = Number.isFinite(headroomBps) && headroomBps >= 0 ? Math.round(headroomBps) : HEADROOM_DEFAULT_BPS;
+  const headroomScaled = SCALE - BigInt(hb * 100);
+  return (ceiling * headroomScaled) / SCALE;
 }
 
 /** Decode V1/V2 PriceAttestation → { priceLamports, timestamp }. */
@@ -89,7 +118,8 @@ function decodeSingleAttestation(data) {
  * 'use_precise_value' on success or 'wait_for_warmup' when the feed isn't ready
  * (caller should fall back to the conservative legacy multiplier and retry).
  */
-export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw, version }) {
+export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw, version, category }) {
+  const headroomBps = headroomBpsForCategory(category);
   const cfg = VERSIONS[version];
   if (!cfg) return { ok: false, status: 400, body: { error: "invalid_program", detail: "program must be v1|v2|v3|v4" } };
   if (!cfg.programId) {
@@ -173,7 +203,7 @@ export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw,
     diagnostics.samples_in_window = inWindow.length;
   }
 
-  const safePerToken = safePerTokenLamports(refLamports);
+  const safePerToken = safePerTokenLamports(refLamports, headroomBps);
 
   let safeCollateralValueLamports = null;
   if (amountRaw && /^\d+$/.test(amountRaw)) {
@@ -200,7 +230,7 @@ export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw,
             safe_collateral_value_sol: lamportsToSol(safeCollateralValueLamports),
           }
         : {}),
-      diagnostics: { ...diagnostics, attestation_tolerance: PROGRAM_ATTESTATION_TOLERANCE, headroom_bps: ATTESTATION_HEADROOM_BPS },
+      diagnostics: { ...diagnostics, attestation_tolerance: PROGRAM_ATTESTATION_TOLERANCE, headroom_bps: headroomBps, category: category || null, drift_tolerance_pct: headroomBps / 100 },
       generated_at: new Date().toISOString(),
     },
   };
@@ -227,11 +257,21 @@ export function versionForProgramId(programId) {
  * Used by every BOT borrow builder (TG /borrow, x402 agent) so they submit a
  * value the program accepts up front, instead of failing the on-chain check.
  */
-export async function capCollateralValueToAttestation(valueLamports, { mintStr, decimals, amountRaw, programId }) {
+export async function capCollateralValueToAttestation(valueLamports, { mintStr, decimals, amountRaw, programId, category }) {
   const version = versionForProgramId(programId);
   if (!version) return valueLamports;
+  let cat = category;
+  if (cat === undefined || cat === null) {
+    // Look up the collateral category so the drift headroom is sized correctly
+    // (memecoin vs RWA). Fail-safe: on lookup failure cat stays undefined →
+    // computeSafeCollateralValue applies the widest (memecoin) headroom.
+    try {
+      const { rows: [r] } = await query(`SELECT category FROM supported_mints WHERE mint = $1`, [mintStr]);
+      cat = r?.category;
+    } catch { /* keep undefined → widest headroom */ }
+  }
   try {
-    const res = await computeSafeCollateralValue({ mintStr, decimals, amountRaw, version });
+    const res = await computeSafeCollateralValue({ mintStr, decimals, amountRaw, version, category: cat });
     if (res?.body?.recommendation === "use_precise_value" && res.body.safe_collateral_value_lamports) {
       const safe = Number(res.body.safe_collateral_value_lamports);
       if (Number.isFinite(safe) && safe > 0 && safe < Number(valueLamports)) {
@@ -260,13 +300,13 @@ export async function handleSafeCollateralValue(req, url) {
   if (!VERSIONS[version]) return { status: 400, body: { error: "invalid_program", detail: "program must be v1|v2|v3|v4" } };
 
   const { rows: [mintRow] } = await query(
-    `SELECT decimals, enabled FROM supported_mints WHERE mint = $1`,
+    `SELECT decimals, enabled, category FROM supported_mints WHERE mint = $1`,
     [mintStr],
   );
   if (!mintRow) return { status: 404, body: { error: "mint_not_supported", mint: mintStr } };
   if (!mintRow.enabled) return { status: 409, body: { error: "mint_disabled", mint: mintStr } };
 
   const decimals = decimalsRaw && /^\d+$/.test(decimalsRaw) ? parseInt(decimalsRaw, 10) : Number(mintRow.decimals);
-  const res = await computeSafeCollateralValue({ mintStr, decimals, amountRaw, version });
+  const res = await computeSafeCollateralValue({ mintStr, decimals, amountRaw, version, category: mintRow.category });
   return { status: res.status, body: res.body };
 }
