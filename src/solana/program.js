@@ -166,11 +166,16 @@ export function chooseProgramId(category, opts = {}) {
   // Operator-mandated 2026-06-15 PM as part of the Token-2022 V4
   // sol_proceeds_vault init bug recovery plan (tasks #281-285).
   if (hasExitArming && process.env.V4_BORROWS_PAUSED === "true") {
+    // NOTE: the "V4_BORROWS_PAUSED:" prefix is load-bearing — callers
+    // (agent.js, self-monitor.js) branch on err.message.startsWith(...).
+    // The text AFTER the colon is user-facing: keep it friendly and
+    // retryable, with no "temporarily disabled / use Telegram" phrasing
+    // (operator-escalated). [[feedback_loans_must_never_fail_no_regressions]]
     throw new Error(
-      "V4_BORROWS_PAUSED: New V4 borrows (with auto-sells) are temporarily " +
-      "paused while we ship a critical V4 program patch. Existing V4 loans " +
-      "are unaffected. This is expected to be brief — please try again shortly. " +
-      "If you need to borrow without an auto-sell, regular borrows still work.",
+      "V4_BORROWS_PAUSED: We're holding new auto-sell borrows for a quick " +
+      "safety check — please try again in about a minute. Your existing " +
+      "loans are completely unaffected, and a plain borrow (without an " +
+      "auto-sell) still works right now.",
     );
   }
   if (hasExitArming) {
