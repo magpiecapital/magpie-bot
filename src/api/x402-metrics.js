@@ -129,7 +129,13 @@ export async function handleX402Record(req) {
     }
   }
 
-  return { status: 200, body: { recorded: true } };
+  // `fresh` is the durable single-use signal for the x402 gateway: true means
+  // this payment signature was claimed for the first time; false means it was
+  // already spent (a cross-instance replay the in-process Map can't see). The
+  // x402 middleware rejects a non-fresh claim. On the db_blip path above we
+  // return no `fresh`, so the gateway fails OPEN (a transient DB blip must
+  // never block a legitimately-paid call).
+  return { status: 200, body: { recorded: true, fresh: inserted } };
 }
 
 /**
