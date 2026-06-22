@@ -443,7 +443,19 @@ export function startRiskEngine(bot) {
       // something an over-collateralized borrower can act on. The
       // signal is still computed and logged; the auto-token-health
       // watcher handles the protocol-side response.
-      const USER_DM_TYPES = new Set(["volatility_spike", "rug_detected", "expiry_risk"]);
+      //
+      // 2026-06-22 (operator): also removed volatility_spike + rug_detected
+      // from the user-DM path. These read as alarmist and gave a bad UX —
+      // an over-collateralized borrower can't usefully act on a transient
+      // volatility blip, and the rug-pull threshold can misfire on legit
+      // collateral, scaring users into needless repays. Both signals are
+      // STILL computed, scored, and logged (the score stays available on
+      // demand via /risk, the site /api/v1/risk, and the x402 token-risk
+      // endpoint), and the protocol-side response — auto-token-health
+      // watcher delisting / pausing new borrows — is unchanged. Only the
+      // unsolicited per-loan DM is suppressed. expiry_risk stays: it's a
+      // factual, actionable reminder to repay/extend before expiry.
+      const USER_DM_TYPES = new Set(["expiry_risk"]);
       const criticalSignals = signals.filter(
         (s) => s.severity === "critical" && USER_DM_TYPES.has(s.type),
       );
