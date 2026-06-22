@@ -46,7 +46,11 @@ export const MAGPIE_TOKEN_PROGRAM = TOKEN_2022_PROGRAM_ID;
 // be read (DB unreachable, first boot before migration, etc). The
 // live value is read at runtime via getHolderRewardBps() — which the
 // governance autopilot flips to 7000 when MGP-001 ratifies.
-export const HOLDER_REWARD_BPS_FALLBACK = 1_000; // 10%
+// MGP-001 ratified — see governance_config.holder_reward_bps for the
+// authoritative runtime value. This fallback is only read when the DB
+// is unreachable; we keep it in sync with the ratified value so a
+// DB-degraded window doesn't temporarily accrue at the old 10% rate.
+export const HOLDER_REWARD_BPS_FALLBACK = 7_000; // 70% (MGP-001 ratified 2026-06-13)
 // Backwards-compat alias for callers that previously imported the
 // hardcoded const for DISPLAY. They'll see the pre-MGP-001 default
 // until they migrate to the async getter. Eventually-consistent.
