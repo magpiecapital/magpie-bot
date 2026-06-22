@@ -331,6 +331,16 @@ export async function handleAgentGetIntent(req, queryParams) {
   if (!rows[0]) return { status: 404, body: { error: "not_found" } };
   const r = rows[0];
 
+  // AUTHZ: the x402 gateway forwards the verified x402 payer as X-Magpie-Payer.
+  // A paid poll must only ever reveal the caller's OWN intent — the intent id is
+  // paid-but-leakable, so without this a payer could read a foreign wallet's
+  // intent (including its matched unsigned tx). Enforce owner == payer; respond
+  // 404 (not 403) so we don't even disclose that the intent exists.
+  const payer = req.headers?.["x-magpie-payer"];
+  if (payer && r.borrower_wallet !== payer) {
+    return { status: 404, body: { error: "not_found" } };
+  }
+
   return {
     status: 200,
     body: {
@@ -374,14 +384,28 @@ export async function handleAgentCancelIntent(req, queryParams) {
   if (!intentId || !/^[A-Za-z0-9_-]{16,32}$/.test(intentId)) {
     return { status: 400, body: { error: "invalid_intent_id" } };
   }
+  // AUTHZ (IDOR fix): the x402 gateway verifies an Ed25519 "intent-cancel/v1"
+  // envelope (OrderId bound to this id, From == signer, fresh) and forwards the
+  // VERIFIED signer as ?owner=. Scope the cancel to the intent's borrower_wallet
+  // so one agent can NEVER cancel another agent's intent (which would forfeit
+  // its create fee and silently kill its conditional borrow). The shared
+  // INTERNAL_API_TOKEN authenticates the x402 service, not the end user — so the
+  // per-resource owner check must live here too.
+  const owner = queryParams?.owner;
+  if (!owner) {
+    return { status: 401, body: { error: "missing_owner", detail: "intent-cancel requires a verified owner" } };
+  }
+  try { new PublicKey(owner); } catch { return { status: 400, body: { error: "invalid_owner" } }; }
+
   const { rows } = await query(
     `UPDATE borrow_intents SET status = 'cancelled'
-       WHERE intent_id = $1 AND status IN ('pending', 'matched')
+       WHERE intent_id = $1 AND borrower_wallet = $2 AND status IN ('pending', 'matched')
        RETURNING intent_id, status`,
-    [intentId],
+    [intentId, owner],
   );
   if (!rows[0]) {
-    return { status: 404, body: { error: "not_found_or_already_terminal" } };
+    // Not found, not owned, or already terminal — don't disclose which.
+    return { status: 404, body: { error: "not_found_or_not_owned" } };
   }
   return { status: 200, body: { ok: true, intent_id: rows[0].intent_id, status: "cancelled" } };
 }
