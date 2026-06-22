@@ -141,12 +141,23 @@ function deriveSeizureSplits(collateralAmountRaw, keeperBps) {
  */
 async function enrollUntrackedLiquidations(keeperBps) {
   const { rows } = await query(
-    `SELECT l.id, l.loan_id, l.borrower_wallet, l.collateral_mint, l.collateral_amount,
+    `SELECT l.id, l.loan_id,
+            -- borrower_wallet was added in a later migration. For older
+            -- TG-bot-only loans it's NULL; fall back to the user's
+            -- custodial wallet public_key via the wallets join. Site
+            -- borrows always have l.borrower_wallet populated directly.
+            COALESCE(l.borrower_wallet, w.public_key) AS borrower_wallet,
+            l.collateral_mint, l.collateral_amount,
             l.original_loan_amount_lamports::bigint AS principal_with_fee,
-            l.actual_received_lamports::bigint AS principal_lent,
+            -- actual_received_lamports was added recently; for historical
+            -- loans it's NULL. Fall back to the headline loan_amount which
+            -- is what actually hit the borrower's wallet (origination fee
+            -- is already netted out of this field on the program side).
+            COALESCE(l.actual_received_lamports, l.loan_amount_lamports)::bigint AS principal_lent,
             sm.symbol AS collateral_symbol
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+       LEFT JOIN wallets w ON w.user_id = l.user_id
       WHERE l.status = 'liquidated'
         AND NOT EXISTS (
           SELECT 1 FROM liquidation_economics le WHERE le.loan_id = l.id
@@ -155,12 +166,17 @@ async function enrollUntrackedLiquidations(keeperBps) {
       LIMIT 100`,
   );
   let enrolled = 0;
+  let skipped = 0;
   for (const loan of rows) {
+    // After the COALESCE fallbacks: if borrower_wallet is still NULL we
+    // can't enroll (would violate liquidation_economics NOT NULL). Skip
+    // silently — operator can backfill the loans row if needed.
+    if (!loan.borrower_wallet) {
+      skipped++;
+      continue;
+    }
     const splits = deriveSeizureSplits(loan.collateral_amount, keeperBps);
     const isMagpie = loan.collateral_mint === MAGPIE_MINT;
-    // For $MAGPIE collateral, principal_lent may be null if it predates
-    // the actual_received_lamports column; fall back to the headline
-    // loan amount minus the standard origination-fee assumption.
     const principalLent = loan.principal_lent != null
       ? loan.principal_lent
       : null;
@@ -190,6 +206,9 @@ async function enrollUntrackedLiquidations(keeperBps) {
     } catch (err) {
       console.warn(`[liq-econ] enroll failed for loan ${loan.loan_id}: ${err.message?.slice(0, 100)}`);
     }
+  }
+  if (skipped > 0) {
+    console.log(`[liq-econ] enroll: ${enrolled} enrolled, ${skipped} skipped (NULL borrower_wallet — no wallets join match)`);
   }
   return enrolled;
 }

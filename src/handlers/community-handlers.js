@@ -757,9 +757,24 @@ async function maybeAnswerPipQuestion(ctx, msg, sender) {
   // Show typing indicator while Anthropic is working
   ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
 
+  // If the user is replying to a Magpie-bot message (announcement,
+  // crosspost, prior Pip answer), pass that as context so Pip can
+  // react to reactions instead of asking "which X?". The
+  // looksLikePromptInjection check above already covers the new
+  // question text; the parent message comes from our own bot, so its
+  // instruction-injection risk is low — but answerGroupQuestion's
+  // wrapping explicitly tells the model not to follow instructions in
+  // the context block, belt + suspenders.
+  const repliedTo =
+    msg.reply_to_message && msg.reply_to_message.from?.id === ctx.me?.id
+      ? msg.reply_to_message.text ||
+        msg.reply_to_message.caption ||
+        null
+      : null;
+
   let answer;
   try {
-    answer = await answerGroupQuestion(question);
+    answer = await answerGroupQuestion(question, { repliedTo });
   } catch (err) {
     console.warn("[community] Pip group answer failed:", err.message);
     answer = null;

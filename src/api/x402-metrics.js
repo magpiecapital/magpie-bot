@@ -77,14 +77,17 @@ export async function handleX402Record(req) {
     return { status: 400, body: { error: "invalid_record_shape" } };
   }
 
+  let inserted = false;
   try {
-    await query(
+    const { rows } = await query(
       `INSERT INTO x402_paid_calls
          (endpoint_path, method, amount_lamports, payer_pubkey, tx_signature, nonce)
        VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (tx_signature) DO NOTHING`,
+       ON CONFLICT (tx_signature) DO NOTHING
+       RETURNING tx_signature`,
       [endpointPath, method, amountLamports, payerPubkey, txSignature, nonce],
     );
+    inserted = rows.length > 0;
   } catch (err) {
     // DB hiccup — log and acknowledge so the x402 service doesn't retry
     // forever on a transient issue. Worst case we miss a metric, not a
@@ -92,7 +95,47 @@ export async function handleX402Record(req) {
     console.warn("[x402-metrics] record insert failed:", err.message?.slice(0, 200));
     return { status: 200, body: { recorded: false, reason: "db_blip" } };
   }
-  return { status: 200, body: { recorded: true } };
+
+  // $MAGPIE holder-rewards flywheel (the x402 leg). Accrue the LIVE
+  // governance holder_reward_bps share of this x402 fee to the $MAGPIE
+  // holder pool, idempotently keyed on the payment signature. This is what
+  // makes "x402 API call fees feed $MAGPIE holder rewards" literally true —
+  // every paid agent call now contributes the same governance-ratified
+  // (MGP-001) share that loan fees do (10% today, auto-picks-up 70% the
+  // moment governance flips holder_reward_bps; no code change needed).
+  //
+  // Safety: ONLY on a genuinely new row (inserted===true) so retries don't
+  // re-attempt; the pool_credit_events UNIQUE(source_type,source_id,pool_kind)
+  // is a hard idempotency backstop regardless. Fully isolated in try/catch —
+  // an accrual hiccup must NEVER fail the payment-record ack or the agent's
+  // call. Gated by X402_FEE_HOLDER_ACCRUAL (default on; set "false" to pause
+  // the x402 leg without touching loan-fee accrual). Crucially the accrual
+  // only credits a ledger obligation — it moves no SOL; distributions stay on
+  // the existing governance/manual cadence.
+  if (inserted && process.env.X402_FEE_HOLDER_ACCRUAL !== "false") {
+    try {
+      const { accrueToHolderPool } = await import(
+        "../services/magpie-holder-rewards.js"
+      );
+      await accrueToHolderPool(amountLamports, {
+        sourceType: "x402_fee",
+        sourceId: txSignature,
+      });
+    } catch (err) {
+      console.warn(
+        "[x402-metrics] holder accrual failed (non-fatal):",
+        err.message?.slice(0, 200),
+      );
+    }
+  }
+
+  // `fresh` is the durable single-use signal for the x402 gateway: true means
+  // this payment signature was claimed for the first time; false means it was
+  // already spent (a cross-instance replay the in-process Map can't see). The
+  // x402 middleware rejects a non-fresh claim. On the db_blip path above we
+  // return no `fresh`, so the gateway fails OPEN (a transient DB blip must
+  // never block a legitimately-paid call).
+  return { status: 200, body: { recorded: true, fresh: inserted } };
 }
 
 /**

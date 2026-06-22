@@ -776,9 +776,9 @@ export async function handleCommunityAudit(ctx) {
   // and the community will eventually find out. Instead: explain
   // what compensates for the missing audit + what's planned.
   const text = [
-    `🔍 *Audit status — honest answer*`,
+    `*Audit status — honest answer*`,
     ``,
-    `Magpie has *not* yet undergone a formal third-party audit. The community deserves transparency on this rather than a misleading "audited" claim.`,
+    `Magpie has *not* yet shipped a formal third-party audit. The team is *actively researching and vetting auditors* right now — that's the current posture. No public timeline yet; the operator will announce when scope + firm are locked.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -788,7 +788,7 @@ export async function handleCommunityAudit(ctx) {
     `• *No admin override* — there's no privileged key that can drain user collateral.`,
     `• *Bug bounty* — see /security to report findings.`,
     ``,
-    `Treat Magpie as you would any unaudited protocol: deposit only what you can afford to lose, and verify everything on-chain.`,
+    `Treat Magpie as you would any pre-audit protocol: deposit only what you can afford to lose, and verify everything on-chain.`,
   ].join("\n");
   await ctx.reply(text, {
     parse_mode: "Markdown",
@@ -819,7 +819,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `Magpie is *not yet formally audited* (see /audit). Source is open. A bug anywhere in the program could result in loss of funds.`,
+    `A formal third-party audit hasn't shipped yet — team is *researching and vetting auditors* (see /audit for the current posture). Source is open. Until an audit lands, a bug anywhere in the program could result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
@@ -951,7 +951,7 @@ export async function handleCommunityApy(ctx) {
       RULE,
       "```",
       ``,
-      `_Rough estimate — assumes 80% of every loan fee (≈ 2% avg) flows to LPs, annualized over 30 days. Actual yield depends on borrow demand. Past performance ≠ future returns._`,
+      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee (≈ 2% avg) flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
       ``,
       `Deposit at [magpie.capital/earn](${SITE_URL}/earn). See /lend for how it works.`,
     ].join("\n");
@@ -1141,15 +1141,15 @@ export async function handleCommunityCredit(ctx) {
 
 export async function handleCommunityLend(ctx) {
   const text = [
-    `🏦 *Lending into the Magpie pool*`,
+    `*Lending into the Magpie pool*`,
     ``,
-    `Deposit SOL → earn *80% of all protocol loan fees*, pro-rata to your share of the pool.`,
+    `Deposit SOL → earn the *10% LP loyalty share* of every protocol loan fee, paid out on the snapshot cadence (random 5–10 day window) by shares × time held.`,
     ``,
     `*How it works*`,
     `• You deposit SOL → receive pool shares`,
-    `• Borrowers pay fees on every loan (Express 3% / Quick 2% / Standard 1.5%)`,
-    `• 80% of every fee flows back to the LP pool, distributed pro-rata`,
-    `• Withdraw your share + earnings any time`,
+    `• Borrowers pay fees on every loan. Memecoin (v1): Express 3% / Quick 2% / Standard 1.5%. RWA (v3): Express 2.5% / Quick 3.5% / Standard 5%`,
+    `• Per MGP-001 (passed 2026-06-13), every fee splits 70/10/10/10: 70% to \$MAGPIE holders, 10% to LP loyalty, 10% to referrer, 10% to protocol reserve. LPs receive the 10% LP loyalty slice on each snapshot`,
+    `• Withdraw your principal at any time — share value reflects the current vault balance and total shares outstanding`,
     ``,
     `*The trade-off*`,
     `Your SOL backs the loan book. In a flash crash, liquidations might lag price moves — LPs can absorb losses in extreme markets. Short terms + low LTV + the keeper network are designed to keep this rare. Zero LP losses to date.`,
@@ -1393,6 +1393,49 @@ const COMMUNITY_CMD_HANDLERS = {
 
 export async function maybeHandlePublicCommand(ctx, msg) {
   const text = (msg?.text || "").trim();
+
+  // Bareword keyword triggers — operator-mandated 2026-06-15 after
+  // @magical_mutes213 typed "CA" in @magpietalk and Pip didn't reply.
+  // Strict whitelist: must be an EXACT match against the lowercased
+  // trimmed message (with optional trailing ?) so we never fire on
+  // mid-sentence noise like "I lost my CA in a dream last night".
+  //
+  // Throttled per (chat, keyword) so a CA-flood doesn't spam the
+  // group. The LLM Q&A path still runs for anything not in the
+  // whitelist (operator: future operator-flagged keywords go here
+  // without waiting for permission).
+  const lower = text.toLowerCase().replace(/[?!.]+$/, "").trim();
+  const BAREWORD_MAP = {
+    "ca": "ca",
+    "contract": "ca",
+    "contract address": "ca",
+    "address": "ca",
+    "what is the ca": "ca",
+    "whats the ca": "ca",
+    "what's the ca": "ca",
+  };
+  const barewordCmd = BAREWORD_MAP[lower];
+  if (barewordCmd) {
+    const throttleKey = `${ctx.chat.id}:bareword:${barewordCmd}`;
+    if (!isBarewordThrottled(throttleKey)) {
+      const fn = COMMUNITY_CMD_HANDLERS[barewordCmd];
+      if (fn) {
+        try {
+          await fn(ctx);
+          markBarewordSent(throttleKey);
+        } catch (err) {
+          console.warn(`[community-public-cmds] bareword "${lower}" → ${barewordCmd} failed:`, err.message);
+        }
+        return true;
+      }
+    } else {
+      // Throttled — silently skip. Pip's LLM path won't fire either
+      // since we return true. Re-firing within 5 minutes risks spam
+      // during a CA-flood.
+      return true;
+    }
+  }
+
   if (!text.startsWith("/")) return false;
   const m = text.match(/^\/([a-z_]+)(?:@\w+)?(?:\s|$)/i);
   if (!m) return false;
@@ -1405,6 +1448,19 @@ export async function maybeHandlePublicCommand(ctx, msg) {
     console.warn(`[community-public-cmds] /${cmd} failed:`, err.message);
   }
   return true;
+}
+
+// In-memory throttle for bareword triggers. 5-minute window per
+// (chat, keyword). Memory-bounded by the set of active chats × the
+// set of bareword keys; trivially small.
+const BAREWORD_THROTTLE_MS = 5 * 60 * 1000;
+const _barewordLastSent = new Map();
+function isBarewordThrottled(key) {
+  const t = _barewordLastSent.get(key);
+  return t != null && Date.now() - t < BAREWORD_THROTTLE_MS;
+}
+function markBarewordSent(key) {
+  _barewordLastSent.set(key, Date.now());
 }
 
 /* ─────────────────────────── UTILS ─────────────────────────── */

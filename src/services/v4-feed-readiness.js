@@ -1,0 +1,643 @@
+/**
+ * V4 feed readiness — architectural fix for the cold-start error class.
+ *
+ * Problem this solves
+ * -------------------
+ * Every bot redeploy resets V4 price feed warmup. Each V4 mint needs
+ * MIN_SAMPLES_FOR_TWAP=8 samples within a TWAP_WINDOW_SECONDS=300s
+ * window before borrows can succeed. The normal price-attestor cycles
+ * each mint roughly every 35s, so a cold mint needs ~5 minutes to
+ * reach 8 samples. During that window, any user trying to borrow that
+ * mint hits AccountNotInitialized / no_samples_yet, and we shipped
+ * four patches today trying to "block" the user from doing so
+ * (PRs #176, #177, #182, #183).
+ *
+ * This is the architectural fix that eliminates the class:
+ *   1. Identify PRIORITY MINTS: every mint borrowed in the last 7
+ *      days + every enabled tokenized-stock mint. Typically ~60 mints.
+ *   2. Burst-attest them on boot: concurrency 8, 4s spacing per mint
+ *      per round, 8 rounds. Total: ~3.5 minutes to warm all priority
+ *      mints, vs ~5 minutes for a SINGLE mint at normal cadence.
+ *   3. Track readiness in shared module state.
+ *   4. Health endpoint reports {ready, warm, total, eta_seconds}.
+ *   5. Site blocks the borrow CTA based on the health signal.
+ *
+ * Net effect: users physically cannot click borrow on a cold mint.
+ * They see a "Markets warming up — Xs" countdown instead. By the time
+ * the countdown clears, the on-chain feed is actually ready.
+ *
+ * Operator-mandated 2026-06-19 PM per
+ * [[feedback_v4_loan_lifecycle_zero_errors_mandate]] +
+ * [[feedback_root_cause_not_symptom_patches]] —
+ * the single class-eliminating PR after four symptom patches.
+ */
+import { PublicKey } from "@solana/web3.js";
+import { query } from "../db/pool.js";
+import { withFailover } from "../solana/connection.js";
+
+const MIN_SAMPLES_FOR_TWAP = 8;
+const TWAP_WINDOW_SECONDS = 300;
+
+const WARMUP_CONCURRENCY = Number(process.env.V4_WARMUP_CONCURRENCY) || 8;
+const WARMUP_BATCH_SPACING_MS = Number(process.env.V4_WARMUP_BATCH_SPACING_MS) || 4_000;
+const PRIORITY_MINT_LOOKBACK_DAYS = Number(process.env.V4_WARMUP_LOOKBACK_DAYS) || 7;
+const READINESS_THRESHOLD_PCT = Number(process.env.V4_READINESS_THRESHOLD_PCT) || 80;
+
+// Per-mint on-demand warmup — how long a mint stays "hot" after a user
+// shows interest. Re-requested mints stay in the burst queue; mints
+// unrequested for this window drop back to the normal attestor cadence
+// to keep SOL spend bounded.
+const ON_DEMAND_HOT_WINDOW_MS = Number(process.env.V4_ON_DEMAND_HOT_WINDOW_MS) || 5 * 60_000;
+const ON_DEMAND_LOOP_SPACING_MS = Number(process.env.V4_ON_DEMAND_LOOP_SPACING_MS) || 3_000;
+
+// CONTINUOUS ALL-MINTS LOOP — the architecture that makes EVERY enabled
+// V4 mint stay warm 24/7. Operator-mandated 2026-06-19 PM:
+// "every single token... needs to pass every single sample and execute."
+//
+// Math:
+//   174 mints (currently) × every CONTINUOUS_BATCH_SPACING_MS / CONTINUOUS_CONCURRENCY
+//   = 174 / 16 = 11 batches × 3000ms = ~33s per full cycle of all mints
+//   → each mint attested every ~33s, which is well within the 300s TWAP
+//     window, guaranteeing ≥8 samples per mint at steady state.
+//
+// SOL cost: ~5.3 attestations/sec × 5000 lamports × 86400s/day ≈ 2.3 SOL/day.
+// Pre-authorized by operator (see feedback_every_mint_must_pass_every_sample).
+//
+// To bound spend further, the loop SKIPS mints that already have a healthy
+// sample buffer (current + 2 samples beyond MIN_SAMPLES_FOR_TWAP). The
+// loop only spends SOL on mints that actually need an attestation.
+// Falsy-zero bug fix: `Number("0") || 16` evaluates to 16, so setting
+// V4_CONTINUOUS_CONCURRENCY=0 to throttle the loop didn't actually disable
+// it. Explicit-undefined check lets the operator set 0 to fully pause the
+// continuous sweep when Jupiter is in a 429 storm.
+const CONTINUOUS_CONCURRENCY =
+  process.env.V4_CONTINUOUS_CONCURRENCY != null && process.env.V4_CONTINUOUS_CONCURRENCY !== ""
+    ? Number(process.env.V4_CONTINUOUS_CONCURRENCY)
+    : 16;
+const CONTINUOUS_BATCH_SPACING_MS = Number(process.env.V4_CONTINUOUS_SPACING_MS) || 3_000;
+const CONTINUOUS_BUFFER_SAMPLES = Number(process.env.V4_CONTINUOUS_BUFFER_SAMPLES) || 2; // skip if mint has ≥ (MIN + buffer) samples
+const CONTINUOUS_LIST_REFRESH_INTERVAL_MS = 10 * 60_000; // re-read supported_mints every 10min in case new mints added
+
+// Shared module state — read by /api/v1/health.
+const state = {
+  startedAt: null,
+  completedAt: null,
+  priorityMints: [],         // Array<{ mint, symbol, category }>
+  warmMints: new Set(),      // mint string — currently warm (sample-in-window check)
+  inFlight: new Set(),       // currently being attested
+  lastError: null,
+  lastErrorAt: null,
+  // On-demand state. Site calls requestMintWarm() for any mint a user
+  // is showing interest in (rendering CTA, clicking borrow). Each
+  // requested mint is tracked with its last-requested timestamp and
+  // gets aggressive attestation until it goes cold (unrequested >
+  // ON_DEMAND_HOT_WINDOW_MS).
+  onDemand: new Map(),       // mint → { lastRequestedAt, requestedCount, decimals }
+  // Continuous all-mints loop state — list of every enabled V4 mint
+  // + round-robin cursor + last-refresh time + counters.
+  continuousList: [],        // Array<{ mint, decimals, symbol, category }>
+  continuousCursor: 0,
+  continuousListRefreshedAt: 0,
+  continuousAttestations: 0, // lifetime counter for /v4-status visibility
+  continuousSkipped: 0,      // skipped because already healthy
+  continuousErrors: 0,
+};
+
+/**
+ * Public snapshot for health endpoint consumers. Cheap — no I/O.
+ */
+export function getFeedReadinessSnapshot() {
+  const total = state.priorityMints.length;
+  const warm = state.warmMints.size;
+  const percentWarm = total > 0 ? Math.round((warm / total) * 100) : 100;
+  const ready = total === 0 || percentWarm >= READINESS_THRESHOLD_PCT;
+
+  // ETA — naive but useful for UI countdown. Assumes ~4s per remaining
+  // sample slot at current concurrency.
+  let etaSeconds = null;
+  if (!ready && state.startedAt) {
+    const remaining = total - warm;
+    const perCycle = WARMUP_CONCURRENCY;
+    const cycles = Math.ceil(remaining / perCycle);
+    etaSeconds = Math.max(5, cycles * 4);
+  }
+
+  return {
+    ready,
+    warm_count: warm,
+    total_count: total,
+    percent_warm: percentWarm,
+    threshold_pct: READINESS_THRESHOLD_PCT,
+    // Continuous all-mints loop telemetry — operator-facing
+    // visibility into what the continuous attestor is doing.
+    continuous: {
+      mint_count: state.continuousList.length,
+      cursor: state.continuousCursor,
+      list_refreshed_at: state.continuousListRefreshedAt
+        ? new Date(state.continuousListRefreshedAt).toISOString()
+        : null,
+      attestations_total: state.continuousAttestations,
+      skipped_total: state.continuousSkipped,
+      errors_total: state.continuousErrors,
+    },
+    in_flight: state.inFlight.size,
+    started_at: state.startedAt,
+    completed_at: state.completedAt,
+    eta_seconds: etaSeconds,
+    last_error: state.lastError,
+    last_error_at: state.lastErrorAt,
+  };
+}
+
+async function listPriorityMints() {
+  // Priority = (a) every mint borrowed in lookback window + (b) every
+  // enabled stock. Stocks are always priority because the operator's
+  // tokenized-stock product is the strategic differentiator.
+  const { rows: recent } = await query(
+    `SELECT DISTINCT l.collateral_mint AS mint
+       FROM loans l
+      WHERE l.start_timestamp > NOW() - INTERVAL '${PRIORITY_MINT_LOOKBACK_DAYS} days'
+        AND l.collateral_mint IS NOT NULL`,
+  );
+  const { rows: stocks } = await query(
+    `SELECT mint, symbol, category
+       FROM supported_mints
+      WHERE enabled = true AND category = 'stock'`,
+  );
+  // Materialize with metadata.
+  const mintSet = new Set([
+    ...recent.map((r) => r.mint),
+    ...stocks.map((r) => r.mint),
+  ]);
+  if (mintSet.size === 0) return [];
+
+  const { rows: enriched } = await query(
+    `SELECT mint, symbol, category, decimals
+       FROM supported_mints
+      WHERE enabled = true AND mint = ANY($1::text[])`,
+    [Array.from(mintSet)],
+  );
+  return enriched;
+}
+
+async function feedIsWarm(mintStr, lenderPk, programIdV4) {
+  const { lendingPoolPda, priceFeedPda } = await import("../solana/pdas.js");
+  const mintPk = new PublicKey(mintStr);
+  const [pool] = lendingPoolPda(lenderPk, programIdV4);
+  const [pf] = priceFeedPda(mintPk, pool, programIdV4);
+
+  let info;
+  try {
+    info = await withFailover((conn) => conn.getAccountInfo(pf, "confirmed"));
+  } catch {
+    return false;
+  }
+  if (!info || info.data.length < 120) return false;
+
+  // PriceHistory layout: offset 104=head, 105=count, 112=samples.
+  // 32 × { price_lamports: u64, ts: i64 } = 16 bytes each.
+  const head = info.data.readUInt8(104);
+  const count = info.data.readUInt8(105);
+  if (count < MIN_SAMPLES_FOR_TWAP) return false;
+
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const windowStart = now - BigInt(TWAP_WINDOW_SECONDS);
+  let inWindow = 0;
+  for (let i = 0; i < Math.min(count, 32); i++) {
+    const idx = (head - 1 - i + 32) % 32;
+    const start = 112 + idx * 16;
+    if (start + 16 > info.data.length) break;
+    const ts = info.data.readBigInt64LE(start + 8);
+    if (ts >= windowStart) inWindow++;
+    if (inWindow >= MIN_SAMPLES_FOR_TWAP) return true;
+  }
+  return false;
+}
+
+async function ensureMintWarm(mint, lenderPk, programIdV4) {
+  if (state.warmMints.has(mint.mint)) return { mint: mint.mint, action: "already_warm" };
+  if (state.inFlight.has(mint.mint)) return { mint: mint.mint, action: "in_flight_skip" };
+  state.inFlight.add(mint.mint);
+  try {
+    // Quick read first — maybe already warm from on-chain ring buffer
+    // (samples persist across bot restarts within the 5-min window).
+    if (await feedIsWarm(mint.mint, lenderPk, programIdV4)) {
+      state.warmMints.add(mint.mint);
+      return { mint: mint.mint, action: "already_warm_onchain" };
+    }
+    // Not warm — fire one attestation. Subsequent burst rounds add
+    // more samples. We don't try to add 8 samples in this call; the
+    // burst loop does that across rounds.
+    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
+    try {
+      await attestPrice(mint.mint, Number(mint.decimals), undefined, programIdV4);
+    } catch (err) {
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
+        await initializePriceFeed(mint.mint, programIdV4);
+        await attestPrice(mint.mint, Number(mint.decimals), undefined, programIdV4);
+      } else {
+        throw err;
+      }
+    }
+    // Re-check warmth — might have crossed threshold with this sample.
+    if (await feedIsWarm(mint.mint, lenderPk, programIdV4)) {
+      state.warmMints.add(mint.mint);
+      return { mint: mint.mint, action: "now_warm" };
+    }
+    return { mint: mint.mint, action: "attested_still_cold" };
+  } catch (err) {
+    state.lastError = err.message?.slice(0, 200);
+    state.lastErrorAt = new Date().toISOString();
+    return { mint: mint.mint, action: "error", error: state.lastError };
+  } finally {
+    state.inFlight.delete(mint.mint);
+  }
+}
+
+async function warmupLoop(lenderPk, programIdV4) {
+  const remaining = state.priorityMints.filter((m) => !state.warmMints.has(m.mint));
+  if (remaining.length === 0) {
+    state.completedAt = new Date().toISOString();
+    console.log(`[v4-readiness] warmup complete — all ${state.priorityMints.length} priority mints warm`);
+    return;
+  }
+
+  // Round-robin in batches of WARMUP_CONCURRENCY.
+  const batch = remaining.slice(0, WARMUP_CONCURRENCY);
+  await Promise.all(batch.map((m) => ensureMintWarm(m, lenderPk, programIdV4)));
+
+  // Recurse after spacing — gives previous batch's tx confirmations
+  // time to settle.
+  setTimeout(() => {
+    warmupLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] loop tick threw:", e.message?.slice(0, 120)),
+    );
+  }, WARMUP_BATCH_SPACING_MS);
+}
+
+export async function startFeedReadinessWarmup() {
+  if (process.env.V4_WARMUP_DISABLED === "true") {
+    console.log("[v4-readiness] disabled via env");
+    return;
+  }
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4) {
+    console.log("[v4-readiness] PROGRAM_ID_V4 unset — skipping");
+    return;
+  }
+  if (!process.env.LENDER_PUBKEY) {
+    console.log("[v4-readiness] LENDER_PUBKEY unset — skipping");
+    return;
+  }
+  const lenderPk = new PublicKey(process.env.LENDER_PUBKEY);
+
+  try {
+    state.priorityMints = await listPriorityMints();
+  } catch (err) {
+    console.error("[v4-readiness] failed to list priority mints:", err.message?.slice(0, 200));
+    return;
+  }
+
+  state.startedAt = new Date().toISOString();
+  console.log(`[v4-readiness] starting warmup — ${state.priorityMints.length} priority mints (concurrency ${WARMUP_CONCURRENCY}, ${WARMUP_BATCH_SPACING_MS}ms spacing)`);
+
+  warmupLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] initial loop threw:", e.message?.slice(0, 120)),
+  );
+
+  // Per-mint on-demand loop. Runs continuously in the background and
+  // aggressively warms any mint a user has shown interest in within
+  // the last ON_DEMAND_HOT_WINDOW_MS. Solves the "user picks a non-
+  // priority mint" gap operator-mandated 2026-06-19 PM after the
+  // global readiness gate was insufficient.
+  onDemandLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
+  );
+
+  // CONTINUOUS ALL-MINTS LOOP — every enabled V4 mint stays warm 24/7.
+  // Operator-mandated 2026-06-19 PM (feedback_every_mint_must_pass_every_sample).
+  // This is THE architectural layer that makes the protocol non-negotiable
+  // for any approved token. Round-robin attests every enabled mint at
+  // CONTINUOUS_CONCURRENCY × CONTINUOUS_BATCH_SPACING_MS cadence.
+  // Skip-if-buffered logic keeps SOL spend bounded.
+  continuousAllMintsLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+  );
+}
+
+/**
+ * Read-only per-mint readiness check. Returns the current sample-in-
+ * window count without firing attestation. Cheap; site can poll.
+ *
+ * Used by the /api/v1/v4/feed-ready endpoint and as the source of
+ * truth in requestMintWarm.
+ */
+export async function checkMintReadiness(mintStr) {
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4 || !process.env.LENDER_PUBKEY) {
+    return { ready: false, reason: "v4_not_configured", samples_in_window: 0 };
+  }
+  const lenderPk = new PublicKey(process.env.LENDER_PUBKEY);
+  const { lendingPoolPda, priceFeedPda } = await import("../solana/pdas.js");
+  const mintPk = new PublicKey(mintStr);
+  const [pool] = lendingPoolPda(lenderPk, PROGRAM_ID_V4);
+  const [pf] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
+
+  let info;
+  try {
+    info = await withFailover((conn) => conn.getAccountInfo(pf, "confirmed"));
+  } catch {
+    return { ready: false, reason: "rpc_unavailable", samples_in_window: 0 };
+  }
+  if (!info || info.data.length < 120) {
+    return { ready: false, reason: "uninitialized", samples_in_window: 0 };
+  }
+  const head = info.data.readUInt8(104);
+  const count = info.data.readUInt8(105);
+  if (count < MIN_SAMPLES_FOR_TWAP) {
+    return { ready: false, reason: "no_samples_yet", samples_in_window: count };
+  }
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const windowStart = now - BigInt(TWAP_WINDOW_SECONDS);
+  let inWindow = 0;
+  for (let i = 0; i < Math.min(count, 32); i++) {
+    const idx = (head - 1 - i + 32) % 32;
+    const start = 112 + idx * 16;
+    if (start + 16 > info.data.length) break;
+    const ts = info.data.readBigInt64LE(start + 8);
+    if (ts >= windowStart) inWindow++;
+  }
+  if (inWindow >= MIN_SAMPLES_FOR_TWAP) {
+    return { ready: true, samples_in_window: inWindow };
+  }
+  // Estimate ETA: at 3s on-demand spacing per round + ~2s per attest
+  // confirmation, each missing sample costs ~5s.
+  const missing = MIN_SAMPLES_FOR_TWAP - inWindow;
+  const etaSeconds = missing * 5;
+  return {
+    ready: false,
+    reason: "insufficient_samples_in_window",
+    samples_in_window: inWindow,
+    samples_needed: MIN_SAMPLES_FOR_TWAP,
+    eta_seconds: etaSeconds,
+  };
+}
+
+/**
+ * Record user interest in a mint. The on-demand loop reads from this
+ * map and aggressively warms any mint requested in the last
+ * ON_DEMAND_HOT_WINDOW_MS. Idempotent and cheap.
+ *
+ * Validates the mint is supported + enabled to prevent random callers
+ * draining lender SOL on garbage mints.
+ */
+export async function requestMintWarm(mintStr) {
+  const { rows: [row] } = await query(
+    `SELECT mint, decimals, enabled, category
+       FROM supported_mints WHERE mint = $1`,
+    [mintStr],
+  );
+  if (!row) {
+    return { ok: false, error: "mint_not_supported" };
+  }
+  if (!row.enabled) {
+    return { ok: false, error: "mint_disabled" };
+  }
+  const existing = state.onDemand.get(mintStr) || { requestedCount: 0 };
+  state.onDemand.set(mintStr, {
+    lastRequestedAt: Date.now(),
+    requestedCount: existing.requestedCount + 1,
+    decimals: Number(row.decimals),
+    category: row.category,
+  });
+  const readiness = await checkMintReadiness(mintStr);
+  return { ok: true, ...readiness };
+}
+
+async function onDemandLoop(lenderPk, programIdV4) {
+  // Pull mints requested in the last hot window. Drop expired entries
+  // so the map stays small.
+  const now = Date.now();
+  const cutoff = now - ON_DEMAND_HOT_WINDOW_MS;
+  for (const [mint, entry] of state.onDemand.entries()) {
+    if (entry.lastRequestedAt < cutoff) state.onDemand.delete(mint);
+  }
+  const hot = Array.from(state.onDemand.entries()).map(([mint, entry]) => ({
+    mint, decimals: entry.decimals, category: entry.category,
+  }));
+
+  if (hot.length > 0) {
+    // Batch process — same concurrency as priority warmup.
+    const batch = hot.slice(0, WARMUP_CONCURRENCY);
+    const results = await Promise.all(batch.map((m) => ensureMintWarm(m, lenderPk, programIdV4)));
+    const initialized = results.filter((r) => r.action === "now_warm").length;
+    if (initialized > 0) {
+      console.log(`[v4-readiness] on-demand round warmed ${initialized}/${batch.length} hot mints`);
+    }
+  }
+  setTimeout(() => {
+    onDemandLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
+    );
+  }, ON_DEMAND_LOOP_SPACING_MS);
+}
+
+/**
+ * CONTINUOUS ALL-MINTS LOOP — the architecture that fulfills the
+ * operator's 2026-06-19 PM mandate: every enabled V4 mint must
+ * continuously have ≥8 fresh TWAP samples on-chain at all times.
+ *
+ * On each tick, picks the next CONTINUOUS_CONCURRENCY mints from a
+ * round-robin cursor over ALL enabled V4 mints. For each picked mint:
+ *   1. Reads the on-chain ring buffer.
+ *   2. If samples_in_window ≥ MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES,
+ *      skip — already healthy.
+ *   3. Otherwise fire one attestation. Init the feed PDA first if needed.
+ *
+ * After a tick, waits CONTINUOUS_BATCH_SPACING_MS, then advances the
+ * cursor and repeats.
+ *
+ * Net behavior at steady state:
+ *   174 mints, concurrency 16, 3s spacing → full cycle every ~33s
+ *   Each mint attested every ~33s
+ *   TWAP window is 300s → ~9 samples per mint per window
+ *   ≥ MIN_SAMPLES_FOR_TWAP = 8 always met
+ *
+ * Skip-if-buffered logic means steady-state SOL spend is BELOW the
+ * worst-case 5.3 attestations/sec. Mints sitting at 10 samples don't
+ * get attested until they drift to 9, then 8.
+ */
+async function refreshContinuousList() {
+  // Tiered attestation Phase 2 (2026-06-19 PM): filter by attestation_tier.
+  // Hot mints always in list. Warm mints included when there's borrower
+  // interest. Cold mints excluded — cosign-borrow JIT warmer handles
+  // first-borrow on cold tier.
+  // See [[feedback_tiered_attestation_cost_conscious]].
+  const { rows } = await query(
+    `WITH active_loan_mints AS (
+       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+     ),
+     armed_exit_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM limit_close_orders lc
+         JOIN loans l ON l.id = lc.loan_id
+        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+     ),
+     recent_intent_mints AS (
+       SELECT DISTINCT l.collateral_mint
+         FROM arm_intents ai
+         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
+        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+     ),
+     -- Hot-on-Select beacon: site POSTs /api/v1/v4/warm-mint when user
+     -- opens the V4 exit picker, even for cold mints. Bot UNIONs that
+     -- mint into continuous attestation for the 10-min TTL so samples
+     -- accumulate during user review time. Operator-mandated 2026-06-19
+     -- PM after $TROLL hit "Markets warming up." See migration 086.
+     warming_mints AS (
+       SELECT DISTINCT mint AS collateral_mint
+         FROM mint_warming_intents
+        WHERE expires_at > NOW()
+     )
+     SELECT sm.mint, sm.decimals, sm.symbol, sm.category
+       FROM supported_mints sm
+       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
+       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+       LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
+      WHERE sm.enabled = TRUE
+        AND sm.category IN ('memecoin', 'stock')
+        AND (
+          sm.attestation_tier = 'hot'
+          -- Safety net: ANY tier (incl. cold) with borrower activity
+          -- gets auto-attested. A cold mint with active loan/arm MUST
+          -- keep its V4 feed warm or the engine can't fire exits.
+          OR sm.protected = TRUE
+          OR alm.collateral_mint IS NOT NULL
+          OR aem.collateral_mint IS NOT NULL
+          OR rim.collateral_mint IS NOT NULL
+          -- Hot-on-Select: user is staring at the V4 picker right now
+          -- for this mint; we have ~10 min to fill the TWAP window.
+          OR wm.collateral_mint IS NOT NULL
+        )`,
+  );
+  state.continuousList = rows.map((r) => ({
+    mint: r.mint,
+    decimals: Number(r.decimals),
+    symbol: r.symbol,
+    category: r.category,
+  }));
+  state.continuousListRefreshedAt = Date.now();
+  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints`);
+}
+
+async function processContinuousMint(target, lenderPk, programIdV4) {
+  if (state.inFlight.has(target.mint)) {
+    return { mint: target.mint, action: "in_flight_skip" };
+  }
+  state.inFlight.add(target.mint);
+  try {
+    const readiness = await checkMintReadiness(target.mint);
+    const buffered =
+      readiness.ready &&
+      typeof readiness.samples_in_window === "number" &&
+      readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
+    if (buffered) {
+      state.continuousSkipped++;
+      return { mint: target.mint, action: "buffered_skip" };
+    }
+    // Fire one attestation. If feed PDA missing, init then attest.
+    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
+    try {
+      await attestPrice(target.mint, target.decimals, undefined, programIdV4);
+    } catch (err) {
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
+        try {
+          await initializePriceFeed(target.mint, programIdV4);
+          await attestPrice(target.mint, target.decimals, undefined, programIdV4);
+        } catch (initErr) {
+          state.continuousErrors++;
+          state.lastError = `init+attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${initErr.message?.slice(0, 120)}`;
+          state.lastErrorAt = new Date().toISOString();
+          return { mint: target.mint, action: "init_failed" };
+        }
+      } else {
+        state.continuousErrors++;
+        state.lastError = `attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`;
+        state.lastErrorAt = new Date().toISOString();
+        return { mint: target.mint, action: "attest_failed" };
+      }
+    }
+    state.continuousAttestations++;
+    return { mint: target.mint, action: "attested" };
+  } finally {
+    state.inFlight.delete(target.mint);
+  }
+}
+
+async function continuousAllMintsLoop(lenderPk, programIdV4) {
+  // Refresh mint list periodically — handles new mints added at runtime.
+  const sinceRefresh = Date.now() - state.continuousListRefreshedAt;
+  if (state.continuousList.length === 0 || sinceRefresh > CONTINUOUS_LIST_REFRESH_INTERVAL_MS) {
+    try {
+      await refreshContinuousList();
+    } catch (err) {
+      console.warn("[v4-readiness] continuous-loop: refresh failed:", err.message?.slice(0, 120));
+    }
+  }
+
+  const list = state.continuousList;
+  if (list.length === 0) {
+    setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+    ), 30_000);
+    return;
+  }
+
+  // Kill-switch: V4_CONTINUOUS_CONCURRENCY=0 pauses the sweep. Re-checks
+  // every 30s so flipping the env var back to nonzero resumes without
+  // a redeploy. Operator uses this when Jupiter is in a 429 storm.
+  if (CONTINUOUS_CONCURRENCY <= 0) {
+    setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+    ), 30_000);
+    return;
+  }
+
+  // Build batch:
+  // 1. ALL stocks always — every tick, guaranteed.
+  //    xStocks (Token-2022, transfer hooks) attest slower and tend to fall
+  //    below the 8-sample threshold first because they're a small subset
+  //    of the round-robin (~5-10 mints out of 172). Putting them in every
+  //    batch guarantees each stock gets attested every 3s — way under the
+  //    37.5s required cadence, so samples never drift below 8 even with
+  //    occasional Token-2022 attestation failures.
+  //    Operator-mandated 2026-06-19 PM after xStock SPCX oscillated at 7/8
+  //    while every memecoin sat at 8+. Per-stock extra cost: ~0.005 SOL/day.
+  // 2. Round-robin memecoins fill the remaining slots — same logic as before.
+  const stocks = list.filter((m) => m.category === 'stock');
+  const memecoins = list.filter((m) => m.category !== 'stock');
+  const batch = [];
+  for (const s of stocks) {
+    if (batch.length >= CONTINUOUS_CONCURRENCY) break;
+    batch.push(s);
+  }
+  const memeSlots = CONTINUOUS_CONCURRENCY - batch.length;
+  for (let i = 0; i < memeSlots && i < memecoins.length; i++) {
+    batch.push(memecoins[(state.continuousCursor + i) % memecoins.length]);
+  }
+  state.continuousCursor = (state.continuousCursor + memeSlots) % Math.max(memecoins.length, 1);
+
+  // Fire in parallel — each mint independently goes through readiness
+  // check + attestation.
+  await Promise.all(batch.map((m) =>
+    processContinuousMint(m, lenderPk, programIdV4).catch((e) => {
+      state.continuousErrors++;
+      return { mint: m.mint, action: "error", error: e.message?.slice(0, 120) };
+    }),
+  ));
+
+  setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
+    console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
+  ), CONTINUOUS_BATCH_SPACING_MS);
+}

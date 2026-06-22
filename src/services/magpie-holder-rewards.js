@@ -32,6 +32,7 @@ import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
+import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 
 export const MAGPIE_MINT = new PublicKey(
   "9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump",
@@ -135,14 +136,62 @@ function loadLenderKeypair() {
 }
 
 /**
- * Add 10% of a loan fee to the holder reward pool. Idempotent NOT
- * guaranteed — caller must ensure they call once per fee event. Safe
- * to call from inside the loan-recording try/catch (errors don't
- * propagate up to the user-facing flow).
+ * Add the holder-share fraction of a loan fee to the holder reward
+ * pool. Fraction is read from governance_config at call time —
+ * currently 70% post-MGP-001 (ratified 2026-06-13), previously 10%.
+ * Idempotent NOT guaranteed — caller must ensure they call once per
+ * fee event. Safe to call from inside the loan-recording try/catch
+ * (errors don't propagate up to the user-facing flow).
  */
-export async function accrueToHolderPool(feeLamports) {
+/**
+ * Credit a pre-computed lamport amount directly to the holder pool.
+ *
+ * Idempotency is enforced at the DB level via the pool_credit_events
+ * ledger UNIQUE(source_type, source_id, pool_kind='holder'). A repeat
+ * call with the same (sourceType, sourceId) is a no-op — the UPDATE
+ * only fires when the INSERT actually inserts a row.
+ *
+ * REQUIRED: sourceType + sourceId. Callers without a stable
+ * identity must mint one (e.g. tx_sig + slice index) — bare credits
+ * without ledger gating are forbidden after the 2026-06-18 PM P0.
+ * See feedback_pool_credits_must_be_idempotent_at_db_level.md.
+ */
+export async function creditHolderPoolDirect({ sourceType, sourceId, lamports, metadata } = {}) {
+  const amt = BigInt(lamports || 0);
+  if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[holder-rewards] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
+  try {
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'holder', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE magpie_holder_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
+              updated_at = NOW()
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
+    );
+    return rows.length > 0 ? amt : null;
+  } catch (err) {
+    console.error("[holder-rewards] direct credit failed:", err.message);
+    return null;
+  }
+}
+
+export async function accrueToHolderPool(feeLamports, { sourceType, sourceId } = {}) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[holder-rewards] CRIT accrueToHolderPool called WITHOUT sourceType/sourceId — refusing. fee=${fee}`);
+    return null;
+  }
   // Read the LIVE bps from governance_config (autopilot will flip
   // this from 10% to 70% the moment MGP-001 ratifies — accrual on
   // every subsequent fee event picks up the new rate without a
@@ -150,19 +199,12 @@ export async function accrueToHolderPool(feeLamports) {
   const liveBps = await getHolderRewardBps();
   const reward = (fee * BigInt(Math.round(liveBps))) / 10_000n;
   if (reward <= 0n) return null;
-  try {
-    await query(
-      `UPDATE magpie_holder_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
-              updated_at = NOW()
-        WHERE id = 1`,
-      [reward.toString()],
-    );
-    return reward;
-  } catch (err) {
-    console.error("[holder-rewards] accrual failed:", err.message);
-    return null;
-  }
+  return await creditHolderPoolDirect({
+    sourceType,
+    sourceId,
+    lamports: reward,
+    metadata: { fee_lamports: fee.toString(), bps: liveBps },
+  });
 }
 
 /**
@@ -574,6 +616,95 @@ export async function snapshotMagpieHolders() {
  */
 const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana tx limit)
 
+/**
+ * Mirror a $MAGPIE-holder distribution cycle into the protocol-wide
+ * `distribution_events` analytics ledger so it sits alongside lp_loyalty
+ * and governance distributions. Operator-mandated 2026-06-19 — every
+ * distribution must be kept, organized, and synced across the protocol
+ * (see [[feedback_distributions_must_be_kept_organized_synced]]).
+ *
+ * Reads canonical state from magpie_holder_distributions +
+ * magpie_holder_rewards and routes through upsertDistributionEvent()
+ * (which has ON CONFLICT (kind, external_ref) baked in). Kind +
+ * external_ref convention match the existing dictionary in
+ * src/services/distribution-events.js. Idempotent — safe to call from
+ * every transition point.
+ */
+export async function syncMagpieHolderDistributionEvent(distributionId) {
+  const { upsertDistributionEvent } = await import("./distribution-events.js");
+  // Pull the snapshot row + aggregated reward state in one round-trip.
+  const { rows: snapRows } = await query(
+    `SELECT mhd.pool_lamports, mhd.total_balance, mhd.holder_count,
+            mhd.eligible_count, mhd.snapshot_at,
+            COUNT(mhr.*)                                                   AS reward_row_count,
+            COUNT(mhr.*) FILTER (WHERE mhr.status = 'paid')                AS paid_count,
+            COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')), 0)::numeric AS unpaid_lamports,
+            MIN(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS min_paid,
+            MAX(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS max_paid,
+            MIN(mhr.paid_at)                                               AS paid_first_at,
+            MAX(mhr.paid_at)                                               AS paid_last_at
+       FROM magpie_holder_distributions mhd
+       LEFT JOIN magpie_holder_rewards mhr ON mhr.distribution_id = mhd.id
+      WHERE mhd.id = $1
+      GROUP BY mhd.id`,
+    [distributionId],
+  );
+  if (snapRows.length === 0) {
+    console.warn(`[holder-rewards] syncMagpieHolderDistributionEvent: distribution ${distributionId} not found`);
+    return null;
+  }
+  const s = snapRows[0];
+  // Median paid payout — second round-trip; ok at ~1k rows for the
+  // holder set, batches scale linearly.
+  let medianPaid = null;
+  if (Number(s.paid_count) > 0) {
+    const { rows: medRows } = await query(
+      `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY reward_lamports::numeric) AS median
+         FROM magpie_holder_rewards
+        WHERE distribution_id = $1 AND status = 'paid'`,
+      [distributionId],
+    );
+    medianPaid = medRows[0]?.median ?? null;
+  }
+  // status: planned (no payouts yet) | partial (some paid, some unpaid)
+  //       | complete (all eligible paid). CHECK constraint enforces these.
+  let status;
+  if (Number(s.paid_count) === 0) status = "planned";
+  else if (Number(s.unpaid_count) === 0) status = "complete";
+  else status = "partial";
+
+  // kind='holder_reward' per the canonical dictionary enforced by the
+  // distribution_events.kind CHECK constraint.
+  return upsertDistributionEvent({
+    kind: "holder_reward",
+    external_ref: `holder-${distributionId}`,
+    snapshot_at: s.snapshot_at,
+    pool_lamports: s.pool_lamports,
+    distributed_lamports: s.paid_lamports,
+    unpaid_lamports: s.unpaid_lamports,
+    // Eligible count = rows captured for payout, NOT enumerated holders.
+    // magpie_holder_distributions.eligible_count is currently miswritten
+    // (snapshotAndDistribute passes holders.length twice — same value as
+    // holder_count). The reward_row_count from the JOIN is the truth.
+    eligible_wallet_count: Number(s.reward_row_count) || Number(s.eligible_count) || Number(s.holder_count) || 0,
+    paid_wallet_count: Number(s.paid_count) || 0,
+    unpayable_wallet_count: 0,
+    denominator_kind: "magpie_balance_at_snapshot",
+    denominator_value: s.total_balance,
+    paid_first_at: s.paid_first_at,
+    paid_last_at: s.paid_last_at,
+    min_payout_lamports: s.min_paid,
+    max_payout_lamports: s.max_paid,
+    median_payout_lamports: medianPaid,
+    source_borrow_fees_lamports: s.pool_lamports, // 70% of borrow fees per MGP-001
+    source_liquidation_lamports: 0,
+    source_other_lamports: 0,
+    status,
+  });
+}
+
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
@@ -597,14 +728,18 @@ export async function snapshotAndDistribute() {
     return null;
   }
 
-  // Pre-flight: lender must cover the entire pool + safety reserve.
-  // Skipped in snapshot-only mode since no SOL moves during the snapshot.
-  const lender = loadLenderKeypair();
+  // Pre-flight: the distributor wallet must cover the entire pool +
+  // safety reserve. Skipped in snapshot-only mode since no SOL moves
+  // during the snapshot. As of 2026-06-14 this reads from the dedicated
+  // rewards distributor wallet (set via REWARDS_DISTRIBUTOR_PRIVATE_KEY);
+  // until the operator flips that env var on Railway it transparently
+  // falls back to the lender wallet, preserving prior behaviour.
+  const distributor = getRewardsDistributorKeypair();
   if (!snapshotOnly) {
-    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-    if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+    if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
       console.warn(
-        `[holder-rewards] Distribution skipped: lender ${lenderBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+        `[holder-rewards] Distribution skipped: distributor ${distributorBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
       );
       return null;
     }
@@ -703,6 +838,15 @@ export async function snapshotAndDistribute() {
   }
   client.release();
 
+  // Mirror into distribution_events so this cycle sits next to lp_loyalty
+  // + governance in the protocol-wide ledger. Idempotent — re-callable.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    await syncMagpieHolderDistributionEvent(distributionId);
+  } catch (syncErr) {
+    console.error(`[holder-rewards] distribution_events sync (Phase 1) failed for dist ${distributionId}:`, syncErr.message);
+  }
+
   // Snapshot-only: bail out before any SOL transfers. Return the
   // captured allocation summary so the caller can DM admin.
   if (snapshotOnly) {
@@ -746,6 +890,14 @@ export async function snapshotAndDistribute() {
       );
       paidCount += batch.length;
       paidLamports += batch.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
+      // Keep distribution_events fresh after every successful batch so
+      // it never lags behind the canonical reward rows even if the
+      // process dies mid-cycle. [[feedback_distributions_must_be_kept_organized_synced]]
+      try {
+        await syncMagpieHolderDistributionEvent(distributionId);
+      } catch (syncErr) {
+        console.warn(`[holder-rewards] distribution_events sync (mid-batch) failed for dist ${distributionId}:`, syncErr.message);
+      }
     } catch (err) {
       console.error(
         `[holder-rewards] Batch payout failed (rows remain 'accrued' for retry):`,
@@ -753,6 +905,14 @@ export async function snapshotAndDistribute() {
       );
       // Leave 'accrued' — a manual /payaccrued admin command or next cycle can clean up.
     }
+  }
+
+  // Final sync — guarantees the row reflects final paid/unpaid state
+  // even if a mid-batch sync failed transiently.
+  try {
+    await syncMagpieHolderDistributionEvent(distributionId);
+  } catch (syncErr) {
+    console.error(`[holder-rewards] distribution_events sync (final) failed for dist ${distributionId}:`, syncErr.message);
   }
 
   return {
@@ -782,11 +942,11 @@ export async function retryAccruedPayouts() {
   );
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
-  const lender = loadLenderKeypair();
+  const distributor = getRewardsDistributorKeypair();
   const totalNeeded = rows.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
-  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-  if (lenderBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn("[holder-rewards] Retry skipped: lender too low");
+  const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+  if (distributorBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn("[holder-rewards] Retry skipped: distributor balance too low");
     return { retried: 0, paid: 0, skipped: rows.length };
   }
 
@@ -797,14 +957,14 @@ export async function retryAccruedPayouts() {
     for (const r of batch) {
       tx.add(
         SystemProgram.transfer({
-          fromPubkey: lender.publicKey,
+          fromPubkey: distributor.publicKey,
           toPubkey: new PublicKey(r.wallet_address),
           lamports: BigInt(r.reward_lamports),
         }),
       );
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
         commitment: "confirmed",
       });
       await query(
@@ -817,6 +977,22 @@ export async function retryAccruedPayouts() {
     } catch (err) {
       console.error("[holder-rewards] retry batch failed:", err.message);
     }
+  }
+  // Sync every touched distribution into distribution_events so the
+  // ledger never lags after a retry sweep.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    const { rows: touched } = await query(
+      `SELECT DISTINCT distribution_id FROM magpie_holder_rewards
+        WHERE id = ANY($1::bigint[])`,
+      [rows.map((r) => r.id)],
+    );
+    for (const t of touched) {
+      try { await syncMagpieHolderDistributionEvent(t.distribution_id); }
+      catch (e) { console.warn(`[holder-rewards] retry-sync dist ${t.distribution_id}:`, e.message); }
+    }
+  } catch (syncErr) {
+    console.warn("[holder-rewards] retry-sweep distribution_events sync failed:", syncErr.message);
   }
   return { retried: rows.length, paid };
 }
@@ -857,26 +1033,26 @@ export async function claimHolderRewards({ walletAddress }) {
       };
     }
 
-    const lender = loadLenderKeypair();
-    const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-    if (lenderBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
+    const distributor = getRewardsDistributorKeypair();
+    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+    if (distributorBalance < total + MIN_LENDER_RESERVE_LAMPORTS) {
       await client.query("ROLLBACK");
       return {
         ok: false,
         reason: "treasury_low",
-        treasury_lamports: lenderBalance,
+        treasury_lamports: distributorBalance,
         required_lamports: total,
       };
     }
 
     const tx = new Transaction().add(
       SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
+        fromPubkey: distributor.publicKey,
         toPubkey: recipient,
         lamports: total,
       }),
     );
-    const signature = await sendAndConfirmTransaction(connection, tx, [lender], {
+    const signature = await sendAndConfirmTransaction(connection, tx, [distributor], {
       commitment: "confirmed",
     });
 

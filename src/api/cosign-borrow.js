@@ -39,7 +39,7 @@ import {
 import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
@@ -48,13 +48,128 @@ import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { getTierByOption } from "../services/loan-tier-resolver.js";
 
+// Rolling counter of borrow failure classifications. self-monitor reads
+// this via getRecentBorrowFailures() and CRIT-alerts the operator when
+// the rate of any class exceeds the threshold. Lets us see in real time
+// whether the problem is stale-blockhash (signing-window issue), rpc-
+// exhausted (infrastructure issue), or sim-failed (program-side reject).
+const _borrowFailureCounts = new Map(); // klass -> array of timestamps (ms)
+const FAILURE_RETENTION_MS = 60 * 60 * 1000; // 1h rolling
+
+function recordBorrowFailure(klass) {
+  const now = Date.now();
+  const arr = _borrowFailureCounts.get(klass) || [];
+  arr.push(now);
+  // Trim entries older than retention window
+  const cutoff = now - FAILURE_RETENTION_MS;
+  while (arr.length > 0 && arr[0] < cutoff) arr.shift();
+  _borrowFailureCounts.set(klass, arr);
+}
+
+/** Snapshot for self-monitor — returns { klass: count_last_hour, ... } */
+export function getRecentBorrowFailures() {
+  const out = {};
+  const cutoff = Date.now() - FAILURE_RETENTION_MS;
+  for (const [klass, arr] of _borrowFailureCounts.entries()) {
+    const recent = arr.filter((ts) => ts >= cutoff).length;
+    if (recent > 0) out[klass] = recent;
+  }
+  return out;
+}
+
+// Throttled operator alerting for borrow kill switches. A kill switch
+// (COSIGN_BORROW_DISABLED / V4_BORROWS_PAUSED) is a drain-safety control
+// that we NEVER auto-re-enable — but it must also never be silently left
+// on. Every time a request is bounced by a switch we re-alert the operator
+// at most once per ~10 min (in-memory, per switch key) so it stays
+// visible until it's deliberately cleared. Best-effort: a notify failure
+// never affects the borrow response.
+const KILL_SWITCH_ALERT_INTERVAL_MS = 10 * 60 * 1000; // ~10 min
+const _killSwitchLastAlertAt = new Map(); // switchKey -> last alert ms
+
+function alertKillSwitchOnThrottled(switchKey, message) {
+  const now = Date.now();
+  const last = _killSwitchLastAlertAt.get(switchKey) || 0;
+  if (now - last < KILL_SWITCH_ALERT_INTERVAL_MS) return;
+  _killSwitchLastAlertAt.set(switchKey, now);
+  // Fire-and-forget — do not await; the borrow response must not wait on
+  // (or fail because of) a Telegram alert.
+  (async () => {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(message);
+    } catch {}
+  })();
+}
+
+// Layer 2 fail-open circuit breaker. When the sim infra fails, we fall
+// through to broadcast because Layer 1's static guard is already proven
+// safe for the canonical tx shape. BUT — sustained sim-infra failure
+// could be the leading edge of either (a) a global RPC outage or (b) an
+// active attack probe. If we see >FAILOPEN_BREAKER_THRESHOLD fail-opens
+// in FAILOPEN_BREAKER_WINDOW_MS, the breaker trips: subsequent sim
+// failures revert to fail-closed until the rate normalizes. Operator
+// gets a single CRIT DM at the moment of trip.
+const _failOpenTimestamps = [];
+const FAILOPEN_BREAKER_WINDOW_MS = Number(process.env.FAILOPEN_BREAKER_WINDOW_MS) || 5 * 60_000;
+const FAILOPEN_BREAKER_THRESHOLD = Number(process.env.FAILOPEN_BREAKER_THRESHOLD) || 5;
+let _failOpenBreakerTripped = false;
+let _failOpenBreakerNotifiedAt = 0;
+
+function recordFailOpenAndShouldTrip() {
+  const now = Date.now();
+  const cutoff = now - FAILOPEN_BREAKER_WINDOW_MS;
+  while (_failOpenTimestamps.length > 0 && _failOpenTimestamps[0] < cutoff) {
+    _failOpenTimestamps.shift();
+  }
+  _failOpenTimestamps.push(now);
+  if (_failOpenTimestamps.length >= FAILOPEN_BREAKER_THRESHOLD) {
+    _failOpenBreakerTripped = true;
+    return true;
+  }
+  return false;
+}
+
+function isFailOpenBreakerTripped() {
+  // Auto-recover when no fail-opens for FAILOPEN_BREAKER_WINDOW_MS.
+  const now = Date.now();
+  const cutoff = now - FAILOPEN_BREAKER_WINDOW_MS;
+  while (_failOpenTimestamps.length > 0 && _failOpenTimestamps[0] < cutoff) {
+    _failOpenTimestamps.shift();
+  }
+  if (_failOpenTimestamps.length === 0 && _failOpenBreakerTripped) {
+    _failOpenBreakerTripped = false;
+    _failOpenBreakerNotifiedAt = 0;
+  }
+  return _failOpenBreakerTripped;
+}
+
 // Programs the lender authority has privileges over
 const V1_PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh",
 );
-const V2_PROGRAM_ID = process.env.PROGRAM_ID_V2
-  ? new PublicKey(process.env.PROGRAM_ID_V2)
+// V2 deprecated + purged 2026-06-17 PM. Forced null so cosign-borrow's
+// program allowlist never accepts V2 borrows. Existing V2 loans are
+// historical-only in DB. See feedback_v2_purged_from_protocol.
+const V2_PROGRAM_ID = null;
+// V3 program — once routing flips for RWA (ROUTE_RWA_TO_V3=true), the site
+// builds borrow txs targeting this program. Without including it in the
+// allowlist + magpie-program check, every V3 borrow returns 403 with
+// "instruction program not allowed in co-signed tx". Discovered 2026-06-14
+// when SPCX borrows started failing immediately after V3 routing went live.
+const V3_PROGRAM_ID = process.env.PROGRAM_ID_V3
+  ? new PublicKey(process.env.PROGRAM_ID_V3)
   : null;
+const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
+
+// V4 program — adds in-vault auto-sell. Once routing flips, the site builds
+// borrow txs targeting this program; including it here prevents the same
+// 403 cosign rejection class we hit on V3 launch day.
+const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4
+  ? new PublicKey(process.env.PROGRAM_ID_V4)
+  : null;
+const ROUTE_MEMECOINS_TO_V4 = process.env.ROUTE_MEMECOINS_TO_V4 === "true";
+const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 
@@ -86,6 +201,8 @@ const ALLOWED_DISCRIMINATORS = [
 const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
   V1_PROGRAM_ID.toBase58(),
   ...(V2_PROGRAM_ID ? [V2_PROGRAM_ID.toBase58()] : []),
+  ...(V3_PROGRAM_ID ? [V3_PROGRAM_ID.toBase58()] : []),
+  ...(V4_PROGRAM_ID ? [V4_PROGRAM_ID.toBase58()] : []),
   "ComputeBudget111111111111111111111111111111",
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
@@ -131,9 +248,188 @@ function loadLenderKeypair() {
   return Keypair.fromSecretKey(new Uint8Array(raw));
 }
 
+/**
+ * Pre-flight balance-delta simulation (Layer 2 of the 2026-06-18 drain
+ * defense). Returns `{ ok: true }` if no lender-owned balance would
+ * decrease, or `{ ok: false, error, detail }` if a drain is detected.
+ *
+ * The tx must ALREADY be lender-signed before calling this — we use
+ * `simulateTransaction` with `sigVerify: false` so the simulation reads
+ * the post-state as if the tx had run.
+ *
+ * Algorithm:
+ *   1. Read pre-state of every account referenced in the tx.
+ *   2. Identify which referenced accounts are owned by LENDER_PUBKEY
+ *      (the SOL wallet itself + any SPL/Token-2022 ATA whose `owner`
+ *      field is LENDER_PUBKEY).
+ *   3. If zero such accounts → no drain surface, return ok.
+ *   4. Simulate the tx, requesting post-state for those accounts.
+ *   5. Compare pre vs post. ANY decrease → drain detected.
+ *
+ * SAFETY: legit borrows NEVER decrease lender balances. Lender SOL is
+ * the pool PDA's source, not the wallet. Borrower pays all fees.
+ * Lender ATAs only receive tokens via liquidation (admin path) and
+ * lose them only via authorized sale (which doesn't go through
+ * cosign-borrow).
+ */
+async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
+  const TOKEN_PROGRAM_KEG = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const TOKEN_PROGRAM_2022 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+  // Step 1+2: enumerate accounts in tx + identify lender-owned ones.
+  const msg = tx.compileMessage();
+  const accountKeys = msg.accountKeys; // PublicKey[]
+  if (accountKeys.length === 0) return { ok: true }; // empty tx
+
+  // World-class reliability — RPC blip on Helius (429 / timeout) used
+  // to leak through as "Pre-flight balance-drain check failed (RPC/
+  // simulation error)" to the borrower. Now: primary + every backup
+  // RPC gets a chance before we surface anything to the user.
+  // [[feedback_loans_must_never_fail_no_regressions]]
+  let preInfos;
+  try {
+    preInfos = await withFailover((conn) => conn.getMultipleAccountsInfo(accountKeys, "confirmed"));
+  } catch (err) {
+    throw new Error(`pre-state read failed: ${err.message?.slice(0, 100)}`);
+  }
+
+  const lenderTouched = [];
+  for (let i = 0; i < accountKeys.length; i++) {
+    const info = preInfos[i];
+    if (!info) continue;
+    // (a) the lender wallet itself (SOL balance)
+    if (accountKeys[i].equals(LENDER_PUBKEY)) {
+      lenderTouched.push({ idx: i, type: "sol", preLamports: info.lamports });
+      continue;
+    }
+    // (b) token account whose `owner` field is LENDER. SPL Token + T22
+    // share the same offset layout: mint(32) + owner(32) + amount(8) + ...
+    const ownerProg = info.owner;
+    if (!ownerProg.equals(TOKEN_PROGRAM_KEG) && !ownerProg.equals(TOKEN_PROGRAM_2022)) continue;
+    if (info.data.length < 72) continue; // not a parseable token account
+    const tokenOwner = new PublicKey(info.data.subarray(32, 64));
+    if (!tokenOwner.equals(LENDER_PUBKEY)) continue;
+    const mint = new PublicKey(info.data.subarray(0, 32)).toBase58();
+    const preAmount = info.data.readBigUInt64LE(64);
+    lenderTouched.push({ idx: i, type: "token", mint, preAmount });
+  }
+
+  if (lenderTouched.length === 0) {
+    // No lender-owned account in this tx — nothing can drain from us.
+    return { ok: true, skipped: "no_lender_accounts_in_tx" };
+  }
+
+  // Step 4: simulate, requesting post-state for the touched lender accounts.
+  // Retry-with-backoff inside withFailover so a transient Helius blip OR a
+  // brief simulator hiccup self-heals. We classify the FINAL error so the
+  // caller can surface accurate guidance to the user (stale signing window
+  // vs. RPC infrastructure issue vs. unexpected) instead of a generic
+  // "oracle settling" message that masks the actual cause.
+  // [[feedback_loans_must_never_fail_no_regressions]]
+  let sim;
+  let lastSimErr = null;
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      sim = await withFailover((conn) => conn.simulateTransaction(tx, {
+        sigVerify: false,
+        commitment: "confirmed",
+        accounts: {
+          encoding: "base64",
+          addresses: lenderTouched.map((t) => accountKeys[t.idx].toBase58()),
+        },
+      }));
+      lastSimErr = null;
+      break;
+    } catch (err) {
+      lastSimErr = err;
+      const msg = (err?.message || "").toLowerCase();
+      // Stale blockhash: no point retrying — the user's signed tx is dead.
+      // Surface a specific signal so the caller can return a "refresh and
+      // re-sign" message instead of an "oracle settling" retry hint.
+      if (/blockhash.*not.*found|block height exceeded/i.test(msg)) {
+        const e = new Error(`simulateTransaction failed: ${err.message?.slice(0, 140)}`);
+        e.classification = "stale_blockhash";
+        throw e;
+      }
+      // Other non-retryable error classes — fail fast, classify.
+      if (!/429|timeout|fetch|network|503|502|connection|etimedout|econn/i.test(msg)) {
+        const e = new Error(`simulateTransaction failed: ${err.message?.slice(0, 140)}`);
+        e.classification = "unclassified";
+        throw e;
+      }
+      if (attempt < MAX_ATTEMPTS) {
+        // Exponential backoff: 200ms, 500ms, 1000ms
+        const delay = [200, 500, 1000][attempt - 1] ?? 1000;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  if (lastSimErr) {
+    const e = new Error(`simulateTransaction failed after ${MAX_ATTEMPTS} attempts: ${lastSimErr.message?.slice(0, 140)}`);
+    e.classification = "rpc_exhausted";
+    throw e;
+  }
+
+  if (sim.value.err) {
+    // Simulation says the tx would fail on-chain. Don't broadcast a tx
+    // that's going to fail anyway. Mark kind="sim_failed" so the caller
+    // surfaces a tx-shape message to the user instead of the drain one.
+    return {
+      ok: false,
+      kind: "sim_failed",
+      error: "Tx would fail on-chain (pre-flight simulation rejected)",
+      detail: `simulated err=${JSON.stringify(sim.value.err).slice(0, 160)} logs=${(sim.value.logs || []).slice(-4).join(" | ").slice(0, 200)}`,
+    };
+  }
+
+  // Step 5: compare pre/post for each tracked lender account.
+  const postAccounts = sim.value.accounts || [];
+  for (let i = 0; i < lenderTouched.length; i++) {
+    const meta = lenderTouched[i];
+    const post = postAccounts[i];
+    if (!post) continue; // RPC didn't return — treat as no change
+
+    if (meta.type === "sol") {
+      if (post.lamports < meta.preLamports) {
+        const delta = meta.preLamports - post.lamports;
+        return {
+          ok: false,
+          error: "Lender wallet SOL would decrease",
+          detail: `pre=${meta.preLamports} post=${post.lamports} delta=-${delta} lamports`,
+        };
+      }
+    } else if (meta.type === "token") {
+      // post.data is [string, encoding] — decode base64
+      const postBytes = Buffer.from(post.data[0], "base64");
+      if (postBytes.length < 72) {
+        // ATA was closed or post-state is malformed — treat as drain
+        return {
+          ok: false,
+          error: "Lender token ATA post-state malformed or closed",
+          detail: `mint=${meta.mint.slice(0, 8)}… preAmount=${meta.preAmount} postDataLen=${postBytes.length}`,
+        };
+      }
+      const postAmount = postBytes.readBigUInt64LE(64);
+      if (postAmount < meta.preAmount) {
+        const delta = meta.preAmount - postAmount;
+        return {
+          ok: false,
+          error: "Lender token balance would decrease",
+          detail: `mint=${meta.mint.slice(0, 8)}… pre=${meta.preAmount} post=${postAmount} delta=-${delta}`,
+        };
+      }
+    }
+  }
+
+  return { ok: true, checked: lenderTouched.length };
+}
+
 function isMagpieProgram(programIdPk) {
   if (programIdPk.equals(V1_PROGRAM_ID)) return true;
   if (V2_PROGRAM_ID && programIdPk.equals(V2_PROGRAM_ID)) return true;
+  if (V3_PROGRAM_ID && programIdPk.equals(V3_PROGRAM_ID)) return true;
+  if (V4_PROGRAM_ID && programIdPk.equals(V4_PROGRAM_ID)) return true;
   return false;
 }
 
@@ -158,7 +454,124 @@ async function readJsonBody(req) {
   });
 }
 
+/**
+ * Wrapper that records every borrow attempt to conversion_events so
+ * /conv-stats + the success-rate self-monitor probe have full
+ * visibility. Phase 1 of the conversion-reliability mandate
+ * [[feedback_loan_conversions_must_execute_zero_50_50]].
+ *
+ * The wrapper classifies failures from the response body shape — same
+ * fields the existing UI already consumes (oracle_warming, sim_failed,
+ * stale_blockhash, ok). Per-mint context arrives in Phase 1B (wiring
+ * the tracker into the existing per-class failure callsites where
+ * mintStr is in scope).
+ */
+/**
+ * Per-class failure recorder. Called at each recordBorrowFailure
+ * callsite inside the impl so failures land in conversion_events with
+ * the FULL inner context (failure class, mint, program, wallet,
+ * latency, raw detail) instead of just the outer-wrapper's body-shape
+ * classification.
+ *
+ * Sets `_convCtx.recorded = true` so the outer wrapper skips its own
+ * write (no double-counting).
+ *
+ * Fire-and-forget so telemetry never blocks the response.
+ */
+function _recordBorrowConversionFailure(_convCtx, klass, detail) {
+  _convCtx.recorded = true;
+  import("../services/conversion-tracker.js")
+    .then(({ recordConversionEvent }) =>
+      recordConversionEvent({
+        path: "borrow",
+        outcome: "failure",
+        failureClass: klass,
+        mint: _convCtx.mint,
+        programId: _convCtx.programId,
+        wallet: _convCtx.wallet,
+        surface: _convCtx.surface,
+        latencyMs: Date.now() - _convCtx.startedAt,
+        detail: detail || null,
+      }),
+    )
+    .catch(() => {});
+}
+
+function classifyBorrowOutcome(result) {
+  if (result?.body?.ok === true) return { outcome: "success", klass: null };
+  const b = result?.body || {};
+  if (b.stale_blockhash) return { outcome: "failure", klass: "stale_blockhash" };
+  if (b.price_moved) return { outcome: "failure", klass: "price_moved" };
+  if (b.oracle_warming) return { outcome: "failure", klass: "oracle_warming" };
+  if (b.borrow_paused) return { outcome: "failure", klass: "borrow_paused" };
+  if (b.exits_require_v4_loan) return { outcome: "failure", klass: "exits_require_v4_loan" };
+  if (result.status === 405) return { outcome: "failure", klass: "method_not_allowed" };
+  if (result.status === 503 && b.paused === true) {
+    return { outcome: "failure", klass: "killswitch" };
+  }
+  if (result.status === 400) return { outcome: "failure", klass: "bad_request" };
+  if (result.status === 503) return { outcome: "failure", klass: "unavailable" };
+  if (result.status === 500) return { outcome: "failure", klass: "server_error" };
+  return { outcome: "failure", klass: "unclassified" };
+}
+
 export async function handleCosignBorrow(req) {
+  // _convCtx is mutated by _handleCosignBorrowImpl as it learns more
+  // about the request (mint, program, wallet). Per-class failure sites
+  // inside the impl can ALSO record their own conversion_events row
+  // with full inner context (e.g. inner-error detail); when they do,
+  // they set `recorded = true` so the outer wrapper skips its own write
+  // and we don't double-count. The wrapper still records SUCCESS and
+  // top-level unclassified failures. [[feedback_user_retention_via_flawless_conversion]]
+  const _convCtx = {
+    mint: null,
+    programId: null,
+    wallet: null,
+    surface: "site",
+    startedAt: Date.now(),
+    recorded: false,
+  };
+  try {
+    const result = await _handleCosignBorrowImpl(req, _convCtx);
+    if (_convCtx.recorded) return result; // per-class site already recorded — skip dup
+    const { outcome, klass } = classifyBorrowOutcome(result);
+    // Fire-and-forget — never let telemetry block the response.
+    import("../services/conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "borrow",
+          outcome,
+          failureClass: klass,
+          mint: _convCtx.mint,
+          programId: _convCtx.programId,
+          wallet: _convCtx.wallet,
+          surface: _convCtx.surface,
+          latencyMs: Date.now() - _convCtx.startedAt,
+        }),
+      )
+      .catch(() => {});
+    return result;
+  } catch (err) {
+    import("../services/conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "borrow",
+          outcome: "failure",
+          failureClass: "thrown",
+          mint: _convCtx.mint,
+          programId: _convCtx.programId,
+          wallet: _convCtx.wallet,
+          surface: _convCtx.surface,
+          latencyMs: Date.now() - _convCtx.startedAt,
+          detail: { error: err?.message?.slice(0, 200) },
+        }),
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+async function _handleCosignBorrowImpl(req, _convCtx) {
   // Trace every hit so the operator can confirm in Railway logs whether
   // failed site borrows are even reaching the bot. The token after
   // COSIGN_HIT is the precise UTC timestamp — easy to grep.
@@ -173,11 +586,20 @@ export async function handleCosignBorrow(req) {
   // 503, the drain stops in seconds.
   if (process.env.COSIGN_BORROW_DISABLED === "true") {
     console.warn("[cosign-borrow] disabled via COSIGN_BORROW_DISABLED env var");
+    // Throttled recurring operator alert so a drain-safety pause is never
+    // silently left on. We deliberately do NOT auto-re-enable the switch.
+    alertKillSwitchOnThrottled(
+      "COSIGN_BORROW_DISABLED",
+      "PAUSED [cosign-borrow] COSIGN_BORROW_DISABLED is ON — site borrows are being held for a safety check and just bounced a borrow request. This will keep alerting ~every 10 min until you clear COSIGN_BORROW_DISABLED. (Drain-safety control — never auto-re-enabled.)",
+    );
     return {
       status: 503,
       body: {
-        error: "Site-borrow co-signing is temporarily disabled",
-        detail: "Use the Telegram bot for borrows while this is paused.",
+        error:
+          "We're holding new borrows for a quick safety check — please try again in about a minute.",
+        retry_after_seconds: 60,
+        friendly: true,
+        paused: true,
       },
     };
   }
@@ -270,6 +692,145 @@ export async function handleCosignBorrow(req) {
     }
   }
 
+  // Gate 0b (NEW, post-2026-06-18 exploit): generalized token-drain check.
+  //
+  // The 2026-06-18 PUMP-drain exploit bundled a `Token-2022 TransferChecked`
+  // with a legit-looking V1 RequestAndFundLoan in the same tx. Token
+  // programs were on the allowlist for legitimate collateral movement,
+  // but no check ensured the SOURCE wasn't a lender-owned ATA. The lender
+  // signature added by tx.partialSign(lender) below would have authorized
+  // both the borrow AND the drain in the same atomic op.
+  //
+  // Fix: for every outer Tokenkeg or Token-2022 transfer/transferChecked,
+  // resolve the source account on-chain and reject if it's owned by
+  // LENDER_PUBKEY. Burn / Approve / SetAuthority / CloseAccount also count
+  // because they all let the authority drain or relinquish control. We
+  // reject them by instruction discriminator too.
+  //
+  // See feedback_cosign_borrow_token_drain_exploit_2026_06_18.md
+  // (also Layer 2 below: pre-flight balance-delta simulation).
+  const TOKEN_PROGRAM_STRS = new Set([
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  ]);
+  // Instruction discriminators (first byte of data) that touch the source
+  // account's balance/authority. SPL Token + Token-2022 share these codes.
+  //   3  Transfer            (legacy — deprecated but still works)
+  //   4  Approve             (delegates authority)
+  //   5  Revoke
+  //   6  SetAuthority
+  //   7  MintTo              (skipping — source is mint, not an ATA)
+  //   8  Burn
+  //   9  CloseAccount
+  //  12  TransferChecked
+  //  13  ApproveChecked
+  //  14  MintToChecked       (skipping for same reason)
+  //  15  BurnChecked
+  // Token-2022 extension instructions (audit fix 2026-06-21): the OUTER
+  // discriminator selects the extension; the byte AFTER it selects the
+  // sub-op. The previous comment+set conflated these:
+  //  26  TransferFeeExtension       — sub-op 1 = TransferCheckedWithFee MOVES
+  //                                    tokens from account[0] (the source). The
+  //                                    old set was MISSING 26, so a real
+  //                                    fee-extension transfer FROM a lender ATA
+  //                                    skipped this static gate entirely.
+  //  27  ConfidentialTransferExtension — confidential transfers also move
+  //                                    tokens; keep it (it was mislabeled as
+  //                                    "TransferCheckedWithFee" before).
+  //  37  ConfidentialTransferFeeExtension — same family, also drain-capable.
+  // We match on the OUTER byte; the source-account == LENDER check below means
+  // benign sub-ops (e.g. InitializeTransferFeeConfig, whose account[0] is the
+  // mint, not a lender ATA) never false-positive a legitimate borrow.
+  // Approve / Revoke / SetAuthority give a future drain capability even
+  // if no immediate balance change — we treat them as if they drained.
+  const DRAIN_CAPABLE_OPS = new Set([3, 4, 5, 6, 8, 9, 12, 13, 15, 26, 27, 37]);
+  const lenderSourceIxs = [];
+  for (let i = 0; i < tx.instructions.length; i++) {
+    const ix = tx.instructions[i];
+    const programIdStr = ix.programId.toBase58();
+    if (!TOKEN_PROGRAM_STRS.has(programIdStr)) continue;
+    if (!ix.data || ix.data.length < 1) continue;
+    const code = ix.data[0];
+    if (!DRAIN_CAPABLE_OPS.has(code)) continue;
+    const sourceAccount = ix.keys?.[0]?.pubkey;
+    if (!sourceAccount) continue;
+    lenderSourceIxs.push({ index: i, source: sourceAccount, code, program: programIdStr });
+  }
+
+  if (lenderSourceIxs.length > 0) {
+    let infos;
+    try {
+      // withFailover so a single Helius blip doesn't fail the borrow —
+      // primary + every backup RPC gets a chance. [[feedback_loans_must_never_fail_no_regressions]]
+      infos = await withFailover((conn) => conn.getMultipleAccountsInfo(
+        lenderSourceIxs.map((t) => t.source),
+        "confirmed",
+      ));
+    } catch (rpcErr) {
+      // Fail CLOSED across primary + every backup. User UX must not leak
+      // the technical reason — friendly retry + DM operator with detail.
+      console.error("[cosign-borrow] DRAIN-CHECK RPC failure (all RPCs failed) — failing closed:", rpcErr.message);
+      recordBorrowFailure("drain_check_rpc");
+      _recordBorrowConversionFailure(_convCtx, "drain_check_rpc", { rpcErr: rpcErr.message?.slice(0, 200) });
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(
+          `CRIT [cosign-borrow] token-source verification FAILED across primary + every backup RPC. A borrow request just bounced. detail=${rpcErr.message?.slice(0, 200)}`,
+        );
+      } catch {}
+      return {
+        status: 503,
+        body: {
+          error: "Our oracle is taking a beat to settle — please tap Borrow again in 5 seconds.",
+          oracle_warming: true,
+          retry_after_seconds: 5,
+          detail: rpcErr.message?.slice(0, 160),
+        },
+      };
+    }
+    for (let i = 0; i < lenderSourceIxs.length; i++) {
+      const t = lenderSourceIxs[i];
+      const info = infos[i];
+      if (!info) {
+        // Source ATA doesn't exist on-chain yet. Either it's being
+        // created in this same tx (CreateATA earlier in the ix list) or
+        // the tx will fail when the program tries to read from a missing
+        // account. Either way it can't drain anything that isn't there.
+        continue;
+      }
+      // SPL Token and Token-2022 token-account layouts both have:
+      //   mint  (32 bytes, offset 0)
+      //   owner (32 bytes, offset 32)
+      // The minimum token account size is 165 bytes; T22 with extensions
+      // can be larger. Anything smaller isn't a token account at all.
+      if (info.data.length < 165) {
+        console.error(`[cosign-borrow] DRAIN-CHECK: ix[${t.index}] source ${t.source.toBase58().slice(0, 8)}… data too small (${info.data.length} bytes) — not a token account, rejecting`);
+        return {
+          status: 403,
+          body: {
+            error: "Token instruction with non-token-account source is not allowed",
+            detail: `outer ix[${t.index}] source account is not a parseable token account (size ${info.data.length} < 165)`,
+            rejected_index: t.index,
+          },
+        };
+      }
+      const sourceOwner = new PublicKey(info.data.subarray(32, 64));
+      if (sourceOwner.equals(LENDER_PUBKEY)) {
+        console.error(`[cosign-borrow] DRAIN-ATTEMPT BLOCKED: outer token ix[${t.index}] code=${t.code} sources from lender-owned ATA ${t.source.toBase58()}`);
+        return {
+          status: 403,
+          body: {
+            error: "Token instruction sourcing from lender-owned account is not allowed",
+            detail: `outer instruction ${t.index} (program=${t.program.slice(0, 8)}… code=${t.code}) targets a token account owned by the lender authority — would drain tokens (same exploit class as the 2026-06-07 SystemProgram drain and the 2026-06-18 Token-2022 drain)`,
+            rejected_index: t.index,
+            rejected_source: t.source.toBase58(),
+            rejected_op_code: t.code,
+          },
+        };
+      }
+    }
+  }
+
   // Gate 1: at least one magpie-program instruction must be present,
   //          and ALL magpie-program instructions must be allowed.
   //          Additionally: if the program is v2 (RWA pool), the
@@ -312,23 +873,26 @@ export async function handleCosignBorrow(req) {
     }
   }
 
-  // POST-$FATHER GATE: hard-stop on v2 (RWA pool) borrows of memecoins.
-  // The v2 pool is RWA-only by policy. If the tx's program is v2 BUT the
-  // collateral mint's category is not in {stock, etf, metal}, refuse to
-  // co-sign — even if every other gate passes.
-  if (chosenProgramId && V2_PROGRAM_ID && chosenProgramId.equals(V2_PROGRAM_ID)) {
+  // POST-$FATHER GATE: hard-stop on RWA-pool borrows of memecoins.
+  // V2 and V3 are RWA-only by policy. If the tx's program is V2 or V3 BUT
+  // the collateral mint's category is not in {stock, etf, metal}, refuse
+  // to co-sign — even if every other gate passes.
+  const v2Targeted = chosenProgramId && V2_PROGRAM_ID && chosenProgramId.equals(V2_PROGRAM_ID);
+  const v3Targeted = chosenProgramId && V3_PROGRAM_ID && chosenProgramId.equals(V3_PROGRAM_ID);
+  if (v2Targeted || v3Targeted) {
     const cat = collateralMintInTx?.category;
     const RWA_OK = cat === "stock" || cat === "etf" || cat === "metal";
     if (!RWA_OK) {
+      const poolLabel = v3Targeted ? "V3" : "V2";
       console.error(
-        `[cosign-borrow] V2-MEMECOIN BLOCK: v2 pool requested with collateral ` +
+        `[cosign-borrow] ${poolLabel}-MEMECOIN BLOCK: ${poolLabel} pool requested with collateral ` +
           `${collateralMintInTx?.mint ?? "<unknown>"} category=${cat ?? "<null>"}`,
       );
       return {
         status: 403,
         body: {
-          error: "v2 pool is RWA-only",
-          detail: `collateral category "${cat ?? "<null>"}" is not in {stock,etf,metal}; memecoins must use v1`,
+          error: `${poolLabel} pool is RWA-only`,
+          detail: `collateral category "${cat ?? "<null>"}" is not in {stock,etf,metal}; memecoins must use V1`,
         },
       };
     }
@@ -401,9 +965,7 @@ export async function handleCosignBorrow(req) {
   // loan size in lamports, then re-derive collateral value via the
   // cross-sourced oracle (don't trust the client's claimed value).
   try {
-    const magpieIx = tx.instructions.find(
-      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIx = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     if (magpieIx && borrowerSig) {
       const data = magpieIx.data; // Buffer
       // Layout: 8-byte discriminator | amount u64 LE | option u8 | value_lamports u64 LE | loan_id u64 LE
@@ -443,25 +1005,97 @@ export async function handleCosignBorrow(req) {
           // The user sees a clear error and is forced to refresh.
           const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
           const ixProgramId = magpieIx.programId;
-          if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
-            return {
-              status: 400,
-              body: {
-                error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V2 RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
-              },
-            };
+          // V4-exclusive routing (2026-06-15): V4 is the only pool that
+          // services exit-armed borrows, regardless of category. Routing
+          // is exit-arming-driven, not category/flag-driven. So a borrow
+          // tx targeting V4 is valid for ANY category (memecoin OR RWA) —
+          // skip the category gate when the tx is V4. The arm-side gate
+          // (limit-close-arm-core's exits_require_v4_loan refusal) is
+          // what enforces "V4 loans are the only ones that can host
+          // exits"; this endpoint just signs the borrow.
+          const isV4Borrow = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID);
+          if (!isV4Borrow) {
+            // V1/V2/V3 category gates — plain borrows still follow category routing.
+            let expectedRwaProgram = V2_PROGRAM_ID;
+            let expectedRwaLabel = "V2";
+            if (V3_PROGRAM_ID && ROUTE_RWA_TO_V3) {
+              expectedRwaProgram = V3_PROGRAM_ID;
+              expectedRwaLabel = "V3";
+            }
+            if (isRwaMint && ixProgramId.equals(V1_PROGRAM_ID)) {
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool, but the tx targets V1. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again — a stale page is constructing the wrong tx.`,
+                },
+              };
+            }
+            if (isRwaMint && expectedRwaProgram && !ixProgramId.equals(expectedRwaProgram)) {
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the ${expectedRwaLabel} RWA pool. Hard-refresh your browser (Cmd+Shift+R / Ctrl+Shift+R) and try again.`,
+                },
+              };
+            }
+            // Memecoin routing mirror. V2 is RWA-only (legacy). V3 is
+            // dual-tier so memecoin → V3 is FINE iff ROUTE_MEMECOINS_TO_V3
+            // is on. V4 is now exit-armed-only and handled above.
+            const memeOnV2 = !isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID);
+            const memeOnV3WhenDisabled =
+              !isRwaMint &&
+              V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) &&
+              process.env.ROUTE_MEMECOINS_TO_V3 !== "true";
+            const memeOnRwaPool = memeOnV2 || memeOnV3WhenDisabled;
+            if (memeOnRwaPool) {
+              const targetedLabel = V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID) ? "V3" : "V2";
+              return {
+                status: 400,
+                body: {
+                  error: "wrong_program_for_collateral",
+                  detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets ${targetedLabel}.`,
+                },
+              };
+            }
           }
-          // Also refuse if a memecoin tries to borrow against V2 (the
-          // symmetric mistake — V2 is RWA-only, fee economics differ).
-          if (!isRwaMint && V2_PROGRAM_ID && ixProgramId.equals(V2_PROGRAM_ID)) {
-            return {
-              status: 400,
-              body: {
-                error: "wrong_program_for_collateral",
-                detail: `${mintRow.symbol || "Collateral"} (${mintRow.category}) must borrow against the V1 pool, but the tx targets V2.`,
-              },
-            };
+
+          // ── V4 canary borrow cap ──────────────────────────────────
+          // During the V4 canary phase the operator funds the pool with
+          // a small amount (e.g., 1 SOL) and sets V4_BORROW_CAP_LAMPORTS
+          // as a belt-and-suspenders ceiling on top of pool liquidity.
+          // Once on-chain pool.totalBorrowed reaches the cap, the bot
+          // refuses to cosign additional V4 borrows. Removed (env unset)
+          // after the operator promotes V4 past canary.
+          if (V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID) && process.env.V4_BORROW_CAP_LAMPORTS) {
+            try {
+              const cap = BigInt(process.env.V4_BORROW_CAP_LAMPORTS);
+              const { getReadOnlyProgram } = await import("../solana/program.js");
+              const v4Program = getReadOnlyProgram(V4_PROGRAM_ID);
+              const [v4PoolPda] = PublicKey.findProgramAddressSync(
+                [Buffer.from("pool"), new PublicKey(process.env.LENDER_PUBKEY).toBuffer()],
+                V4_PROGRAM_ID,
+              );
+              const v4Pool = await v4Program.account.lendingPool.fetch(v4PoolPda);
+              const totalBorrowed = BigInt(v4Pool.totalBorrowed.toString());
+              if (totalBorrowed >= cap) {
+                console.warn(`[cosign-borrow] V4 canary cap reached: totalBorrowed=${totalBorrowed} >= cap=${cap}`);
+                return {
+                  status: 503,
+                  body: {
+                    error: "v4_canary_cap_reached",
+                    detail: `V4 pool has reached the operator-set canary borrow cap. New V4 borrows are paused until the cap is raised. V1/V2/V3 are unaffected.`,
+                  },
+                };
+              }
+            } catch (capErr) {
+              // Fail-open here — if we can't fetch pool state at borrow
+              // time, the pool's own liquidity check is still the hard
+              // backstop (you can't borrow what isn't there). Log so
+              // ops can see it.
+              console.warn(`[cosign-borrow] V4 cap check failed (allowing borrow): ${capErr.message}`);
+            }
           }
           // ── LTV ladder resolution (category-aware) ─────────────────
           // 2026-06-13 root cause: this endpoint previously hardcoded the
@@ -508,8 +1142,24 @@ export async function handleCosignBorrow(req) {
           // moment. Operator-stated mandate 2026-06-13: protocol must
           // operate at the highest level; momentary oracle blips can't
           // block borrows.
-          const PRICE_RETRY_DELAYS_MS = [0, 800, 2200];
-          const STALE_SNAPSHOT_MAX_AGE_MS = 3 * 60_000; // 3 min — snapshotter runs every ~2 min
+          // Operator hit "Price oracle briefly unavailable" on hard-refresh
+          // V1 borrows 2026-06-15 PM despite the existing 3-retry +
+          // 3-min-snapshot fallback. Widen both: 5 retries instead of 3
+          // (covers longer rate-limit windows from Jupiter/DexScreener)
+          // and the snapshot cap goes 3min→15min so a delayed snapshotter
+          // run doesn't manifest as a borrow rejection. The cap is still
+          // far below any pump-and-front-run window — the LTV math and
+          // the pre-existing fresh-pump gates downstream protect against
+          // adversarial mispricing even on a 15-min-old snapshot.
+          // 2026-06-16 PM: widened again after operator hit the banned
+          // "Price oracle briefly unavailable" copy on a V4 laddered borrow
+          // despite the 5-retry + 15-min snapshot fallback. Laddered borrows
+          // craft for longer than typical, so the feed has more time to go
+          // stale. Bump to 7 attempts (+ longer trailing delays) AND extend
+          // the snapshot ceiling to 30 min — still well below any pump-and-
+          // front-run window. Per [[feedback_oracle_briefly_unavailable_banned_recurrence]].
+          const PRICE_RETRY_DELAYS_MS = [0, 500, 1200, 2500, 4500, 7000, 10000];
+          const STALE_SNAPSHOT_MAX_AGE_MS = 30 * 60_000; // 30 min — was 15
           let valueLamports;
           let lastErr;
           for (const delayMs of PRICE_RETRY_DELAYS_MS) {
@@ -571,11 +1221,20 @@ export async function handleCosignBorrow(req) {
             }
           }
           if (!valueLamports || valueLamports <= 0) {
+            // 2026-06-16 PM: the banned "briefly unavailable" copy was
+            // surfacing on V4 laddered borrows where the user crafted
+            // for longer than typical. We've already widened the retry
+            // budget + snapshot window above; if we STILL land here it
+            // means every layer failed in a window measured in minutes,
+            // which is exceptional. Surface a soft "refreshing — re-sign"
+            // tone instead of the banned copy. Per
+            // [[feedback_oracle_briefly_unavailable_banned_recurrence]].
             return {
               status: 502,
               body: {
-                error: "Price oracle briefly unavailable — please retry in a moment",
+                error: "Refreshing market data — please tap Sign once more.",
                 detail: lastErr?.message?.slice(0, 200) || "no fresh quote AND no recent snapshot",
+                retry_after_ms: 1500,
               },
             };
           }
@@ -583,11 +1242,16 @@ export async function handleCosignBorrow(req) {
             return { status: 400, body: { error: "Collateral value computed to zero" } };
           }
           const proposedLoanLamports = Math.floor((Number(valueLamports) * ltv) / 100);
-          // Resolve user_id (linked wallet → user; or null if standalone)
-          const { rows: [walletRow] } = await query(
-            `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-            [borrowerPubkeyStr],
-          );
+          // Resolve user_id (linked wallet → user; or null if standalone).
+          // Uses the canonical resolver so we ALWAYS pick the TG-linked
+          // user_id when one exists. Without this, a wallet that has
+          // both a site_native row and an imported-into-TG row would
+          // attribute the loan to the older site_native user — and the
+          // user wouldn't see the loan in TG /repay. Caused operator
+          // report on V3 SPCX loan id=720 on 2026-06-14.
+          const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+          const resolvedUserId = await resolveWalletOwner(borrowerPubkeyStr);
+          const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
           // Per-user soft-lock check (operator can lock individual
           // users via /lock_user during investigations). Fires only if
           // we resolved a user_id — unlinked wallets can't be locked
@@ -642,28 +1306,112 @@ export async function handleCosignBorrow(req) {
   // before the contract's 120s wall. If the price feed PDA hasn't
   // been initialized yet, init + attest in one shot.
   try {
-    const magpieIxForAttest = tx.instructions.find(
-      (ix) => ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIxForAttest = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     const mintKey = magpieIxForAttest?.keys?.[4]?.pubkey;
     if (mintKey) {
       const mintStr = mintKey.toBase58();
+      _convCtx.mint = mintStr; // for conversion_events on every per-class failure
       const { rows: [mintRow] } = await query(
         `SELECT decimals FROM supported_mints WHERE mint = $1`,
         [mintStr],
       );
       if (mintRow) {
-        const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds } =
+        const { attestPrice, initializePriceFeed, getPriceFeedAgeSeconds, ensureV4TwapReady } =
           await import("../services/price-attestor.js");
         const FRESH_THRESHOLD_SEC = 60;
-        const age = await getPriceFeedAgeSeconds(mintStr);
-        if (age === null || age > FRESH_THRESHOLD_SEC) {
+        // V4-aware JIT attestation (2026-06-15): use the borrow tx's
+        // own programId so V4 borrows attest V4's PriceHistory PDA
+        // (not the category-default V1/V3). Without this, V4 borrows
+        // surface as "Account state mismatch" because V4's price_feed
+        // PDA was never initialized — bot's category routing never
+        // reaches V4.
+        const borrowProgramId = magpieIxForAttest.programId;
+        _convCtx.programId = borrowProgramId.toBase58(); // populate before any per-class failure
+        // V3 AND V4 both use the price_v3 PriceHistory layout with the
+        // same TWAP gate (>= 8 samples in 300s). Originally I only
+        // JIT-warmed V4, which left SPCX (RWA, defaults to V3 borrow
+        // routing) exposed. Operator hit TwapInsufficientHistory on an
+        // SPCX V3 borrow 2026-06-18 PM — see
+        // [[feedback_twap_insufficient_history_never_again]] for the
+        // mandate that this MUST cover every program with TWAP.
+        const usesTwapGate =
+          (process.env.PROGRAM_ID_V4 &&
+            borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4) ||
+          (process.env.PROGRAM_ID_V3 &&
+            borrowProgramId.toBase58() === process.env.PROGRAM_ID_V3);
+
+        if (usesTwapGate) {
+          // Program's TWAP gate needs >= 8 samples within 300s OR
+          // `TwapInsufficientHistory` (Anchor 6016 / 0x1780) rejects
+          // the borrow. The single-shot freshness attest below is
+          // necessary but not sufficient — we MUST loop until the
+          // PriceHistory PDA has the count it needs.
+          const warm = await ensureV4TwapReady(
+            mintStr,
+            Number(mintRow.decimals),
+            { programIdOverride: borrowProgramId },
+          );
+          if (!warm.ok) {
+            console.warn(
+              `[cosign-borrow] TWAP warming TIMED OUT prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
+            );
+            recordBorrowFailure("twap_warming_timeout");
+            _recordBorrowConversionFailure(_convCtx, "twap_warming_timeout", {
+              inWindow: warm.inWindow,
+              required: 8,
+              waitedMs: warm.waitedMs,
+              attests: warm.attests,
+              reason: warm.reason,
+            });
+            // CRIT-DM operator the FIRST time the JIT warmer can't deliver
+            // 8 samples in its budget — this is the symptom of an attestor
+            // stall, Jupiter outage, or unattested mint. The user-facing
+            // message is friendly; this DM is the trip wire.
+            try {
+              const { notifyAdmin } = await import("../services/admin-notify.js");
+              await notifyAdmin(
+                `CRIT [cosign-borrow] JIT TWAP warmer TIMED OUT — user hit TwapInsufficientHistory on borrow. prog=${borrowProgramId.toBase58().slice(0, 8)} mint=${mintStr.slice(0, 12)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
+              );
+            } catch {}
+            return {
+              status: 503,
+              body: {
+                error:
+                  "Price oracle is warming up for this token (we need a few more samples in the rolling 5-min window). This usually clears in 30–45 seconds — please tap Borrow again.",
+                oracle_warming: true,
+                in_window: warm.inWindow,
+                required_in_window: 8,
+                retry_after_seconds: 30,
+              },
+            };
+          }
+          console.log(
+            `[cosign-borrow] TWAP ready prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests}`,
+          );
+        } else {
+          // V1/V3 path: ALWAYS force-attest immediately before signing.
+          //
+          // Operator-mandated 2026-06-19 PM after V1 FARM borrow failed
+          // with StalePriceAttestation: even when the per-tick attestor
+          // is running, the sample on-chain can be 30-60s old when the
+          // user clicks Borrow. They then take 30-60s to review the
+          // wallet prompt. By submit time the sample could be 60-120s
+          // old — racing the program's 120s stale wall. Wallet sim
+          // rejects, user sees "Transaction rejected: StalePriceAttestation."
+          //
+          // Force-attesting RIGHT BEFORE returning the cosigned tx means
+          // the sample is <2s old when the bot returns. Even with a 60s
+          // user-review delay, submit time is 62s — well under 120s.
+          // Cost: 1 extra attest per borrow = ~5000 lamports = negligible.
+          //
+          // This is the "real-time price" guarantee the operator asked
+          // for, enforced at the cosign step where it actually matters.
           try {
-            await attestPrice(mintStr, Number(mintRow.decimals));
+            await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
           } catch (attestErr) {
             if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(attestErr.message)) {
-              await initializePriceFeed(mintStr);
-              await attestPrice(mintStr, Number(mintRow.decimals));
+              await initializePriceFeed(mintStr, borrowProgramId);
+              await attestPrice(mintStr, Number(mintRow.decimals), undefined, borrowProgramId);
             } else {
               throw attestErr;
             }
@@ -681,7 +1429,7 @@ export async function handleCosignBorrow(req) {
     };
   }
 
-  // All gates passed. Add the lender signature.
+  // All explicit gates passed. Add the lender signature.
   let lender;
   try {
     lender = loadLenderKeypair();
@@ -691,6 +1439,298 @@ export async function handleCosignBorrow(req) {
   }
 
   tx.partialSign(lender);
+
+  // Gate 0c (Layer 2 of the 2026-06-18 exploit defense): pre-flight
+  // balance-delta simulation. Even after Gate 0b's discriminator
+  // enumeration, a yet-unknown instruction shape on an allowlisted
+  // program could decrease a lender-owned balance. Belt-and-suspenders:
+  // simulate the now-fully-signed tx and reject if ANY lender SOL or
+  // token balance would decrease.
+  //
+  // Legitimate borrows NEVER decrease lender balances — the protocol
+  // sources principal SOL from the pool PDA, not the lender wallet,
+  // and the borrower pays all fees. ANY decrease in the lender wallet
+  // during cosign-borrow is suspicious.
+  //
+  // The check is read-only on-chain (simulateTransaction). On RPC
+  // failure we fail CLOSED — refuse to broadcast — because the cost of
+  // a missed drain is much higher than a transient unavailability.
+  try {
+    let drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    // Sim-time TWAP retry: when the simulation rejects specifically
+    // because TwapInsufficientHistory is in the logs (sim err contains
+    // 0x1780 / "TwapInsufficientHistory"), the on-chain PriceHistory
+    // PDA hasn't ripened despite the JIT warmer thinking it had. Re-warm
+    // up to 3 times before giving up. This closes the race condition
+    // where samples fall out of the rolling 300s window between the
+    // ensureV4TwapReady measurement and the broadcast moment. Operator
+    // hit this on SPCX 2026-06-18 PM.
+    let twapRetries = 0;
+    while (
+      !drainCheck.ok &&
+      typeof drainCheck.detail === "string" &&
+      /TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail) &&
+      twapRetries < 3
+    ) {
+      twapRetries++;
+      console.warn(
+        `[cosign-borrow] Layer 2 sim hit TwapInsufficient — re-warming (retry ${twapRetries}/3)`,
+      );
+      try {
+        const { ensureV4TwapReady } = await import("../services/price-attestor.js");
+        const magpieIxForRetry = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
+        const retryProgramId = magpieIxForRetry?.programId;
+        const collateralMintForRetry = magpieIxForRetry?.keys?.[4]?.pubkey?.toBase58();
+        if (collateralMintForRetry && retryProgramId) {
+          const { rows: [mr] } = await query(
+            `SELECT decimals FROM supported_mints WHERE mint = $1`,
+            [collateralMintForRetry],
+          );
+          if (mr) {
+            await ensureV4TwapReady(collateralMintForRetry, Number(mr.decimals), {
+              programIdOverride: retryProgramId,
+              requiredInWindow: 12,
+              spacingMs: 1_000,
+              maxWaitMs: 30_000,
+            });
+          }
+        }
+      } catch (warmErr) {
+        console.warn(
+          `[cosign-borrow] re-warm retry ${twapRetries} threw: ${warmErr.message?.slice(0, 120)}`,
+        );
+      }
+      drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    }
+    if (!drainCheck.ok) {
+      // tx is now signed but we never broadcast — the lender signature
+      // is wasted but the funds stay safe. The attacker learned nothing
+      // they couldn't have learned from any other failed tx.
+      console.error(`[cosign-borrow] LAYER-2 BLOCK: ${drainCheck.error}. detail=${drainCheck.detail}`);
+      // Surface TWAP-specific failures as a clean retry hint instead of
+      // the generic drain-block message — the user just needs to wait
+      // for warming and tap Borrow again.
+      if (/TwapInsufficientHistory|0x1780|"Custom":\s*6016/i.test(drainCheck.detail || "")) {
+        recordBorrowFailure("twap_sim_reject");
+        _recordBorrowConversionFailure(_convCtx, "twap_sim_reject", { detail: drainCheck.detail?.slice(0, 220) });
+        return {
+          status: 503,
+          body: {
+            error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+            oracle_warming: true,
+            retry_after_seconds: 25,
+          },
+        };
+      }
+      // Humanize the two remaining drainCheck failure modes. Operator-mandated
+      // 2026-06-18 PM. [[feedback_loans_must_never_fail_no_regressions]]
+      if (drainCheck.kind === "sim_failed") {
+        // The user's tx itself would fail on-chain. Classify by inner code
+        // so the user gets actionable guidance + operator gets a CRIT DM.
+        recordBorrowFailure("sim_failed");
+        _recordBorrowConversionFailure(_convCtx, "sim_failed", { detail: drainCheck.detail?.slice(0, 220) });
+        const detail = drainCheck.detail || "";
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            `CRIT [cosign-borrow] sim_failed — tx would fail on-chain. detail=${detail.slice(0, 220)}`,
+          );
+        } catch {}
+
+        // Stale blockhash inside the sim envelope (rare but possible).
+        if (/BlockhashNotFound|block height exceeded/i.test(detail)) {
+          return {
+            status: 409,
+            body: {
+              error: "Your signing window expired before we could broadcast. Please tap Borrow again to refresh and re-sign.",
+              friendly: true,
+              stale_blockhash: true,
+              detail,
+            },
+          };
+        }
+        // Insufficient lamports — actionable user fix.
+        if (/insufficient lamports|InsufficientFunds.*Lamports|0x1$/i.test(detail)) {
+          return {
+            status: 400,
+            body: {
+              error: "Not quite enough SOL for fees — add a small amount of SOL to your wallet and try again.",
+              friendly: true,
+              detail,
+            },
+          };
+        }
+        // CollateralValueExceedsAttestation = custom 6014 (0x177e) on ALL
+        // versions (V1/V2/V3/V4 — verified against every IDL). The old regex
+        // matched 6016/6018 (TwapInsufficientHistory / PriceTimestampWentBackwards)
+        // and MISSED a bare-Custom 6014 (no program logs), dropping it to the
+        // generic "we hit a snag" instead of this retryable price-moved path.
+        if (/CollateralValueExceedsAttestation|"Custom":\s*6014\b|0x177e/i.test(detail)) {
+          return {
+            status: 503,
+            body: {
+              error: "Price moved while you were signing. Please tap Borrow again to get a fresh quote.",
+              price_moved: true,
+              retry_after_seconds: 3,
+              detail,
+            },
+          };
+        }
+        // StalePriceAttestation = custom 6013 (0x177d). Price feed too old at
+        // broadcast time. (Old regex matched 6019, which is not a real code.)
+        if (/StalePriceAttestation|"Custom":\s*6013\b|0x177d/i.test(detail)) {
+          recordBorrowFailure("stale_price_attestation");
+          _recordBorrowConversionFailure(_convCtx, "stale_price_attestation", { detail: detail?.slice(0, 220) });
+          return {
+            status: 503,
+            body: {
+              error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+              oracle_warming: true,
+              retry_after_seconds: 25,
+              detail,
+            },
+          };
+        }
+        // TwapInsufficientHistory = custom 6016 (0x1780) — V3/V4 feed lacks
+        // enough TWAP samples yet. Same warming UX as a stale feed (was being
+        // mis-caught by the CollateralValueExceeds regex and shown "price moved").
+        if (/TwapInsufficientHistory|"Custom":\s*6016\b|0x1780/i.test(detail)) {
+          recordBorrowFailure("twap_insufficient_history");
+          _recordBorrowConversionFailure(_convCtx, "twap_insufficient_history", { detail: detail?.slice(0, 220) });
+          return {
+            status: 503,
+            body: {
+              error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
+              oracle_warming: true,
+              retry_after_seconds: 25,
+              detail,
+            },
+          };
+        }
+        // Unclassified sim-fail — generic friendly + operator was already DM'd above.
+        return {
+          status: 503,
+          body: {
+            error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
+            friendly: true,
+            retry_after_seconds: 8,
+            detail,
+          },
+        };
+      }
+      // drain_detected — real safety trip. Friendly UX for the user, but
+      // log + DM operator since this should never fire on a legitimate
+      // borrow. Either an attempted drain (attacker-side) OR a protocol
+      // bug we need to investigate.
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(
+          `CRIT [cosign-borrow] LAYER-2 drain trip on legitimate-shape request. detail=${(drainCheck.detail || "").slice(0,200)}`,
+        );
+      } catch {}
+      return {
+        status: 403,
+        body: {
+          error: "We couldn't process this borrow safely right now. Please refresh the page and try again. If this keeps happening, ping us in @magpietalk.",
+          friendly: true,
+          detail: drainCheck.detail,
+          layer: "L2-pre-flight-sim",
+        },
+      };
+    }
+  } catch (simErr) {
+    // Operator-mandated 2026-06-18 PM after escalation: "I dont care about
+    // the user messages that we send for errors. I care about getting the
+    // errors FIXED." The Layer 2 sim is BELT-AND-SUSPENDERS over Layer 1.
+    // Layer 1 already statically verified the tx is the canonical safe
+    // shape (single request_and_fund_loan instruction, no System ix
+    // sourcing from lender, no Token ix sourcing from lender ATA). When
+    // Layer 2 sim infrastructure fails on a Layer-1-passed tx, fail OPEN
+    // with a loud CRIT DM rather than blocking the user.
+    //
+    // The drain protection survives: an attacker still has to pass
+    // Layer 1. Layer 2 was a redundancy — and a redundancy that breaks
+    // legitimate users is worse than no redundancy at all.
+    //
+    // Stale blockhash is a different beast: the tx itself will fail on
+    // broadcast, so we DO surface that to the user (we'd waste a lender
+    // sig + tx fee otherwise). [[feedback_loans_must_never_fail_no_regressions]]
+    const klass = simErr.classification || "unclassified";
+    recordBorrowFailure(klass);
+    _recordBorrowConversionFailure(_convCtx, klass, { sim_err: simErr.message?.slice(0, 200) });
+    console.error(`[cosign-borrow] LAYER-2 SIM-ERROR [${klass}]: ${simErr.message?.slice(0, 240)}`);
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        `CRIT [cosign-borrow] sim-error klass=${klass} — falling through to broadcast (Layer 1 trust). detail=${simErr.message?.slice(0, 200)}`,
+      );
+    } catch {}
+
+    // STALE BLOCKHASH — broadcast will fail anyway, so save the lender
+    // signature and surface immediately.
+    if (klass === "stale_blockhash") {
+      return {
+        status: 409,
+        body: {
+          error: "Your signing window expired before we could broadcast. Please tap Borrow again to refresh and re-sign.",
+          friendly: true,
+          stale_blockhash: true,
+          detail: simErr.message?.slice(0, 160),
+        },
+      };
+    }
+
+    // FAIL OPEN on rpc_exhausted + unclassified. Layer 1 already passed.
+    // Broadcast the tx; if there's a real on-chain issue, Solana will
+    // reject and the broadcast catch handles it cleanly. If it's just a
+    // transient RPC blip in the sim path, the user's borrow goes through.
+    //
+    // CIRCUIT BREAKER: if >threshold fail-opens in a short window, revert
+    // to fail-closed automatically. Sustained sim-infra failure could be
+    // an attack probe; the breaker bounds the exposure window. Operator
+    // gets a CRIT DM on the trip.
+    //
+    // Opt-out env COSIGN_FAIL_CLOSED_ON_SIM_ERROR=true forces fail-closed
+    // regardless.
+    const forcedClosed = /^(1|true|yes|on)$/i.test(process.env.COSIGN_FAIL_CLOSED_ON_SIM_ERROR || "");
+    const breakerTripped = isFailOpenBreakerTripped();
+    if (forcedClosed || breakerTripped) {
+      if (breakerTripped && Date.now() - _failOpenBreakerNotifiedAt > 10 * 60_000) {
+        _failOpenBreakerNotifiedAt = Date.now();
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            `CRIT [cosign-borrow] FAIL-OPEN CIRCUIT BREAKER TRIPPED — sustained Layer 2 sim failures. Reverted to fail-closed. Investigate RPC infra OR potential attack probe.`,
+          );
+        } catch {}
+      }
+      return {
+        status: 503,
+        body: {
+          error: "We hit a snag confirming this borrow. Please refresh the page and try again.",
+          friendly: true,
+          retry_after_seconds: 8,
+          detail: simErr.message?.slice(0, 160),
+        },
+      };
+    }
+    // Record the fail-open. If this trip pushes us over the breaker
+    // threshold, the NEXT request will be fail-closed (this one still
+    // goes through — already past the threshold check).
+    const justTripped = recordFailOpenAndShouldTrip();
+    if (justTripped) {
+      try {
+        const { notifyAdmin } = await import("../services/admin-notify.js");
+        await notifyAdmin(
+          `CRIT [cosign-borrow] FAIL-OPEN BREAKER ARMING — ${FAILOPEN_BREAKER_THRESHOLD} fail-opens in ${Math.round(FAILOPEN_BREAKER_WINDOW_MS / 60_000)}min. Next sim failure reverts to fail-closed. Check RPC infra status.`,
+        );
+      } catch {}
+    }
+    // Fall through: the lender sig is already on the tx (line ~1201) —
+    // the code below will broadcast it. Layer 1's static guard remains
+    // the drain protection.
+    console.warn(`[cosign-borrow] LAYER-2 SIM FAIL-OPEN — broadcasting with Layer 1 trust (klass=${klass})`);
+  }
 
   // Submit the fully-signed tx ourselves so the site doesn't need
   // submit/confirm logic for what's now a fully-signed payload.
@@ -733,9 +1773,7 @@ export async function handleCosignBorrow(req) {
     const { getReadOnlyProgram } = await import("../solana/program.js");
     const { recordLoan } = await import("../services/loans.js");
     const program = getReadOnlyProgram(chosenProgramId);
-    const magpieIx = tx.instructions.find((ix) =>
-      ix.programId.equals(V1_PROGRAM_ID) || (V2_PROGRAM_ID && ix.programId.equals(V2_PROGRAM_ID)),
-    );
+    const magpieIx = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
     if (magpieIx) {
       // Loan PDA is at index 2 in the request_and_fund_loan accounts
       // (pool, loan_token_vault, loan, ...). We've already validated
@@ -744,12 +1782,52 @@ export async function handleCosignBorrow(req) {
       const borrowerAccountKey = magpieIx.keys[8]?.pubkey;
       if (loanAccountKey && borrowerAccountKey) {
         recordedLoanPda = loanAccountKey.toBase58();
-        const onChainLoan = await program.account.loan.fetch(loanAccountKey);
+        // RPC propagation race: the tx confirmed but our read RPC
+        // may still return null for ~1-3s. Single-shot was responsible
+        // for the 2026-06-18 V4 SPCX silent-loan loss (operator's
+        // wallet 3LfT7WLc — loan_id 116769228150579532, loan_pda
+        // 3FkFJ91i...). Retry 4× with exponential backoff (0.5s, 1s,
+        // 2s, 4s = ~7.5s total) before falling back to the warn path.
+        // See feedback_no_loan_slips_through.md.
+        let onChainLoan = null;
+        let fetchErr = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            onChainLoan = await program.account.loan.fetch(loanAccountKey);
+            break;
+          } catch (e) {
+            fetchErr = e;
+            const delayMs = 500 * Math.pow(2, attempt);
+            console.warn(
+              `[cosign-borrow] loan.fetch attempt ${attempt + 1}/4 for ${recordedLoanPda.slice(0, 8)}… failed (${e.message?.slice(0, 60)}) — retrying in ${delayMs}ms`,
+            );
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
+        }
+        if (!onChainLoan) {
+          // Final failure. Throw so the outer catch surfaces the
+          // sig + loan_pda LOUDLY in logs — invisible loans must be
+          // diagnosable in retrospect.
+          throw new Error(
+            `loan.fetch failed after 4 retries for loan_pda=${recordedLoanPda} sig=${signature}: ${fetchErr?.message?.slice(0, 120)}`,
+          );
+        }
         const borrowerStr = borrowerAccountKey.toBase58();
-        const { rows: [walletRow] } = await query(
-          `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-          [borrowerStr],
+        // Same TG-preferring resolver as the proposed-loan-lamports gate
+        // above. Both must agree or recordLoan attributes to a different
+        // user than the gates validated.
+        // 2026-06-17 PM — for V4 anonymous borrowers (Phantom-only
+        // wallets with no `wallets` row), auto-link instead of skipping
+        // recordLoan. Without this, the borrow succeeds on chain but
+        // the dashboard's Active Loans tab is empty — operator hit
+        // exactly that scenario on wallet 3J1Ut4tK1... See
+        // feedback_cosign_borrow_must_auto_link_anonymous_wallets.md.
+        const { resolveOrAutoLinkWalletOwner } = await import("../services/wallet-owner-resolver.js");
+        const recordUserId = await resolveOrAutoLinkWalletOwner(
+          borrowerStr,
+          "cosign_borrow_autolink",
         );
+        const walletRow = recordUserId ? { user_id: recordUserId } : null;
         if (walletRow) {
           await recordLoan({
             userId: walletRow.user_id,
@@ -774,9 +1852,14 @@ export async function handleCosignBorrow(req) {
     }
   } catch (err) {
     // Don't fail the request — the on-chain tx already succeeded.
-    // sync-loan from the site (or the every-5-min reconciler) will
-    // fold this into DB shortly.
-    console.warn("[cosign-borrow] post-submit recordLoan failed (sync-loan will catch up):", err.message);
+    // sync-loan from the site (or the wallet-backfill safety net)
+    // will fold this into DB shortly. Log LOUDLY with sig + loan_pda
+    // + chosenProgramId so the next operator search ("why didn't my
+    // loan land?") can find this in logs. See
+    // feedback_no_loan_slips_through.md.
+    console.error(
+      `[cosign-borrow] CRITICAL post-submit recordLoan failed — silent-loan risk. sig=${signature} loan_pda=${recordedLoanPda} program=${chosenProgramId.toBase58()} err=${err.message?.slice(0, 200)}\nstack=${err.stack?.slice(0, 400)}`,
+    );
   }
 
   return {

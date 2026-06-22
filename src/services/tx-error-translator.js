@@ -94,9 +94,109 @@ export function translateTxError(err, ctx = {}) {
   const blob = raw + "\n" + logs;
   const flow = ctx.flow || "repay";
 
-  // Pattern 1: insufficient lamports — by far the most common
+  // Pattern 1a: SPL Token InsufficientFunds (custom error 0x1 thrown by
+  // Token-2022 or legacy Token program). Distinct from a lamports
+  // shortage — this means the borrower's COLLATERAL TOKEN balance is
+  // insufficient for the transfer. Translating this as "Not enough SOL"
+  // (the old behavior) told users to /deposit SOL when they actually
+  // needed more of the collateral token. Caught 2026-06-15 during V4
+  // testing: user successfully borrowed on V1 with X tokens, then
+  // tried V4 with the same amount but the V1 vault already held them.
+  const tokenInsufficient =
+    /Error: insufficient funds/i.test(blob) ||
+    /Program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA|TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb) failed: custom program error: 0x1/.test(blob);
+  if (tokenInsufficient && !/insufficient lamports/i.test(blob)) {
+    if (flow === "borrow" || flow === "reborrow") {
+      const cmd = flow === "reborrow" ? "/reborrow" : "/borrow";
+      return [
+        "⚠️ *Not enough of the collateral token in your wallet*",
+        "",
+        "The borrow tried to lock more of this token than you currently hold. Your SOL balance is fine — it's the collateral side that's short.",
+        "",
+        "*Common cause:* you already used some of this token for another loan, so the rest is locked in that loan's vault.",
+        "",
+        "*Two ways to fix:*",
+        "1. Try the borrow again with a smaller collateral amount that fits what's in your wallet",
+        `2. /repay the existing loan first to release the collateral, then ${cmd} again`,
+      ].join("\n");
+    }
+    if (flow === "topup") {
+      return [
+        "⚠️ *Not enough of the collateral token in your wallet*",
+        "",
+        "The top-up tried to add more tokens than you currently hold. Your SOL balance is fine — it's the collateral side that's short.",
+        "",
+        "Send more of the collateral token to your Magpie wallet via /deposit, then /topup again.",
+      ].join("\n");
+    }
+    // Generic SPL InsufficientFunds for other flows
+    return [
+      "⚠️ *Not enough tokens in your wallet for this transaction*",
+      "",
+      "The transaction tried to move more tokens than you currently hold. Your SOL balance is fine — it's a specific SPL token that's short.",
+      "",
+      "_Tap *Ask the agent* below for a walkthrough._",
+    ].join("\n");
+  }
+
+  // Pattern 1b-pre: V4 program-specific Anchor errors. V4 returns
+  // Anchor codes in the 6000–6027 range (hex 0x1770–0x178b). The naive
+  // `/custom program error: 0x1/` test below matches ANY hex starting
+  // with 0x1 — including 0x1780 (TwapInsufficientHistory = 6016) —
+  // which used to render as "Not enough SOL for gas + ATA rent" even
+  // when the wallet had plenty of SOL. Operator hit this 2026-06-17 PM
+  // borrowing $BP on V4 (TWAP window hadn't filled). Route each known
+  // V4 code to its OWN user-actionable message BEFORE falling through
+  // to the lamports path.
+  const anchorCodeMatch = blob.match(/Error (?:Number|Code): (\d{4,5})|Error Number: (\d{4,5})/);
+  const anchorCode = anchorCodeMatch ? Number(anchorCodeMatch[1] || anchorCodeMatch[2]) : null;
+  if (anchorCode === 6016 || /TwapInsufficientHistory/i.test(blob)) {
+    return [
+      "*Oracle is finalizing — tap Borrow once more.*",
+      "",
+      "We're filling the last few price samples. This should clear in 30–60 seconds. Your collateral and tier selection are saved.",
+    ].join("\n");
+  }
+  if (anchorCode === 6017 || /PriceImpactPumpDetected/i.test(blob)) {
+    return [
+      "⚠️ *Spot price moved too far above the 5-min TWAP*",
+      "",
+      "The lending program refuses to lend when the latest attested price is more than 15% above the trailing 5-minute average — pump protection (applies to both V3 and V4 borrows).",
+      "",
+      "*What to do:* wait 1-2 minutes for the TWAP to catch up, then /borrow again. Collateral size doesn't change this check — only price stability does.",
+      "",
+      "_This isn't a wallet issue — your balance is fine._",
+    ].join("\n");
+  }
+  if (anchorCode === 6013 || /StalePriceAttestation/i.test(blob)) {
+    return [
+      "⚠️ *Price attestation expired*",
+      "",
+      "The on-chain price feed for this token is older than 2 minutes. The bot's attestor should refresh it on the next tick.",
+      "",
+      "Try /borrow again in ~30 seconds.",
+    ].join("\n");
+  }
+  if (anchorCode === 6014 || /CollateralValueExceedsAttestation/i.test(blob)) {
+    return [
+      "⚠️ *Borrow value too high vs. on-chain TWAP*",
+      "",
+      "The borrow amount exceeds what the TWAP-attested collateral price allows. Try a slightly smaller %.",
+    ].join("\n");
+  }
+
+  // Pattern 1b: insufficient lamports — true SOL shortage from the
+  // Solana runtime. The pattern `insufficient lamports X, need Y` is
+  // emitted by the system program when an account-creation rent or
+  // transfer exceeds the payer's native balance.
+  //
+  // The `0x1\b` boundary is load-bearing: without it, the regex matches
+  // V4 error 0x1780 (TwapInsufficientHistory = 6016) and every other
+  // 0x1NNN code, producing the "Not enough SOL" mis-translation that
+  // operator hit 2026-06-17 PM. The boundary requires a non-hex char
+  // (or end-of-string) immediately after the "1".
   const insufficientMatch = blob.match(/insufficient lamports\s+(\d+),\s*need\s+(\d+)/i);
-  if (insufficientMatch || /custom program error: 0x1/.test(blob)) {
+  if (insufficientMatch || /custom program error: 0x1(?![0-9a-fA-F])/.test(blob)) {
     const have = insufficientMatch ? BigInt(insufficientMatch[1]) : null;
     const need = insufficientMatch ? BigInt(insufficientMatch[2]) : null;
     const short = (have != null && need != null) ? need - have : null;

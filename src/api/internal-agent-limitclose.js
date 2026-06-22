@@ -220,14 +220,26 @@ export async function handleAgentLimitCloseArm(req) {
   // can return the agent-flavored loan_not_found_for_wallet error
   // before armOrder is even called. We also pull loan.loan_id so the
   // response body keeps its existing shape (agents key off it).
-  const { rows: [walletGuard] } = await query(
-    `SELECT l.loan_id::text AS loan_id_chain,
-            l.original_loan_amount_lamports::text AS owed
-       FROM loans l
-       JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
-      WHERE l.user_id = $2 AND l.loan_id = $3`,
-    [userWallet, delegation.user_id, loanIdRaw],
-  );
+  //
+  // Race-tolerant: agents acting on autonomous policies can fire within
+  // seconds of a borrow tx confirming. Same 6s/400ms poll the other
+  // arm paths use so /sync-loan has a chance to commit the loans row.
+  const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
+  const LOAN_LOOKUP_INTERVAL_MS = 400;
+  let walletGuard = null;
+  for (;;) {
+    const { rows } = await query(
+      `SELECT l.loan_id::text AS loan_id_chain,
+              l.original_loan_amount_lamports::text AS owed
+         FROM loans l
+         JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
+        WHERE l.user_id = $2 AND l.loan_id = $3`,
+      [userWallet, delegation.user_id, loanIdRaw],
+    );
+    if (rows.length > 0) { walletGuard = rows[0]; break; }
+    if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
+    await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
+  }
   if (!walletGuard) {
     return { status: 404, body: { error: "loan_not_found_for_wallet" } };
   }
@@ -537,15 +549,23 @@ export async function handleAgentLimitClosePreflight(req) {
     return { status: 403, body: { error: "delegation_expired" } };
   }
 
-  // Wallet binding + loan owed lookup (same as /arm)
-  const { rows: [walletGuard] } = await query(
-    `SELECT l.loan_id::text AS loan_id_chain,
-            l.original_loan_amount_lamports::text AS owed
-       FROM loans l
-       JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
-      WHERE l.user_id = $2 AND l.loan_id = $3`,
-    [userWallet, delegation.user_id, loanIdRaw],
-  );
+  // Wallet binding + loan owed lookup (same as /arm) — race-tolerant.
+  const PREFLIGHT_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
+  const PREFLIGHT_LOOKUP_INTERVAL_MS = 400;
+  let walletGuard = null;
+  for (;;) {
+    const { rows } = await query(
+      `SELECT l.loan_id::text AS loan_id_chain,
+              l.original_loan_amount_lamports::text AS owed
+         FROM loans l
+         JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
+        WHERE l.user_id = $2 AND l.loan_id = $3`,
+      [userWallet, delegation.user_id, loanIdRaw],
+    );
+    if (rows.length > 0) { walletGuard = rows[0]; break; }
+    if (Date.now() >= PREFLIGHT_LOOKUP_DEADLINE_MS) break;
+    await new Promise((r) => setTimeout(r, PREFLIGHT_LOOKUP_INTERVAL_MS));
+  }
   if (!walletGuard) {
     return { status: 404, body: { error: "loan_not_found_for_wallet" } };
   }

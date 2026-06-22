@@ -1,6 +1,13 @@
 import { Bot } from "grammy";
 import "dotenv/config";
 
+// Sentry — env-gated stub. No-op when SENTRY_DSN unset. Initialized
+// before installDbQuotaGuard so it can capture any startup-phase
+// exceptions. Operator pays $26/mo when ready to flip; until then
+// this is dormant. See src/services/sentry.js.
+import { initSentry } from "./services/sentry.js";
+initSentry();
+
 // DB-quota guard — installs global unhandledRejection /
 // uncaughtException handlers that detect DB-quota / DB-dead errors
 // and switch the bot to degraded mode INSTEAD of crashing. Closes the
@@ -112,6 +119,8 @@ import {
   handlePause,
   handleResume,
   handleAdminStatus,
+  handleConvStats,
+  handleV4Status,
   handleEnableMint,
   handleDisableMint,
   handleBroadcast,
@@ -165,22 +174,39 @@ import { startEngineTopupWatcher } from "./services/engine-topup-watcher.js";
 import { startLcOperatorAlerts } from "./services/lc-operator-alerts.js";
 import { startEngineHeartbeatWatcher } from "./services/engine-heartbeat-watcher.js";
 import { startAutoProtect } from "./services/auto-protect.js";
+import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
+import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
+import { startPendingArmRetryWatcher } from "./services/pending-arm-retry-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
 import { registerSupportVigilCallbacks } from "./services/support-vigil.js";
 import { startInfraHealth } from "./services/infra-health.js";
 import { startLimitCloseStalenessWatcher } from "./services/limit-close-staleness-watcher.js";
+import { startStaleArmIntentWatcher } from "./services/stale-arm-intent-watcher.js";
 import { startLimitCloseNearTriggerWatcher } from "./services/limit-close-near-trigger-watcher.js";
 import { registerLcStalenessCallbacks } from "./handlers/lc-staleness-callbacks.js";
+import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js";
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
+import { startBorrowCanary } from "./services/borrow-canary.js";
+import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
+import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
+import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
+import { startLimitCloseEngineProgramIdSentinel } from "./services/limit-close-engine-program-id-sentinel.js";
+import { startWalletAttributionSentinel } from "./services/wallet-attribution-sentinel.js";
+import { startStocksRwaProtectionSentinel } from "./services/stocks-rwa-protection-sentinel.js";
 import { startLoanReceivedWatchdog } from "./services/loan-received-watchdog.js";
 import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
+import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
+import { startLimitCloseFirstV4FireWatcher } from "./services/limit-close-first-v4-fire-watcher.js";
+import { startV4FireFailureRateWatcher } from "./services/limit-close-v4-fire-failure-rate-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
+import { startTreasurySweeper } from "./services/treasury-sweeper.js";
+import { startLiquidationCollateralSweeper } from "./services/liquidation-collateral-sweeper.js";
 import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
 import { startIdleSolNudge } from "./services/idle-sol-nudge.js";
 import { startWinbackAgent, registerWinbackCallbacks } from "./services/winback-agent.js";
@@ -268,6 +294,8 @@ bot.command("mydistributions", handleDistributions); // alias
 bot.command("pause", handlePause);
 bot.command("resume", handleResume);
 bot.command("adminstatus", handleAdminStatus);
+bot.command("convstats", handleConvStats); // /convstats — per-path conversion success rates
+bot.command(["v4status", "v4-status", "v4"], handleV4Status);
 bot.command(["admincmds", "adminlog"], handleAdminCmds);
 // Limit-close engine observability (operator-facing). Read-only.
 {
@@ -275,11 +303,26 @@ bot.command(["admincmds", "adminlog"], handleAdminCmds);
   bot.command(["lc-status", "lcstatus", "lc_status"], lcStatus.handleLcStatus);
   const lcPerf = await import("./commands/lc-perf.js");
   bot.command(["lc-perf", "lcperf", "lc_perf"], lcPerf.handleLcPerf);
+  // V4 Hardening T7 (2026-06-15 PM) — one-shot V4 health snapshot
+  // (active loans + arms/fires + sol_proceeds_vault probe + canary
+  // tail + arm-attempt audit). Read-only diagnostic.
+  const v4Status = await import("./commands/v4-status.js");
+  bot.command(["v4-status", "v4status", "v4_status"], v4Status.handleV4Status);
+  // Treasury sweeper observability (operator-facing). Read-only.
+  const treasuryStatus = await import("./commands/treasury-status.js");
+  bot.command(
+    ["treasury-status", "treasurystatus", "treasury_status", "treasury"],
+    treasuryStatus.handleTreasuryStatus,
+  );
   const scanImp = await import("./commands/scan-impersonators.js");
   bot.command(
     ["scan-impersonators", "scanimpersonators", "scan_impersonators"],
     scanImp.handleScanImpersonators,
   );
+  // Attestation tier management (Phase 1: schema + admin tooling only,
+  // no behavior change in attestor loops yet).
+  const tierCmd = await import("./commands/tier.js");
+  bot.command(["tier", "tiers"], tierCmd.handleTier);
 }
 // F-4 multi-step approval — second-admin sign-off for sensitive commands.
 // Default gated commands: enablemint, disablemint, broadcast (tunable via
@@ -339,6 +382,7 @@ bot.command("pools", handleHolderPool); // alias
 // the handlers ensures it does nothing in groups that haven't opted in.
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
+import { handleBurnConfirm, handleBurnRecord, handleBurnStats } from "./commands/burn-admin.js";
 import { handleVote, handleVotingPower } from "./commands/vote.js";
 import {
   handleNominate,
@@ -383,6 +427,19 @@ bot.command("crosspost", handleCommunityCrosspost);
   bot.command("takeprofit", lc.handleLimitClose);
   bot.command("tp", lc.handleLimitClose);
   bot.command("lo", lc.handleLimitClose);
+  // /sell — operator-mandated 2026-06-16 PM after PUMP loan 810: users
+  // reach for "sell at 1.3x" before they reach for "takeprofit at 1.3x".
+  // Routes to handleLimitClose which infers direction from the parsed
+  // strike (multiplier >= 1 → above/TP, < 1 → below/SL). Natural verb,
+  // same arm-core path.
+  bot.command("sell", lc.handleLimitClose);
+  // /preview, /previewsl — TG arm pre-flight (operator-mandated
+  // 2026-06-16 PM, feedback_tg_must_follow_v4_at_highest_level.md).
+  // Dry-run any /takeprofit or /stoploss without persisting. Mirror
+  // of x402's /agent/preflight + site's /arm-preflight so TG users
+  // get the same "would this work?" check before committing a slot.
+  bot.command(["preview", "checkarm", "preflight"], lc.handlePreviewTp);
+  bot.command(["previewsl", "checkarmsl"], lc.handlePreviewSl);
   // Stop-loss — same arm-core path, direction='below' flips the engine's
   // trigger comparator from >= to <=. 1% protocol fee applies in BOTH
   // directions (operator rule 2026-06-12). Cutting losses before the
@@ -422,6 +479,14 @@ bot.command("crosspost", handleCommunityCrosspost);
   // the borrower's slippage cap.
   const lci = await import("./commands/limit-close-intervention.js");
   lci.registerLimitCloseInterventionCallbacks(bot);
+
+  // /fixarm — TG analog of the site's V4 silent-arm-recovery banner
+  // (operator-mandated 2026-06-16 PM). Detects V4 loans without
+  // armed orders and surfaces one-tap retry buttons. Companion to
+  // PR #147 (site recovery banner) so TG-only users get the same
+  // rescue path.
+  bot.command(["fixarm", "armretry", "recoverarm"], lc.handleFixArm);
+  lc.registerFixArmCallbacks(bot);
 }
 // Agent delegations — Tier 2 (x402 agentic wrapper). Users authorize
 // agents to arm limit-close orders on their behalf within explicit
@@ -457,6 +522,14 @@ bot.command("gov_status", handleGovStatus);
 bot.command("gov-confirm-manual", handleGovConfirmManual);
 bot.command("gov_confirm_manual", handleGovConfirmManual);
 
+// $MAGPIE burn ledger admin
+bot.command("burn-confirm", handleBurnConfirm);
+bot.command("burn_confirm", handleBurnConfirm);
+bot.command("burn-record", handleBurnRecord);
+bot.command("burn_record", handleBurnRecord);
+bot.command("burn-stats", handleBurnStats);
+bot.command("burn_stats", handleBurnStats);
+
 // Public voter-engagement commands
 bot.command("vote", handleVote);
 bot.command("votingpower", handleVotingPower);
@@ -488,6 +561,7 @@ registerMyTicketsCallbacks(bot);
 // the runtime startup section.
 registerSupportVigilCallbacks(bot);
 registerLcStalenessCallbacks(bot);
+registerLcRetryingCallbacks(bot);
 registerAutoProtectCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
@@ -538,13 +612,11 @@ bot.catch(async (err) => {
       await ctx.api.sendMessage(
         ctx.chat.id,
         [
-          "⚠️ *Something unexpected happened*",
+          "*That didn't go through.*",
           "",
-          "We hit a snag handling that. The team has been logged.",
+          "Server-side hiccup — logged and routed to ops.",
           "",
-          "*What to do:*",
-          "• Try the command again",
-          "• Or /support → Chat with agent and describe what you were doing",
+          "Try the same command again. If it sticks, use /support to chat with a human.",
         ].join("\n"),
         { parse_mode: "Markdown" },
       );
@@ -741,6 +813,18 @@ bot.start({
     // external watchdogs can't see (queue backlog, DB pool exhaustion,
     // stuck orders, lingering TWAPs, migration ledger drift).
     import("./services/self-monitor.js").then((m) => m.startSelfMonitor(bot));
+    // LP-excess monitor — every 6h, reads each program's pool +
+    // loan_token_vault and DMs operator with the per-pool excess
+    // (vault_balance - total_deposits). Read-only telemetry; no
+    // on-chain action. Foundation for the eventual auto-sweeper.
+    // [[feedback_distribution_wallet_must_be_auto_funded]]
+    import("./services/lp-excess-monitor.js").then((m) => m.startLpExcessMonitor(bot));
+    // LP-excess auto-sweeper (Phase 2) — every 24h, calls admin_withdraw
+    // on each pool with positive excess and routes the SOL directly to
+    // CHCAM via the closeAccount-with-arbitrary-destination pattern.
+    // Default: dry-run. Operator flips LP_EXCESS_AUTO_SWEEP_ENABLED=true
+    // on Railway to live-broadcast. [[feedback_distribution_wallet_must_be_auto_funded]]
+    import("./services/lp-excess-sweeper.js").then((m) => m.startLpExcessSweeper(bot));
     // Upside Watcher — every 15 min, scans active loans whose collateral
     // has appreciated and DMs the borrower a Pip nudge to arm a TP. Seeds
     // first take-profit fills by surfacing the opportunity the moment it
@@ -789,10 +873,17 @@ bot.start({
     setTimeout(() => startExtendLoanWatcher(), 40_000);
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
     // queries supported_mints (enabled=TRUE) every tick, so newly approved
-    // tokens get attested without a restart. Drift-gated to keep cost low.
-    // 45s interval so refresh fires before the 60s force-attest gap.
-    // Keeps on-chain feed timestamp comfortably under 120s contract limit.
-    setTimeout(() => startPriceAttestor(45_000), 35_000);
+    // tokens get attested without a restart.
+    //
+    // 20s interval: V4's on-chain TWAP needs 8 samples in the rolling
+    // 5-minute window. At 20s ticks the V4 throttle (MAX_GAP_MS_V4=35s)
+    // writes every other tick → ~40s effective cadence → 7-8 samples in
+    // any 5-min window. Previous 45s interval gave ~90s effective cadence
+    // (only 3-4 samples in window), which caused SPCX V3 borrows to fail
+    // with PriceImpactPumpDetected when price moved during the long gap.
+    // Operator hit it 2026-06-17 PM. Forensic: scripts/diagnose-spcx-twap-lag.mjs
+    const PRICE_ATTESTOR_TICK_MS = Number(process.env.PRICE_ATTESTOR_TICK_MS) || 20_000;
+    setTimeout(() => startPriceAttestor(PRICE_ATTESTOR_TICK_MS), 35_000);
     // RWA screener — discovers Backed Finance xStocks + similar via DexScreener
     // search every 4h. Auto-adds new mints meeting liquidity/volume thresholds.
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
@@ -813,12 +904,20 @@ bot.start({
     setTimeout(() => startLoanReconciler(), 45_000);
     // Liquidation economics watcher (2026-06-14 policy, Phase 1A) —
     // tracks per-default principal vs sale proceeds and the
-    // pre-computed 70/10/10/10 distribution splits. Data capture
-    // only; the actual SOL routing happens in Phase 2. $MAGPIE
-    // collateral defaults stay 'magpie_burn_pending' until the
-    // operator manually conducts the burn.
+    // pre-computed 70/10/10/10 distribution splits. Data capture only;
+    // the actual ledger credits happen in the distribution watcher
+    // below. $MAGPIE collateral defaults stay 'magpie_burn_pending'
+    // until the operator manually conducts the burn.
     import("./services/liquidation-economics-watcher.js").then((m) =>
       m.startLiquidationEconomicsWatcher(),
+    );
+    // Liquidation distribution watcher (Phase 2) — picks up
+    // 'awaiting_distribution' rows and credits the rewards pool
+    // ledgers via the existing accrual primitives. Idempotent via
+    // row status transitions + per-loan event_type='default_profit'
+    // uniqueness on protocol_reserve_events + referral_earnings.
+    import("./services/liquidation-distribution-watcher.js").then((m) =>
+      m.startLiquidationDistributionWatcher(),
     );
     // Exploit-detector — auto-bans wallets/users matching the
     // pump-and-borrow attack pattern, alerts on weaker signals.
@@ -849,6 +948,14 @@ bot.start({
     // orders are old AND trigger far from current price. One-time
     // nudge per order. See feedback_tg_changes_careful.
     setTimeout(() => startLimitCloseStalenessWatcher(), 90_000);
+    // Stale-arm-intent watcher — every 60s DMs users whose V4 arm
+    // intents (recorded by site / TG / Pip / x402) haven't resolved
+    // to an armed order within 90s. Proactive recovery for silent
+    // arm drops; reactive surfaces (/fixarm + site recovery banner)
+    // still work without this, but the watcher catches users who
+    // never look. Operator-mandated 2026-06-16 PM after PUMP loan
+    // 810. See [[feedback_tg_v4_must_match_site_quality]].
+    setTimeout(() => startStaleArmIntentWatcher(), 30_000);
     // Near-trigger nudge — every 5 min DMs users whose armed orders
     // are within ~10% of firing. One-time per arm; reset on modify so
     // a re-tuned trigger gets a fresh nudge if it lands in the band.
@@ -869,6 +976,27 @@ bot.start({
     // The actual canary RUNS in the magpie-limitclose engine; this
     // is the bot-side observation surface.
     setTimeout(() => startCanaryWatcher(bot), 105_000);
+    // Borrow canary — every 60s, probes the 4 critical predictors of a
+    // successful V4 borrow. Logs to conversion_events.borrow_canary;
+    // DMs operator on 2 consecutive fails per check, recovery DM on
+    // first success after a fail. Catches every "users would currently
+    // see this class" degradation within 60s. Mandated 2026-06-19 PM.
+    setTimeout(() => startBorrowCanary(bot), 110_000);
+    // Boot-time V4 PriceFeed sync — at +90s, walk every enabled
+    // supported_mints entry and ensure the V4 PriceFeed PDA exists.
+    // Eliminates the AccountNotInitialized class for never-borrowed-
+    // against mints. Per V4 loan lifecycle mandate NN1 (operator-
+    // mandated 2026-06-19 PM after user 948 incident).
+    startBootV4FeedSync(bot);
+    // V4 feed readiness — priority-mint burst warmup on boot. After
+    // a 30s settle window so DB pool + attestor are alive. State
+    // surfaces on /api/v1/health.v4_feeds; the site reads it to gate
+    // the borrow CTA so users never see wait_for_warmup. THE
+    // architectural class-elimination fix for the redeploy-cold-feed
+    // class. Operator-mandated 2026-06-19 PM.
+    setTimeout(() => startFeedReadinessWarmup().catch((e) =>
+      console.warn("[v4-readiness] start threw:", e.message)
+    ), 30_000);
     // Loan program_id healer — every 10 min, scans non-closed loans
     // and auto-corrects any DB row whose stored program_id disagrees
     // with the on-chain owner of loan_pda. Defense-in-depth layer
@@ -877,6 +1005,28 @@ bot.start({
     // wallet-scoped filtering on the dashboard never silently drops
     // a loan due to stale/wrong program_id.
     setTimeout(() => startLoanProgramIdHealer(bot), 115_000);
+    // engine_program_id NULL sentinel — DMs admin if any post-2026-06-13
+    // limit_close_orders row is missing engine_program_id. Closes the
+    // silent-wrong-pool-fire failure mode flagged in the V3 audit.
+    setTimeout(() => startLimitCloseEngineProgramIdSentinel(bot), 120_000);
+    // Wallet-attribution sentinel — DMs admin if any active/overdue loan
+    // is attributed to the wrong user_id (ghost site_native instead of the
+    // canonical TG-linked user). Closes the failure-mode behind PR #231
+    // + #232 — operator hit it on V3 SPCX loan id=720 not visible in /repay.
+    setTimeout(() => startWalletAttributionSentinel(bot), 125_000);
+    // Stocks/RWA protection sentinel — enforces category-level invariant
+    // that every enabled stock/rwa mint MUST be hot+protected. Operator-
+    // mandated 2026-06-19 PM after TSLAx StalePriceAttestation. JIT
+    // attestation cannot fill the 8-sample TWAP window for low-liquidity
+    // xStocks. Runs immediately on boot, then every 5 min.
+    setTimeout(() => startStocksRwaProtectionSentinel(), 5_000);
+    // V4 Hardening T5 (2026-06-15 PM) — sweeps every active V4 loan
+    // every 15 min and verifies the sol_proceeds_vault PDA is either
+    // uninitialized OR owned by classic SPL Token (NOT Token-2022).
+    // Catches any regression of the patched Token-2022 init bug class
+    // within minutes instead of when the next user hits it. Read-only;
+    // V4-only; degrades silently on RPC blip.
+    setTimeout(() => startV4LoanHealthProbe(bot), 130_000);
     // Loan actual-received watchdog — backfills + verifies the
     // on-chain SOL delta per borrow row. Catches the class of bug
     // where the dashboard shows ~$1 more "received" than the
@@ -889,8 +1039,41 @@ bot.start({
     // limit-close shipped 2026-06-13; this watcher closes the loop
     // by announcing when production validates it.
     setTimeout(() => startFirstV2FireWatcher(bot), 145_000);
+    // First V3 limit-close fire watcher — two prongs: celebrate the first
+    // successful V3 fire AND alert on the first V3 fire FAILURE so the
+    // operator hears about a broken executeRepayLoanV3 path BEFORE more
+    // orders pile up. Closes the V3-engine-readiness gap from the audit.
+    setTimeout(() => startLimitCloseFirstV3FireWatcher(bot), 150_000);
+    // First-V4-fire watcher (2026-06-15) — V4 fires via convert_collateral_slice
+    // which is a brand-new path. Same celebrate/alert two-prong model
+    // as V3; closes the V4-engine-readiness gap from the Wave 4 audit.
+    setTimeout(() => startLimitCloseFirstV4FireWatcher(bot), 150_000);
+    // V4 fire-failure RATE watcher — complements the first-fire one-shot
+    // by tracking ongoing failure rates per mint and engine-wide. Alerts
+    // when 3+ failures hit one mint or 5+ across all mints in a 1h window.
+    // First-fire watcher catches "V4 wired up?" — this one catches "V4
+    // is wired but something is silently failing repeatedly."
+    setTimeout(() => startV4FireFailureRateWatcher(bot), 180_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
+    // Fee-wallet auto-sweeper — every 1h moves accrued fee SOL from
+    // the lender's wSOL ATA to the distribution wallet (CHCAMWtn).
+    // Idempotent + audit-logged via fee_wallet_sweeps table.
+    // See src/services/fee-wallet-sweeper.js +
+    // feedback_distribution_wallet_must_be_auto_funded.md.
+    setTimeout(() => startFeeWalletSweeper(bot), 120_000);
+    // Distribution-wallet gap monitor — every 10 min checks DB
+    // accruals vs distributor on-chain balance, admin-DMs if the
+    // next snapshot would skip (P0 if > 5 SOL deficit).
+    setTimeout(() => startDistributionGapMonitor(bot), 130_000);
+    // Pending-arm retry watcher — Tier-2 architectural fix for the
+    // arm-race failure class. When arm-core's 30s phase-1 polling
+    // window expires, the arm is queued to pending_arms with the
+    // signed-envelope freshness anchor. This watcher polls every 10s
+    // and replays the arm the moment the loan row lands in DB —
+    // user never has to re-sign. See
+    // feedback_loan_830_full_postmortem_and_defenses.md.
+    setTimeout(() => startPendingArmRetryWatcher(bot), 140_000);
     // Conditional-borrow watcher — fires agent intents when their
     // trigger condition (price/time/liquidity) matches. Postgres
     // advisory lock ensures single-instance even across replicas.
@@ -919,6 +1102,19 @@ bot.start({
     // autonomously instead of pinging admin. Critical-reason tickets
     // (security/bug) skipped — those go to admin as designed.
     setTimeout(() => startAutoTicketResolver(bot), 120_000);
+    // Treasury sweeper — periodically moves accumulated fees from the
+    // lender wallet to the hardware-key-controlled treasury vault so a
+    // compromise of the hot key bounds the lifetime-fee-drain loss to
+    // a single sweep window. Disabled until TREASURY_SWEEP_DISABLED
+    // is explicitly unset and an operational reserve is verified.
+    // See project_treasury_vault_2026_06_18.
+    setTimeout(() => startTreasurySweeper(bot), 130_000);
+    // Liquidation collateral auto-sweeper — Layer 5 of the 2026-06-18
+    // cosign-borrow exploit defense. Auto-Jupiters seized memecoin
+    // collateral to SOL within ~60s of liquidation so the lender wallet
+    // doesn't hold drain-bait. See
+    // feedback_cosign_borrow_token_drain_exploit_2026_06_18.
+    setTimeout(() => startLiquidationCollateralSweeper(bot), 140_000);
     // Dormant Re-Engagement — every 6h, nudges users who hold approved
     // collateral but have never borrowed. One DM per user per 30 days.
     setTimeout(() => startDormantReengagement(bot), 135_000);

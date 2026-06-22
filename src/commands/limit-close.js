@@ -28,6 +28,7 @@ import { query } from "../db/pool.js";
 import { upsertUser } from "../services/users.js";
 import { runArmPreflight } from "../services/limit-close-preflight.js";
 import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
+import { parseStrike } from "../lib/strike-price-parser.js";
 
 const MIN_LOAN_LAMPORTS = BigInt(1_000_000_000n); // 1 SOL eligibility floor
 const MAX_ACTIVE_ORDERS_PER_USER = 10;
@@ -92,73 +93,72 @@ function parseLimitCloseArgs(text, direction = "above") {
   let slippage_bps = 200;
   let dest = "sol";
   let expire_iso = null;
+  // TP/SL ladder slice (migration 064). Default 100% (10000 bps) =
+  // single-leg full close, matching pre-ladder behavior. User opts in
+  // with `slice=25%` to arm a 25% leg, leaving 75% available for
+  // additional legs at other price targets.
+  let slice_pct = 10000;
 
-  // Natural-language path: "at <value>" where <value> is either:
-  //   - "<N>x"     → multiplier semantic
-  //   - "$<num>m"  → market cap USD
-  //   - "$<num>"   → USD price target
+  // Natural-language path: "at <value>" — the value can be ANY shape
+  // the shared strike-price parser accepts. Examples:
+  //   at 17M                  →  $17M MC (bare big numbers default to MC)
+  //   at 17m mc               →  $17M MC (explicit kind word)
+  //   at 17,000,000 MC        →  $17M MC (commas tolerated)
+  //   at 17 million market cap →  $17M MC (number words tolerated)
+  //   at $0.005               →  $0.005 USD price
+  //   at 0.0025 sol           →  0.0025 SOL price
+  //   at 2x / 0.7x            →  multiplier (resolved to USD price downstream)
+  //   at -30% / down 30%      →  -30% multiplier (SL only)
+  //   at +50% / up 50%        →  +50% multiplier (TP only)
+  // Operator mandate (2026-06-14): all these forms MUST work the same
+  // across TG, Pip, and the site. See src/lib/strike-price-parser.js.
   for (let i = 1; i < filtered.length; i++) {
     const t = filtered[i];
 
-    // Handle "at <value>" — consume i+1 too.
+    // Handle "at <value [more words]>" — slurp everything until we hit
+    // a key=value token or end of input. That way "at 17 million market
+    // cap" works as one logical value even though it's 4 tokens.
     if (t.toLowerCase() === "at" && i + 1 < filtered.length) {
-      const v = filtered[i + 1];
-      // Stop-loss percent: "-30%" / "-5%"
-      const mPct = v.match(/^-([0-9]+(?:\.[0-9]+)?)%$/);
-      if (mPct) {
-        if (direction !== "below") {
-          return { ok: false, error: "Percent-drop targets (e.g. `at -30%`) are only valid for /stoploss." };
-        }
-        const p = Number(mPct[1]);
-        if (!Number.isFinite(p) || p <= 0 || p >= 100) {
-          return { ok: false, error: "Stop-loss percent must be between 0% and 100% (e.g. `at -30%`)." };
-        }
-        multiplier = 1 - (p / 100); // 30% drop → 0.7x of current
+      const slurpedParts = [];
+      let j = i + 1;
+      while (j < filtered.length) {
+        const next = filtered[j];
+        // key=value tokens end the slurp.
+        if (/^([a-z_]+)=/i.test(next)) break;
+        slurpedParts.push(next);
+        j++;
+      }
+      const rawValue = slurpedParts.join(" ");
+      // bareNumberDefaultKind hint: SL uses price_usd by default (most
+      // SL targets are USD price drops), TP uses mc_usd for big numbers.
+      // The parser only uses this when the input is bare ("17"); explicit
+      // kind words always win.
+      const parsed = parseStrike(rawValue, {
+        bareNumberDefaultKind: direction === "below" ? "price_usd" : undefined,
+      });
+      if (!parsed.ok) {
+        return { ok: false, error: parsed.error };
+      }
+      // Direction sanity: percent-move and multiplier targets carry
+      // their own implied direction. Reject mismatches loudly.
+      if (parsed.impliedDirection && parsed.impliedDirection !== direction) {
+        return {
+          ok: false,
+          error: parsed.impliedDirection === "below"
+            ? "That's a downside target — use /stoploss, not /takeprofit."
+            : "That's an upside target — use /takeprofit, not /stoploss.",
+        };
+      }
+      if (parsed.kind === "multiplier") {
+        // Caller resolves to USD price using cross-sourced oracle.
+        multiplier = parsed.multiplier;
         trigger_kind = "price_usd";
-        i++; continue;
+      } else {
+        trigger_kind = parsed.kind;
+        trigger_value_micro = parsed.valueMicro;
       }
-      // multiplier: "2x", "1.5x" (TP) or "0.7x", "0.5x" (SL)
-      const mMul = v.match(/^([0-9]+(?:\.[0-9]+)?)x$/i);
-      if (mMul) {
-        const n = Number(mMul[1]);
-        if (!Number.isFinite(n) || n <= 0) {
-          return { ok: false, error: "Multiplier must be a positive number (e.g. `at 2x`, `at 0.7x`)." };
-        }
-        if (direction === "below") {
-          if (n >= 1) {
-            return { ok: false, error: "Stop-loss multiplier must be < 1x (e.g. `at 0.7x` = sell at 70% of current). Use /takeprofit for upside targets." };
-          }
-        } else {
-          if (n <= 1) {
-            return { ok: false, error: "Take-profit multiplier must be > 1x (e.g. `at 2x`). Use /stoploss for downside targets." };
-          }
-        }
-        multiplier = n;
-        trigger_kind = "price_usd"; // resolved to actual USD value before INSERT
-        i++; // consume value
-        continue;
-      }
-      // market cap: "$130m", "150M"
-      const mMc = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)([KMBkmb])$/);
-      if (mMc) {
-        trigger_kind = "mc_usd";
-        const parsed = parseMcOrPrice(mMc[1] + mMc[2], "mc");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-        i++;
-        continue;
-      }
-      // USD price: "$0.005" or "0.005"
-      const mPrice = v.match(/^\$?([0-9]+(?:\.[0-9]+)?)$/);
-      if (mPrice) {
-        trigger_kind = "price_usd";
-        const parsed = parseMcOrPrice(mPrice[1], "price_usd");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-        i++;
-        continue;
-      }
-      return { ok: false, error: `Couldn't parse target after "at": \`${v}\`. Try \`at 2x\` or \`at $150m\` or \`at $0.005\`.` };
+      i = j - 1; // outer loop increment will move us past the consumed slurp
+      continue;
     }
 
     // Power-user path: key=value
@@ -167,23 +167,23 @@ function parseLimitCloseArgs(text, direction = "above") {
     const k = m[1].toLowerCase();
     const v = m[2];
     if (k === "mc") {
-      trigger_kind = "mc_usd";
-      const parsed = parseMcOrPrice(v, "mc");
-      if (!parsed.ok) return parsed;
-      trigger_value_micro = parsed.micro;
-    } else if (k === "price") {
-      // Default unit is USD unless v ends in "sol"
-      if (/sol$/i.test(v)) {
-        trigger_kind = "price_sol";
-        const parsed = parseMcOrPrice(v.replace(/sol$/i, ""), "price_sol");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
-      } else {
-        trigger_kind = "price_usd";
-        const parsed = parseMcOrPrice(v, "price_usd");
-        if (!parsed.ok) return parsed;
-        trigger_value_micro = parsed.micro;
+      // Route through the shared parser so commas, kind words, and
+      // magnitude words all work in key=value form too.
+      const parsed = parseStrike(v, { bareNumberDefaultKind: "mc_usd" });
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      if (parsed.kind === "multiplier") {
+        return { ok: false, error: "Use `at 2x` syntax for multipliers (not `mc=`)." };
       }
+      trigger_kind = parsed.kind;
+      trigger_value_micro = parsed.valueMicro;
+    } else if (k === "price") {
+      const parsed = parseStrike(v, { bareNumberDefaultKind: "price_usd" });
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      if (parsed.kind === "multiplier") {
+        return { ok: false, error: "Use `at 2x` syntax for multipliers (not `price=`)." };
+      }
+      trigger_kind = parsed.kind;
+      trigger_value_micro = parsed.valueMicro;
     } else if (k === "slip") {
       const parsed = parseSlippage(v);
       if (!parsed.ok) return parsed;
@@ -198,8 +198,21 @@ function parseLimitCloseArgs(text, direction = "above") {
       const parsed = parseExpiry(v);
       if (!parsed.ok) return parsed;
       expire_iso = parsed.iso;
+    } else if (k === "slice") {
+      // Accepted forms: "25%", "25", "2500bps". Bps stored as integer
+      // 1..10000. Sum across armed legs per (loan_id, direction) is
+      // enforced at INSERT time by migration 064's trigger.
+      const raw = String(v).replace(/%$/, "").replace(/bps$/i, "").trim();
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n <= 0) {
+        return { ok: false, error: `Invalid slice: \`${v}\`. Use a percent like \`slice=25%\`.` };
+      }
+      slice_pct = /bps$/i.test(v) ? Math.round(n) : Math.round(n * 100);
+      if (slice_pct < 1 || slice_pct > 10000) {
+        return { ok: false, error: "Slice must be between 0.01% and 100%." };
+      }
     } else {
-      return { ok: false, error: `Unknown option \`${k}=\`. Allowed: mc=, price=, slip=, dest=, expire=` };
+      return { ok: false, error: `Unknown option \`${k}=\`. Allowed: mc=, price=, slip=, dest=, expire=, slice=` };
     }
   }
 
@@ -208,7 +221,7 @@ function parseLimitCloseArgs(text, direction = "above") {
   }
   return {
     ok: true,
-    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso, multiplier },
+    parsed: { loan_id, trigger_kind, trigger_value_micro, slippage_bps, dest, expire_iso, multiplier, slice_pct },
   };
 }
 
@@ -297,7 +310,14 @@ function fmtTrigger(kind, value_micro) {
 
 /* ─── /limitclose ──────────────────────────────────────────────── */
 
-export async function handleLimitClose(ctx, direction = "above") {
+export async function handleLimitClose(ctx, direction = "above", opts = {}) {
+  // opts.dryRun (operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md): run every
+  // validation, oracle quote, slice/ladder check, and arm-core gate
+  // — but skip the INSERT. Mirror of the x402 preflight endpoint;
+  // closes the "did this arm actually validate?" question on TG
+  // BEFORE the user gets a confusing failure DM.
+  const dryRun = opts.dryRun === true;
   const tgUser = ctx.from;
   if (!tgUser) return;
   const text = ctx.message?.text ?? "";
@@ -350,6 +370,8 @@ export async function handleLimitClose(ctx, direction = "above") {
     slippageBps: slippage_bps,
     sellDestination: dest,
     expiresAt: expire_iso,
+    slicePct: parseResult.parsed.slice_pct,
+    dryRun,
   });
 
   if (!armed.ok) {
@@ -366,6 +388,12 @@ export async function handleLimitClose(ctx, direction = "above") {
           return `Loan is below the 1 SOL minimum for limit-close orders.`;
         case "collateral_not_enabled":
           return `Collateral token is not currently enabled in the protocol.`;
+        case "invalid_slice_pct":
+          return `Slice must be between 0.01% and 100%. Try \`slice=25%\` for a 25% leg.`;
+        case "fractional_slice_not_supported_today":
+          return `Partial-slice TP/SL is rolling out. For now, slice must be 100%. Multi-target arming at different prices IS supported today — e.g. \`/takeprofit ${loan_id} at 1.5x\` AND \`/takeprofit ${loan_id} at 2x\`.`;
+        case "ladder_sum_exceeds_100":
+          return `You already have armed legs on this loan/direction totaling near 100%. Cancel one or shrink your slice.`;
         case "rwa_collateral_not_supported_in_v1":
           // Unreachable since 2026-06-13 (PR C flipped the arm-core
           // gate; RWA collateral is now arm-eligible end-to-end via the
@@ -443,6 +471,39 @@ export async function handleLimitClose(ctx, direction = "above") {
     return ctx.reply(m, { parse_mode: "Markdown" });
   }
 
+  // Dry-run preview — operator-mandated 2026-06-16 PM,
+  // feedback_tg_must_follow_v4_at_highest_level.md. armOrder with
+  // dryRun:true returned ok=true having validated every gate without
+  // persisting. Tell the user explicitly that nothing was armed, then
+  // show what WOULD have armed so they can choose to commit.
+  if (dryRun && armed.ok) {
+    const loanD = armed.loan;
+    const mintD = armed.mint;
+    const triggerLabelD = fmtTrigger(trigger_kind, trigger_value_micro);
+    const isSlD = direction === "below";
+    const symD = mintD?.symbol || "your collateral";
+    const owedSolD = loanD?.owed ? (Number(loanD.owed) / 1e9).toFixed(4) : "?";
+    const appliedD = armed.initialSlippageBpsApplied ?? slippage_bps;
+    const originalD = armed.initialSlippageBpsRequested ?? slippage_bps;
+    const bumpedD = appliedD !== originalD;
+    return ctx.reply(
+      [
+        `*Preview only — nothing armed.*`,
+        ``,
+        `Loan: #${loanD?.loan_id || loan_id} (${symD}) · owes ${owedSolD} SOL`,
+        `Direction: ${isSlD ? "stop-loss" : "take-profit"}`,
+        `Trigger: ${triggerLabelD}`,
+        multiplierContextLine ? `_${multiplierContextLine}_` : null,
+        `Slippage: ${(appliedD / 100).toFixed(2)}%${bumpedD ? ` _(would be bumped from ${(originalD / 100).toFixed(2)}%)_` : ""}`,
+        `Destination: ${dest.toUpperCase()}`,
+        ``,
+        `All gates passed at this moment. Run \`/${isSlD ? "stoploss" : "takeprofit"} ${loan_id} at ${multiplier ? `${multiplier}x` : triggerLabelD}\` (without "preview") to actually arm it.`,
+        `_Liquidity can shift between now and a real arm._`,
+      ].filter(Boolean).join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  }
+
   // Success — render the confirmation. arm-core surfaces any liquidity
   // bump via initialSlippageBpsRequested vs initialSlippageBpsApplied
   // so we can show the bump line when relevant.
@@ -463,9 +524,23 @@ export async function handleLimitClose(ctx, direction = "above") {
     ? `*Stop-loss armed* — order #${orderId}${expiryLabel}`
     : `*Take-profit armed* — order #${orderId}${expiryLabel}`;
   const triggerVerb = isStopLoss ? "drops to" : "hits";
-  const purpose = isStopLoss
-    ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
-    : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`;
+  // V4 in-vault behavior vs V1/V2/V3 fire-and-close behavior. The
+  // operator-mandated V4 thesis is non-negotiable
+  // (feedback_v4_in_vault_thesis_non_negotiable): on V4 fires, SOL
+  // accumulates inside the per-loan sol_proceeds_vault and the loan
+  // STAYS ACTIVE; the only path to the user's wallet is borrower-
+  // signed repay. Legacy programs sell + repay + close in one shot.
+  // The success DM must describe what will actually happen so users
+  // know to repay when they want their SOL.
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const isV4 = !!v4ProgramId && loan?.program_id === v4ProgramId;
+  const purpose = isV4
+    ? (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`
+        : `When ${symbol} ${triggerVerb} your target, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`)
+    : (isStopLoss
+        ? `If ${symbol} ${triggerVerb} your floor, I'll cut the position before liquidation: repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`
+        : `When ${symbol} ${triggerVerb} your target, I'll repay the ${owedSol} SOL loan + sell the collateral into ${dest.toUpperCase()}.`);
   const listCmd = isStopLoss ? "/stoplosses" : "/takeprofitorders";
 
   await ctx.reply(
@@ -495,8 +570,24 @@ export async function handleLimitClose(ctx, direction = "above") {
 // Thin wrapper that delegates to handleLimitClose with direction='below'.
 // Shares every gate, fill-guarantee, and 1% fee — only the trigger
 // comparator flips at fire time (see magpie-limitclose isTriggerHit).
-export async function handleStopLoss(ctx) {
-  return handleLimitClose(ctx, "below");
+export async function handleStopLoss(ctx, opts = {}) {
+  return handleLimitClose(ctx, "below", opts);
+}
+
+/* ─── /preview ─────────────────────────────────────────────────── */
+// TG arm pre-flight (operator-mandated 2026-06-16 PM,
+// feedback_tg_must_follow_v4_at_highest_level.md). Mirror of the
+// site / x402 dry-run endpoints — runs the entire validation +
+// oracle + slice / cap stack against the user's loan and reports
+// whether an arm WOULD succeed right now, without persisting.
+// Lets the user catch "trigger would fire immediately" / "loan
+// below minimum size" / "ladder sum exceeds 100" before they
+// commit a slot.
+export async function handlePreviewTp(ctx) {
+  return handleLimitClose(ctx, "above", { dryRun: true });
+}
+export async function handlePreviewSl(ctx) {
+  return handleLimitClose(ctx, "below", { dryRun: true });
 }
 
 /* ─── /trailingstop ────────────────────────────────────────────── */
@@ -621,6 +712,16 @@ export async function handleTrailingStop(ctx) {
   }
 
   const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 trail fire,
+  // proceeds accumulate in the per-loan sol_proceeds_vault and the
+  // loan STAYS active until borrower-signed repay. Legacy programs
+  // close the loan on fire.
+  const v4ProgramIdTrail = process.env.PROGRAM_ID_V4 || null;
+  const isV4Trail = !!v4ProgramIdTrail && armed.loan?.program_id === v4ProgramIdTrail;
+  const fireLine = isV4Trail
+    ? `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak — sells into SOL on-chain, proceeds accumulate inside your loan's vault. Run /repay when you want the SOL released.`
+    : `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`;
   return ctx.reply([
     `*Trailing stop armed* on loan #${loan_id}`,
     "",
@@ -629,7 +730,7 @@ export async function handleTrailingStop(ctx) {
     `Initial floor: $${fmt(r.targetUsd)} (-${(trailingDistanceBps / 100).toFixed(1)}%)`,
     `Slippage: ${(slippage_bps / 100).toFixed(2)}%`,
     "",
-    `Floor rises with each new high. Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`,
+    `Floor rises with each new high. ${fireLine}`,
     `Order ID: \`${armed.orderId}\` — \`/limitorders\` to view, \`/cancellimitorder ${armed.orderId}\` to cancel.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
@@ -868,6 +969,16 @@ export async function handleBracket(ctx) {
     : sl.kind === "mc_usd"
       ? `MC $${(slResolved.resolvedMc / 1e6).toFixed(1)}M`
       : `$${fmt(slResolved.resolvedUsd)}`;
+  // V4 in-vault verbiage — operator-mandated
+  // (feedback_v4_in_vault_thesis_non_negotiable.md). On V4 the first
+  // leg to fire converts its slice into SOL inside the per-loan vault
+  // and sibling-cancels the other leg; the loan stays Active and the
+  // user releases the SOL via /repay. Legacy programs close the loan.
+  const v4ProgramIdBracket = process.env.PROGRAM_ID_V4 || null;
+  const isV4Bracket = !!v4ProgramIdBracket && tpArm.loan?.program_id === v4ProgramIdBracket;
+  const bracketFireLine = isV4Bracket
+    ? `First leg to fire converts that slice to SOL inside your loan's vault, auto-cancels the other leg, and leaves the loan Active. Run /repay when you want the SOL released.`
+    : `First leg to fire closes the loan and auto-cancels the other.`;
   return ctx.reply([
     `*Bracket armed* on loan #${loan_id}`,
     "",
@@ -876,7 +987,7 @@ export async function handleBracket(ctx) {
     `Slippage: ${(slippage_bps / 100).toFixed(2)}% · proceeds → ${sell_destination.toUpperCase()}`,
     expiresAtIso ? `Both legs expire: ${new Date(expiresAtIso).toISOString().slice(0, 10)}` : null,
     "",
-    `First leg to fire closes the loan and auto-cancels the other.`,
+    bracketFireLine,
     `\`/limitorders\` to view, \`/cancellimitorder <id>\` to cancel either leg.`,
   ].join("\n"), { parse_mode: "Markdown" });
 }
@@ -936,6 +1047,8 @@ export async function handleLimitOrders(ctx) {
             lc.armed_at, lc.expires_at,
             lc.trailing_distance_bps,
             lc.peak_price_micros::text AS peak_price_micros,
+            COALESCE(lc.slice_pct, 10000) AS slice_pct,
+            lc.ladder_group_id,
             l.loan_id AS chain_loan_id,
             l.collateral_mint,
             m.symbol AS collateral_symbol,
@@ -1003,11 +1116,40 @@ export async function handleLimitOrders(ctx) {
       const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
       peakLine = `\n   ~ peak $${fmt(peakUsd)} (floor floats with each new high)`;
     }
+    // Slice badge — surfaces ladder legs. Hidden for the default 100%
+    // case to keep single-leg display unchanged. Showing "slice 25%"
+    // tells the user this is one rung of a multi-target plan.
+    const slicePct = Number(r.slice_pct) || 10000;
+    const sliceBadge = slicePct < 10000 ? ` · slice ${(slicePct / 100).toFixed(slicePct % 100 === 0 ? 0 : 1)}%` : "";
+    // Ladder badge — when the row belongs to a ladder_group_id, surface a
+    // short 4-char prefix so the user can visually tie sibling legs
+    // together. Same prefix appears on every leg of the same ladder.
+    const ladderBadge = r.ladder_group_id ? ` · ladder ${r.ladder_group_id.slice(0, 4)}` : "";
     lines.push(
       `${directionPill}${rwaBadge}  #${r.id} · loan ${r.chain_loan_id}${sym}`,
-      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
+      `   → ${trig}  ·  slip ${slip}%  ·  ${r.sell_destination.toUpperCase()}${sliceBadge}${ladderBadge}  ·  armed ${ageLabel(r.armed_at)}${expiry}${peakLine}${distLine}`,
       "",
     );
+  }
+
+  // Ladder summary — for any ladder_group_id with multiple legs, add a
+  // one-line "Ladder X: total Y% across N legs" so the user can see the
+  // aggregate at a glance. Sorted by group so legs of the same ladder
+  // appear consecutive in the message.
+  const groups = new Map();
+  for (const r of rows) {
+    if (!r.ladder_group_id) continue;
+    const g = groups.get(r.ladder_group_id) || { count: 0, totalSlice: 0, sym: r.collateral_symbol || "?" };
+    g.count++;
+    g.totalSlice += Number(r.slice_pct) / 100;
+    groups.set(r.ladder_group_id, g);
+  }
+  if (groups.size > 0) {
+    lines.push("_Ladders armed:_");
+    for (const [gid, g] of groups) {
+      lines.push(`  ${gid.slice(0, 4)}  ${g.sym}  ${g.count} legs  ${g.totalSlice.toFixed(0)}% total`);
+    }
+    lines.push("");
   }
 
   // One inline cancel button per order — keeps the keyboard compact
@@ -1279,4 +1421,389 @@ export async function handleCancelLimitOrder(ctx) {
     return ctx.reply(`Order #${orderId} not found or already filled/cancelled.`);
   }
   await ctx.reply(`Order #${orderId} cancelled.`);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * /fixarm — TG analog of the site's V4 silent-arm-recovery banner.
+ *
+ * Operator-mandated 2026-06-16 PM. Loan 800 PUMP V4 silent auto-arm
+ * failure exposed a UX gap: when arming chain dies silently, a TG
+ * user has no way to retry one-tap. This command:
+ *
+ *   1. Looks up the user's V4 active loans
+ *   2. For each loan with zero armed orders, renders inline preset
+ *      buttons: [Sell at 2x] [Sell at 3x] [Sell at 0.7x] [Bracket]
+ *   3. Tapping a button calls armOrder() directly through the same
+ *      arm-core that powers /takeprofit + /bracket
+ *
+ * Companion to the site recovery banner (PR #147) so TG-only users
+ * get the same one-tap rescue path.
+ *
+ * Per feedback_v4_loans_never_show_exit_not_set.md +
+ *     feedback_every_exit_click_must_arm.md.
+ * ───────────────────────────────────────────────────────────────── */
+export async function handleFixArm(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const user = await upsertUser(tgUser.id, tgUser.username);
+  const v4ProgramId = process.env.PROGRAM_ID_V4 ?? null;
+  if (!v4ProgramId) {
+    return ctx.reply("V4 routing is not configured on this bot instance.");
+  }
+
+  // Find user's active V4 loans whose only "armed" status count is
+  // zero. These are the candidates for the silent-arm recovery flow.
+  const { rows: loans } = await query(
+    `SELECT l.id AS db_id, l.loan_id::text AS loan_id_chain,
+            l.collateral_mint, sm.symbol AS symbol,
+            sm.decimals AS decimals
+       FROM loans l
+       LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
+      WHERE l.user_id = $1
+        AND l.status = 'active'
+        AND l.program_id = $2
+        AND NOT EXISTS (
+          SELECT 1 FROM limit_close_orders o
+           WHERE o.loan_id = l.id
+             AND o.status IN ('armed','firing','twap_in_progress','awaiting_user')
+        )
+      ORDER BY l.id DESC
+      LIMIT 5`,
+    [user.id, v4ProgramId],
+  );
+
+  if (loans.length === 0) {
+    return ctx.reply(
+      "No V4 loans need recovery. Either you have no V4 loans, or every active V4 loan already has at least one armed order. Use /limitorders to inspect.",
+    );
+  }
+
+  // Lazy-load grammy InlineKeyboard so this file's existing callers
+  // don't pay the import on warm paths.
+  const { InlineKeyboard } = await import("grammy");
+
+  // Intent-aware retry (operator-mandated 2026-06-16 PM,
+  // feedback_tg_v4_must_match_site_quality.md). For each candidate
+  // loan, look up pending arm_intents and surface the EXACT requested
+  // strike as the primary retry button — not generic 2x/3x/0.7x
+  // defaults. The hardcoded presets render only as a SECONDARY tier
+  // when no intent exists for the loan.
+  const loanChainIds = loans.map((l) => l.loan_id_chain);
+  const intentsByLoanChain = new Map();
+  if (loanChainIds.length > 0) {
+    try {
+      const { rows: intents } = await query(
+        `SELECT id, loan_id_chain, direction, target_kind,
+                target_value_micro::text AS target_value_micro,
+                slice_pct_bps
+           FROM arm_intents
+          WHERE wallet IN (
+            SELECT public_key FROM wallets WHERE user_id = $1
+          )
+            AND status = 'pending'
+            AND loan_id_chain = ANY($2::text[])
+            AND created_at > NOW() - INTERVAL '24 hour'
+          ORDER BY created_at DESC`,
+        [user.id, loanChainIds],
+      );
+      for (const r of intents) {
+        const arr = intentsByLoanChain.get(r.loan_id_chain) || [];
+        arr.push(r);
+        intentsByLoanChain.set(r.loan_id_chain, arr);
+      }
+    } catch (e) {
+      console.warn(`[fixarm] intent lookup failed (continuing with defaults): ${e.message?.slice(0, 100)}`);
+    }
+  }
+
+  for (const ln of loans) {
+    const sym = ln.symbol || ln.collateral_mint.slice(0, 4) + "…";
+    const intents = intentsByLoanChain.get(ln.loan_id_chain) || [];
+
+    const kb = new InlineKeyboard();
+    let intentButtonsRendered = 0;
+    for (const intent of intents) {
+      const v = Number(intent.target_value_micro) / 1e6;
+      const sliceBps = intent.slice_pct_bps ?? 10000;
+      let label;
+      // Callback shape: fixarm:intent:<loan_id_chain>:<intent_id> —
+      // handler reads the intent row to drive the arm. Stays under
+      // Telegram's 64-byte callback_data limit.
+      if (intent.target_kind === "multiplier") {
+        const verb = intent.direction === "above" ? "Sell at" : "Stop at";
+        label = `${verb} ${v}x`;
+        if (sliceBps < 10000) label += ` (${(sliceBps / 100).toFixed(0)}%)`;
+      } else if (intent.target_kind === "price_usd") {
+        const usd =
+          v >= 1 ? `$${v.toFixed(2)}` : v >= 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(8)}`;
+        label = `${intent.direction === "above" ? "Sell at" : "Stop at"} ${usd}`;
+      } else if (intent.target_kind === "mc_usd") {
+        const mc =
+          v >= 1e9 ? `$${(v / 1e9).toFixed(2)}B mc` : `$${(v / 1e6).toFixed(2)}M mc`;
+        label = `${intent.direction === "above" ? "Sell at" : "Stop at"} ${mc}`;
+      } else {
+        label = `Retry ${intent.target_kind} ${v}`;
+      }
+      kb.text(label, `fixarm:intent:${ln.loan_id_chain}:${intent.id}`).row();
+      intentButtonsRendered += 1;
+    }
+
+    if (intentButtonsRendered === 0) {
+      kb.text("Sell at 2x", `fixarm:tp:${ln.loan_id_chain}:2`)
+        .text("Sell at 3x", `fixarm:tp:${ln.loan_id_chain}:3`)
+        .row()
+        .text("Sell at 0.7x", `fixarm:sl:${ln.loan_id_chain}:0.7`)
+        .text("Bracket 2x / 0.7x", `fixarm:br:${ln.loan_id_chain}`)
+        .row();
+    }
+    kb.text("Skip this loan", `fixarm:skip:${ln.loan_id_chain}`);
+
+    const headline =
+      intentButtonsRendered > 0
+        ? `*V4 loan on ${sym}* — your auto-sell didn't finish arming.\n\nWe have your exact strike on file. One tap retries it without losing the original target.`
+        : `*V4 loan on ${sym}* — no armed exit found.\n\nThis loan landed on V4 because you set up an auto-sell, but the arming step didn't complete. Pick a preset to retry now — single Telegram tap:`;
+
+    await ctx.reply(headline, { parse_mode: "Markdown", reply_markup: kb });
+  }
+}
+
+export function registerFixArmCallbacks(bot) {
+  bot.callbackQuery(/^fixarm:skip:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery("Skipped.");
+    await ctx.editMessageText("Skipped — you can re-run /fixarm anytime.");
+  });
+
+  bot.callbackQuery(/^fixarm:(tp|sl):(\d+):([\d.]+)$/, async (ctx) => {
+    const [, side, loanIdChain, mulStr] = ctx.match;
+    const multiplier = Number(mulStr);
+    const direction = side === "sl" ? "below" : "above";
+    if (!Number.isFinite(multiplier) || multiplier <= 0) {
+      await ctx.answerCallbackQuery("Invalid multiplier.");
+      return;
+    }
+    await ctx.answerCallbackQuery("Arming…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    // Find the loan's collateral mint so we can resolve the multiplier
+    // through the same cross-source oracle the site uses.
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found in your account.`);
+      return;
+    }
+
+    const r = await resolveMultiplierToPrice(loan.collateral_mint, multiplier, {
+      allowBelowOne: direction === "below",
+    });
+    if (!r.ok) {
+      await ctx.editMessageText(
+        `Couldn't resolve ${multiplier}x target: ${r.detail || r.error}\n\nTry again in a few seconds.`,
+      );
+      return;
+    }
+
+    const armed = await armOrder({
+      userId: user.id,
+      source: "tg",
+      loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: r.triggerValueMicro.toString(),
+      triggerDirection: direction,
+      slippageBps: direction === "below" ? 300 : 200,
+      sellDestination: "sol",
+    });
+
+    if (!armed.ok) {
+      await ctx.editMessageText(
+        `❌ Arm failed (${armed.error}). ${armed.detail || ""}\n\nUse /limitclose ${loanIdChain} at ${multiplier}x to retry manually.`,
+      );
+      return;
+    }
+
+    const fmt = (n) => n < 0.01 ? n.toFixed(8) : n < 1 ? n.toFixed(6) : n.toFixed(4);
+    const sideLabel = side === "tp" ? "Take-profit" : "Stop-loss";
+    await ctx.editMessageText(
+      `✓ ${sideLabel} armed at *${multiplier}x* — fires at $${fmt(r.targetUsd)}.\n\n` +
+        `Order #${armed.orderId}. Manage via /limitorders.`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  // Intent-aware retry handler (operator-mandated 2026-06-16 PM,
+  // feedback_tg_v4_must_match_site_quality.md). Loads the pending
+  // arm_intent row, resolves to a concrete trigger, calls armOrder
+  // with intentId so the existing reconcile path marks the intent
+  // 'armed' on success and the banner auto-hides.
+  bot.callbackQuery(/^fixarm:intent:(\d+):(\d+)$/, async (ctx) => {
+    const [, loanIdChain, intentIdStr] = ctx.match;
+    const intentId = Number(intentIdStr);
+    if (!Number.isInteger(intentId) || intentId <= 0) {
+      await ctx.answerCallbackQuery("Invalid intent.");
+      return;
+    }
+    await ctx.answerCallbackQuery("Arming…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    const { rows: [intent] } = await query(
+      `SELECT ai.id, ai.loan_id_chain, ai.direction, ai.target_kind,
+              ai.target_value_micro::text AS target_value_micro,
+              ai.slice_pct_bps
+         FROM arm_intents ai
+         JOIN wallets w ON w.public_key = ai.wallet AND w.user_id = $1
+        WHERE ai.id = $2
+          AND ai.loan_id_chain = $3
+          AND ai.status = 'pending'
+        LIMIT 1`,
+      [user.id, intentId, loanIdChain],
+    );
+    if (!intent) {
+      await ctx.editMessageText(
+        `That intent isn't pending anymore — it may have already armed. /limitorders to inspect.`,
+      );
+      return;
+    }
+
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found in your account.`);
+      return;
+    }
+
+    let triggerKind;
+    let triggerValueMicro;
+    let labelForUser;
+    const targetVal = Number(intent.target_value_micro) / 1e6;
+    if (intent.target_kind === "multiplier") {
+      const r = await resolveMultiplierToPrice(loan.collateral_mint, targetVal, {
+        allowBelowOne: intent.direction === "below",
+      });
+      if (!r.ok) {
+        await ctx.editMessageText(
+          `Couldn't resolve ${targetVal}x target: ${r.detail || r.error}\n\nTry again in a few seconds.`,
+        );
+        return;
+      }
+      triggerKind = "price_usd";
+      triggerValueMicro = r.triggerValueMicro.toString();
+      labelForUser = `${targetVal}x`;
+    } else if (
+      intent.target_kind === "price_usd" ||
+      intent.target_kind === "mc_usd" ||
+      intent.target_kind === "price_sol"
+    ) {
+      triggerKind = intent.target_kind;
+      triggerValueMicro = intent.target_value_micro;
+      if (intent.target_kind === "mc_usd") {
+        labelForUser =
+          targetVal >= 1e9 ? `$${(targetVal / 1e9).toFixed(2)}B mc` : `$${(targetVal / 1e6).toFixed(2)}M mc`;
+      } else if (intent.target_kind === "price_usd") {
+        labelForUser =
+          targetVal >= 1 ? `$${targetVal.toFixed(2)}` : targetVal >= 0.01 ? `$${targetVal.toFixed(4)}` : `$${targetVal.toFixed(8)}`;
+      } else {
+        labelForUser = `${targetVal.toFixed(6)} SOL`;
+      }
+    } else {
+      await ctx.editMessageText(`Intent kind \`${intent.target_kind}\` not retryable here yet. Use /limitclose ${loanIdChain} ${targetVal} manually.`);
+      return;
+    }
+
+    const sliceBps = intent.slice_pct_bps && intent.slice_pct_bps < 10000 ? intent.slice_pct_bps : 10000;
+
+    const armed = await armOrder({
+      userId: user.id,
+      source: "tg",
+      loanIdChain,
+      triggerKind,
+      triggerValueMicro,
+      triggerDirection: intent.direction,
+      slicePct: sliceBps,
+      slippageBps: intent.direction === "below" ? 300 : 200,
+      sellDestination: "sol",
+      intentId,
+    });
+
+    if (!armed.ok) {
+      await ctx.editMessageText(
+        `Arm failed (${armed.error}). ${armed.detail || ""}\n\nUse /limitclose ${loanIdChain} ${targetVal}${intent.target_kind === "multiplier" ? "x" : ""} to retry manually.`,
+      );
+      return;
+    }
+
+    const verb = intent.direction === "above" ? "Take-profit" : "Stop-loss";
+    await ctx.editMessageText(
+      `✓ ${verb} armed at *${labelForUser}* — exact strike you asked for.\n\nOrder #${armed.orderId}. Manage via /limitorders.`,
+      { parse_mode: "Markdown" },
+    );
+  });
+
+  bot.callbackQuery(/^fixarm:br:(\d+)$/, async (ctx) => {
+    const [, loanIdChain] = ctx.match;
+    await ctx.answerCallbackQuery("Arming bracket…");
+
+    const tgUser = ctx.from;
+    const user = await upsertUser(tgUser.id, tgUser.username);
+
+    const { rows: [loan] } = await query(
+      `SELECT collateral_mint FROM loans WHERE user_id = $1 AND loan_id::text = $2 LIMIT 1`,
+      [user.id, loanIdChain],
+    );
+    if (!loan) {
+      await ctx.editMessageText(`Loan #${loanIdChain} not found.`);
+      return;
+    }
+
+    const tpR = await resolveMultiplierToPrice(loan.collateral_mint, 2, { allowBelowOne: false });
+    const slR = await resolveMultiplierToPrice(loan.collateral_mint, 0.7, { allowBelowOne: true });
+    if (!tpR.ok || !slR.ok) {
+      await ctx.editMessageText(
+        `Couldn't resolve bracket prices: ${tpR.detail || slR.detail || "oracle blip"}. Try again in a few seconds.`,
+      );
+      return;
+    }
+
+    // Arm TP first, then SL. If SL fails, we leave TP armed (still
+    // protective on the upside) and tell the user. Matches /bracket
+    // best-effort semantics.
+    const tpArm = await armOrder({
+      userId: user.id, source: "tg", loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: tpR.triggerValueMicro.toString(),
+      triggerDirection: "above",
+      slippageBps: 200,
+      sellDestination: "sol",
+    });
+    if (!tpArm.ok) {
+      await ctx.editMessageText(`❌ TP arm failed (${tpArm.error}). Bracket aborted.`);
+      return;
+    }
+    const slArm = await armOrder({
+      userId: user.id, source: "tg", loanIdChain,
+      triggerKind: "price_usd",
+      triggerValueMicro: slR.triggerValueMicro.toString(),
+      triggerDirection: "below",
+      slippageBps: 300,
+      sellDestination: "sol",
+    });
+    if (!slArm.ok) {
+      await ctx.editMessageText(
+        `✓ TP armed (order #${tpArm.orderId}) at 2x.\n` +
+          `❌ SL failed (${slArm.error}). Re-try with /sl ${loanIdChain} at 0.7x.`,
+      );
+      return;
+    }
+
+    await ctx.editMessageText(
+      `✓ Bracket armed — TP order #${tpArm.orderId} at 2x, SL order #${slArm.orderId} at 0.7x. Manage via /limitorders.`,
+    );
+  });
 }

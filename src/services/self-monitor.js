@@ -459,17 +459,468 @@ async function probeCreditCoverage(bot) {
     if (audit.missing_repay > 0) parts.push(`${audit.missing_repay} repay`);
     if (audit.missing_liquidated > 0) parts.push(`${audit.missing_liquidated} liquidated`);
     await alertIfNew(bot, KIND,
-      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 6h; investigate the WRITE path if this persists.`,
-      audit.total >= 10 ? "crit" : "warn",
+      `Credit-event coverage gap: ${audit.total} loan(s) missing canonical events (${parts.join(", ")}). Healer auto-backfills within 1h. ` +
+      `If the same loan persists across two self-monitor ticks, the live WRITE path dropped — investigate before the healer hides it.`,
+      audit.total >= 3 ? "crit" : "warn",
     );
   } else {
     await alertRecovery(bot, KIND, `Credit-event coverage clean (0 gaps).`);
   }
 }
 
+/**
+ * V4 TWAP sample-count health. Every enabled V4 mint must have
+ * >= 8 samples within the rolling 5-min window — otherwise a borrow
+ * lands on `TwapInsufficientHistory`. Background attestor SHOULD keep
+ * this satisfied at the 35s cadence shipped in PR #348, but this probe
+ * is the trip-wire if the attestor stalls (RPC blip, Jupiter outage,
+ * service restart) or a freshly-enabled mint hasn't warmed yet.
+ *
+ * Operator-mandated 2026-06-18 PM after a "0 samples in window" borrow
+ * rejection. See [[feedback_twap_insufficient_history_never_again]] for
+ * the full defense; this is Layer 3 (Layer 1 is the cosign-borrow JIT
+ * warmer that catches it before the user signs anything).
+ */
+async function probeV4TwapHealth(bot) {
+  const KIND = "v4_twap_health";
+  if (!process.env.PROGRAM_ID_V4 && !process.env.PROGRAM_ID_V3) {
+    recordOutcome(KIND, false);
+    return;
+  }
+  try {
+    const { getV4TwapSampleCount } = await import("./price-attestor.js");
+    const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+    // Probe V3 + V4 — both use the price_v3 PriceHistory layout with
+    // the same >=8-samples-in-300s TWAP rule. The V4-only probe missed
+    // SPCX V3 borrows (RWA defaults to V3) — operator hit
+    // TwapInsufficientHistory on SPCX 2026-06-18 PM.
+    const programsToProbe = [];
+    if (PROGRAM_ID_V4) programsToProbe.push({ id: PROGRAM_ID_V4, label: "V4" });
+    if (PROGRAM_ID_V3) programsToProbe.push({ id: PROGRAM_ID_V3, label: "V3" });
+
+    const { rows } = await query(
+      `SELECT mint, symbol, decimals FROM supported_mints
+        WHERE enabled = TRUE
+        ORDER BY symbol`,
+    );
+    const REQUIRED = 8;
+    const GAP_TOLERANCE_SEC = 60;
+    const warming = [];
+    const cold = [];
+    for (const m of rows) {
+      for (const prog of programsToProbe) {
+        const status = await getV4TwapSampleCount(m.mint, 300, prog.id);
+        if (status === null) {
+          cold.push(`${m.symbol}(${prog.label} no feed)`);
+          continue;
+        }
+        if (status.inWindow >= REQUIRED) continue;
+        const now = Math.floor(Date.now() / 1000);
+        const ageSec = status.newestTs ? now - status.newestTs : Infinity;
+        if (ageSec > GAP_TOLERANCE_SEC) {
+          cold.push(`${m.symbol}(${prog.label} ${status.inWindow}/8, last attest ${Math.round(ageSec)}s ago)`);
+        } else {
+          warming.push(`${m.symbol}(${prog.label} ${status.inWindow}/8)`);
+        }
+      }
+    }
+    const isBad = cold.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND,
+        `V4 TWAP health: ${cold.length} mint(s) cold (attestor stalled OR not running for them): ${cold.slice(0, 8).join(", ")}` +
+        (warming.length > 0 ? `. Warming but tolerable: ${warming.slice(0, 5).join(", ")}` : "") +
+        `. Cosign-borrow JIT warmer is Layer 1, but if it's tripping for users RIGHT NOW, investigate attestor logs.`,
+        cold.length >= 3 ? "crit" : "warn",
+      );
+    } else if (warming.length > 0) {
+      // Warming-only is not a fail — just log so /lc-perf can show it.
+      console.log(`[self-monitor] v4_twap warming: ${warming.join(", ")}`);
+    } else {
+      await alertRecovery(bot, KIND, `V4 TWAP health: all ${rows.length} enabled mint(s) have 8+ samples in window.`);
+    }
+  } catch (err) {
+    console.warn("[self-monitor] v4_twap_health probe threw:", err.message?.slice(0, 160));
+  }
+}
+
+/**
+ * Lender-wallet drain detector. Snapshots the lender wallet's SOL +
+ * every token balance (SPL + Token-2022) on each tick, compares to the
+ * previous snapshot, and CRIT-alerts on ANY decrease that isn't
+ * accounted for by an expected outflow.
+ *
+ * This is the Layer 4 defense for the 2026-06-18 cosign-borrow
+ * Token-2022 drain exploit (see
+ * [[feedback_cosign_borrow_token_drain_exploit_2026_06_18]]). Even if
+ * a future allowlisted program lets some new state-mutating
+ * instruction shape slip past the Gate 0b enumeration in
+ * cosign-borrow.js, this probe catches it within 60 seconds and pages
+ * the operator.
+ *
+ * Expected-outflow filter: legitimate decreases happen when
+ *   - treasury-sweeper moves SOL to the cold treasury vault
+ *   - the holder-rewards distributor pays $MAGPIE holders
+ *   - the lender voluntarily distributes liquidation proceeds
+ * For the MVP we DO NOT pre-filter these — over-alerting is FAR safer
+ * than missing a drain. Operator gets the tx signature in the alert
+ * and can mark expected ones as such. Follow-up will subtract a
+ * pre-registered allowlist of expected tx hashes.
+ */
+const lenderBalanceState = {
+  lastSolLamports: null,
+  lastTokenBalances: new Map(), // ata pubkey → { mint, owner, amount: bigint, decimals }
+  initialized: false,
+};
+async function probeLenderWalletBalance(bot) {
+  const KIND = "lender_wallet_balance_decrease";
+  let LENDER_PUBKEY;
+  try {
+    LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
+  } catch {
+    return; // not configured
+  }
+  let solLamports;
+  let snapshot;
+  try {
+    solLamports = await connection.getBalance(LENDER_PUBKEY, "confirmed");
+    const [sslTokens, t22Tokens] = await Promise.all([
+      connection.getParsedTokenAccountsByOwner(
+        LENDER_PUBKEY,
+        { programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") },
+        "confirmed",
+      ),
+      connection.getParsedTokenAccountsByOwner(
+        LENDER_PUBKEY,
+        { programId: new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb") },
+        "confirmed",
+      ),
+    ]);
+    snapshot = new Map();
+    for (const accts of [sslTokens.value, t22Tokens.value]) {
+      for (const a of accts) {
+        const info = a.account.data.parsed.info;
+        const amt = BigInt(info.tokenAmount.amount);
+        if (amt === 0n) continue; // skip empty ATAs
+        snapshot.set(a.pubkey.toBase58(), {
+          mint: info.mint,
+          owner: info.owner,
+          amount: amt,
+          decimals: info.tokenAmount.decimals,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("[self-monitor] lender_wallet_balance probe RPC error:", err.message?.slice(0, 120));
+    return;
+  }
+
+  if (!lenderBalanceState.initialized) {
+    lenderBalanceState.lastSolLamports = solLamports;
+    lenderBalanceState.lastTokenBalances = snapshot;
+    lenderBalanceState.initialized = true;
+    return; // first run baselines, doesn't alert
+  }
+
+  const decreases = [];
+  // Threshold: ignore tiny SOL deltas that come from price-attestor tx
+  // fees (the lender pays ~5000 lamports per attest, ~70 per minute).
+  // 0.01 SOL is well above the per-hour fee budget but small enough to
+  // catch real drains.
+  const SOL_DECREASE_THRESHOLD_LAMPORTS = 10_000_000n; // 0.01 SOL
+  const solDelta = BigInt(lenderBalanceState.lastSolLamports) - BigInt(solLamports);
+  if (solDelta > SOL_DECREASE_THRESHOLD_LAMPORTS) {
+    decreases.push(`SOL: -${(Number(solDelta) / 1e9).toFixed(4)} SOL (was ${(lenderBalanceState.lastSolLamports / 1e9).toFixed(4)}, now ${(solLamports / 1e9).toFixed(4)})`);
+  }
+  for (const [ata, last] of lenderBalanceState.lastTokenBalances) {
+    const current = snapshot.get(ata);
+    if (!current) {
+      // ATA was closed — full balance vanished. Mint info from last snapshot.
+      decreases.push(`token ${last.mint.slice(0, 8)}… ATA ${ata.slice(0, 8)}… DRAINED+CLOSED (was ${Number(last.amount) / 10 ** last.decimals})`);
+      continue;
+    }
+    if (current.amount < last.amount) {
+      const delta = last.amount - current.amount;
+      decreases.push(
+        `token ${last.mint.slice(0, 8)}… ATA ${ata.slice(0, 8)}… -${Number(delta) / 10 ** last.decimals} (${Number(last.amount) / 10 ** last.decimals} → ${Number(current.amount) / 10 ** current.decimals})`,
+      );
+    }
+  }
+
+  const isBad = decreases.length > 0;
+  recordOutcome(KIND, isBad);
+  if (isBad) {
+    await alertIfNew(bot, KIND,
+      `LENDER WALLET BALANCE DECREASED — investigate immediately. Changes: ${decreases.join(" | ")}. ` +
+      `If you didn't initiate a sweep/distribution/sale in the last 60s, treat as a potential drain.`,
+      "crit",
+    );
+  } else {
+    await alertRecovery(bot, KIND, `Lender wallet balance stable across tick.`);
+  }
+
+  // Update baseline AFTER alerting so the next tick sees the new "stable" state.
+  lenderBalanceState.lastSolLamports = solLamports;
+  lenderBalanceState.lastTokenBalances = snapshot;
+}
+
 /* ─── Tick loop ──────────────────────────────────────────────── */
 
 let _timer = null;
+
+/**
+ * Pool credit drift probe. Detects when pool.accrued_lamports grows
+ * faster than pool_credit_events.lamports would predict — the signature
+ * of any future regression of the 2026-06-18 PM holder over-credit bug.
+ *
+ * Tracks each tick: for each pool kind, compute
+ *   ledger_total = SUM(pool_credit_events.lamports WHERE pool_kind=X)
+ *   pool_actual  = pool.accrued_lamports
+ *   drift        = pool_actual - (last_tick_pool_actual + (ledger_total - last_tick_ledger_total))
+ *
+ * If drift is positive and exceeds the dust threshold for 2 consecutive
+ * ticks, CRIT alert — the pool is being credited from outside the
+ * ledger. If drift is negative, that's a distribution payout (expected).
+ */
+const _poolDriftState = new Map(); // pool_kind -> {lastPool, lastLedger}
+async function probePoolCreditDrift(bot) {
+  const KIND = "pool_credit_drift";
+  const DUST_TOLERANCE = 1_000_000n; // 0.001 SOL — covers floor-division rounding
+  try {
+    const pools = [
+      { kind: "holder", table: "magpie_holder_pool" },
+      { kind: "lp_loyalty", table: "lp_loyalty_pool" },
+      { kind: "protocol_reserve", table: "protocol_reserve_pool" },
+    ];
+    const offenders = [];
+    for (const p of pools) {
+      const pr = await query(`SELECT accrued_lamports::text v FROM ${p.table} WHERE id=1`).catch(() => null);
+      if (!pr || pr.rows.length === 0) continue;
+      const pool = BigInt(pr.rows[0].v);
+      const lr = await query(
+        `SELECT COALESCE(SUM(lamports), 0)::text v FROM pool_credit_events WHERE pool_kind = $1`,
+        [p.kind],
+      ).catch(() => ({ rows: [{ v: "0" }] }));
+      const ledger = BigInt(lr.rows[0].v);
+      const prev = _poolDriftState.get(p.kind);
+      _poolDriftState.set(p.kind, { lastPool: pool, lastLedger: ledger });
+      if (!prev) continue; // first tick — no delta yet
+      const poolDelta = pool - prev.lastPool;
+      const ledgerDelta = ledger - prev.lastLedger;
+      // Positive drift = pool grew more than the ledger says. That's the bug class.
+      const drift = poolDelta - ledgerDelta;
+      if (drift > DUST_TOLERANCE) {
+        offenders.push(`${p.kind} drifted +${(Number(drift) / 1e9).toFixed(4)} SOL beyond ledger (pool +${(Number(poolDelta) / 1e9).toFixed(4)} vs ledger +${(Number(ledgerDelta) / 1e9).toFixed(4)})`);
+      }
+    }
+    const isBad = offenders.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND, `pool credit drift detected: ${offenders.join("; ")}`, "crit");
+    } else {
+      await alertRecovery(bot, KIND, "pool credit drift cleared");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] pool_credit_drift probe error:", err.message?.slice(0, 160));
+  }
+}
+
+// Kill-switch probe — operator-mandated 2026-06-18 PM.
+// Any *_DISABLED=true or *_PAUSED=true env var that blocks a USER-FACING flow
+// must alert CRIT once it has been on for > KILLSWITCH_STALE_MS. Catches cases
+// like COSIGN_BORROW_DISABLED being flipped by an alarm and never cleared.
+// [[feedback_loans_must_never_fail_no_regressions]]
+const KILLSWITCH_STALE_MS = Number(process.env.KILLSWITCH_STALE_MS) || 10 * 60_000;
+// User-facing switches. Background-only switches (FEE_WALLET_SWEEPER_DISABLED,
+// TREASURY_SWEEP_DISABLED, DIST_GAP_MONITOR_DISABLED, EXPLOIT_DETECTOR_DISABLED,
+// PRICE_SNAPSHOTTER_DISABLED, RAID_MONITOR_DISABLED, FUNDING_GRAPH_DISABLED,
+// PIP_PROACTIVE_DISABLED, PENDING_ARM_WATCHER_DISABLED) are intentionally
+// EXCLUDED — they don't block users from borrowing/repaying. Add to this list
+// any future env var that, when set, would surface as a user-visible error.
+const USER_FACING_KILL_SWITCHES = [
+  "COSIGN_BORROW_DISABLED",
+  "V4_BORROWS_PAUSED",
+  "LIQUIDATION_DISTRIBUTION_DISABLED",
+  "AGENT_API_DISABLED",
+  "LIMIT_CLOSE_AGENT_DISABLED",
+  "PIP_ASK_DISABLED",
+];
+const _killswitchFirstSeen = new Map(); // name -> timestamp ms
+
+function isSwitchOn(v) {
+  return /^(1|true|yes|on)$/i.test(String(v || "").trim());
+}
+
+// Borrow failure rate probe — reads the rolling in-memory counter in
+// cosign-borrow.js and CRIT-alerts if any classification exceeds the
+// per-hour threshold. Real-time visibility into how often each failure
+// mode fires so operator can act on patterns (e.g. high stale_blockhash
+// rate means site signing window needs widening).
+// [[feedback_loans_must_never_fail_no_regressions]]
+const BORROW_FAILURE_THRESHOLD_PER_HOUR = Number(process.env.BORROW_FAILURE_THRESHOLD_PER_HOUR) || 5;
+const BORROW_FAILURE_COOLDOWN_MS = Number(process.env.BORROW_FAILURE_COOLDOWN_MS) || 30 * 60_000;
+let _lastBorrowFailureAlertAt = 0;
+let _lastBorrowFailureSnapshot = "";
+
+async function probeBorrowFailures(bot) {
+  const KIND = "borrow_failures_high";
+  try {
+    const { getRecentBorrowFailures } = await import("../api/cosign-borrow.js");
+    const failures = getRecentBorrowFailures();
+    const klasses = Object.keys(failures);
+    if (klasses.length === 0) {
+      recordOutcome(KIND, false);
+      await alertRecovery(bot, KIND, "borrow failure rate back to zero");
+      return;
+    }
+    const overThreshold = klasses.filter((k) => failures[k] >= BORROW_FAILURE_THRESHOLD_PER_HOUR);
+    const isBad = overThreshold.length > 0;
+    recordOutcome(KIND, isBad);
+    if (!isBad) {
+      // Below threshold but non-zero — fine, no alert.
+      await alertRecovery(bot, KIND, "borrow failure rate normalized");
+      return;
+    }
+    const snapshot = klasses
+      .sort((a, b) => failures[b] - failures[a])
+      .map((k) => `${k}=${failures[k]}`)
+      .join(" ");
+    // Throttle — don't re-DM if snapshot hasn't materially changed.
+    if (snapshot === _lastBorrowFailureSnapshot
+        && Date.now() - _lastBorrowFailureAlertAt < BORROW_FAILURE_COOLDOWN_MS) {
+      return;
+    }
+    _lastBorrowFailureAlertAt = Date.now();
+    _lastBorrowFailureSnapshot = snapshot;
+    const guidance = overThreshold.map((k) => {
+      if (k === "stale_blockhash")
+        return "stale_blockhash: users signing too late — site should refresh the blockhash if signing takes >30s";
+      if (k === "rpc_exhausted")
+        return "rpc_exhausted: Helius + every backup failing simulateTransaction — check provider status";
+      if (k === "sim_failed")
+        return "sim_failed: tx would fail on-chain — check recent CRIT DMs for inner reason";
+      if (k === "unclassified")
+        return "unclassified: a new failure shape — pull recent CRIT DMs for the inner error";
+      if (k === "twap_warming_timeout")
+        return "twap_warming_timeout: JIT warmer couldn't deliver 8 samples in budget — check price-attestor logs + Jupiter health";
+      if (k === "twap_sim_reject")
+        return "twap_sim_reject: program rejected with TwapInsufficientHistory at sim — JIT warm + post-sim re-warm both insufficient; investigate attestor + PriceHistory PDA per mint";
+      if (k === "stale_price_attestation")
+        return "stale_price_attestation: PriceHistory age > MAX_PRICE_AGE_SEC at sim — attestor is falling behind for these mints";
+      if (k === "drain_check_rpc")
+        return "drain_check_rpc: primary + every backup RPC failed getMultipleAccountsInfo — provider status";
+      return `${k}: investigate`;
+    }).join(" | ");
+    await alertIfNew(bot, KIND,
+      `cosign-borrow failures over threshold in last 1h: ${snapshot}. Guidance: ${guidance}`,
+      "crit",
+    );
+  } catch (err) {
+    console.warn("[self-monitor] borrow_failures probe error:", err.message?.slice(0, 160));
+  }
+}
+
+// Attestor liveness probe — the price-attestor MUST tick continuously
+// or every V4 borrow will fail with TwapInsufficientHistory. A silent
+// stall (e.g. SQL type-cast bug killing every tick) is catastrophic
+// because the symptoms only surface when a user tries to borrow.
+// [[feedback_borrow_conversion_must_be_world_class]]
+const ATTESTOR_STUCK_THRESHOLD_MS = Number(process.env.ATTESTOR_STUCK_MS) || 90_000;
+async function probeAttestorLiveness(bot) {
+  const KIND = "attestor_stuck";
+  try {
+    const { getAttestorHeartbeat } = await import("../services/price-attestor.js");
+    const hb = getAttestorHeartbeat();
+    // If we've never ticked yet, give it a couple of minutes from boot.
+    if (hb.lastSuccessfulTickAt === 0) {
+      recordOutcome(KIND, false);
+      return;
+    }
+    const isBad = hb.msSinceLast > ATTESTOR_STUCK_THRESHOLD_MS;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      await alertIfNew(bot, KIND,
+        `price-attestor STUCK — last successful tick ${Math.round(hb.msSinceLast / 1000)}s ago (threshold ${ATTESTOR_STUCK_THRESHOLD_MS / 1000}s). V4 TWAPs will cool off and every borrow will hit TwapInsufficientHistory. Check logs for SQL/Jupiter errors.`,
+        "crit",
+      );
+    } else {
+      await alertRecovery(bot, KIND, "price-attestor recovered — ticking normally");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] attestor_liveness probe error:", err.message?.slice(0, 160));
+  }
+}
+
+// Conversion success-rate probe — Phase 1 of the conversion-reliability
+// mandate [[feedback_user_retention_via_flawless_conversion]]. Reads
+// conversion_events and pages the operator the moment any path/mint
+// pair drops below 95% with ≥5 attempts in the last hour. Without this,
+// the first signal we get is a user complaint — too late to prevent
+// the churn this rule is meant to stop.
+const CONV_MIN_SUCCESS_RATE = Number(process.env.CONV_MIN_SUCCESS_RATE) || 0.95;
+const CONV_MIN_ATTEMPTS_TO_ALERT = Number(process.env.CONV_MIN_ATTEMPTS_TO_ALERT) || 5;
+async function probeConversionRate(bot) {
+  const KIND = "conversion_rate_low";
+  try {
+    const { findDegradedConversionTargets } = await import("../services/conversion-tracker.js");
+    const degraded = await findDegradedConversionTargets({
+      windowSec: 3600,
+      minAttempts: CONV_MIN_ATTEMPTS_TO_ALERT,
+      minSuccessRate: CONV_MIN_SUCCESS_RATE,
+    });
+    const isBad = degraded.length > 0;
+    recordOutcome(KIND, isBad);
+    if (!isBad) {
+      await alertRecovery(bot, KIND, "all conversion paths back to ≥95% success");
+      return;
+    }
+    const lines = degraded.slice(0, 8).map((d) => {
+      const mintShort = d.mint && d.mint !== "<no-mint>" ? `${d.mint.slice(0, 8)}…` : "(no-mint)";
+      const rate = (d.success_rate * 100).toFixed(1) + "%";
+      return `${d.path} ${mintShort} attempts=${d.attempts} success_rate=${rate}`;
+    });
+    await alertIfNew(bot, KIND,
+      `CRIT conversion rate degraded (last 1h, ≥${CONV_MIN_ATTEMPTS_TO_ALERT} attempts, <${(CONV_MIN_SUCCESS_RATE * 100).toFixed(0)}% success):\n` +
+      lines.join("\n") +
+      "\n\nRun /convstats for the full breakdown + failure classes. Each affected user just hit an error — investigate which class is firing.",
+      "crit",
+    );
+  } catch (err) {
+    console.warn("[self-monitor] conversion_rate probe error:", err.message?.slice(0, 160));
+  }
+}
+
+async function probeKillSwitches(bot) {
+  const KIND = "killswitch_stale";
+  try {
+    const now = Date.now();
+    const active = [];
+    const stale = [];
+    for (const name of USER_FACING_KILL_SWITCHES) {
+      if (isSwitchOn(process.env[name])) {
+        if (!_killswitchFirstSeen.has(name)) _killswitchFirstSeen.set(name, now);
+        const age = now - _killswitchFirstSeen.get(name);
+        active.push({ name, ageMin: Math.round(age / 60_000) });
+        if (age > KILLSWITCH_STALE_MS) stale.push({ name, ageMin: Math.round(age / 60_000) });
+      } else {
+        _killswitchFirstSeen.delete(name);
+      }
+    }
+    const isBad = stale.length > 0;
+    recordOutcome(KIND, isBad);
+    if (isBad) {
+      const list = stale.map((s) => `${s.name} (~${s.ageMin}min)`).join(", ");
+      await alertIfNew(bot, KIND,
+        `user-facing kill switch(es) stale: ${list}. Users may be hitting borrow/repay errors. Flip OFF on Railway if no longer needed.`,
+        "crit",
+      );
+    } else if (active.length === 0) {
+      await alertRecovery(bot, KIND, "all user-facing kill switches are OFF");
+    }
+  } catch (err) {
+    console.warn("[self-monitor] killswitch_stale probe error:", err.message?.slice(0, 160));
+  }
+}
 
 async function tick(bot) {
   try {
@@ -483,6 +934,13 @@ async function tick(bot) {
       probeLoanProgramIdDrift(bot).catch((e) => console.warn("[self-monitor] program_drift probe threw:", e.message)),
       probeStaleSupport(bot).catch((e) => console.warn("[self-monitor] stale_support probe threw:", e.message)),
       probeCreditCoverage(bot).catch((e) => console.warn("[self-monitor] credit_coverage probe threw:", e.message)),
+      probeV4TwapHealth(bot).catch((e) => console.warn("[self-monitor] v4_twap_health probe threw:", e.message)),
+      probeLenderWalletBalance(bot).catch((e) => console.warn("[self-monitor] lender_wallet_balance probe threw:", e.message)),
+      probePoolCreditDrift(bot).catch((e) => console.warn("[self-monitor] pool_credit_drift probe threw:", e.message)),
+      probeKillSwitches(bot).catch((e) => console.warn("[self-monitor] killswitch_stale probe threw:", e.message)),
+      probeBorrowFailures(bot).catch((e) => console.warn("[self-monitor] borrow_failures probe threw:", e.message)),
+      probeAttestorLiveness(bot).catch((e) => console.warn("[self-monitor] attestor_stuck probe threw:", e.message)),
+      probeConversionRate(bot).catch((e) => console.warn("[self-monitor] conversion_rate probe threw:", e.message)),
     ]);
   } catch (err) {
     // Belt-and-suspenders catch — Promise.all shouldn't throw because

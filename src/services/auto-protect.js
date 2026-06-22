@@ -237,25 +237,58 @@ async function attemptAutoProtect(bot, row) {
   }
 }
 
+// Health threshold below which we DM "manual action needed". Above this
+// (but still below DANGER_THRESHOLD=1.30) we silently log and wait —
+// 1.20x is uncomfortable but not crisis territory, the user has time.
+// 1.15x is when liquidation risk becomes real and a DM is justified.
+const INSUFFICIENT_FUNDS_DM_THRESHOLD = 1.15;
+// Cooldown between DMs for the same loan. The tick runs every 90s; without
+// a cooldown, a user with sustained low-health-but-no-SOL gets ~960 DMs/day.
+const INSUFFICIENT_FUNDS_DM_COOLDOWN_HOURS = 6;
+
 async function dmInsufficientFunds(bot, row, healthBefore, balance, needed) {
+  // Stay silent on "uncomfortable but not crisis" — only DM when health
+  // is actually in danger territory. Cuts noise dramatically without
+  // hiding real risk.
+  if (healthBefore >= INSUFFICIENT_FUNDS_DM_THRESHOLD) {
+    await logAction({
+      user_id: row.user_id,
+      loan_id: row.id,
+      action_type: "insufficient_funds_silent",
+      amount_lamports: needed,
+      health_before: healthBefore.toFixed(3),
+      error: `insufficient idle SOL; below DM threshold ${INSUFFICIENT_FUNDS_DM_THRESHOLD}`,
+    });
+    return;
+  }
+  // Throttle — don't re-DM within COOLDOWN_HOURS for the same loan.
+  // The watcher ticks every 90s; spamming the user every 90s when their
+  // wallet is empty teaches them to mute the bot. One urgent DM per
+  // window is enough — operator-mandated 2026-06-18 PM.
+  const { rows: [recent] } = await query(
+    `SELECT created_at FROM auto_protect_actions
+       WHERE loan_id = $1
+         AND action_type = 'insufficient_funds_warning'
+         AND created_at >= NOW() - make_interval(hours => $2)
+       ORDER BY created_at DESC LIMIT 1`,
+    [row.id, INSUFFICIENT_FUNDS_DM_COOLDOWN_HOURS],
+  );
+  if (recent) {
+    return; // already warned this user inside the cooldown
+  }
+
   const kb = new InlineKeyboard()
-    .text("🔧 Repay now", `repay:loan:${row.id}`)
-    .text("➕ Top up", `topup:loan:${row.id}`)
+    .text("Repay now", `repay:loan:${row.id}`)
+    .text("Top up", `topup:loan:${row.id}`)
     .row()
-    .text("⏱ Extend", `extend:loan:${row.id}`);
+    .text("Extend", `extend:loan:${row.id}`);
 
   const msg = [
-    "🛡 *Auto-Protect couldn't help — manual action needed*",
+    "*Your loan is close to liquidation.*",
     "",
-    `Your loan #${row.loan_id} dropped to *${healthBefore.toFixed(2)}x*.`,
-    `Would need ~\`${(Number(needed) / 1e9).toFixed(4)} SOL\` to bring it back to safe.`,
-    `You have \`${(Number(balance) / 1e9).toFixed(4)} SOL\` idle — not enough.`,
+    `Loan #${row.loan_id} health: *${healthBefore.toFixed(2)}x*. Auto-Protect can't act — your wallet has \`${(Number(balance) / 1e9).toFixed(4)} SOL\` idle and we'd need \`${(Number(needed) / 1e9).toFixed(4)} SOL\` to bring it back to safe.`,
     "",
-    "*Act now:*",
-    "• /deposit more SOL, then I'll auto-protect on the next tick",
-    "• /topup with more collateral",
-    "• /partialrepay or /repay manually",
-    "• /extend to push the due date out",
+    "Tap one option below or deposit more SOL and I'll handle it on the next tick.",
   ].join("\n");
 
   try {
@@ -263,7 +296,6 @@ async function dmInsufficientFunds(bot, row, healthBefore, balance, needed) {
       parse_mode: "Markdown",
       reply_markup: kb,
     });
-    // Log the insufficient-funds attempt so we can audit
     await logAction({
       user_id: row.user_id,
       loan_id: row.id,
@@ -284,8 +316,12 @@ async function tick(bot) {
   try {
     // Pull all active loans where the user has auto_protect ON
     const { rows } = await query(
+      // program_id MUST be selected — executePartialRepay routes the
+      // repay tx via chooseProgramIdForLoan(loanDbRow). Without it,
+      // V3/V4 loans get a V1-shape repay and AccountOwnedByWrongProgram
+      // fires every tick. [[feedback_cross_version_program_routing_required]]
       `SELECT l.id, l.loan_id, l.user_id, l.collateral_mint, l.collateral_amount,
-              l.original_loan_amount_lamports, l.loan_pda,
+              l.original_loan_amount_lamports, l.loan_pda, l.program_id,
               u.telegram_id, sm.decimals
        FROM loans l
        JOIN users u ON u.id = l.user_id

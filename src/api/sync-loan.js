@@ -35,6 +35,7 @@ import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import {
   markLoanRepaid,
@@ -42,6 +43,65 @@ import {
   recordExtendLoan,
   recordLoan,
 } from "../services/loans.js";
+import { connection, withFailover } from "../solana/connection.js";
+
+/**
+ * Verify the provided `signature` is a real on-chain tx, recent, and the
+ * borrower wallet IS one of its signers. Prevents an attacker who scrapes
+ * publicly-readable V4 loan PDAs from spraying random signature strings
+ * to auto-link the real borrower's wallet into the attacker's DB-poisoning
+ * loop (audit HIGH#1 2026-06-17 PM).
+ *
+ * Why this is a proof-of-ownership: the borrower wallet's private key
+ * MUST have signed the borrow tx (Solana enforces this at the runtime
+ * level). An attacker without the borrower's key cannot forge a tx where
+ * the borrower wallet is a signer.
+ *
+ * Returns { ok: boolean, reason?: string } so the caller can decide how
+ * to respond (we deliberately return a generic 404 to avoid leaking the
+ * reason class to attackers; the reason is logged internally).
+ */
+async function verifyBorrowerSignedTx(signature, borrowerPubkey) {
+  // Cheap shape check — Solana signatures are base58 of 64 bytes, so
+  // 86-88 chars. Reject obviously-garbage strings without hitting RPC.
+  if (typeof signature !== "string" || signature.length < 64 || signature.length > 128) {
+    return { ok: false, reason: "signature_shape" };
+  }
+  try {
+    // Wrapped in withFailover (audit 2026-06-19) so a Helius blip during
+    // borrower-signature verification doesn't cause legitimate sync attempts
+    // to fail. Falls through to backup RPCs automatically.
+    const tx = await withFailover((conn) =>
+      conn.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      }),
+    );
+    if (!tx) return { ok: false, reason: "tx_not_found" };
+    // Reject ancient txs — a fresh sync-loan from the site happens within
+    // seconds of confirm; tightening the window bounds the replay surface.
+    const blockTimeMs = tx.blockTime ? tx.blockTime * 1000 : 0;
+    const ageMs = blockTimeMs ? Date.now() - blockTimeMs : 0;
+    if (blockTimeMs && ageMs > 24 * 60 * 60 * 1000) {
+      return { ok: false, reason: "tx_too_old" };
+    }
+    // Extract the signer list. The first `numRequiredSignatures` entries
+    // in accountKeys are signers (Solana tx layout). Handle both legacy
+    // and v0 message shapes.
+    const message = tx.transaction.message;
+    const numSigs = message.header?.numRequiredSignatures ?? 1;
+    const keys = message.staticAccountKeys ?? message.accountKeys ?? [];
+    const signerPubkeys = keys.slice(0, numSigs).map((k) =>
+      typeof k === "string" ? k : k.toBase58?.() ?? String(k),
+    );
+    if (!signerPubkeys.includes(borrowerPubkey)) {
+      return { ok: false, reason: "borrower_not_signer" };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: `verify_error:${err.message?.slice(0, 80)}` };
+  }
+}
 
 const PER_LOAN_MIN_INTERVAL_MS = 2_000;
 const lastByLoan = new Map();
@@ -164,7 +224,7 @@ export async function handleSyncLoan(req) {
       if (RETRY_DELAYS_MS[attempt] > 0) {
         await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
       }
-      for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean)) {
+      for (const candidate of [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4].filter(Boolean)) {
         try {
           const prog = getReadOnlyProgram(candidate);
           onChainNew = await prog.account.loan.fetch(loanPk);
@@ -181,10 +241,45 @@ export async function handleSyncLoan(req) {
       };
     }
     const borrowerStr = onChainNew.borrower.toBase58();
-    const { rows: [walletRow] } = await query(
-      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-      [borrowerStr],
-    );
+
+    // SECURITY: before we create a new (user, wallet) row in response to
+    // an unauth POST, prove that the caller has access to the borrower's
+    // signed borrow tx. The signature was already required to enter the
+    // recovery path above; here we verify it's a real on-chain tx whose
+    // signer set includes the borrower wallet. Without this, an attacker
+    // can scrape every V4 loan PDA off-chain and spray garbage signature
+    // strings to attribute synthetic users for every real borrower
+    // (audit HIGH#1 2026-06-17 PM).
+    //
+    // First check: is the wallet already linked? If yes, no auto-link
+    // happens — just attribute the existing user. This is the common
+    // legitimate case (TG-linked borrowers re-syncing via the site).
+    const { resolveWalletOwner, resolveOrAutoLinkWalletOwner } = await import("../services/wallet-owner-resolver.js");
+    let resolvedUserId = await resolveWalletOwner(borrowerStr);
+
+    if (!resolvedUserId) {
+      // Wallet not yet linked — would create a new (user, wallet) row.
+      // Require proof the caller actually owns the borrow tx first.
+      const proof = await verifyBorrowerSignedTx(signature, borrowerStr);
+      if (!proof.ok) {
+        // Log internally, return generic 404 (don't leak whether the
+        // wallet exists vs whether the signature was bad).
+        console.warn(
+          `[sync-loan] rejecting auto-link for ${borrowerStr.slice(0, 8)}…: signature did not prove ownership (${proof.reason})`,
+        );
+        return {
+          status: 404,
+          body: { error: "loan_pda not found" },
+        };
+      }
+      // Proof OK — auto-link is now safe (operator-mandated parity with
+      // V4 anon-wallet sprint, see feedback_anonymous_wallets_full_feature_parity_v4).
+      resolvedUserId = await resolveOrAutoLinkWalletOwner(
+        borrowerStr,
+        "sync_loan_autolink",
+      );
+    }
+    const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
     if (!walletRow) {
       // Borrower's wallet isn't linked to a Magpie account — likely an
       // agent borrow whose synthetic user was already created by the

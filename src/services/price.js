@@ -1,10 +1,39 @@
 import axios from "axios";
 import "dotenv/config";
 import { hasPythCoverage, pythPriceInSol, pythPriceInUsd } from "./pyth-price.js";
+import {
+  routeFor,
+  tryAcquireJupiterToken,
+  recordJupiterOk,
+  recordJupiter429,
+  recordJupiterErr,
+  recordBudgetDefer,
+  recordBackoffSkip,
+  clearMintJupiterBackoff,
+  isMintInJupiterBackoff,
+} from "./jupiter-budget.js";
 
 // Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
 // prices are derived as token_usd / sol_usd.
-const JUPITER_API = process.env.JUPITER_API_URL || "https://lite-api.jup.ag/price/v3";
+//
+// Paid-tier support (operator-mandated 2026-06-19 PM after free lite-api
+// 429 storms starved the V4 continuous loop):
+//   - When JUPITER_API_KEY is set, route to api.jup.ag (paid Pro tier) and
+//     send x-api-key header on every request.
+//   - When unset, fall back to lite-api.jup.ag (free, aggressive 429s).
+// The env var can be flipped on/off at runtime without a code change.
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || null;
+const JUPITER_API =
+  process.env.JUPITER_API_URL ||
+  (JUPITER_API_KEY
+    ? "https://api.jup.ag/price/v3"
+    : "https://lite-api.jup.ag/price/v3");
+const JUPITER_HEADERS = JUPITER_API_KEY ? { "x-api-key": JUPITER_API_KEY } : {};
+if (JUPITER_API_KEY) {
+  console.log("[price] Jupiter Pro tier active (api.jup.ag with x-api-key)");
+} else {
+  console.log("[price] Jupiter lite-api active (no JUPITER_API_KEY set — 429s expected under load)");
+}
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 // Jupiter v3 accepts up to ~100 ids per call, but we chunk at 50 for headroom.
 const JUP_BATCH_SIZE = 50;
@@ -27,16 +56,30 @@ const JUP_BATCH_SIZE = 50;
  * path used by the on-chain price-feed attestor.
  */
 async function jupiterPriceInSol(mint) {
-  const resp = await axios.get(JUPITER_API, {
-    params: { ids: `${mint},${SOL_MINT}` },
-    timeout: 10_000,
-  });
-  const tokenUsd = resp.data?.[mint]?.usdPrice;
-  const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
-  if (!tokenUsd || !solUsd) {
-    throw new Error(`No price data for mint ${mint}`);
+  try {
+    const resp = await axios.get(JUPITER_API, {
+      params: { ids: `${mint},${SOL_MINT}` },
+      headers: JUPITER_HEADERS,
+      timeout: 10_000,
+    });
+    const tokenUsd = resp.data?.[mint]?.usdPrice;
+    const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+    if (!tokenUsd || !solUsd) {
+      recordJupiterErr();
+      throw new Error(`No price data for mint ${mint}`);
+    }
+    recordJupiterOk();
+    clearMintJupiterBackoff(mint);
+    return tokenUsd / solUsd;
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status === 429) {
+      recordJupiter429(mint);
+    } else if (!err?.response?.status?.toString().startsWith("2")) {
+      recordJupiterErr();
+    }
+    throw err;
   }
-  return tokenUsd / solUsd;
 }
 
 function isTransientPriceError(err) {
@@ -49,12 +92,50 @@ function isTransientPriceError(err) {
 }
 
 export async function getPriceInSol(mint) {
-  // Attempt 1: Jupiter
+  // Route decision: budget + backoff + RWA-class aware. See
+  // jupiter-budget.js for the policy.
+  const { route, reason } = await routeFor(mint);
+
+  if (route === "dexscreener_only") {
+    // Jupiter is off the table this round. Dex or bust.
+    recordBackoffSkip();
+    return await dexscreenerPriceInSol(mint);
+  }
+
+  if (route === "dexscreener_first") {
+    if (reason !== "rwa-category=stock" && reason !== "rwa-category=etf" && reason !== "rwa-category=metal") {
+      // Memecoin being deferred — note it for metrics.
+      recordBudgetDefer();
+    }
+    try {
+      return await dexscreenerPriceInSol(mint);
+    } catch (errDex) {
+      // Dex failed. Try Jupiter ONLY if budget allows + not in backoff.
+      if (isMintInJupiterBackoff(mint) || !tryAcquireJupiterToken()) {
+        throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter skipped: ${reason})`);
+      }
+      try {
+        return await jupiterPriceInSol(mint);
+      } catch (errJup) {
+        throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter: ${errJup.message})`);
+      }
+    }
+  }
+
+  // jupiter_first path — original logic with budget consumption.
+  if (!tryAcquireJupiterToken()) {
+    // Edge: routeFor said we had budget but it raced out. Defer to Dex.
+    recordBudgetDefer();
+    try {
+      return await dexscreenerPriceInSol(mint);
+    } catch (errDex) {
+      throw new Error(`No price for ${mint} (Jupiter budget exhausted; Dex: ${errDex.message})`);
+    }
+  }
   try {
     return await jupiterPriceInSol(mint);
   } catch (err1) {
     if (!isTransientPriceError(err1)) {
-      // Non-transient (e.g. mint not on Jupiter). Skip retry, try DexScreener.
       try {
         const dex = await dexscreenerPriceInSol(mint);
         console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter: ${err1.message})`);
@@ -64,12 +145,21 @@ export async function getPriceInSol(mint) {
       }
     }
 
-    // Transient — wait 200-700ms with jitter, retry Jupiter once.
+    // Transient — wait 200-700ms with jitter, retry Jupiter once IF budget allows.
     await new Promise((r) => setTimeout(r, 200 + Math.random() * 500));
+    if (!tryAcquireJupiterToken()) {
+      // No budget for retry. Skip to Dex.
+      try {
+        const dex = await dexscreenerPriceInSol(mint);
+        console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (no budget for Jupiter retry)`);
+        return dex;
+      } catch (err2) {
+        throw new Error(`No price data for ${mint} (Jupiter: ${err1.message}; Dex: ${err2.message})`);
+      }
+    }
     try {
       return await jupiterPriceInSol(mint);
     } catch (err2) {
-      // Retry failed too. Fall back to DexScreener.
       try {
         const dex = await dexscreenerPriceInSol(mint);
         console.warn(`[price] ${mint.slice(0, 8)} fallback to DexScreener (Jupiter still failing after retry: ${err2.message})`);
@@ -94,18 +184,46 @@ export async function getPricesInSolBatch(mints) {
 
   for (let i = 0; i < unique.length; i += JUP_BATCH_SIZE) {
     const chunk = unique.slice(i, i + JUP_BATCH_SIZE);
-    const ids = chunk.concat(solUsd ? [] : [SOL_MINT]).join(",");
-    const resp = await axios.get(JUPITER_API, {
-      params: { ids },
-      timeout: 15_000,
-    });
-    if (!solUsd) {
-      solUsd = resp.data?.[SOL_MINT]?.usdPrice;
-      if (!solUsd) throw new Error("No SOL price from Jupiter");
+    // Each batch HTTP call costs 1 token even though it covers up to
+    // JUP_BATCH_SIZE mints. If we can't afford it, return what we have
+    // so far and the per-mint fallback in callers will pick up the rest
+    // via DexScreener.
+    if (!tryAcquireJupiterToken()) {
+      recordBudgetDefer();
+      break;
     }
-    for (const mint of chunk) {
-      const usd = resp.data?.[mint]?.usdPrice;
-      if (usd) result.set(mint, usd / solUsd);
+    const ids = chunk.concat(solUsd ? [] : [SOL_MINT]).join(",");
+    try {
+      const resp = await axios.get(JUPITER_API, {
+        params: { ids },
+        headers: JUPITER_HEADERS,
+        timeout: 15_000,
+      });
+      recordJupiterOk();
+      if (!solUsd) {
+        solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+        if (!solUsd) throw new Error("No SOL price from Jupiter");
+      }
+      for (const mint of chunk) {
+        const usd = resp.data?.[mint]?.usdPrice;
+        if (usd) {
+          result.set(mint, usd / solUsd);
+          // A successful price clears any prior backoff for this mint —
+          // Jupiter is healthy for it again.
+          clearMintJupiterBackoff(mint);
+        }
+      }
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 429) {
+        // Bump backoff for ALL mints in this chunk so we don't waste the
+        // next batch hammering the same set.
+        for (const mint of chunk) recordJupiter429(mint);
+      } else {
+        recordJupiterErr();
+      }
+      // Don't throw — let the caller's per-mint fallback fill in via Dex.
+      break;
     }
   }
   return result;
@@ -129,6 +247,57 @@ export async function getPricesInSolBatch(mints) {
  * drift (different DEX paths, latency) doesn't false-positive.
  */
 const MAX_DIVERGENCE = Number(process.env.PRICE_MAX_DIVERGENCE) || 0.05;
+// Above this RATIO two sources aren't "disagreeing" — one is a mis-derived /
+// broken pair (e.g. a thin exotic-quote DEX pair). A believable price
+// manipulation stays well under this; $PUMP's only DexScreener pair (PUMP/MET
+// on Meteora) reported $7.32 vs Jupiter $0.00146 — ~5000x. When the gap is
+// this wild we trust JUPITER (the same source the on-chain price attestation
+// uses, so a Jupiter-based value is exactly what the program accepts) rather
+// than dead-ending a legit borrow in a "refreshing market data" loop. We only
+// override TOWARD Jupiter and corroborate with the recent agreed cache, so we
+// never over-value vs the lower source nor weaken the sub-ratio manipulation
+// defense. P0 2026-06-21.
+const WILD_OUTLIER_RATIO = Number(process.env.PRICE_WILD_OUTLIER_RATIO) || 3;
+
+// ─── Recent-agreement cache (reliability layer) ─────────────────────────
+//
+// When BOTH sources already agreed within MAX_DIVERGENCE in the last
+// CROSS_SOURCED_CACHE_TTL_MS, we cache that agreed price. If a later
+// call hits a transient 429 / 5xx on one source (Jupiter rate-limits
+// HARD when DexScreener is unaffected — see Railway logs), we can
+// safely return the cached agreed price instead of throwing.
+//
+// Why this is safe:
+//   - The cached price was already cross-source-validated, so the
+//     security guarantee is preserved at population time.
+//   - TTL is short (90s default) — an attacker would need to pump
+//     both sources simultaneously during the cache window to influence
+//     anything, and we already valued at a clean price before the cache.
+//   - This ONLY engages when the live cross-source check would have
+//     failed for transient reasons (0 or 1 source responded). When the
+//     live check succeeds, the live price wins.
+//
+// Operator-mandated 2026-06-17 PM after recurring "Couldn't fetch price
+// right now" failures on TG /borrow during Jupiter 429 storms.
+const CROSS_SOURCED_CACHE = new Map(); // mint → { priceSol, agreedAt, agreedSources }
+const CROSS_SOURCED_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_FALLBACK_TTL_MS) || 90_000;
+
+function cacheAgreedPrice(mint, priceSol, agreedSources) {
+  CROSS_SOURCED_CACHE.set(mint, { priceSol, agreedAt: Date.now(), agreedSources });
+}
+
+/**
+ * Returns a recently-agreed cross-source price for `mint` if it's still
+ * within the fallback TTL, otherwise null. Used internally as a stale-on-
+ * failure fallback and exposed for callers that want to warm-check
+ * availability (e.g. TG /borrow prefetch).
+ */
+export function getCachedAgreedPriceIfFresh(mint) {
+  const c = CROSS_SOURCED_CACHE.get(mint);
+  if (!c) return null;
+  if (Date.now() - c.agreedAt > CROSS_SOURCED_CACHE_TTL_MS) return null;
+  return c.priceSol;
+}
 
 /**
  * Three-source agreement helper (audit F-2 follow-up — Pyth as 3rd source).
@@ -258,24 +427,80 @@ export async function getPriceInSolCrossSourced(mint) {
   const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;
 
   if (respondingCount === 0) {
+    // Reliability fallback: if NO source responded but we have a recent
+    // agreed price in cache (≤ CROSS_SOURCED_CACHE_TTL_MS old), serve it
+    // rather than failing the user's borrow. The cached price was already
+    // cross-source validated; the alternative is a "Couldn't fetch price"
+    // dead-end for the user. The cache is short-TTL so manipulation risk
+    // is bounded.
+    const cached = getCachedAgreedPriceIfFresh(mint);
+    if (cached != null) {
+      console.warn(`[price] ALL sources down for ${mint.slice(0,8)} — serving cached agreed price ${cached.toFixed(9)} (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"})`);
+      return cached;
+    }
     throw new Error(`No price data for ${mint} from any source (jup=${jupErr ?? "n/a"}; dex=${dexErr ?? "n/a"}${usePyth ? `; pyth=${pythErr ?? "n/a"}` : ""})`);
   }
 
   // Single-source case — fail closed unless the env-var escape hatch is on.
+  // Reliability layer: BEFORE refusing, check the recent-agreement cache.
+  // If both sources already agreed within TTL, the surviving source must
+  // agree with the cached price for us to trust it (within MAX_DIVERGENCE).
+  // This catches the common Jupiter-429 / DexScreener-up case without
+  // dropping security: we only trust the single source if it corroborates
+  // a recent multi-source agreement.
   if (respondingCount === 1) {
     const survivor = sources.find((s) => s.price != null && s.price > 0);
     const down = sources.filter((s) => s.price == null).map((s) => s.name).join(",");
+    const cached = getCachedAgreedPriceIfFresh(mint);
+    if (cached != null) {
+      const div = Math.abs(survivor.price - cached) / Math.min(survivor.price, cached);
+      if (div <= MAX_DIVERGENCE) {
+        // Survivor corroborates a recent agreement — safe to use as proof
+        // of continuity. Cache survives the broken source.
+        console.warn(`[price] ${mint.slice(0,8)} single-source RELIABILITY OK: ${survivor.name} agrees with ${(Date.now() - CROSS_SOURCED_CACHE.get(mint).agreedAt)/1000 | 0}s-old cache (${(div*100).toFixed(2)}% drift, ${down} down)`);
+        // Refresh cache with average so subsequent calls stay smooth.
+        cacheAgreedPrice(mint, (survivor.price + cached) / 2, [survivor.name, "cache"]);
+        return (survivor.price + cached) / 2;
+      }
+      console.warn(`[price] ${mint.slice(0,8)} single-source DIVERGES from cache by ${(div*100).toFixed(1)}% (${survivor.name}=${survivor.price.toFixed(9)} vs cache=${cached.toFixed(9)}); refusing`);
+    }
     if (process.env.ALLOW_SINGLE_SOURCE_PRICING === "true") {
       console.warn(`[price] SINGLE-SOURCE FALLBACK ALLOWED for ${mint.slice(0, 8)} via ${survivor.name} (${down} down). Escape hatch is ON — security posture is degraded.`);
       return survivor.price;
     }
-    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down). Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
+    console.warn(`[price] REFUSED ${mint.slice(0, 8)} — only ${survivor.name} responded (${down} down), no fresh cache. Set ALLOW_SINGLE_SOURCE_PRICING=true to override.`);
     throw new Error(`Price data temporarily unavailable for ${mint.slice(0, 8)} — only ${survivor.name} responded. Try again in a moment.`);
   }
 
   // 2 or 3 sources responded — delegate to the agreement helper.
   const agreed = agreeOnPrice({ mint, sources, maxDivergence: MAX_DIVERGENCE });
   if (!agreed) {
+    // WILD-OUTLIER TIE-BREAKER (P0 2026-06-21). A disagreement this large is a
+    // mis-derived/broken pair, not a believable manipulation. Trust Jupiter —
+    // it's the source the on-chain attestation uses, so a Jupiter-based value
+    // is exactly what the program accepts. Without this, $PUMP (DexScreener
+    // PUMP/MET $7.32 vs Jupiter $0.00146) dead-ends every borrow in a
+    // "refreshing market data" loop. Only overrides TOWARD Jupiter,
+    // corroborated by the recent agreed cache; never over-values.
+    if (jup != null && jup > 0) {
+      const others = sources.filter((s) => s.name !== "Jupiter" && s.price != null && s.price > 0);
+      const allWild =
+        others.length > 0 &&
+        others.every((s) => Math.max(s.price, jup) / Math.min(s.price, jup) >= WILD_OUTLIER_RATIO);
+      if (allWild) {
+        const cached = getCachedAgreedPriceIfFresh(mint);
+        const cacheOk = cached == null || Math.abs(jup - cached) / Math.min(jup, cached) <= MAX_DIVERGENCE;
+        if (cacheOk) {
+          console.warn(
+            `[price] WILD-OUTLIER for ${mint.slice(0, 8)}: ${others.map((s) => `${s.name}=${s.price.toFixed(9)}`).join(",")} ` +
+              `vs Jupiter=${jup.toFixed(9)} (>= ${WILD_OUTLIER_RATIO}x) — mis-derived pair; trusting Jupiter (the attestation source).`,
+          );
+          cacheAgreedPrice(mint, jup, ["Jupiter"]);
+          return jup;
+        }
+        console.warn(`[price] WILD-OUTLIER for ${mint.slice(0, 8)} but Jupiter diverges from recent cache — refusing.`);
+      }
+    }
     const detail = sources.filter((s) => s.price != null && s.price > 0)
       .map((s) => `${s.name}=${s.price.toFixed(9)}`).join(", ");
     throw new Error(
@@ -285,7 +510,19 @@ export async function getPriceInSolCrossSourced(mint) {
   if (agreed.outlier) {
     console.warn(`[price] outlier rejected for ${mint.slice(0, 8)}: ${agreed.agreed.join("+")} agreed; ${agreed.outlier} flagged`);
   }
+  // Cache the live-validated price for future reliability fallback.
+  cacheAgreedPrice(mint, agreed.price, agreed.agreed);
   return agreed.price;
+}
+
+/**
+ * Warm the cross-source price cache for `mint` without blocking the caller.
+ * Used by TG /borrow's token-select to make sure the cache is hot before
+ * the user picks a percentage — so a transient Jupiter 429 between the
+ * two callbacks doesn't drop them. Errors are swallowed by design.
+ */
+export function warmPriceCache(mint) {
+  getPriceInSolCrossSourced(mint).catch(() => { /* best-effort warm */ });
 }
 
 /**
@@ -296,6 +533,7 @@ export async function getPriceInSolCrossSourced(mint) {
 async function jupiterPriceInUsd(mint) {
   const resp = await axios.get(JUPITER_API, {
     params: { ids: mint },
+    headers: JUPITER_HEADERS,
     timeout: 10_000,
   });
   const tokenUsd = resp.data?.[mint]?.usdPrice;
@@ -393,12 +631,41 @@ export async function getPriceInUsdCrossSourced(mint) {
  *
  * Verified live 2026-06-10 against real SPYx (multiplier 1.002561 →
  * 0.26% under-valuation if uncorrected) and NVDAx (multiplier 1.000103).
+ *
+ * ATTESTATION-SAFE MULTIPLIER CLAMP (2026-06-20, P0). The on-chain program
+ * values collateral at the ATTESTED price (price-attestor posts getPriceInSol
+ * × 1e9 — WITHOUT the scaled-UI multiplier) and rejects any submitted
+ * collateral_value more than MAX_VALUE_TOLERANCE_BPS (3%) above it
+ * (ErrorCode::CollateralValueExceedsAttestation, identical across V1/V2/V3/V4).
+ * Because the attestor omits the multiplier but this offer applies it, a
+ * scaled-UI multiplier above ~1.03 makes the offer exceed what the chain will
+ * ever accept — producing an inflated "dollar figure offered" AND an on-chain
+ * rejection on borrow. A normal Backed dividend multiplier is ~1.00x; a value
+ * far above 1.03 is a split/large-accrual/misread, never a routine dividend.
+ * We clamp the applied multiplier to the on-chain tolerance so the offer can
+ * NEVER exceed the attestation from the multiplier term — fixing the offer +
+ * the rejection in one shared chokepoint that every borrow path uses. Legit
+ * small multipliers (<= the clamp) pass through unchanged.
  */
+// 1.03 on-chain tolerance × 0.997 buffer for spot/TWAP drift between this
+// quote and the user signing. Mirrors the v4-twap endpoint's 30bps buffer.
+const MAX_SAFE_SCALED_UI_MULTIPLIER = 1.03 * 0.997; // ≈ 1.02691
+
 export async function collateralValueLamports(mint, rawAmount, decimals) {
-  const [priceSol, multiplier] = await Promise.all([
+  const [priceSol, rawMultiplier] = await Promise.all([
     getPriceInSolCrossSourced(mint),
     getScaledUiMultiplier(mint),
   ]);
+  // Clamp the scaled-UI multiplier so the offer can never exceed the on-chain
+  // attestation (which carries no multiplier) beyond its 3% tolerance.
+  const multiplier = Math.min(rawMultiplier, MAX_SAFE_SCALED_UI_MULTIPLIER);
+  if (rawMultiplier > MAX_SAFE_SCALED_UI_MULTIPLIER) {
+    console.warn(
+      `[price] scaled-UI multiplier ${rawMultiplier} for ${mint.slice(0, 8)}… exceeds the ` +
+        `on-chain attestation tolerance; clamped to ${multiplier.toFixed(5)} to prevent ` +
+        `CollateralValueExceedsAttestation + inflated offer. (attestor posts no multiplier.)`,
+    );
+  }
   // (rawAmount × multiplier) / 10^decimals = the UI amount users see in
   // their wallet, which is what Jupiter/DexScreener price quotes refer to.
   const humanAmount = (Number(rawAmount) * multiplier) / 10 ** decimals;

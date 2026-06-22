@@ -50,6 +50,14 @@ import {
   resolveMultiplierToPrice,
   MIN_LOAN_LAMPORTS,
 } from "../services/limit-close-arm-core.js";
+// Kill-switch helpers — TG /lock (per-user) + /sitedisable (global). Every
+// signed-envelope handler in this module honors these so a user who
+// suspects compromise can pause site-side actions from TG (operator-
+// mandated audit HIGH#3 2026-06-17 PM). Already-armed orders keep firing
+// through the engine path; only NEW arms/cancels/modifies/intents are
+// gated by the lock.
+import { rejectIfLocked } from "../services/site-lock.js";
+import { rejectIfSiteDisabled } from "../services/site-global.js";
 
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
@@ -214,30 +222,124 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
     return { ok: false, status: 500, error: "nonce_check_failed" };
   }
 
-  // Wallet ownership + custodial check
-  const { rows: [walletRow] } = await query(
-    `SELECT user_id, encrypted_secret, source
-       FROM wallets WHERE public_key = $1 LIMIT 1`,
+  // Wallet ownership + custodial check.
+  // Prefer the TG-linked wallet row when multiple exist; see
+  // src/services/wallet-owner-resolver.js. We need encrypted_secret
+  // here so we can't use the helper directly — inline the same
+  // ranking so the chosen row is consistent with /repay etc.
+  let { rows: [walletRow] } = await query(
+    `SELECT w.user_id, w.encrypted_secret, w.source
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
     [signerPubkey],
   );
   if (!walletRow) {
-    return { ok: false, status: 403, error: "wallet_not_linked",
-             detail: "This wallet isn't linked to a Magpie account. Link via the TG bot first." };
+    // Auto-create a TG-less user + wallet row so any Phantom-only
+    // wallet can arm V4 exits without first connecting to the TG bot.
+    // Operator-mandated 2026-06-17 PM:
+    //   "I want EVERY SINGLE wallet, it doesn't matter where it came
+    //    from, TG or not, to be able to execute these exit order loans
+    //    on the V4 pool."
+    //
+    // We INSERT atomically: create the user (telegram_id NULL),
+    // then the wallet row, then re-fetch via the same ranking query.
+    // The V4-only enforcement still blocks V1/V2/V3 arms, so this
+    // open auto-create only opens V4 exit arming to anonymous wallets
+    // — never plain V1/V2/V3 loan management.
+    //
+    // If the user later /links this wallet via TG, the wallet-owner-
+    // resolver attaches the existing wallet row to their TG user_id
+    // (no duplicate, no data loss).
+    //
+    // See feedback_v4_auto_sells_no_custodial_requirement_2026_06_17.md.
+    try {
+      // SQL traps the audit caught 2026-06-17 PM (PR #344 shipped these
+      // broken — every anon V4 arm has been silently 500'ing since):
+      //   1. users.telegram_id was NOT NULL — fixed in migration 072.
+      //   2. wallets has NO unique constraint on public_key (pool.js
+      //      drops it on every boot), so ON CONFLICT (public_key) threw
+      //      "no unique or exclusion constraint". Use the SELECT-then-
+      //      INSERT pattern proven in account-link.js.
+      const { rows: [newUser] } = await query(
+        `INSERT INTO users (telegram_id, created_at)
+         VALUES (NULL, NOW())
+         RETURNING id`,
+      );
+      const existsCheck = await query(
+        `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+        [signerPubkey, newUser.id],
+      );
+      if (existsCheck.rowCount === 0) {
+        try {
+          await query(
+            `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+             VALUES ($1, $2, 'site_v4_autolink', TRUE, NOW())`,
+            [newUser.id, signerPubkey],
+          );
+        } catch (raceErr) {
+          // Tolerate concurrent autolink — both INSERTs are equivalent.
+          if (!/duplicate key|unique constraint/i.test(raceErr.message || "")) {
+            throw raceErr;
+          }
+        }
+      }
+      const refetch = await query(
+        `SELECT w.user_id, w.encrypted_secret, w.source
+           FROM wallets w
+           JOIN users u ON u.id = w.user_id
+          WHERE w.public_key = $1
+          ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+                   w.is_active DESC,
+                   w.created_at DESC
+          LIMIT 1`,
+        [signerPubkey],
+      );
+      walletRow = refetch.rows[0];
+      if (!walletRow) {
+        return {
+          ok: false,
+          status: 503,
+          error: "auto_link_race",
+          detail: "Wallet auto-link is racing. Retry in a moment.",
+        };
+      }
+      console.log(`[site-limit-close] auto-linked wallet ${signerPubkey.slice(0, 8)}… → user_id=${walletRow.user_id} (V4 anonymous, no TG)`);
+    } catch (insertErr) {
+      console.error(`[site-limit-close] auto-link insert failed for ${signerPubkey.slice(0, 8)}…:`, insertErr.message);
+      return {
+        ok: false,
+        status: 500,
+        error: "auto_link_failed",
+        detail: insertErr.message?.slice(0, 200) || "wallet auto-link failed",
+      };
+    }
   }
-  // The engine needs a custodial keypair to autonomously fire the
-  // repay+sell tx. wallets.encrypted_secret holds the encrypted key
-  // for custodial + imported wallets. Phantom-only wallets get NULL
-  // and can't have autonomous take-profit.
-  if (!walletRow.encrypted_secret || walletRow.encrypted_secret.length === 0) {
-    return {
-      ok: false, status: 403,
-      error: "requires_linked_custodial_wallet",
-      detail: "Autonomous take-profit needs a Magpie custodial keypair to sign the repay+sell tx at fire time. " +
-              "Connect via the Telegram bot or import a key to enable.",
-    };
-  }
+  // HISTORICAL — the custodial-keypair check that lived here was OBSOLETE
+  // for V4 loans. The engine fires `convert_collateral_slice` signed by
+  // the lender keypair (not the borrower's). Engine-side borrower-keypair
+  // skip already landed in task #327 + execution.js line 909 V4 branch.
+  // The auth-time check was a leftover from V1/V2/V3 — it forced users
+  // with Phantom-only wallets to /import their key just to use auto-sells
+  // that wouldn't actually need their signature.
+  //
+  // Operator-mandated 2026-06-17 PM:
+  //   "EVERY SINGLE WALLET, whether it is TG linked or not needs to
+  //    bypass this. WE CANNOT have it set up to only support wallets
+  //    that are connected to the TG."
+  //
+  // Defense-in-depth: V1/V2/V3 loans STILL block arming via
+  // `exits_require_v4_loan` (V4_EXIT_EXCLUSIVE_ENFORCE=true) — the only
+  // path that reaches the arm-core insert is a V4 loan, which the engine
+  // can fire without the borrower's keypair. No regression vector.
+  //
+  // See feedback_v4_auto_sells_no_custodial_requirement_2026_06_17.md.
 
-  return { ok: true, userId: walletRow.user_id, signerPubkey, fields };
+  return { ok: true, userId: walletRow.user_id, signerPubkey, fields, body };
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -245,11 +347,27 @@ async function authSignedEnvelope(req, expectedMagpieHeader, requiredFields = []
  * ───────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseList(req, url) {
   if (req.method !== "GET") return { status: 405, body: { error: "GET only" } };
+  // Global kill switch (audit HIGH#3) — during a /sitedisable incident,
+  // even reads are paused to prevent dashboards from rendering stale
+  // state that conflicts with the actual chain truth. Per-user /lock is
+  // skipped here because List is unauthenticated public-read and locking
+  // a wallet shouldn't hide their orders from themselves.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const wallet = url.searchParams.get("wallet") || "";
   if (!isValidPubkey(wallet)) return { status: 400, body: { error: "invalid_wallet" } };
 
+  // Same TG-preferring ranking as the arm path so the list shows
+  // orders for the wallet's canonical user_id.
   const { rows: [walletRow] } = await query(
-    `SELECT user_id, encrypted_secret FROM wallets WHERE public_key = $1 LIMIT 1`,
+    `SELECT w.user_id, w.encrypted_secret
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
     [wallet],
   );
   if (!walletRow) {
@@ -263,15 +381,36 @@ export async function handleSiteLimitCloseList(req, url) {
       },
     };
   }
-  const isCustodial = !!walletRow.encrypted_secret;
+  // Align GET's custodial check with POST's stricter version at line 241.
+  // An empty Buffer is TRUTHY in JS (`!!Buffer.from([])` === true) but
+  // unusable as a signing key, so the old `!!encrypted_secret` would
+  // wrongly report `custodial: true` for a Phantom-only wallet whose
+  // wallets.encrypted_secret column was a zero-length Buffer. The POST
+  // /arm path correctly catches that with `length === 0` and 403s with
+  // `requires_linked_custodial_wallet`. The lie at GET-time let the site
+  // open the borrow flow, the user signed + funded a V4 loan, then the
+  // arm-batch 403'd → recovery banner forever. Operator hit this on
+  // 2026-06-17 PM. See
+  // feedback_custodial_check_get_post_mismatch_2026_06_17.md.
+  const isCustodial =
+    !!walletRow.encrypted_secret &&
+    (walletRow.encrypted_secret.length ?? 0) > 0;
 
   // Loans owned by this wallet (status='active' only — take-profit
   // is for active loans).
   const { rows: loans } = await query(
     `SELECT l.id, l.loan_id::text AS loan_id, l.loan_pda,
             l.collateral_mint, l.collateral_amount::text AS collateral_amount,
+            -- Remainder watcher columns (migration 066, engine maintains
+            -- them per fire). NULL on pre-066 rows → site falls back to
+            -- collateral_amount cleanly.
+            COALESCE(l.current_collateral_amount, l.collateral_amount)::text
+              AS current_collateral_amount,
+            COALESCE(l.sol_proceeds_amount, 0)::text AS sol_proceeds_amount,
+            COALESCE(l.auto_sells_fired, 0) AS auto_sells_fired,
             l.original_loan_amount_lamports::text AS owed_lamports,
             l.start_timestamp, l.due_timestamp,
+            l.program_id,
             sm.symbol AS collateral_symbol, sm.decimals AS collateral_decimals,
             sm.category AS collateral_category, sm.enabled AS collateral_enabled
        FROM loans l
@@ -282,7 +421,11 @@ export async function handleSiteLimitCloseList(req, url) {
     [walletRow.user_id, wallet],
   );
 
-  // Armed orders for those loans.
+  // Orders for those loans. Returns BOTH currently-active AND fired/
+  // cancelled orders within the loan's lifetime so the dashboard can
+  // show ladder progression (e.g. "80% leg fired @ $180 ✓ | 20% leg
+  // armed @ $182"). Slice_pct is included so the UI can render the
+  // ladder composition (default 10000 = 100% if column NULL).
   const loanIds = loans.map((l) => l.id);
   let orders = [];
   if (loanIds.length > 0) {
@@ -294,14 +437,81 @@ export async function handleSiteLimitCloseList(req, url) {
               max_slippage_bps_cap, auto_escalate_slippage,
               source, source_agent_pubkey,
               trailing_distance_bps,
-              peak_price_micros::text AS peak_price_micros
+              peak_price_micros::text AS peak_price_micros,
+              COALESCE(slice_pct, 10000) AS slice_pct,
+              ladder_group_id,
+              -- Fire details (NULL for non-fired orders)
+              fired_at,
+              proceeds_lamports::text AS proceeds_lamports,
+              net_to_user_lamports::text AS net_to_user_lamports,
+              tx_signature_swap,
+              tx_signature_repay,
+              -- Failure details (populated when status = 'failed' or
+              -- 'max_retries_exceeded'). Dashboard renders the leg in
+              -- red with this reason per the active-loans-dashboard rule.
+              failure_reason,
+              failure_count,
+              cancellation_reason
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
-          AND status IN ('armed','firing','twap_in_progress','awaiting_user')
-        ORDER BY armed_at DESC`,
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled','failed','max_retries_exceeded')
+        ORDER BY
+          -- Active states sort first by armed_at DESC, history by fired_at DESC
+          CASE WHEN status IN ('fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
+          armed_at DESC`,
       [loanIds],
     );
     orders = r.rows;
+  }
+
+  // Intent reconciliation for the recovery banner (operator-mandated
+  // 2026-06-17 — see feedback_recovery_banner_must_show_failed_
+  // intents_too.md). Returns both 'pending' (arm in flight) AND
+  // 'failed' (arm rejected within the recent 1h window) intents so
+  // the banner can render the user's EXACT strike as a one-tap retry
+  // — even when the prior attempt hard-failed and the
+  // failure-reconcile flipped status to 'failed'. Without 'failed' in
+  // this filter, the banner falls back to generic 2x/3x/0.7x defaults
+  // and the user loses sight of what they actually asked for.
+  //
+  // 1h window prevents stale week-old failed corpses from haunting
+  // the banner forever; recent failures are immediately recoverable.
+  // The 24h window for 'pending' is kept for in-flight intents (rare
+  // but possible — webhook delays etc.).
+  let pendingIntents = [];
+  try {
+    const loanChainIds = loans.map((l) => l.loan_id);
+    if (loanChainIds.length > 0) {
+      const ir = await query(
+        `SELECT id, loan_id_chain, direction, target_kind,
+                target_value_micro::text AS target_value_micro,
+                slice_pct_bps, source, status, error_code, created_at
+           FROM arm_intents
+          WHERE wallet = $1
+            AND loan_id_chain = ANY($2::text[])
+            AND (
+              -- Banner-surface window for unfinished-arm intents. The
+              -- whole point is to never lose the user's exact strike:
+              -- if they came back the next day to the same V4 loan,
+              -- the banner must STILL surface their target so they can
+              -- one-click retry. The original 1h window evaporated the
+              -- strike right when operator hit it (2026-06-17 night,
+              -- intents 15/16 went out of window at ~67 min old).
+              -- 24h matches the 'pending' window and is long enough to
+              -- catch overnight retries while keeping ancient failures
+              -- from spamming the banner forever.
+              (status = 'pending' AND created_at > NOW() - INTERVAL '24 hour')
+              OR (status = 'failed' AND created_at > NOW() - INTERVAL '24 hour')
+            )
+          ORDER BY created_at DESC`,
+        [wallet, loanChainIds],
+      );
+      pendingIntents = ir.rows;
+    }
+  } catch (err) {
+    // arm_intents table may not exist yet on pre-071 schemas; degrade
+    // gracefully so the dashboard still renders.
+    console.warn(`[site-limit-close] arm_intents lookup failed (pre-071?): ${err.message?.slice(0, 80)}`);
   }
 
   // Eligibility annotation per loan — same checks the arm endpoint
@@ -319,10 +529,26 @@ export async function handleSiteLimitCloseList(req, url) {
   const armedBelowByLoan = new Set(
     orders.filter((o) => o.status === "armed" && o.trigger_direction === "below").map((o) => Number(o.loan_id)),
   );
+  // V4-exclusive enforcement: when V4_EXIT_EXCLUSIVE_ENFORCE=true (the
+  // operator-stated policy posture as of 2026-06-15), only loans that
+  // landed on the V4 program can be armed with new exits. Mirrors the
+  // arm-core gate (`exits_require_v4_loan`) so the dashboard renders
+  // the ineligibility BEFORE the user signs an envelope that would
+  // just bounce. Operator hit this on 2026-06-15 with $KINS and $PUMP
+  // V1 loans that still showed the "Set upside auto-sell" CTA.
+  const v4EnforceOn = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+  const v4ProgramIdStr = process.env.PROGRAM_ID_V4 ?? null;
+
   const annotated = loans.map((l) => {
     const baseReasons = [];
     if (BigInt(l.owed_lamports) < MIN_LOAN_LAMPORTS) baseReasons.push("loan_below_minimum_size");
     if (!l.collateral_enabled) baseReasons.push("collateral_not_enabled");
+    // V4 enforcement: non-V4 loans can't take new exits. NOTE: this
+    // intentionally does NOT touch already-armed orders — those keep
+    // firing through their legacy path. Only blocks NEW arms.
+    if (v4EnforceOn && v4ProgramIdStr && l.program_id && l.program_id !== v4ProgramIdStr) {
+      baseReasons.push("exits_require_v4_loan");
+    }
     // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible
     // for limit-close. Engine's V2 fill path landed in PR B; arm-core
     // applies a weekend-aware initial-slippage bump for thin RWA routes.
@@ -343,6 +569,39 @@ export async function handleSiteLimitCloseList(req, url) {
     };
   });
 
+  // Tier-2 architectural fix (defense C in
+  // feedback_loan_830_full_postmortem_and_defenses.md). Surface
+  // pending_arms rows so the dashboard can render an "Arming…"
+  // state instead of the recovery banner when the race window is
+  // still open. The watcher will replay these every 10s; once orders
+  // land they'll appear in the `orders` array above and the dashboard
+  // can flip the loan card from arming → armed in-place.
+  let pendingArms = [];
+  try {
+    const loanChainIds = loans.map((l) => l.loan_id);
+    if (loanChainIds.length > 0) {
+      const par = await query(
+        `SELECT id, loan_id_chain, status, legs, intent_ids,
+                envelope_issued_at, retry_count, last_retry_at,
+                last_retry_error, order_ids,
+                EXTRACT(EPOCH FROM (envelope_issued_at + INTERVAL '5 minutes' - NOW()))::int
+                  AS seconds_remaining
+           FROM pending_arms
+          WHERE wallet = $1
+            AND loan_id_chain = ANY($2::text[])
+            AND status = 'pending'
+            AND envelope_issued_at >= NOW() - INTERVAL '5 minutes'
+          ORDER BY created_at DESC`,
+        [wallet, loanChainIds],
+      );
+      pendingArms = par.rows;
+    }
+  } catch (err) {
+    // pending_arms table may not exist on pre-Tier-2 schemas; degrade
+    // gracefully.
+    console.warn(`[site-limit-close] pending_arms lookup failed: ${err.message?.slice(0, 80)}`);
+  }
+
   return {
     status: 200,
     body: {
@@ -350,6 +609,17 @@ export async function handleSiteLimitCloseList(req, url) {
       custodial: isCustodial,
       loans: annotated,
       orders,
+      // Pending arm intents (operator-mandated 2026-06-16 PM,
+      // feedback_every_arm_envelope_must_reach_server.md). Dashboard
+      // reconciles against orders: an intent without a matching armed
+      // order means the auto-arm chain silently failed → render the
+      // V4 recovery banner with one-click retry.
+      pending_intents: pendingIntents,
+      // Tier-2 pending_arms — dashboard should render an "Arming…"
+      // state for loans with any row here, NOT the recovery banner.
+      // The watcher will replay these every 10s while the user's
+      // signature stays fresh (5 min ceiling).
+      pending_arms: pendingArms,
       generated_at: new Date().toISOString(),
     },
   };
@@ -380,13 +650,115 @@ export async function handleSiteLimitCloseList(req, url) {
  *   Slippage: 200               (optional, default 200, bps)
  *   Dest: sol                   (optional, default sol)
  *   Expire: 30d                 (optional, days or hours)
+ *   Slice: 7000                 (optional, default 10000 = 100% = full close.
+ *                                Set <10000 to arm a LADDER LEG that sells
+ *                                slice/10000 of original collateral when
+ *                                this leg fires. arm-core stamps a shared
+ *                                ladder_group_id when siblings exist on the
+ *                                same loan/direction. Migration 065 trigger
+ *                                enforces SUM(slice) <= 10000.)
  *   Nonce: <random_base58_or_uuid>
  *   IssuedAt: <ISO timestamp>
  * ───────────────────────────────────────────────────────────────── */
+/**
+ * Classify an arm response into success/failure + failure class for
+ * conversion telemetry. Used by the wrapper around the single-arm and
+ * batch-arm handlers. [[feedback_user_retention_via_flawless_conversion]]
+ */
+function _classifyArmOutcome(result) {
+  if (result?.body?.ok === true) return { outcome: "success", klass: null };
+  const b = result?.body || {};
+  if (b.error) return { outcome: "failure", klass: String(b.error).slice(0, 60) };
+  if (result?.status >= 400) return { outcome: "failure", klass: `http_${result.status}` };
+  return { outcome: "failure", klass: "unclassified" };
+}
+
+/**
+ * Record an arm-path conversion event. Pulls the mint via loan_id when
+ * possible so /convstats can show per-mint arm success rates. Fire-and-
+ * forget so telemetry never blocks the response.
+ */
+function _recordArmConversion({ result, loanIdChain, userId, startedAt }) {
+  const { outcome, klass } = _classifyArmOutcome(result);
+  import("../services/conversion-tracker.js")
+    .then(async ({ recordConversionEvent }) => {
+      let mint = null;
+      let programId = null;
+      if (loanIdChain) {
+        try {
+          const { rows } = await query(
+            `SELECT collateral_mint, program_id FROM loans WHERE loan_id = $1 LIMIT 1`,
+            [loanIdChain],
+          );
+          if (rows.length > 0) {
+            mint = rows[0].collateral_mint;
+            programId = rows[0].program_id;
+          }
+        } catch { /* don't let lookup failure block the record */ }
+      }
+      await recordConversionEvent({
+        path: "arm",
+        outcome,
+        failureClass: klass,
+        mint,
+        programId,
+        userId,
+        surface: "site",
+        latencyMs: Date.now() - startedAt,
+        detail: loanIdChain ? { loan_id_chain: String(loanIdChain) } : null,
+      });
+    })
+    .catch(() => {});
+}
+
 export async function handleSiteLimitCloseArm(req) {
+  const _convStart = Date.now();
+  try {
+    const result = await _handleSiteLimitCloseArmImpl(req);
+    const loanIdChain = result?.body?.loan_id ?? null;
+    _recordArmConversion({ result, loanIdChain, userId: null, startedAt: _convStart });
+    return result;
+  } catch (err) {
+    _recordArmConversion({
+      result: { status: 500, body: { error: "thrown" } },
+      loanIdChain: null,
+      userId: null,
+      startedAt: _convStart,
+    });
+    throw err;
+  }
+}
+
+async function _handleSiteLimitCloseArmImpl(req) {
+  // V4 Hardening T1 (2026-06-15 PM): structured entry log so every arm
+  // POST is visible in Railway, including those rejected by auth or
+  // parsing. Operator hit a class of bug where dashboard arms produced
+  // ZERO orders in DB and NO traces in bot logs — we couldn't tell if
+  // the request was even reaching the bot. This log closes that gap.
+  // Logs only request metadata (wallet, loan_id, envelope tag) — no
+  // private fields, no signatures.
+  const reqId = Math.random().toString(36).slice(2, 10);
+  console.log(`[arm] ENTRY req=${reqId} ip=${req.socket?.remoteAddress?.slice(0, 20) || "?"} ua="${(req.headers["user-agent"] || "").slice(0, 60)}"`);
+  // Global kill switch (audit HIGH#3) — operator can /sitedisable all
+  // site-signed writes during an incident without touching the engine.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-arm/v1", ["LoanId"]);
-  if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
+  if (!auth.ok) {
+    console.warn(`[arm] AUTH-FAIL req=${reqId} status=${auth.status} error=${auth.error} detail=${(auth.detail || "").slice(0, 120)}`);
+    return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.expected ? { expected: auth.expected } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
+  }
   const { userId, fields } = auth;
+  // Per-user kill switch (audit HIGH#3) — borrower can /lock their
+  // account from TG when they suspect Phantom compromise.
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
+  console.log(
+    `[arm] AUTH-OK req=${reqId} user_id=${userId} signer=${auth.signerPubkey.slice(0, 8)}… ` +
+    `loan_id_chain=${fields.LoanId} direction=${fields.Direction || "above"} ` +
+    `target=${fields.Target || ""} price=${fields.Price || ""} mc=${fields.MC || ""} ` +
+    `trailing=${fields.Trailing || ""} slippage=${fields.Slippage || ""} slice=${fields.Slice || ""} dest=${fields.Dest || ""}`,
+  );
 
   // ── Parse direction ──
   // 2026-06-13: site now supports stop-loss arming. Old envelopes that
@@ -478,6 +850,22 @@ export async function handleSiteLimitCloseArm(req) {
   }
   const dest = (fields.Dest || "sol").toLowerCase();
 
+  // ── Slice (ladder leg) parsing ──
+  // Optional Slice: <bps>  field on the envelope. When set <10000, this
+  // arm is a ladder leg (one of N siblings sharing a ladder_group_id).
+  // The bot's arm-core stamps ladder_group_id + original_collateral_amount
+  // when slicePct<10000. Multiple legs from the same loan/direction with
+  // sum(slice_pct)<=10000 are enforced by the migration-065 trigger.
+  let slicePctApplied = 10000;
+  if (fields.Slice !== undefined) {
+    const raw = String(fields.Slice).trim();
+    const s = Number(raw);
+    if (!Number.isInteger(s) || s < 1 || s > 10000) {
+      return { status: 400, body: { error: "invalid_slice_pct", detail: "Slice must be an integer in [1, 10000] bps (0.01%–100%)." } };
+    }
+    slicePctApplied = s;
+  }
+
   // Expire parsing — "30d" / "12h"
   let expiresAt = null;
   if (fields.Expire) {
@@ -490,12 +878,23 @@ export async function handleSiteLimitCloseArm(req) {
   }
 
   // ── Load loan to resolve multiplier (needs collateral_mint) ──
+  // Race-tolerant: same 6s/400ms poll as armOrder / armOrderBatch. The
+  // borrow tx may have confirmed but /sync-loan hasn't committed the
+  // loans row yet when a multiplier-arm fires immediately after.
   if (multiplierUsed != null) {
-    const { rows: [loanLite] } = await query(
-      `SELECT collateral_mint FROM loans
-        WHERE user_id = $1 AND loan_id = $2 AND status = 'active'`,
-      [userId, fields.LoanId],
-    );
+    const LOAN_LOOKUP_DEADLINE_MS = Date.now() + 30_000;
+    const LOAN_LOOKUP_INTERVAL_MS = 400;
+    let loanLite = null;
+    for (;;) {
+      const { rows } = await query(
+        `SELECT collateral_mint FROM loans
+          WHERE user_id = $1 AND loan_id = $2 AND status = 'active'`,
+        [userId, fields.LoanId],
+      );
+      if (rows.length > 0) { loanLite = rows[0]; break; }
+      if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
+      await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
+    }
     if (!loanLite) return { status: 404, body: { error: "loan_not_found_for_signer" } };
     // allowBelowOne is the contract with resolveMultiplierToPrice — it
     // rejects mismatched direction/multiplier pairs as a defense-in-
@@ -521,7 +920,8 @@ export async function handleSiteLimitCloseArm(req) {
     slippageBps,
     sellDestination: dest,
     expiresAt,
-    armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}) by ${auth.signerPubkey.slice(0, 8)}…`,
+    slicePct: slicePctApplied,
+    armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}${slicePctApplied < 10000 ? ` slice=${(slicePctApplied/100).toFixed(0)}%` : ""}) by ${auth.signerPubkey.slice(0, 8)}…`,
   });
   if (!armed.ok) {
     return {
@@ -619,9 +1019,14 @@ export async function handleSiteLimitCloseArm(req) {
  * move gap.
  * ────────────────────────────────────────────────────────────────── */
 export async function handleSiteLimitCloseModify(req) {
+  // Kill switches (audit HIGH#3): /sitedisable before auth, /lock after.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-modify/v1", ["OrderId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   const { userId, fields } = auth;
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
 
   const orderId = Number(fields.OrderId);
   if (!Number.isInteger(orderId)) return { status: 400, body: { error: "invalid_OrderId" } };
@@ -722,9 +1127,17 @@ export async function handleSiteLimitCloseModify(req) {
 }
 
 export async function handleSiteLimitCloseCancel(req) {
+  // Kill switches (audit HIGH#3): /sitedisable + /lock honored on cancel too.
+  // The lock matters most here — a user who suspects compromise can /lock and
+  // an attacker still can't cancel their stop-loss right before manipulating
+  // the price down.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
   const auth = await authSignedEnvelope(req, "limit-close-cancel/v1", ["OrderId"]);
   if (!auth.ok) return { status: auth.status, body: { error: auth.error, ...(auth.detail ? { detail: auth.detail } : {}), ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}) } };
   const { userId, fields } = auth;
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
 
   const orderId = Number(fields.OrderId);
   if (!Number.isInteger(orderId)) return { status: 400, body: { error: "invalid_OrderId" } };
@@ -736,4 +1149,473 @@ export async function handleSiteLimitCloseCancel(req) {
   });
   if (!r.ok) return { status: 409, body: { error: r.error } };
   return { status: 200, body: { ok: true, cancelled_order_id: r.orderId } };
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * POST /api/v1/site/limit-close/intent
+ *
+ * Lightweight intent beacon, operator-mandated 2026-06-16 PM (per
+ * feedback_every_arm_envelope_must_reach_server.md). The site POSTs
+ * this BEFORE asking Phantom to sign so the server has a durable
+ * record of the user's intent even if the subsequent signed arm
+ * silently fails.
+ *
+ * Auth: unsigned. This endpoint stores intent, NOT authoritative
+ * state — no funds move, no orders arm. The wallet field is the
+ * user's claimed pubkey; we record it as-is and resolve to user_id
+ * via wallets.public_key lookup. A bad actor can spam intents on any
+ * wallet, but they can never cause an actual fire because the signed
+ * /arm endpoint still gates on Ed25519 verification + the cosign
+ * cron only acts on `status='armed'` rows.
+ *
+ * Body: {
+ *   wallet: string,
+ *   loan_id_chain: string,
+ *   direction: 'above' | 'below',
+ *   target_kind: 'multiplier' | 'price_usd' | 'mc_usd' | 'price_sol' | 'trailing',
+ *   target_value_micro: string | number,
+ *   slice_pct_bps?: number,
+ *   source?: string (defaults to 'site')
+ * }
+ *
+ * Returns: { ok: true, intent_id: number }
+ * The site uses intent_id when subsequently POSTing /arm so the
+ * server can mark the intent armed on success.
+ * ───────────────────────────────────────────────────────────────── */
+// Layered DoS / spoofing defense for the unsigned intent beacon (audit
+// HIGH#2 2026-06-17 PM):
+//   - Global /sitedisable kill switch.
+//   - Per-IP rate limit so an attacker can't spam from one origin.
+//   - Per-wallet rate limit so even IP-rotated attackers can't flood a
+//     specific victim's recovery banner.
+//   - Hard cap on pending arm_intents per wallet so the table can't be
+//     used as a DB-bloat vector.
+//
+// The site will upgrade to signed-envelope intents in a follow-up; until
+// then this bounds the damage while keeping legitimate dashboards working.
+const INTENT_IP_WINDOW_MS = 60_000;
+const INTENT_IP_MAX = 30;
+const intentIpBuckets = new Map();
+const INTENT_WALLET_WINDOW_MS = 60 * 60_000; // 1 hour
+const INTENT_WALLET_MAX = 20;
+const intentWalletBuckets = new Map();
+const INTENT_WALLET_PENDING_CAP = 30;
+function intentIpKey(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+function checkIntentBucket(map, key, windowMs, maxCount) {
+  const now = Date.now();
+  const bucket = map.get(key) || [];
+  const fresh = bucket.filter((t) => now - t < windowMs);
+  if (fresh.length >= maxCount) return false;
+  fresh.push(now);
+  map.set(key, fresh);
+  // Periodic eviction so the map is bounded — audit API#6/Bot#6.
+  if (map.size > 5000 && Math.random() < 0.004) {
+    for (const [k, v] of map.entries()) {
+      if (v.every((t) => now - t >= windowMs)) map.delete(k);
+    }
+  }
+  return true;
+}
+
+export async function handleSiteLimitCloseIntent(req) {
+  // Global kill switch (audit HIGH#3) — intent beacons paused too.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
+
+  // Per-IP rate limit BEFORE body parse so a flood can't OOM us on read.
+  if (!checkIntentBucket(intentIpBuckets, intentIpKey(req), INTENT_IP_WINDOW_MS, INTENT_IP_MAX)) {
+    return { status: 429, body: { error: "intent_rate_limit" } };
+  }
+
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== "object") {
+    return { status: 400, body: { error: "invalid_body" } };
+  }
+  const {
+    wallet,
+    loan_id_chain,
+    direction,
+    target_kind,
+    target_value_micro,
+    slice_pct_bps,
+    source,
+  } = body;
+
+  if (typeof wallet !== "string" || wallet.length < 32 || wallet.length > 44) {
+    return { status: 400, body: { error: "invalid_wallet" } };
+  }
+
+  // Per-wallet rate limit. Stops an IP-rotating attacker from spraying
+  // intents on one victim's recovery banner — they can hit 20 in an
+  // hour total, not per IP. Combined with the pending-cap below this
+  // bounds the recovery-banner-spoofing attack to a small constant.
+  if (!checkIntentBucket(intentWalletBuckets, wallet, INTENT_WALLET_WINDOW_MS, INTENT_WALLET_MAX)) {
+    return { status: 429, body: { error: "wallet_intent_rate_limit" } };
+  }
+
+  // Pending-cap per wallet — bounds DB bloat AND recovery-banner-spoof
+  // surface. A legitimate dashboard never has > ~5 pending intents at
+  // once (one per pre-borrow exit leg, at most).
+  try {
+    const { rows: [{ count }] } = await query(
+      `SELECT COUNT(*)::int AS count FROM arm_intents
+        WHERE wallet = $1 AND status = 'pending'
+          AND created_at > NOW() - INTERVAL '24 hours'`,
+      [wallet],
+    );
+    if (count >= INTENT_WALLET_PENDING_CAP) {
+      return {
+        status: 429,
+        body: {
+          error: "too_many_pending_intents",
+          detail: `Wallet has ${count} pending intents in last 24h. Clear via the dashboard or wait.`,
+        },
+      };
+    }
+  } catch (err) {
+    console.warn("[intent] pending-cap check failed:", err.message?.slice(0, 120));
+  }
+
+  if (typeof loan_id_chain !== "string" || !/^\d+$/.test(loan_id_chain)) {
+    return { status: 400, body: { error: "invalid_loan_id_chain" } };
+  }
+  if (direction !== "above" && direction !== "below") {
+    return { status: 400, body: { error: "invalid_direction" } };
+  }
+  const validKinds = new Set(["multiplier", "price_usd", "mc_usd", "price_sol", "trailing"]);
+  if (!validKinds.has(target_kind)) {
+    return { status: 400, body: { error: "invalid_target_kind" } };
+  }
+  // target_value_micro: accept string or number, store as numeric.
+  const tvm = typeof target_value_micro === "string" ? target_value_micro : String(target_value_micro);
+  if (!/^\d+$/.test(tvm)) {
+    return { status: 400, body: { error: "invalid_target_value_micro" } };
+  }
+  const sliceBps =
+    slice_pct_bps == null
+      ? null
+      : Number.isInteger(slice_pct_bps) && slice_pct_bps > 0 && slice_pct_bps <= 10000
+        ? slice_pct_bps
+        : null;
+  const src = typeof source === "string" && source.length <= 32 ? source : "site";
+
+  // Resolve user_id from wallets.public_key. Best-effort — intent is
+  // recorded even if the wallet isn't linked yet, which lets us spot
+  // "pre-link" intents on the reconciliation cron.
+  let userId = null;
+  try {
+    const walletRow = await query(
+      "SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1",
+      [wallet],
+    );
+    if (walletRow.rows.length > 0) userId = walletRow.rows[0].user_id;
+  } catch (err) {
+    console.warn("[intent] wallet lookup failed:", err.message?.slice(0, 100));
+  }
+
+  // De-dupe before INSERT — operator-mandated 2026-06-17 03:50 UTC
+  // (feedback_no_duplicate_intents_in_recovery_banner_NEVER.md, ZERO
+  // TOLERANCE). If an identical pending intent exists for the same
+  // (wallet, loan_id_chain, direction, target_kind, target_value_micro,
+  // slice_pct_bps) within the last 5 minutes, return its id instead of
+  // writing a new row. Prevents the SPCX loan 816 incident where user
+  // retried a 2-leg ladder twice and ended up with 4 duplicate pending
+  // intents surfaced as 4 buttons on the recovery banner.
+  //
+  // The 5-min window is the same idempotency window used by the
+  // breadcrumb writer in arm-core.js — every entry point must agree.
+  try {
+    const dedup = await query(
+      `SELECT id, created_at FROM arm_intents
+        WHERE wallet = $1
+          AND loan_id_chain = $2
+          AND direction = $3
+          AND target_kind = $4
+          AND target_value_micro = $5::numeric
+          AND COALESCE(slice_pct_bps, 0) = COALESCE($6::int, 0)
+          AND status = 'pending'
+          AND created_at > NOW() - INTERVAL '5 minutes'
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [wallet, loan_id_chain, direction, target_kind, tvm, sliceBps],
+    );
+    if (dedup.rows.length > 0) {
+      const existing = dedup.rows[0];
+      return {
+        status: 200,
+        body: { ok: true, intent_id: existing.id, created_at: existing.created_at, deduped: true },
+      };
+    }
+  } catch (err) {
+    // Dedupe is best-effort. If it fails, fall through to INSERT —
+    // safety net is still in place via the dashboard's dedupe logic.
+    console.warn("[intent] dedupe lookup failed (proceeding):", err.message?.slice(0, 120));
+  }
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO arm_intents
+         (user_id, wallet, loan_id_chain, direction, target_kind, target_value_micro, slice_pct_bps, source, status)
+       VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, 'pending')
+       RETURNING id, created_at`,
+      [userId, wallet, loan_id_chain, direction, target_kind, tvm, sliceBps, src],
+    );
+    const intent = rows[0];
+    return {
+      status: 201,
+      body: { ok: true, intent_id: intent.id, created_at: intent.created_at },
+    };
+  } catch (err) {
+    console.error("[intent] INSERT failed:", err.message?.slice(0, 200));
+    return { status: 500, body: { error: "intent_persist_failed" } };
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * POST /api/v1/site/limit-close/arm-batch
+ *
+ * Operator-mandated 2026-06-16 PM
+ * (feedback_one_signature_for_n_legs_always.md). ONE Phantom signature
+ * arms ALL legs of a ladder atomically. Replaces the N-popups-for-N-
+ * legs pattern that caused silent-leg-drop UX disasters on loans 798
+ * and 802 when Phantom sessions died between sequential signs.
+ *
+ * Signed envelope shape:
+ *   magpie: limit-close-arm-batch/v1
+ *   From:   <signer_wallet>
+ *   LoanId: <chain_loan_id>
+ *   Legs:   <json-array>
+ *   Nonce / Timestamp via signed_message envelope
+ *
+ * Where Legs is a JSON-stringified array:
+ *   [
+ *     {"d":"above","k":"price_usd","v":"212000000","s":5000,"slip":200},
+ *     {"d":"above","k":"price_usd","v":"230000000","s":5000,"slip":200}
+ *   ]
+ *   - d: 'above' (TP) | 'below' (SL)
+ *   - k: 'price_usd' | 'mc_usd' | 'price_sol'
+ *   - v: trigger_value_micro as string
+ *   - s: slice_bps (1..10000)
+ *   - slip: slippage_bps initial (10..MAX_PROTOCOL_SLIPPAGE_BPS)
+ *   - intent_id (optional): pending arm_intents row id to mark armed
+ *
+ * Body may ALSO include `intent_ids: [int, ...]` at the top level so
+ * the server reconciles each leg's intent without it being in the
+ * signed payload. Either path works; signed payload takes precedence.
+ *
+ * Returns:
+ *   201 + { ok: true, order_ids: [...], ladder_group_ids: { above?, below? } }
+ * or
+ *   409 + { ok: false, error, failed_leg_index, detail }
+ * ───────────────────────────────────────────────────────────────── */
+export async function handleSiteLimitCloseArmBatch(req) {
+  const _convStart = Date.now();
+  try {
+    const result = await _handleSiteLimitCloseArmBatchImpl(req);
+    const loanIdChain = result?.body?.loan_id_chain ?? null;
+    _recordArmConversion({ result, loanIdChain, userId: null, startedAt: _convStart });
+    return result;
+  } catch (err) {
+    _recordArmConversion({
+      result: { status: 500, body: { error: "thrown" } },
+      loanIdChain: null,
+      userId: null,
+      startedAt: _convStart,
+    });
+    throw err;
+  }
+}
+
+async function _handleSiteLimitCloseArmBatchImpl(req) {
+  // Kill switches (audit HIGH#3): gate batch-arm same as single arm.
+  const globalReject = await rejectIfSiteDisabled();
+  if (globalReject) return globalReject;
+  const auth = await authSignedEnvelope(req, "limit-close-arm-batch/v1", [
+    "LoanId",
+    "Legs",
+  ]);
+  if (!auth.ok) {
+    return {
+      status: auth.status,
+      body: {
+        error: auth.error,
+        ...(auth.detail ? { detail: auth.detail } : {}),
+        ...(auth.expected ? { expected: auth.expected } : {}),
+        ...(auth.retry_after_seconds ? { retry_after_seconds: auth.retry_after_seconds } : {}),
+      },
+    };
+  }
+  const { userId, fields, body: rawBody } = auth;
+  // Kill switch (audit HIGH#3): per-user /lock applies to batch-arm too.
+  const lockReject = await rejectIfLocked(userId);
+  if (lockReject) return lockReject;
+  const reqId = (Math.random() * 1e9 | 0).toString(36);
+
+  // Parse Legs (signed payload — tamper-proof from middlemen).
+  let legs;
+  try {
+    legs = JSON.parse(String(fields.Legs));
+  } catch (e) {
+    return { status: 400, body: { error: "legs_json_parse_failed", detail: e.message?.slice(0, 120) } };
+  }
+  if (!Array.isArray(legs)) {
+    return { status: 400, body: { error: "legs_not_an_array" } };
+  }
+  if (legs.length === 0) {
+    return { status: 400, body: { error: "no_legs_supplied" } };
+  }
+  if (legs.length > 8) {
+    return { status: 400, body: { error: "too_many_legs", detail: "max 8 per batch" } };
+  }
+
+  // Translate the compact wire shape (d/k/v/s/slip) to armOrderBatch's
+  // friendlier internal shape.
+  const armCoreLegs = [];
+  for (let i = 0; i < legs.length; i++) {
+    const l = legs[i];
+    if (!l || typeof l !== "object") {
+      return { status: 400, body: { error: "leg_not_object", failed_leg_index: i } };
+    }
+    // Multiplier kind needs to forward the raw multiplier to arm-core's
+    // batch oracle-resolve phase. l.multiplier OR l.v (which carries
+    // the multiplier as a stringified number when k==="multiplier").
+    const armLeg = {
+      direction: l.d,
+      kind: l.k,
+      valueMicro: l.v,
+      sliceBps: Number.isInteger(l.s) ? l.s : 10000,
+      slippageBps: Number.isInteger(l.slip) ? l.slip : (l.d === "below" ? 300 : 200),
+      expiresAt: l.exp || null,
+    };
+    if (l.k === "multiplier" || typeof l.multiplier === "number") {
+      armLeg.multiplier =
+        typeof l.multiplier === "number" && l.multiplier > 0
+          ? l.multiplier
+          : Number(l.v);
+    }
+    armCoreLegs.push(armLeg);
+  }
+
+  // intent_ids may travel on the body (cheaper than padding the
+  // signed envelope). Site populates them from the postArmIntent
+  // calls that happen leg-by-leg in the picker.
+  const intentIds = Array.isArray(rawBody?.intent_ids) ? rawBody.intent_ids : null;
+
+  console.log(
+    `[arm-batch] AUTH-OK req=${reqId} user_id=${userId} signer=${auth.signerPubkey.slice(0, 8)}… ` +
+    `loan_id_chain=${fields.LoanId} n_legs=${armCoreLegs.length} ` +
+    `legs=${armCoreLegs.map((l) => `${l.direction}@${l.valueMicro}/${l.sliceBps}bps`).join(",")}`,
+  );
+
+  // Envelope context for the Tier-2 pending-arm queue
+  // (feedback_loan_830_full_postmortem_and_defenses.md, defense B).
+  // If arm-core's phase 1 can't find the loan within the 30s polling
+  // window, it writes a pending_arm row using THIS envelope context and
+  // the background watcher retries every 10s while the signature is
+  // still inside the 5-min freshness window. User never has to re-sign.
+  // We pass the parsed IssuedAt rather than the full signed-message
+  // bytes because the watcher doesn't re-verify the signature — that
+  // already happened above; we just need the freshness anchor.
+  const envelopeIssuedAtMs = Date.parse(fields.IssuedAt);
+  const envelope = Number.isFinite(envelopeIssuedAtMs)
+    ? {
+        signer_pubkey: auth.signerPubkey,
+        wallet: auth.signerPubkey,
+        envelope_issued_at_ms: envelopeIssuedAtMs,
+      }
+    : null;
+
+  // Hand off to arm-core batch primitive.
+  const { armOrderBatch } = await import("../services/limit-close-arm-core.js");
+  const result = await armOrderBatch({
+    userId,
+    source: "site",
+    loanIdChain: String(fields.LoanId),
+    legs: armCoreLegs,
+    intentIds,
+    armNotePrefix: `armed via site batch by ${auth.signerPubkey.slice(0, 8)}…`,
+    envelope,
+  });
+
+  // Pending-arm queued path (race-tolerant). Returns 202 so the site
+  // can switch to an "Arming…" state and poll until orders land.
+  if (result.ok && result.pending === true) {
+    console.log(
+      `[arm-batch] PENDING req=${reqId} pending_arm_id=${result.pending_arm_id} ` +
+      `loan_id_chain=${fields.LoanId} expires_at_ms=${result.envelope_expires_at_ms}`,
+    );
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        pending: true,
+        pending_arm_id: result.pending_arm_id,
+        envelope_expires_at_ms: result.envelope_expires_at_ms,
+        retry_in_ms: result.retry_in_ms,
+        detail: result.detail,
+      },
+    };
+  }
+
+  if (!result.ok) {
+    console.log(
+      `[arm-batch] FAIL req=${reqId} error=${result.error} failed_leg=${result.failedLegIndex ?? "n/a"} detail=${result.detail?.slice?.(0, 200) || ""}`,
+    );
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: result.error,
+        ...(result.failedLegIndex != null ? { failed_leg_index: result.failedLegIndex } : {}),
+        ...(result.detail ? { detail: result.detail } : {}),
+      },
+    };
+  }
+
+  console.log(
+    `[arm-batch] SUCCESS req=${reqId} order_ids=${result.orderIds.join(",")} ` +
+    `ladder_above=${result.ladderGroupIds.above?.slice(0, 8) || "-"} ` +
+    `ladder_below=${result.ladderGroupIds.below?.slice(0, 8) || "-"}`,
+  );
+
+  // Best-effort single combined DM. The site already shows immediate
+  // optimistic UI on the dashboard, so this is the operator-visible
+  // record for the borrower. Failure here does NOT undo the arm.
+  try {
+    const { enqueueNotification } = await import("../services/notification-sender.js");
+    await enqueueNotification({
+      userId,
+      kind: "limit_close_armed_batch",
+      payload: {
+        loan_id_chain: result.loanIdChain,
+        collateral_symbol: result.collateralSymbol,
+        n_legs: result.orderIds.length,
+        order_ids: result.orderIds,
+        legs: result.legs.map((l) => ({
+          order_id: l.orderId,
+          direction: l.direction,
+          trigger_kind: l.triggerKind,
+          trigger_value_micro: l.triggerValueMicro,
+          slice_pct_bps: l.slicePctBps,
+        })),
+        source: "site",
+      },
+    });
+  } catch (dmErr) {
+    console.warn(`[arm-batch] DM enqueue failed (non-fatal): ${dmErr.message?.slice(0, 120)}`);
+  }
+
+  return {
+    status: 201,
+    body: {
+      ok: true,
+      order_ids: result.orderIds,
+      ladder_group_ids: result.ladderGroupIds,
+      legs: result.legs,
+    },
+  };
 }

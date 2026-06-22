@@ -101,10 +101,25 @@ const THRESHOLDS = [
   { ratio: 1.1, emoji: "🔴", label: "Imminent liquidation risk." },
 ];
 
-function alertFor(ratio, lastAlertedAt) {
-  // Pick the lowest threshold the loan is now under, that we haven't warned
-  // the user about yet.
+function alertFor(ratio, lastAlertedAt, ltvPercentage = null) {
+  // Compute starting health for this loan based on its LTV. A loan at
+  // 70% LTV starts at 1/0.70 ≈ 1.43x — already BELOW our 1.5x "heads up"
+  // threshold. Without this gate, every 70% LTV RWA loan would fire a
+  // health alert the moment it was borrowed, regardless of price action.
+  // Operator-reported 2026-06-15 after the first SPCX 70% LTV V4 borrow
+  // triggered an immediate health DM.
+  //
+  // Rule: skip any threshold that is >= the loan's STARTING health. The
+  // alert should fire on a meaningful drop FROM origination, not on a
+  // condition that was true at borrow time.
+  const startingHealth = ltvPercentage && ltvPercentage > 0
+    ? 100 / ltvPercentage
+    : null;
+
   for (const t of THRESHOLDS) {
+    // Skip thresholds at or above starting health — they'd fire on a
+    // flat or even slightly-up market. Annoying, not informative.
+    if (startingHealth != null && t.ratio >= startingHealth) continue;
     if (ratio < t.ratio) {
       if (lastAlertedAt == null || Number(lastAlertedAt) > t.ratio) {
         return t;

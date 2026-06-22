@@ -1,5 +1,19 @@
 [deploy]
 startCommand = "node src/index.js"
+# Cheap, dependency-free liveness probe (returns 200 the moment the HTTP server
+# is listening). Railway gates deploy cutover on this — so a new instance only
+# takes traffic once it's actually live (zero-downtime deploys, no deploy-time
+# 502 window) — and restarts the service if the process hangs/dies. NOT
+# /api/v1/health: that does a DB ping + heartbeat checks and 503s on a transient
+# DB blip, which would block deploys / cause restart loops. See server.js.
+healthcheckPath = "/api/v1/livez"
+# Generous window: the HTTP server listens a few seconds into boot (after
+# bot.start connects to Telegram). If a slow connect ever exceeded this, the
+# deploy just fails its healthcheck and the OLD instance keeps serving — zero
+# downtime either way.
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
 
 [service]
 # Expose HTTP API alongside the Telegram bot

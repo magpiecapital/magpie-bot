@@ -24,7 +24,9 @@ import { connection } from "../solana/connection.js";
 import {
   getProgramForSigner,
   PROGRAM_ID,
+  PROGRAM_ID_V4,
   chooseProgramIdForCategory,
+  chooseProgramId,
   assertProgramMatchesCategory,
   chooseProgramIdForLoan,
 } from "../solana/program.js";
@@ -158,22 +160,53 @@ export async function executeBorrow({
   collateralAmountRaw,
   collateralValueLamports,
   loanOption,
+  // V4-exclusive routing (2026-06-15): when the borrow is part of a
+  // flow that ALSO arms an exit (TP/SL/trailing/bracket/ladder), set
+  // this flag so the borrow lands on V4. V4 is the only pool whose
+  // engine fire path keeps the loan ACTIVE and accumulates SOL in the
+  // per-loan vault. Plain borrows (no exit) keep the legacy V1/V2/V3
+  // category-based routing.
+  hasExitArming = false,
 }) {
   // Look up the collateral's category to decide which lending program to use.
   // RWAs (stocks/ETFs/metals) route to v2 (newer anchor-spl with Token-2022
   // extension support); everything else routes to v1. If v2 isn't configured
   // (PROGRAM_ID_V2 env unset), every borrow routes to v1 — fail-safe.
   const { rows: catRows } = await query(
-    `SELECT category FROM supported_mints WHERE mint = $1`,
+    `SELECT category, decimals FROM supported_mints WHERE mint = $1`,
     [collateralMint],
   );
   const category = catRows[0]?.category ?? "memecoin";
-  const programId = chooseProgramIdForCategory(category);
+  // Detect Token-2022 collateral. Token-2022 + exit-armed borrows are
+  // temporarily BLOCKED (operator-mandated V4 in-vault thesis 2026-06-15
+  // PM) until V4.x ships with the Token-2022 repay fix. Plain (no exit)
+  // borrows of Token-2022 collateral continue routing to V3 normally.
+  const collateralTokenProgram = await getMintTokenProgram(collateralMint);
+  const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+  const isToken2022 = collateralTokenProgram.equals(TOKEN_2022_PROGRAM_ID);
+  // Exit-armed borrows force V4 (refuses with TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED
+  // if Token-2022). Plain borrows take the category path.
+  const programId = chooseProgramId(category, { hasExitArming, isToken2022 });
   // Hard safety stop — refuse to open a loan if the program/category
   // pairing is wrong. The v2 pool must NEVER hold memecoin collateral,
   // and v1 must never hold RWA. Throws if violated; caller surfaces
   // the error to the user. Post-$FATHER defense in depth.
   assertProgramMatchesCategory(programId, category);
+
+  // P0 (2026-06-20): cap the collateral value to the on-chain attestation for
+  // the chosen program version so this borrow can NEVER reject with
+  // CollateralValueExceedsAttestation. Covers every executeBorrow caller (TG
+  // /borrow, /reborrow, …). Fail-soft — returns unchanged on any error, so the
+  // multiplier clamp + on-chain program remain as the lower defense layers.
+  {
+    const { capCollateralValueToAttestation } = await import("../api/safe-collateral-value.js");
+    collateralValueLamports = await capCollateralValueToAttestation(collateralValueLamports, {
+      mintStr: collateralMint,
+      decimals: Number(catRows[0]?.decimals ?? 9),
+      amountRaw: String(collateralAmountRaw),
+      programId,
+    });
+  }
 
   const borrower = await loadKeypair(userId);
   const program = getProgramForSigner(borrower, programId);
@@ -184,7 +217,7 @@ export async function executeBorrow({
   const [lendingPool] = lendingPoolPda(LENDER_PUBKEY, programId);
   const [loanTokenVault] = loanTokenVaultPda(lendingPool, programId);
 
-  const collateralTokenProgram = await getMintTokenProgram(collateralMint);
+  // collateralTokenProgram already resolved above for the Token-2022 gate.
   const loanTokenProgram = TOKEN_PROGRAM_ID; // wSOL is classic SPL
 
   const loanId = new BN(Date.now());
@@ -256,13 +289,35 @@ export async function executeBorrow({
   // Authority must co-sign to attest the collateral value
   const lenderKeypair = loadLenderKeypair();
 
+  // V3's request_and_fund_loan takes one additional `category` u8 arg
+  // (0 = memecoin, 1 = RWA stock/etf/metal). V1 + V2 take just the 4
+  // pre-existing args. Picking the right shape per program is the
+  // difference between the on-chain ix deserializing cleanly and the
+  // borrower seeing "InstructionDidNotDeserialize" (operator hit this
+  // on 2026-06-14 borrowing SPCX from TG).
+  const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
+  const programIdB58 = programId.toBase58();
+  const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
+  const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+  // V3 and V4 both take the 5-arg shape (extra `category` u8).
+  const needsCategoryArg = isV3 || isV4;
+  const categoryByte = RWA_CATEGORIES.has(category) ? 1 : 0;
+  const ixArgs = needsCategoryArg
+    ? [
+        new BN(collateralAmountRaw.toString()),
+        loanOption,
+        new BN(collateralValueLamports.toString()),
+        loanId,
+        categoryByte,
+      ]
+    : [
+        new BN(collateralAmountRaw.toString()),
+        loanOption,
+        new BN(collateralValueLamports.toString()),
+        loanId,
+      ];
   const sig = await program.methods
-    .requestAndFundLoan(
-      new BN(collateralAmountRaw.toString()),
-      loanOption,
-      new BN(collateralValueLamports.toString()),
-      loanId,
-    )
+    .requestAndFundLoan(...ixArgs)
     .accounts({
       pool: lendingPool,
       loanTokenVault,
@@ -300,6 +355,54 @@ export async function executeBorrow({
  *   3. Close wSOL ATA (recover rent, convert leftover wSOL back to SOL).
  */
 export async function executeRepay({ userId, loanDbRow }) {
+  // Conversion telemetry wrapper. Phase 1D of the conversion-reliability
+  // mandate [[feedback_user_retention_via_flawless_conversion]]. Fire-
+  // and-forget — telemetry can NEVER block the repay. Captures mint,
+  // program, wallet, latency, signature on success; error message on
+  // failure. Records to conversion_events so /convstats shows repay
+  // success rate alongside borrow/arm/fire.
+  const _convStart = Date.now();
+  try {
+    const result = await _executeRepayImpl({ userId, loanDbRow });
+    import("./conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "repay",
+          outcome: "success",
+          mint: loanDbRow?.collateral_mint || null,
+          programId: loanDbRow?.program_id || null,
+          wallet: loanDbRow?.borrower_wallet || null,
+          userId,
+          surface: "tg",
+          latencyMs: Date.now() - _convStart,
+          detail: { signature: result?.signature?.slice(0, 88) },
+        }),
+      )
+      .catch(() => {});
+    return result;
+  } catch (err) {
+    const failureClass = err?.classification || err?.errorCode || (err?.message ? err.message.slice(0, 60) : "thrown");
+    import("./conversion-tracker.js")
+      .then(({ recordConversionEvent }) =>
+        recordConversionEvent({
+          path: "repay",
+          outcome: "failure",
+          failureClass,
+          mint: loanDbRow?.collateral_mint || null,
+          programId: loanDbRow?.program_id || null,
+          wallet: loanDbRow?.borrower_wallet || null,
+          userId,
+          surface: "tg",
+          latencyMs: Date.now() - _convStart,
+          detail: { error: err?.message?.slice(0, 200) },
+        }),
+      )
+      .catch(() => {});
+    throw err;
+  }
+}
+
+async function _executeRepayImpl({ userId, loanDbRow }) {
   // Use the program the loan was originally created on (v1 for everything
   // pre-v2-launch, populated via the program_id column at borrow time).
   const programId = chooseProgramIdForLoan(loanDbRow);
@@ -402,23 +505,63 @@ export async function executeRepay({ userId, loanDbRow }) {
     ),
   ];
 
-  const sig = await program.methods
-    .repayLoan()
-    .accounts({
-      pool: lendingPool,
-      loanTokenVault,
-      loan: loanPdaPk,
-      collateralMint: collateralMintPk,
-      collateralVault,
-      borrowerCollateralAccount: borrowerCollateralAta,
-      borrowerLoanTokenAccount: borrowerWsolAta,
-      borrower: borrower.publicKey,
-      tokenProgram: collateralTokenProgram,
-      loanTokenProgram,
-    })
-    .preInstructions(preIxs)
-    .postInstructions(postIxs)
-    .rpc({ commitment: "confirmed" });
+  // V4 Wave 5 C1 (2026-06-15): V4's repayLoan now requires the
+  // sol_proceeds_vault + wsol_mint + system_program + rent accounts so
+  // it can `init_if_needed` the vault for loans whose auto-sell never
+  // fired. Without these the V4 repay tx fails AccountNotEnoughKeys.
+  // V1/V2/V3 paths unchanged.
+  const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+  let v4ExtraAccounts = {};
+  if (isV4) {
+    const [solProceedsVault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+      programId,
+    );
+    v4ExtraAccounts = {
+      solProceedsVault,
+      wsolMint: NATIVE_MINT,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    };
+  }
+
+  const buildRepayMethod = () =>
+    program.methods
+      .repayLoan()
+      .accounts({
+        pool: lendingPool,
+        loanTokenVault,
+        loan: loanPdaPk,
+        collateralMint: collateralMintPk,
+        collateralVault,
+        borrowerCollateralAccount: borrowerCollateralAta,
+        borrowerLoanTokenAccount: borrowerWsolAta,
+        borrower: borrower.publicKey,
+        tokenProgram: collateralTokenProgram,
+        loanTokenProgram,
+        ...v4ExtraAccounts,
+      })
+      .preInstructions(preIxs)
+      .postInstructions(postIxs);
+
+  // Pre-flight simulate before the user's wallet pays fees. Operator-mandated
+  // 2026-06-15 "Repay must never simulate-fail" — catches Token-2022
+  // account-mismatch + missing-account class of bugs at the bot layer so
+  // the user sees a clean error instead of a confirmed-failure tx on chain.
+  // Symmetric across V1/V2/V3/V4 per the world-class engineering standard.
+  try {
+    await buildRepayMethod().simulate({ commitment: "confirmed" });
+  } catch (simErr) {
+    const annotated = new Error(
+      `[repay] pre-flight simulation failed before send: ${simErr?.message || simErr}`,
+    );
+    annotated.simulationError = simErr;
+    annotated.logs = simErr?.simulationResponse?.logs || simErr?.logs || [];
+    annotated.programErrorStack = simErr?.programErrorStack;
+    throw annotated;
+  }
+
+  const sig = await buildRepayMethod().rpc({ commitment: "confirmed" });
 
   return { signature: sig };
 }
@@ -516,6 +659,33 @@ export async function recordLoan({
         `loan_pda=${loanPda} — row will be inserted with NULL; ` +
         `re-check the caller (this used to silently drop borrowers from snapshots).`,
     );
+  }
+
+  // LAYER 3 — pre-write user_id validation. Operator-mandated 2026-06-19
+  // after 22 loans were mis-attributed because callers passed a context-
+  // derived user_id that didn't match the wallet's true owner. Re-verify
+  // RIGHT BEFORE the INSERT that the userId arg matches what the wallets
+  // table says for borrowerWallet. If mismatch: log loudly + use the
+  // wallet's user_id (chain-of-trust: wallets row > caller's context).
+  //
+  // After migration 080 added UNIQUE on wallets.public_key, this check is
+  // unambiguous — exactly one wallets row exists per pubkey.
+  // [[feedback_never_misattribute_loans]]
+  if (borrowerWallet && userId) {
+    try {
+      const { rows: walletCheck } = await query(
+        `SELECT user_id::int AS uid FROM wallets WHERE public_key = $1`,
+        [borrowerWallet],
+      );
+      if (walletCheck.length > 0 && walletCheck[0].uid !== Number(userId)) {
+        console.warn(
+          `[loans.recordLoan] USER_ID DRIFT — caller passed user_id=${userId} but wallets.user_id for ${borrowerWallet.slice(0, 12)}... is ${walletCheck[0].uid}. Overriding with wallets row (the canonical owner) to prevent attribution bug.`,
+        );
+        userId = walletCheck[0].uid;
+      }
+    } catch (err) {
+      console.warn(`[loans.recordLoan] user_id pre-write check failed: ${err.message?.slice(0, 80)}`);
+    }
   }
 
   const { rows } = await query(
@@ -647,11 +817,13 @@ export async function recordLoan({
     console.error("[loans] referral accrual on borrow failed (continuing):", err.message);
   }
 
-  // $MAGPIE holder pool accrual (10% of fee)
+  // $MAGPIE holder pool accrual — 70% of fee post-MGP-001 (the bps is
+  // read from governance_config at accrual time; comment kept current
+  // so future readers don't think this is the legacy 10% share).
   try {
     const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
     if (feeLamports > 0n) {
-      await accrueToHolderPool(feeLamports);
+      await accrueToHolderPool(feeLamports, { sourceType: "borrow_fee", sourceId: `loan_${rows[0].id}` });
     }
   } catch (err) {
     console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
@@ -661,7 +833,7 @@ export async function recordLoan({
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
     if (feeLamports > 0n) {
-      await accrueToLpLoyaltyPool(feeLamports);
+      await accrueToLpLoyaltyPool(feeLamports, { sourceType: "borrow_fee", sourceId: `loan_${rows[0].id}` });
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on borrow failed (continuing):", err.message);
@@ -746,6 +918,33 @@ export async function markLoanRepaid(loanDbId, txSignature) {
  */
 export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }) {
   const programId = chooseProgramIdForLoan(loanDbRow);
+
+  // V4 Wave 5 H2 (2026-06-15): refuse add_collateral on V4 loans that have
+  // an armed limit_close_order. V4's convert_collateral_slice slice math
+  // is `loan.collateral_amount × slice_bps / 10000` ON-CHAIN. Adding more
+  // collateral mid-ladder grows the base, so subsequent fires sell larger
+  // slices than the user expected at arm time AND than the engine quoted
+  // (engine snapshots are off-by-one from on-chain reality). Cleanest
+  // mitigation: block topup while the order is armed. User can cancel
+  // the order, topup, then re-arm — explicit and predictable.
+  const v4ProgramIdStr = process.env.PROGRAM_ID_V4 || null;
+  const isV4Loan = v4ProgramIdStr && programId.toBase58() === v4ProgramIdStr;
+  if (isV4Loan) {
+    const { rows: [armed] } = await query(
+      `SELECT id FROM limit_close_orders
+        WHERE loan_id = $1
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user')
+        LIMIT 1`,
+      [loanDbRow.id],
+    );
+    if (armed) {
+      const err = new Error(
+        "add_collateral blocked: V4 loan has an armed auto-sell. Cancel the order with /cancellimitorder, then /topup.",
+      );
+      err.code = "v4_topup_blocked_armed_order";
+      throw err;
+    }
+  }
 
   const borrower = await loadKeypair(userId);
   const program = getProgramForSigner(borrower, programId);
@@ -958,7 +1157,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   try {
     const { accrueToHolderPool } = await import("./magpie-holder-rewards.js");
     if (feeLamports > 0n) {
-      await accrueToHolderPool(feeLamports);
+      await accrueToHolderPool(feeLamports, { sourceType: "extend_fee", sourceId: `loan_${loanDbRow.id}_extend_${loanDbRow.duration_days || "n"}` });
     }
   } catch (err) {
     console.error("[loans] holder pool accrual on extend failed (continuing):", err.message);
@@ -968,7 +1167,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
     if (feeLamports > 0n) {
-      await accrueToLpLoyaltyPool(feeLamports);
+      await accrueToLpLoyaltyPool(feeLamports, { sourceType: "extend_fee", sourceId: `loan_${loanDbRow.id}_extend_${loanDbRow.duration_days || "n"}` });
     }
   } catch (err) {
     console.error("[loans] LP loyalty accrual on extend failed (continuing):", err.message);

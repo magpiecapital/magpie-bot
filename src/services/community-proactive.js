@@ -47,12 +47,19 @@ const PROACTIVE_DISABLED = process.env.PIP_PROACTIVE_DISABLED === "1";
 // Cumulative tuning: faster sweep cadence (1min), shorter wait before
 // Pip jumps in (45s), higher daily cap (20), shorter per-chat gap
 // (5min). Cost at the new ceiling: ~20 × $0.005 = $0.10/day/chat worst-case.
-const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 20);
+const DAILY_PROACTIVE_MAX = Math.max(0, Number(process.env.PIP_DAILY_PROACTIVE_MAX) || 40);
 const QUESTION_PICKUP_INTERVAL_MS = 60 * 1000;       // sweep every minute
 const MILESTONE_INTERVAL_MS = 30 * 60 * 1000;
-const QUESTION_MIN_AGE_MS = 45 * 1000;               // 45s — fast enough to feel responsive
+// Wait briefly so a human in the chat has a chance to answer first,
+// but jump in fast enough that the asker doesn't feel ignored.
+// Operator-mandated tightening 2026-06-18: was effectively 10 min in the
+// SQL query (the constant said 45s but the WHERE clause hard-coded 10 min,
+// so questions sat for 10 min before Pip ever looked at them). Now
+// genuinely 60s end-to-end via QUESTION_MIN_AGE_INTERVAL below.
+const QUESTION_MIN_AGE_MS = 60 * 1000;
+const QUESTION_MIN_AGE_INTERVAL = "1 minute"; // mirrors QUESTION_MIN_AGE_MS for the SQL clause
 const QUESTION_MAX_AGE_MS = 60 * 60 * 1000;          // ignore older than 1h
-const PICKUP_GAP_MS = 5 * 60 * 1000;                 // 5min between Pip pickups in a chat
+const PICKUP_GAP_MS = 2 * 60 * 1000;                 // 2min between Pip pickups in a chat
 const MILESTONE_GAP_MS = 3 * 60 * 60 * 1000;
 
 // Command-cheatsheet reminder cadence.
@@ -140,12 +147,33 @@ const QUESTION_KEYWORDS = [
   // wallets users commonly mention (questions about Phantom support
   // are extremely common — "if i hold in Phantom will i get rewards")
   "phantom", "solflare", "backpack", "ledger", "trezor", "hardware",
+  // exit/limit-close vocabulary — TP/SL/ladder/bracket/trailing.
+  // Added 2026-06-18 — operator wants Pip to catch "anyone tried TP at
+  // 2x?", "what's a ladder?", etc. Bounded by short-keyword \b rule.
+  "tp", "sl", "take profit", "take-profit", "stop loss", "stop-loss",
+  "ladder", "bracket", "trailing", "trail", "auto-sell", "autosell",
+  "trigger", "target", "strike", "exit", "limit order", "limit-order",
+  // rate / yield vocabulary
+  "apy", "apr", "interest", "rate",
+  // status / safety vocabulary (people often complain in shape of a question)
+  "overdue", "late", "default", "stuck", "broken", "bug", "error",
+  "not working", "doesn't work", "didn't work", "help", "support",
+  // surfaces users ask about
+  "dashboard", "stats", "site", "telegram", "x402",
+  // collateral categories
+  "stock", "etf", "metal", "xstocks", "rwa", "memecoin",
+  // growth / activity vocabulary — "are users growing?", "is the
+  // protocol active?", etc. Operator-flagged 2026-06-18 after a
+  // legit "Are users growing?" question slipped past the filter.
+  "users", "growing", "growth", "active",
   // common how-to verbs
   "how do i", "how does", "how can", "what happens", "what's the",
   "what is", "can i ", "is it safe", "is it possible", "is there",
   "do i need", "what tier", "how long", "when does", "when will",
-  "why does", "anyone know", "anyone using",
+  "why does", "anyone know", "anyone using", "anyone tried",
   "will i", "will i get", "do i get", "where do i",
+  "should i", "would i", "could i", "thinking of", "thinking about",
+  "considering", "looking at", "trying to", "any way",
 ];
 
 // Short keywords (lp, fee, ltv) match inside common words ("help" →
@@ -168,7 +196,14 @@ function isCandidateQuestion(text) {
   // ("anyone here borrowed", "wondering if...", etc.) — community users
   // often skip the question mark on TG.
   const endsWithQ = trimmed.endsWith("?");
-  const startsWithQVerb = /^(anyone|can\s+(?:i|we|you)|how\s+(?:do|does|can)|what(?:'s|\s+is)|why\s+(?:does|is)|when\s+(?:will|does)|where\s+(?:do|is)|wondering|curious|is\s+it)/i.test(trimmed);
+  // Widened 2026-06-18: catch more naturally-phrased questions that
+  // don't end in '?'. "thinking of borrowing", "any way to extend",
+  // "would love to know how this works", etc.
+  // "what\b" (any word after) replaces the narrow what's/what is — catches
+  // "what apy do LPs get", "what tier should i pick", "what's a ladder".
+  // "help" / "halp" catches naked help requests like "help my loan is stuck"
+  // and "help please i'm new". Both shapes count as Pip-eligible.
+  const startsWithQVerb = /^(anyone|any\s+way|can\s+(?:i|we|you)|how\s+(?:do|does|can)|what\b|why\s+(?:does|is)|when\s+(?:will|does)|where\s+(?:do|is)|wondering|curious|is\s+it|should\s+i|would\s+(?:i|love|like)|could\s+(?:i|you|we)|do\s+(?:i|we|you)|does\s+(?:it|the|magpie)|thinking\s+(?:of|about)|considering|looking\s+(?:to|at|for)|trying\s+to|halp\b|help\b)/i.test(trimmed);
   if (!endsWithQ && !startsWithQVerb) return false;
   if (trimmed.startsWith("/")) return false;
   return QUESTION_KEYWORD_RE.test(trimmed);
@@ -258,13 +293,15 @@ async function lastPickupAt(chatId) {
 
 async function pickQuestionForChat(chatId) {
   // Oldest unanswered candidate within the eligible window.
+  // Min-age via the constant so the SQL stays in sync with QUESTION_MIN_AGE_MS.
+  // Previously hardcoded to 10 min — the comment said 45s but the SQL won.
   const { rows } = await query(
     `SELECT message_id, sender_id, text
        FROM community_pending_questions
       WHERE chat_id = $1
         AND pip_picked_up_at IS NULL
         AND answered_in_chat_at IS NULL
-        AND created_at < NOW() - INTERVAL '10 minutes'
+        AND created_at < NOW() - INTERVAL '${QUESTION_MIN_AGE_INTERVAL}'
         AND created_at > NOW() - INTERVAL '60 minutes'
       ORDER BY created_at ASC
       LIMIT 1`,

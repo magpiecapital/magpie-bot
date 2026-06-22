@@ -69,6 +69,62 @@ export async function accrueToProtocolReserve({ loanDbId, feeLamports, eventType
 }
 
 /**
+ * Credit a pre-computed lamport amount directly to the protocol
+ * reserve pool. Same idempotency model as accrueToProtocolReserve
+ * (INSERT a protocol_reserve_events row first; if it duplicates,
+ * skip the pool counter bump). Used by the Phase 2
+ * liquidation-distribution-watcher, which has already done the
+ * fraction math against the defaulted-loan net profit. Idempotency
+ * key is (loan_db_id, event_type) — caller should use a distinct
+ * event_type like 'default_profit' so it doesn't collide with
+ * the regular fee-side accrual.
+ */
+export async function creditProtocolReserveDirect(opts) {
+  // Accept either the new ledger-style ({sourceType, sourceId, lamports})
+  // OR the legacy ({loanDbId, eventType, lamports}) shape. New callers
+  // should use sourceType+sourceId; legacy callers are auto-mapped to
+  // sourceType='legacy_'+eventType, sourceId=String(loanDbId).
+  const lamports = opts?.lamports;
+  let { sourceType, sourceId, metadata } = opts || {};
+  if (!sourceType) {
+    const { loanDbId, eventType } = opts || {};
+    if (eventType) {
+      sourceType = `legacy_${eventType}`;
+      sourceId = String(loanDbId ?? "null");
+    }
+  }
+  const amt = BigInt(lamports || 0);
+  if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[protocol-reserve] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
+  try {
+    // Dual-write: pool_credit_events is the canonical idempotency ledger,
+    // protocol_reserve_events stays for backward-compat readers.
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'protocol_reserve', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE protocol_reserve_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
+              last_accrual_at = NOW(),
+              updated_at = NOW()
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
+    );
+    return rows.length > 0 ? amt : null;
+  } catch (err) {
+    console.error("[protocol-reserve] direct credit failed:", err.message);
+    return null;
+  }
+}
+
+/**
  * Current reserve pool state — read-only.
  */
 export async function getProtocolReserveState() {

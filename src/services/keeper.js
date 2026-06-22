@@ -20,6 +20,8 @@ import {
   Keypair,
   Transaction,
   ComputeBudgetProgram,
+  SystemProgram,
+  SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -34,6 +36,7 @@ import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { readFileSync } from "node:fs";
@@ -142,6 +145,57 @@ async function liquidateLoan(program, keeper, loan, pool) {
     collateralTokenProgram,
   );
 
+  // V4-aware liquidation (2026-06-15): V4's liquidate_loan needs 4
+  // extra accounts to distribute the mixed collateral (SPL + accumulated
+  // SOL in sol_proceeds_vault). Without these, every V4 overdue loan
+  // fails with AccountNotEnoughKeys and stays uncollected.
+  const isV4 = PROGRAM_ID_V4 && program.programId.equals(PROGRAM_ID_V4);
+  let v4ExtraAccounts = {};
+  let preIxs = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+  ];
+  if (isV4) {
+    const { NATIVE_MINT } = await import("@solana/spl-token");
+    const { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction } =
+      await import("@solana/spl-token");
+    const [solProceedsVaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("sol-proceeds"), loanPubkey.toBuffer()],
+      program.programId,
+    );
+    // wSOL ATAs for keeper + authority. SOL pot bounty goes to keeper,
+    // residual to authority.
+    const keeperWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, keeper.publicKey, false, TOKEN_PROGRAM_ID,
+    );
+    const authorityWsolAta = getAssociatedTokenAddressSync(
+      NATIVE_MINT, pool.authority, false, TOKEN_PROGRAM_ID,
+    );
+    // V4 Wave 5 C1 (2026-06-15): liquidate_loan now also needs
+    // wsol_mint + system_program + rent because sol_proceeds_vault
+    // is `init_if_needed` (so V4 loans whose auto-sell never fired
+    // can still be liquidated — Anchor needs system_program to
+    // allocate, rent to size it).
+    v4ExtraAccounts = {
+      solProceedsVault: solProceedsVaultPda,
+      keeperLoanTokenAccount: keeperWsolAta,
+      authorityLoanTokenAccount: authorityWsolAta,
+      loanTokenProgram: TOKEN_PROGRAM_ID,
+      wsolMint: NATIVE_MINT,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    };
+    // Create the wSOL ATAs idempotently — keeper pays.
+    preIxs.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        keeper.publicKey, keeperWsolAta, keeper.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID,
+      ),
+      createAssociatedTokenAccountIdempotentInstruction(
+        keeper.publicKey, authorityWsolAta, pool.authority, NATIVE_MINT, TOKEN_PROGRAM_ID,
+      ),
+    );
+  }
+
   const tx = await program.methods
     .liquidateLoan()
     .accounts({
@@ -153,11 +207,9 @@ async function liquidateLoan(program, keeper, loan, pool) {
       authorityCollateralAccount: authorityCollateralAta.address,
       keeper: keeper.publicKey,
       tokenProgram: collateralTokenProgram,
+      ...v4ExtraAccounts,
     })
-    .preInstructions([
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-    ])
+    .preInstructions(preIxs)
     .rpc({ commitment: "confirmed" });
 
   return { success: true, txSig: tx };
@@ -246,6 +298,13 @@ export async function startKeeper() {
       label: "V3",
       programId: PROGRAM_ID_V3,
       program: getProgramForSigner(keeper, PROGRAM_ID_V3),
+    });
+  }
+  if (PROGRAM_ID_V4) {
+    programConfigs.push({
+      label: "V4",
+      programId: PROGRAM_ID_V4,
+      program: getProgramForSigner(keeper, PROGRAM_ID_V4),
     });
   }
 

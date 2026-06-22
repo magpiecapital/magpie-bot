@@ -23,6 +23,7 @@ import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import { query } from "../db/pool.js";
 import { recordLoan } from "../services/loans.js";
@@ -135,10 +136,9 @@ export async function handleBackfillWalletLoans(req) {
   // can spray random pubkeys to learn the wallet↔Magpie-account
   // mapping (same fix pattern as sync-loan PR #52). Log internally
   // for ops visibility but stay opaque to the caller.
-  const { rows: [walletRow] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [walletStr],
-  );
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(walletStr);
+  const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!walletRow) {
     console.error(`[backfill] wallet ${walletStr.slice(0, 8)}... not linked — returning generic noop`);
     return {
@@ -148,7 +148,15 @@ export async function handleBackfillWalletLoans(req) {
   }
 
   // Scan every known program for loans by this borrower.
-  const programs = [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3].filter(Boolean);
+  //
+  // V4 added 2026-06-18: a V4 SPCX loan landed on-chain for operator's
+  // user but never reached the DB; the dashboard couldn't see it and
+  // the arm-intent for the exit failed with loan_not_found_for_user.
+  // Root cause: this backfill safety net only scanned V1/V2/V3, so V4
+  // borrows that slipped past cosign-borrow's primary recordLoan call
+  // had no recovery path. Every future Vn MUST be added here at deploy
+  // time. See [[feedback_backfill_must_scan_every_program_version]].
+  const programs = [PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4].filter(Boolean);
   const onChainLoans = [];
   for (const programId of programs) {
     const prog = getReadOnlyProgram(programId);

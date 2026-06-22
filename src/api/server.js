@@ -14,6 +14,7 @@ import { gzip, brotliCompress } from "node:zlib";
 import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
+import { constantTimeEqual } from "./auth-utils.js";
 
 const gzipAsync = promisify(gzip);
 const brotliAsync = promisify(brotliCompress);
@@ -72,6 +73,7 @@ import {
   handleAgentListIntents,
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
+import { handleWarmMint } from "./warm-mint.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
@@ -404,10 +406,10 @@ async function handleCreditHistory(req, url) {
     return { status: 400, body: { error: "Provide ?wallet=<address>" } };
   }
 
-  const { rows: [w] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1`, [wallet],
-  );
-  if (!w) return { status: 404, body: { error: "Wallet not found" } };
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const wUserId = await resolveWalletOwner(wallet);
+  if (!wUserId) return { status: 404, body: { error: "Wallet not found" } };
+  const w = { user_id: wUserId };
 
   const { getScoreHistory } = await import("../services/credit-score.js");
   const history = await getScoreHistory(w.user_id, 50);
@@ -486,11 +488,18 @@ async function handleTransparency() {
        (SELECT created_at FROM magpie_holder_distributions ORDER BY id DESC LIMIT 1)
          AS last_distribution_at`,
   );
-  // LP loyalty pool
+  // LP loyalty pool. Surface uniformity: same shape as holders block above
+  // so consumers (site /stats, TG /stats, dashboard) can render a
+  // "Last SOL LP distribution: X SOL — N ago" line that matches the
+  // $MAGPIE holders line. Operator-mandated 2026-06-19 PM.
   const { rows: [lpLoy] } = await query(
     `SELECT
        (SELECT accrued_lamports::text FROM lp_loyalty_pool WHERE id = 1) AS current_pool_lamports,
-       (SELECT COUNT(*)::int FROM lp_loyalty_distributions) AS lifetime_distributions`,
+       (SELECT COUNT(*)::int FROM lp_loyalty_distributions) AS lifetime_distributions,
+       (SELECT pool_lamports::text FROM lp_loyalty_distributions
+          ORDER BY id DESC LIMIT 1) AS last_distribution_lamports,
+       (SELECT created_at FROM lp_loyalty_distributions
+          ORDER BY id DESC LIMIT 1) AS last_distribution_at`,
   );
   // Referral payouts lifetime
   const { rows: [refs] } = await query(
@@ -533,9 +542,13 @@ async function handleTransparency() {
       },
       lp_loyalty: {
         // current_pool_sol is OPERATOR-PRIVATE (same reason as
-        // holder_rewards above). Only historical distribution count
-        // is public.
+        // holder_rewards above). Historical distribution count + last
+        // distribution amount/time are public so consumers can render a
+        // post-distribution "fired" signal symmetric with holders.
         lifetime_distributions: lpLoy.lifetime_distributions,
+        last_distribution_sol: lpLoy.last_distribution_lamports
+          ? Number(lpLoy.last_distribution_lamports) / 1e9 : null,
+        last_distribution_at: lpLoy.last_distribution_at,
       },
       referrals: {
         lifetime_accrued_sol: Number(refs.lifetime_accrued) / 1e9,
@@ -623,16 +636,17 @@ async function handleLoans(req, url) {
     return { status: 400, body: { error: "Provide ?wallet=<address>" } };
   }
 
-  const { rows: [w] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1`, [wallet],
-  );
-  if (!w) {
+  const { resolveWalletOwner: resolveOwner3 } = await import("../services/wallet-owner-resolver.js");
+  const wUserId2 = await resolveOwner3(wallet);
+  if (!wUserId2) {
     // Unknown wallet — return empty (not an error: dashboard may render zero state)
     return { status: 200, body: { wallet, active: [], history: [] } };
   }
+  const w = { user_id: wUserId2 };
 
   const { rows: allUserRows } = await query(
     `SELECT l.id, l.loan_id, l.loan_pda, l.collateral_mint, l.collateral_amount,
+            l.current_collateral_amount, l.sol_proceeds_amount, l.auto_sells_fired,
             l.loan_amount_lamports, l.original_loan_amount_lamports,
             l.actual_received_lamports,
             l.ltv_percentage, l.duration_days,
@@ -665,6 +679,9 @@ async function handleLoans(req, url) {
   const shape = (l, healthRatio) => ({
     loan_id: l.loan_id?.toString?.() ?? null,
     loan_pda: l.loan_pda,
+    // 2026-06-16 — surface program_id so the site dashboard can gate
+    // the V4-only exit-position panel per the V4-is-exit-only rule.
+    program_id: l.program_id || null,
     status: l.status,
     health_ratio: healthRatio,
     collateral: {
@@ -675,6 +692,13 @@ async function handleLoans(req, url) {
       image: l.image_url || null,
       category: l.category || "memecoin",
       amount: l.collateral_amount?.toString?.() ?? null,
+      // V4 mixed-collateral fields. For V1/V2/V3 (and V4 loans before
+      // any auto-sell fires) current_amount equals amount, sol_proceeds
+      // is "0", and auto_sells_fired is 0 — site can branch on
+      // auto_sells_fired > 0 to render the mixed display.
+      current_amount: (l.current_collateral_amount ?? l.collateral_amount)?.toString?.() ?? null,
+      sol_proceeds_lamports: (l.sol_proceeds_amount ?? 0)?.toString?.() ?? "0",
+      auto_sells_fired: Number(l.auto_sells_fired ?? 0),
     },
     loan: {
       // Legacy field (kept for back-compat with existing site code):
@@ -713,8 +737,19 @@ async function handleLoans(req, url) {
         const owed = await getLiveOwedLamports(r).catch(() => BigInt(r.original_loan_amount_lamports ?? "0"));
         if (!owed || owed <= 0n) return [r.loan_id, null];
         if (r.decimals == null) return [r.loan_id, null];
-        const cVal = await collateralValueLamports(r.collateral_mint, r.collateral_amount, r.decimals);
-        if (!cVal || cVal <= 0n) return [r.loan_id, null];
+        // V4 mixed: use REMAINING SPL for the price lookup, then add
+        // already-realized SOL proceeds 1:1 to the value. For V1/V2/V3
+        // both branches collapse to the same expression (current ===
+        // amount, sol_proceeds === 0).
+        const isMixed = Number(r.auto_sells_fired ?? 0) > 0;
+        const splAmount = isMixed
+          ? (r.current_collateral_amount ?? r.collateral_amount)
+          : r.collateral_amount;
+        const splVal = await collateralValueLamports(r.collateral_mint, splAmount, r.decimals);
+        const cVal = (splVal && splVal > 0n)
+          ? splVal + BigInt(r.sol_proceeds_amount ?? 0)
+          : BigInt(r.sol_proceeds_amount ?? 0);
+        if (cVal <= 0n) return [r.loan_id, null];
         const ratio = Number(cVal) / Number(owed);
         return [r.loan_id, Number.isFinite(ratio) ? Number(ratio.toFixed(3)) : null];
       } catch {
@@ -726,11 +761,111 @@ async function handleLoans(req, url) {
     console.warn("[loans] health enrich failed:", err.message);
   }
 
+  // ── 2026-06-16 — optional ?include=orders ────────────────────────
+  // Site dashboard's Active Loans render needs every attached exit
+  // (TP/SL/Trailing/Ladder/Bracket) per V4 loan, in one round trip.
+  // Backward-compatible: only adds the `orders` field when explicitly
+  // requested. Per the V4-is-exit-only rule, orders only attach to V4
+  // loans in practice; V1/V2/V3 loans return an empty orders array.
+  const includeParam = url.searchParams.get("include") || "";
+  const wantsOrders = includeParam.split(",").map((s) => s.trim()).includes("orders");
+  let ordersByLoanId = new Map();
+  if (wantsOrders && activeRows.length > 0) {
+    try {
+      const activeIds = activeRows.map((r) => Number(r.id));
+      const { rows: orderRows } = await query(
+        `SELECT id, loan_id, status,
+                trigger_kind, trigger_value_micro, trigger_direction,
+                slippage_bps, max_slippage_bps_cap, slice_pct,
+                ladder_group_id, trailing_distance_bps, peak_price_micros,
+                armed_at, firing_started_at, fired_at, expires_at,
+                tx_signature_repay, proceeds_lamports, protocol_fee_lamports,
+                net_to_user_lamports, failure_reason, failure_count,
+                intervention_state, intervention_suggested_slippage_bps,
+                source
+           FROM limit_close_orders
+          WHERE loan_id = ANY($1::bigint[])
+            AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','failed','cancelled')
+          ORDER BY id`,
+        [activeIds],
+      );
+      for (const o of orderRows) {
+        const arr = ordersByLoanId.get(Number(o.loan_id)) || [];
+        // Derive `kind` for the UI from the order shape. The DB stores
+        // direction + ladder_group + trailing_distance; the dashboard
+        // wants a single label per order (tp / sl / trailing_tp /
+        // trailing_sl / ladder_tp / ladder_sl). Brackets are TP+SL
+        // co-existing on the same loan — the client groups them.
+        const isTrailing = o.trailing_distance_bps != null && Number(o.trailing_distance_bps) > 0;
+        const isLadder = o.ladder_group_id != null;
+        const direction = o.trigger_direction === "below" ? "sl" : "tp";
+        let kind = direction;
+        if (isTrailing) kind = `trailing_${direction}`;
+        else if (isLadder) kind = `ladder_${direction}`;
+        arr.push({
+          id: o.id,
+          loan_id: o.loan_id?.toString?.() || null,
+          kind, // 'tp' | 'sl' | 'trailing_tp' | 'trailing_sl' | 'ladder_tp' | 'ladder_sl'
+          direction: o.trigger_direction || "above",
+          status: o.status,
+          trigger: {
+            kind: o.trigger_kind,
+            value_micro: o.trigger_value_micro?.toString?.() || null,
+          },
+          slice_pct_bps: Number(o.slice_pct ?? 10000),
+          slippage_bps: o.slippage_bps,
+          max_slippage_bps_cap: o.max_slippage_bps_cap,
+          ladder_group_id: o.ladder_group_id ? Number(o.ladder_group_id) : null,
+          trailing: isTrailing
+            ? {
+                distance_bps: Number(o.trailing_distance_bps),
+                peak_price_micros: o.peak_price_micros?.toString?.() || null,
+              }
+            : null,
+          timestamps: {
+            armed_at: o.armed_at,
+            firing_started_at: o.firing_started_at,
+            fired_at: o.fired_at,
+            expires_at: o.expires_at,
+          },
+          execution: o.status === "fired"
+            ? {
+                tx_signature: o.tx_signature_repay,
+                proceeds_lamports: o.proceeds_lamports?.toString?.() || null,
+                protocol_fee_lamports: o.protocol_fee_lamports?.toString?.() || null,
+                net_to_user_lamports: o.net_to_user_lamports?.toString?.() || null,
+              }
+            : null,
+          failure: (o.failure_count && o.failure_count > 0) ? {
+            count: o.failure_count,
+            reason: o.failure_reason || null,
+          } : null,
+          intervention: o.intervention_state ? {
+            state: o.intervention_state,
+            suggested_slippage_bps: o.intervention_suggested_slippage_bps,
+          } : null,
+          source: o.source || null,
+        });
+        ordersByLoanId.set(Number(o.loan_id), arr);
+      }
+    } catch (err) {
+      console.warn("[loans] orders enrich failed:", err.message);
+    }
+  }
+
+  const shapeWithOrders = (r, healthRatio) => {
+    const base = shape(r, healthRatio);
+    if (wantsOrders) {
+      base.orders = ordersByLoanId.get(Number(r.id)) || [];
+    }
+    return base;
+  };
+
   return {
     status: 200,
     body: {
       wallet,
-      active: activeRows.map((r) => shape(r, healthByLoanId.get(r.loan_id) ?? null)),
+      active: activeRows.map((r) => shapeWithOrders(r, healthByLoanId.get(r.loan_id) ?? null)),
       history: historyRows.map((r) => shape(r, null)),
     },
   };
@@ -951,18 +1086,38 @@ async function handlePublicPoolStats() {
 }
 
 async function handleAdminPoolStats(req, url) {
-  const wallet = url.searchParams.get("wallet");
-  if (!wallet) {
-    return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+  // SECURITY (audit HIGH#4 2026-06-17 PM): the prior gate was
+  // `wallet === LENDER_PUBKEY` — but the lender pubkey is publicly readable
+  // on-chain (it's stamped into every loan PDA's borrower field's sibling
+  // accounts). Anyone could read it from any V4 loan tx, hit the endpoint,
+  // and exfil operator-private fee splits.
+  //
+  // Real auth: require a header `X-Admin-Token` matching env-stored
+  // ADMIN_API_TOKEN (32+ random bytes operator manages out-of-band). Falls
+  // back to the public-pubkey gate ONLY when ADMIN_API_TOKEN is unset, so
+  // legacy bootstrap deployments aren't bricked — but with a loud log so
+  // operator notices and rotates a token in.
+  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+  const provided = (req.headers["x-admin-token"] || "").toString().trim();
+  const wallet = url.searchParams.get("wallet"); // still used downstream
+  if (ADMIN_API_TOKEN) {
+    // Constant-time compare so an attacker can't time-probe the admin
+    // token byte-by-byte. constantTimeEqual guards type/empty/length
+    // before timingSafeEqual (which throws on unequal-length buffers).
+    if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
+      return { status: 403, body: { error: "Forbidden" } };
+    }
+  } else {
+    console.warn(
+      "[admin] ADMIN_API_TOKEN unset — falling back to LENDER_PUBKEY-equality gate (audit HIGH#4 mitigation). Set ADMIN_API_TOKEN to a 32-byte random hex/base64 string and rotate the deploy.",
+    );
+    if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
+    const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
+    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    }
   }
-
-  // Gate: only the configured creator/lender wallet can see this view.
-  // Anyone querying with a different wallet gets a 403, not a 404, so we
-  // don't leak existence of the endpoint.
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
-  }
 
   const { PublicKey } = await import("@solana/web3.js");
   const { getReadOnlyProgram } = await import("../solana/program.js");
@@ -1268,10 +1423,25 @@ async function computeLifetimeStats() {
 }
 
 async function handleAdminLifetimeStats(req, url) {
+  // Same auth model as handleAdminPoolStats (audit HIGH#4 2026-06-17 PM).
+  // X-Admin-Token header REQUIRED when ADMIN_API_TOKEN env is set;
+  // public-pubkey fallback only when unset, with a loud warn.
+  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+  const provided = (req.headers["x-admin-token"] || "").toString().trim();
   const wallet = url.searchParams.get("wallet");
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-  if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-    return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+  if (ADMIN_API_TOKEN) {
+    // Constant-time compare (see handleAdminPoolStats for rationale).
+    if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
+      return { status: 403, body: { error: "Forbidden" } };
+    }
+  } else {
+    console.warn(
+      "[admin] ADMIN_API_TOKEN unset on lifetime-stats — falling back to LENDER_PUBKEY-equality gate. Set ADMIN_API_TOKEN and rotate the deploy.",
+    );
+    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    }
   }
 
   const now = Date.now();
@@ -1457,6 +1627,8 @@ async function handleLeaderboard() {
 
 const PUBLIC_ROUTES = new Set([
   "/api/v1/health",
+  "/api/v1/livez",
+  "/healthz",
   "/api/v1/tokens",
   "/api/v1/loans",
   "/api/v1/wallet/balance",
@@ -1469,6 +1641,7 @@ const PUBLIC_ROUTES = new Set([
   // short-forms only, pure aggregates on protocol-pulse.
   "/api/v1/public/activity",
   "/api/v1/public/protocol-pulse",
+  "/api/v1/public/distributions",
   // Live x402 revenue + adoption — pure aggregates over the
   // x402_paid_calls log. No payer pubkeys surfaced, only counts +
   // SOL totals + per-endpoint breakdown.
@@ -1495,14 +1668,40 @@ const PUBLIC_ROUTES = new Set([
   // tx — closes the window where Phantom rejects with StalePriceAttestation
   // before the user can even sign.
   "/api/v1/price/refresh",
+  // V4 feed-health read. Sprint Item 3 (V4 hardening 2026-06-17). Site
+  // calls before rendering the Borrow CTA so a cold V4 feed shows
+  // "Refreshing oracle…" instead of letting the user click into a
+  // StalePriceAttestation rejection.
+  "/api/v1/v4/feed-health",
+  // V4 TWAP precise-value read. Sprint Item 4 (T15). Returns the
+  // bot-computed safe collateral_value the site can submit instead of
+  // multiplying by the legacy 0.89. Drops the under-shoot from 11% to
+  // ~0.3% — same precision as the on-chain TWAP attestation.
+  "/api/v1/v4/twap",
+  // Universal attestation-safe collateral value (V1/V2/V3/V4). Generalizes
+  // /v4/twap to every program version so EVERY borrow path can submit a
+  // collateral_value the on-chain program is guaranteed to accept — the
+  // class fix for CollateralValueExceedsAttestation. Read-only, allowlisted.
+  "/api/v1/safe-collateral-value",
+  // Per-mint readiness check + on-demand warmup request. Site calls
+  // this BEFORE asking the user to borrow a specific mint — it
+  // returns the on-chain sample-in-window count and bumps the mint
+  // into the high-priority warmup queue if not yet warm.
+  "/api/v1/v4/feed-ready",
   // Site take-profit (limit-close) endpoints. GET is unsigned read-only;
   // POST + DELETE require an Ed25519-signed envelope. Security is
   // enforced internally by the handler (signature verification + linked
   // wallet check), so the API-key gate is bypassed.
   "/api/v1/site/limit-close",
   "/api/v1/site/limit-close/arm",
+  "/api/v1/site/limit-close/arm-batch",
+  "/api/v1/site/limit-close/arm-preflight",
   "/api/v1/site/limit-close/modify",
   "/api/v1/site/limit-close/cancel",
+  // Intent beacon (no signature — handler validates shape only,
+  // stores intent for dashboard reconciliation). Operator rule
+  // feedback_every_arm_envelope_must_reach_server.md.
+  "/api/v1/site/limit-close/intent",
   // Admin routes are "public" at the HTTP layer but gate internally on
   // wallet === LENDER_PUBKEY, so any non-creator caller gets a 403.
   "/api/v1/admin/pool-stats",
@@ -1596,6 +1795,13 @@ const PUBLIC_ROUTES = new Set([
   // or write anything that isn't already true on-chain — so it's safe
   // to expose without auth.
   "/api/v1/sync-loan",
+  // Hot-on-Select warm-mint beacon — pings continuous-attestation
+  // loop to include a mint for the next 10 min so V4 borrows on
+  // cold mints can fill their TWAP window during user review time.
+  // No auth — pure intent beacon, validates mint via PublicKey +
+  // supported_mints check. Operator-mandated 2026-06-19 PM after
+  // $TROLL V4 borrow hit "Markets warming up."
+  "/api/v1/v4/warm-mint",
   // Live-debug ring buffer of recent console.error/warn output. No
   // PII; bounded in-memory; cleared on restart.
   "/api/v1/debug/recent-errors",
@@ -1645,7 +1851,23 @@ async function router(req, res) {
     }
   }
 
-  // Health check (no auth) — real liveness probe
+  // Liveness probe (no auth, ZERO dependencies). Railway's healthcheckPath
+  // targets THIS — not /api/v1/health. It returns 200 the instant the event
+  // loop is responsive, regardless of DB / RPC / heartbeat state.
+  //
+  // Why a separate probe: /api/v1/health does a DB ping + heartbeat checks and
+  // 503s on a transient DB blip. Pointing Railway's healthcheck at that would
+  // (a) block zero-downtime deploy cutover whenever the DB hiccups and (b) risk
+  // a restart loop on a DB blip. /livez only fails when the process is genuinely
+  // dead or hung — exactly when Railway SHOULD restart it — and lets Railway gate
+  // deploy cutover on the new instance being live, eliminating the deploy-time
+  // 502 window. /api/v1/health stays the rich readiness/monitoring signal.
+  if (path === "/api/v1/livez" || path === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ live: true, ts: new Date().toISOString() }));
+  }
+
+  // Health check (no auth) — rich readiness/monitoring signal (DB + heartbeats)
   if (path === "/api/v1/health") {
     const checks = { db: "unknown", screener: "unknown", "token-health": "unknown" };
     const reasons = [];
@@ -1699,6 +1921,16 @@ async function router(req, res) {
       checks[name] = "ok";
     }
 
+    // V4 feed readiness — surface separately from overall status. Bot
+    // can be "ok" overall (TG, DB, attestor all working) but feeds
+    // still warming, which the site uses to gate the borrow CTA.
+    // Operator-mandated 2026-06-19 PM per V4 loan lifecycle mandate.
+    let v4Feeds = null;
+    try {
+      const { getFeedReadinessSnapshot } = await import("../services/v4-feed-readiness.js");
+      v4Feeds = getFeedReadinessSnapshot();
+    } catch { /* module not loaded yet — safe to omit */ }
+
     const failing = reasons.length > 0;
     res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -1709,6 +1941,7 @@ async function router(req, res) {
       uptimeMs: hb.uptimeMs,
       startedAt: hb.startedAt,
       heartbeats: hb.services,
+      v4_feeds: v4Feeds,
     }));
   }
 
@@ -1754,6 +1987,15 @@ async function router(req, res) {
       case "/api/v1/public/x402-metrics": {
         const { handleX402Metrics } = await import("./x402-metrics.js");
         result = await handleX402Metrics();
+        break;
+      }
+      case "/api/v1/public/distributions": {
+        // Unified investor-facing distribution roll-up.
+        // See feedback_unified_distribution_accounting.md.
+        const { listDistributionEventsPublic } = await import("../services/distribution-events.js");
+        const limit = url.searchParams.get("limit");
+        const { events, totals } = await listDistributionEventsPublic({ limit });
+        result = { status: 200, body: { ok: true, events, totals } };
         break;
       }
       case "/api/v1/internal/x402/record": {
@@ -1805,6 +2047,50 @@ async function router(req, res) {
         result = await handlePriceRefresh(req);
         break;
       }
+      case "/api/v1/v4/feed-health": {
+        // Sprint Item 3 (V4 hardening 2026-06-17) — read-only freshness
+        // probe for a single mint's V4 + default price feeds. Site uses
+        // the recommendation field to gate the borrow CTA.
+        const { handleV4FeedHealth } = await import("./v4-feed-health.js");
+        result = await handleV4FeedHealth(req, url);
+        break;
+      }
+      case "/api/v1/v4/twap": {
+        // Sprint Item 4 (T15) — precise collateral_value computation
+        // from the V4 on-chain TWAP. Replaces the legacy 0.89
+        // multiplier (11% under-shoot) with a 30bps headroom (~0.3%
+        // under-shoot) site value.
+        const { handleV4Twap } = await import("./v4-twap.js");
+        result = await handleV4Twap(req, url);
+        break;
+      }
+      case "/api/v1/safe-collateral-value": {
+        // Universal attestation-safe collateral_value (V1/V2/V3/V4) — the
+        // class fix for CollateralValueExceedsAttestation. Read-only,
+        // allowlisted to enabled supported_mints; only ever under-quotes
+        // vs the on-chain attestation (fail-safe — can't inflate a loan).
+        const { handleSafeCollateralValue } = await import("./safe-collateral-value.js");
+        result = await handleSafeCollateralValue(req, url);
+        break;
+      }
+      case "/api/v1/v4/feed-ready": {
+        // Per-mint readiness check + on-demand warmup request.
+        // GET /api/v1/v4/feed-ready?mint=X — returns sample-in-window
+        // count and ETA. Side-effect: if not warm, bumps the mint
+        // into the high-priority on-demand warmup queue so the next
+        // attestor cycle prioritizes it. Operator-mandated 2026-06-19
+        // PM after the global-readiness gate was insufficient for
+        // mints outside the priority list.
+        const mintStr = url.searchParams.get("mint") || "";
+        if (!mintStr) {
+          result = { status: 400, body: { error: "missing_mint" } };
+          break;
+        }
+        const { requestMintWarm } = await import("../services/v4-feed-readiness.js");
+        const readiness = await requestMintWarm(mintStr);
+        result = { status: readiness.ok === false ? 404 : 200, body: readiness };
+        break;
+      }
       case "/api/v1/site/limit-close": {
         const { handleSiteLimitCloseList } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseList(req, url);
@@ -1815,9 +2101,38 @@ async function router(req, res) {
         result = await handleSiteLimitCloseArm(req);
         break;
       }
+      case "/api/v1/site/limit-close/arm-batch": {
+        // Operator-mandated 2026-06-16 PM. One Phantom signature arms
+        // all legs of a ladder atomically. Replaces the N-popups-for-N-
+        // legs pattern that caused silent-leg-drop UX on loans 798/802.
+        // Per feedback_one_signature_for_n_legs_always.md.
+        const { handleSiteLimitCloseArmBatch } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseArmBatch(req);
+        break;
+      }
+      case "/api/v1/site/limit-close/arm-preflight": {
+        // V4 Hardening T2 (2026-06-15): dry-run validator the dashboard
+        // calls before asking Phantom to sign. Public read — no
+        // envelope required. Mirrors the arm endpoint's eligibility
+        // + parsing checks so the dashboard can surface failures
+        // BEFORE the user signs.
+        const { handleSiteLimitCloseArmPreflight } = await import("./site-limit-close-preflight.js");
+        result = await handleSiteLimitCloseArmPreflight(req);
+        break;
+      }
       case "/api/v1/site/limit-close/cancel": {
         const { handleSiteLimitCloseCancel } = await import("./site-limit-close.js");
         result = await handleSiteLimitCloseCancel(req);
+        break;
+      }
+      case "/api/v1/site/limit-close/intent": {
+        // Operator-mandated 2026-06-16 PM
+        // (feedback_every_arm_envelope_must_reach_server.md). Beacon
+        // POST recording user intent BEFORE Phantom signing. Unsigned
+        // — stores intent only; the signed /arm path is still
+        // required to actually arm an order.
+        const { handleSiteLimitCloseIntent } = await import("./site-limit-close.js");
+        result = await handleSiteLimitCloseIntent(req);
         break;
       }
       case "/api/v1/site/limit-close/modify": {
@@ -1908,6 +2223,13 @@ async function router(req, res) {
         break;
       case "/api/v1/sync-loan":
         result = await handleSyncLoan(req);
+        break;
+      case "/api/v1/v4/warm-mint":
+        // Hot-on-Select beacon — site pings this when user opens V4
+        // exit picker. Bot adds mint to mint_warming_intents (10-min
+        // TTL) so the continuous attestation loop picks it up. By the
+        // time the user signs the borrow tx, samples are in window.
+        result = await handleWarmMint(req);
         break;
       case "/api/v1/debug/recent-errors":
         // Live tail of console.error/warn. Safe to expose — no PII,
@@ -2020,7 +2342,11 @@ async function router(req, res) {
         };
     }
   } catch (err) {
-    console.error(`[api] Error on ${path}:`, err.message);
+    // Log the FULL stack so we can debug 500s without re-instrumenting
+    // every code path. message-only logging burned an investigation
+    // on 2026-06-15 (trailing-SL arm 500: needed the stack to see the
+    // throw was inside getPriceInUsdCrossSourced).
+    console.error(`[api] Error on ${path}:`, err?.stack || err?.message || err);
     result = { status: 500, body: { error: "Internal server error" } };
   }
 

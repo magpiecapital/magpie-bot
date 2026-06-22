@@ -1,9 +1,12 @@
 /**
  * LP Loyalty Bonus Pool.
  *
- * Mechanic:
- *   - 2% of every loan fee accrues to the lp_loyalty_pool (source: the
- *     protocol's 5% slice — LPs keep their full 80% base yield).
+ * Mechanic (post-MGP-001 ratified 2026-06-13):
+ *   - 10% of every loan fee accrues to the lp_loyalty_pool. This IS
+ *     the LP yield stream — there is no separate "base 80% share"
+ *     anymore. The fee split is now 70% holders / 10% LP loyalty /
+ *     10% referrer / 10% protocol reserve, with 0% retained in the
+ *     lending pool itself.
  *   - Each LP's "weight" at snapshot time = current shares × seconds
  *     since their weighted_deposit_at (the time-weighted average of
  *     their deposit moments).
@@ -30,6 +33,7 @@ import { connection } from "../solana/connection.js";
 import { getReadOnlyProgram, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
+import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 import { getRuntimeConfigBps } from "./runtime-config.js";
 
 // Fallback used when governance_config.lp_loyalty_reward_bps can't be
@@ -74,27 +78,63 @@ function loadLenderKeypair() {
 }
 
 /**
- * Hook called on every loan fee event. Accrues 2% of the fee to the
- * loyalty pool. Idempotent NOT guaranteed — caller must ensure they
- * call once per fee event (recordLoan + executeExtendLoan handle this).
+ * Hook called on every loan fee event. Accrues the loyalty bps share
+ * via the pool_credit_events ledger (UNIQUE per source). Repeat calls
+ * with the same (sourceType, sourceId) are no-ops.
+ *
+ * REQUIRED: sourceType + sourceId. See
+ * feedback_pool_credits_must_be_idempotent_at_db_level.md.
  */
-export async function accrueToLpLoyaltyPool(feeLamports) {
+export async function accrueToLpLoyaltyPool(feeLamports, { sourceType, sourceId } = {}) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[lp-loyalty] CRIT accrueToLpLoyaltyPool called WITHOUT sourceType/sourceId — refusing. fee=${fee}`);
+    return null;
+  }
   const liveBps = await getLpLoyaltyRewardBps();
   const reward = (fee * BigInt(liveBps)) / 10_000n;
   if (reward <= 0n) return null;
+  return await creditLpLoyaltyPoolDirect({
+    sourceType,
+    sourceId,
+    lamports: reward,
+    metadata: { fee_lamports: fee.toString(), bps: liveBps },
+  });
+}
+
+/**
+ * Credit a pre-computed lamport amount directly to the LP loyalty
+ * pool. Idempotency enforced by pool_credit_events.UNIQUE(source_type,
+ * source_id, pool_kind='lp_loyalty'). Repeat calls are no-ops.
+ *
+ * REQUIRED: sourceType + sourceId.
+ */
+export async function creditLpLoyaltyPoolDirect({ sourceType, sourceId, lamports, metadata } = {}) {
+  const amt = BigInt(lamports || 0);
+  if (amt <= 0n) return null;
+  if (!sourceType || sourceId === undefined || sourceId === null) {
+    console.error(`[lp-loyalty] CRIT ledger-gated credit called WITHOUT sourceType/sourceId — refusing. amt=${amt}`);
+    return null;
+  }
   try {
-    await query(
-      `UPDATE lp_loyalty_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
+    const { rows } = await query(
+      `WITH ins AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         VALUES ($1, $2, 'lp_loyalty', $3::numeric, $4::jsonb)
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE lp_loyalty_pool
+          SET accrued_lamports = accrued_lamports + $3::numeric,
               updated_at = NOW()
-        WHERE id = 1`,
-      [reward.toString()],
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ins)
+        RETURNING accrued_lamports::text AS new_total`,
+      [sourceType, String(sourceId), amt.toString(), metadata ? JSON.stringify(metadata) : null],
     );
-    return reward;
+    return rows.length > 0 ? amt : null;
   } catch (err) {
-    console.error("[lp-loyalty] accrual failed:", err.message);
+    console.error("[lp-loyalty] direct credit failed:", err.message);
     return null;
   }
 }
@@ -350,11 +390,12 @@ export async function snapshotAndDistributeLpLoyalty() {
   // Sync from chain so positions are current
   await syncOnChainPositions();
 
-  // Pre-flight lender balance
-  const lender = loadLenderKeypair();
-  const lenderBalance = BigInt(await connection.getBalance(lender.publicKey));
-  if (lenderBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn(`[lp-loyalty] Skipped: lender balance too low for pool ${pool}`);
+  // Pre-flight distributor balance (REWARDS_DISTRIBUTOR_PRIVATE_KEY,
+  // with backward-compat fallback to LENDER_PRIVATE_KEY).
+  const distributor = getRewardsDistributorKeypair();
+  const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+  if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn(`[lp-loyalty] Skipped: distributor balance too low for pool ${pool}`);
     return null;
   }
 
@@ -367,10 +408,31 @@ export async function snapshotAndDistributeLpLoyalty() {
   );
   if (rows.length === 0) return null;
 
+  // Operator-curated exempt list (migration 084). The operator's
+  // lender wallet is excluded permanently so the auto-cron doesn't
+  // pay 95% of every cycle back to the wallet that funded LP in the
+  // first place — that would be a wasteful operator-to-operator
+  // round-trip. See [[feedback_lender_wallet_exempt_from_lp_loyalty]].
+  // Empty table = no exemptions, behavior identical to pre-migration.
+  let exempt = new Set();
+  try {
+    const { rows: exemptRows } = await query(
+      `SELECT wallet_address FROM lp_loyalty_exempt_wallets`,
+    );
+    exempt = new Set(exemptRows.map((r) => r.wallet_address));
+    if (exempt.size > 0) {
+      console.log(`[lp-loyalty] honoring ${exempt.size} exempt wallet(s)`);
+    }
+  } catch (err) {
+    // Table missing (pre-migration deploy) — fall back to no exemptions.
+    console.warn("[lp-loyalty] lp_loyalty_exempt_wallets read failed (using empty exemption set):", err.message);
+  }
+
   // Compute weights
   let totalWeight = 0n;
   const items = [];
   for (const r of rows) {
+    if (exempt.has(r.wallet_address)) continue;
     const shares = BigInt(r.shares);
     const seconds = BigInt(r.seconds_held ?? 0);
     if (seconds <= 0n) continue; // brand-new deposits get no loyalty this round
@@ -451,14 +513,14 @@ export async function snapshotAndDistributeLpLoyalty() {
     for (const r of batch) {
       tx.add(
         SystemProgram.transfer({
-          fromPubkey: lender.publicKey,
+          fromPubkey: distributor.publicKey,
           toPubkey: new PublicKey(r.wallet_address),
           lamports: BigInt(r.reward_lamports),
         }),
       );
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], { commitment: "confirmed" });
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
       await query(
         `UPDATE lp_loyalty_rewards
             SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
@@ -496,9 +558,9 @@ export async function retryAccruedLpLoyaltyPayouts() {
   );
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
-  const lender = loadLenderKeypair();
+  const distributor = getRewardsDistributorKeypair();
   const total = rows.reduce((s, r) => s + BigInt(r.reward_lamports), 0n);
-  const bal = BigInt(await connection.getBalance(lender.publicKey));
+  const bal = BigInt(await connection.getBalance(distributor.publicKey));
   if (bal < total + MIN_LENDER_RESERVE_LAMPORTS) return { retried: 0, paid: 0, skipped: rows.length };
 
   let paid = 0;
@@ -507,13 +569,13 @@ export async function retryAccruedLpLoyaltyPayouts() {
     const tx = new Transaction();
     for (const r of batch) {
       tx.add(SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
+        fromPubkey: distributor.publicKey,
         toPubkey: new PublicKey(r.wallet_address),
         lamports: BigInt(r.reward_lamports),
       }));
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], { commitment: "confirmed" });
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
       await query(
         `UPDATE lp_loyalty_rewards SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2 WHERE id = ANY($1::bigint[])`,
         [batch.map((r) => r.id), sig],

@@ -1,0 +1,163 @@
+/**
+ * Wallet → user_id resolver — the ONE correct way to look up which
+ * Magpie user owns a given Solana pubkey.
+ *
+ * Why this exists:
+ *
+ *   A wallet pubkey can have MULTIPLE rows in the `wallets` table —
+ *   one per (user_id, public_key) pair. This is by design: the site
+ *   auto-creates a "site_native" user the first time someone connects
+ *   a Phantom wallet, AND a separate "imported" row appears when the
+ *   user later links that same wallet to their Telegram account.
+ *
+ *   Before this helper, the codebase had ~15 spots doing
+ *     `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`
+ *   with NO `ORDER BY`. Postgres returned whichever row it pleased,
+ *   which was usually the older `site_native` row. New loans (and
+ *   especially V3 RWA loans borrowed via the site) ended up under
+ *   the site-only user_id rather than the TG-linked one. When the
+ *   user ran /repay in Telegram, the loan didn't show up.
+ *
+ *   This helper picks the RIGHT user_id deterministically:
+ *
+ *     1. Prefer the row whose owning user has a non-null/non-zero
+ *        telegram_id (that's the human controlling the wallet from TG).
+ *     2. Among those, prefer is_active=TRUE rows (the user explicitly
+ *        chose this wallet as their active one).
+ *     3. Among those, prefer the most-recently-created row (the most
+ *        recent intent wins).
+ *     4. Fall back to any wallet row if no TG-linked rows exist (site-
+ *        only users still get a valid user_id).
+ *
+ *   The bot's /repay, /topup, /extend, etc. all scope by user_id. Picking
+ *   the TG-linked user_id whenever possible means loans always land in
+ *   the correct user's TG-visible scope.
+ *
+ * Use this for every wallet → user_id lookup:
+ *
+ *     import { resolveWalletOwner } from "./wallet-owner-resolver.js";
+ *     const userId = await resolveWalletOwner(borrowerPubkey);
+ */
+
+import { query } from "../db/pool.js";
+
+/**
+ * Look up the canonical user_id for a wallet pubkey.
+ *
+ * Returns the resolved user_id (string) or null if no wallet row exists.
+ *
+ * Implementation detail: a single ranked SELECT keeps this to one
+ * round-trip. ORDER BY:
+ *   - tg-linked rows first (NULLS LAST so a NULL telegram_id loses)
+ *   - is_active DESC so explicit-current-wallet wins
+ *   - created_at DESC so most-recent linkage wins on ties
+ */
+export async function resolveWalletOwner(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") return null;
+  const { rows } = await query(
+    `SELECT w.user_id
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
+    [publicKey],
+  );
+  return rows[0]?.user_id ?? null;
+}
+
+/**
+ * Resolve OR auto-create the user+wallet row for an anonymous wallet.
+ *
+ * Operator-mandated 2026-06-17 PM after a Phantom-only wallet borrowed
+ * on V4 successfully but the loan never landed in DB (cosign-borrow
+ * silently skipped recordLoan because the wallet had no `wallets` row).
+ * For V4 anonymous wallets, the borrow MUST persist; otherwise the
+ * dashboard's Active Loans tab shows nothing and the user can't manage
+ * the loan they just paid for.
+ *
+ * Behavior:
+ *   1. If a wallets row exists, return its user_id (same as resolveWalletOwner).
+ *   2. Otherwise INSERT a new user (telegram_id NULL) + wallets row
+ *      (source=source, is_active=true), then return the new user_id.
+ *
+ * Race-safe: the wallets table has `UNIQUE (public_key)` enforced by
+ * the schema, so a concurrent INSERT for the same wallet falls back
+ * to the existing row via ON CONFLICT DO NOTHING + re-fetch.
+ *
+ * Mandated by feedback_anonymous_wallets_full_feature_parity_v4.md.
+ */
+export async function resolveOrAutoLinkWalletOwner(publicKey, source = "anonymous_borrow") {
+  if (!publicKey || typeof publicKey !== "string") return null;
+  // Fast path: existing row.
+  const existing = await resolveWalletOwner(publicKey);
+  if (existing) return existing;
+
+  // Slow path: auto-create user + wallets row. Two SQL-level traps the
+  // audit caught 2026-06-17 PM (both shipped broken in PR #344):
+  //   1. users.telegram_id was NOT NULL — fixed in migration 072.
+  //   2. wallets has NO unique constraint on public_key (pool.js startup
+  //      patches drop it on every boot), so ON CONFLICT (public_key)
+  //      threw "no unique or exclusion constraint matches". Use the same
+  //      SELECT-then-INSERT race-tolerant pattern as account-link.js.
+  try {
+    const { rows: [newUser] } = await query(
+      `INSERT INTO users (telegram_id, created_at)
+       VALUES (NULL, NOW())
+       RETURNING id`,
+    );
+    // Re-check before insert in case another concurrent call won the race.
+    const existsCheck = await query(
+      `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+      [publicKey, newUser.id],
+    );
+    if (existsCheck.rowCount === 0) {
+      try {
+        await query(
+          `INSERT INTO wallets (user_id, public_key, source, is_active, created_at)
+           VALUES ($1, $2, $3, TRUE, NOW())`,
+          [newUser.id, publicKey, source],
+        );
+      } catch (insertErr) {
+        // Tolerate duplicate-key race from a sibling auto-link path —
+        // the row already exists, which is what we wanted.
+        if (!/duplicate key|unique constraint/i.test(insertErr.message || "")) {
+          throw insertErr;
+        }
+      }
+    }
+    const retry = await resolveWalletOwner(publicKey);
+    if (retry) return retry;
+    console.warn(`[wallet-resolver] auto-link race on ${publicKey.slice(0, 8)}…`);
+    return null;
+  } catch (err) {
+    console.error(
+      `[wallet-resolver] auto-link insert failed for ${publicKey.slice(0, 8)}…: ${err.message?.slice(0, 200)}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Variant that returns the full wallet row (user_id + metadata) so
+ * callers that need more than just the id (e.g. cosign-borrow checking
+ * is_active) don't have to re-query.
+ */
+export async function resolveWalletOwnerRow(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") return null;
+  const { rows } = await query(
+    `SELECT w.user_id, w.public_key, w.is_active, w.source, w.label,
+            w.created_at, u.telegram_id
+       FROM wallets w
+       JOIN users u ON u.id = w.user_id
+      WHERE w.public_key = $1
+      ORDER BY (u.telegram_id IS NOT NULL AND u.telegram_id > 0) DESC,
+               w.is_active DESC,
+               w.created_at DESC
+      LIMIT 1`,
+    [publicKey],
+  );
+  return rows[0] ?? null;
+}

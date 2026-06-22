@@ -27,12 +27,15 @@ export async function handleExtend(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
+  // Layer 5 defense [[feedback_never_misattribute_loans]]
   const { rows } = await query(
     `SELECT l.*, sm.symbol
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-     WHERE l.user_id = $1 AND l.status = 'active'
+     WHERE l.status = 'active'
        AND COALESCE(l.suspended, FALSE) = FALSE
+       AND (l.user_id = $1
+            OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
@@ -109,7 +112,9 @@ export function registerExtendCallbacks(bot) {
       `SELECT l.*, sm.symbol
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-       WHERE l.id = $1 AND l.user_id = $2 AND l.status = 'active'`,
+       WHERE l.id = $1 AND l.status = 'active'
+         AND (l.user_id = $2
+              OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $2))`,
       [loanDbId, user.id],
     );
     const loan = rows[0];

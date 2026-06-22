@@ -64,6 +64,26 @@ export async function query(text, params) {
 }
 
 /**
+ * Connect-out a client for a transactional sequence (BEGIN…COMMIT).
+ * Use for atomic multi-row writes where partial state is unacceptable
+ * — e.g. armOrderBatch's all-or-nothing N-leg insert
+ * (feedback_one_signature_for_n_legs_always.md). Always release the
+ * client in a finally block.
+ *
+ * Pins to the primary pool — we intentionally do NOT fail over to the
+ * secondary on connection-class errors here, because if a transaction
+ * is on a different DB than the rest of the request's writes the user
+ * would see "phantom" partial state. Better to surface a hard fail
+ * and let the caller decide.
+ */
+export async function getClient() {
+  if (!pool) {
+    throw new Error("No primary database connection available for transactional client");
+  }
+  return await pool.connect();
+}
+
+/**
  * One-shot schema patches run on bot startup. Each statement must be
  * idempotent — safe to re-run on every boot. Use sparingly; prefer
  * proper migration files for non-urgent changes.
@@ -320,12 +340,13 @@ export async function applyStartupPatches() {
        added_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
 
-    // ─────── LP LOYALTY BONUS POOL ───────
-    // 2% of every loan fee accrues to this pool, distributed pro-rata to
-    // each LP's share-seconds (shares × time held). Long-term holders
-    // earn meaningfully more than flippers on top of the base 80% LP
-    // yield. Sourced from the protocol's 5% slice (drops to 3%); LPs
-    // keep their full 80%.
+    // ─────── LP LOYALTY POOL ───────
+    // Post-MGP-001 (ratified 2026-06-13): 10% of every loan fee accrues
+    // to this pool — it IS the LP yield stream (the prior "base 80%
+    // share-price growth" model was eliminated when voters chose to
+    // reweight more aggressively toward $MAGPIE holders). Distributed
+    // pro-rata to each LP's share-seconds (shares × time held). Long-
+    // term LPs earn meaningfully more than flippers.
     `CREATE TABLE IF NOT EXISTS lp_loyalty_pool (
        id INTEGER PRIMARY KEY,
        accrued_lamports NUMERIC(30,0) NOT NULL DEFAULT 0,
@@ -885,6 +906,147 @@ export async function applyStartupPatches() {
     // $MAGPIE auto-defaults to unlimited (it's our protocol token —
     // there's no upside in arbitrarily capping borrows against it).
     `ALTER TABLE supported_mints ADD COLUMN IF NOT EXISTS max_open_lamports NUMERIC(20,0)`,
+
+    // 2026-06-19 PM — Tiered attestation (mirrors migrations/085_supported_mints_attestation_tier.sql).
+    // Inlined here because this codebase doesn't have an automatic
+    // migration runner — the migrations/ folder is applied manually.
+    // Putting the schema change in pool.js's init list makes it
+    // self-healing on boot.
+    //
+    // attestation_tier: hot (always attested) / warm (active-loan-only) /
+    //   cold (JIT only at cosign-borrow).
+    // Default 'hot' preserves prior behavior for every existing mint.
+    // See [[feedback_tiered_attestation_cost_conscious]].
+    `ALTER TABLE supported_mints
+       ADD COLUMN IF NOT EXISTS attestation_tier TEXT NOT NULL DEFAULT 'hot'
+       CHECK (attestation_tier IN ('hot', 'warm', 'cold'))`,
+    `CREATE INDEX IF NOT EXISTS idx_supported_mints_tier_enabled
+       ON supported_mints (attestation_tier, enabled)
+       WHERE enabled = TRUE`,
+    `CREATE TABLE IF NOT EXISTS supported_mints_tier_changes (
+       id BIGSERIAL PRIMARY KEY,
+       mint TEXT NOT NULL,
+       from_tier TEXT,
+       to_tier TEXT NOT NULL,
+       changed_by TEXT,
+       reason TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_smtc_mint_created
+       ON supported_mints_tier_changes (mint, created_at DESC)`,
+
+    // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
+    // (feedback_distribution_wallet_must_be_auto_funded.md).
+    // Records every move of accrued fees from fee_wallet (lender pubkey's
+    // wSOL ATA) → distribution wallet (CHCAMWtn). 'planned' rows are
+    // the idempotency anchor: written BEFORE tx broadcast so a crash
+    // mid-flight leaves a reconcilable audit trail. 'confirmed' rows
+    // include the on-chain tx_signature.
+    `CREATE TABLE IF NOT EXISTS fee_wallet_sweeps (
+       id              BIGSERIAL PRIMARY KEY,
+       source_pubkey   TEXT NOT NULL,
+       dest_pubkey     TEXT NOT NULL,
+       amount_lamports NUMERIC(30,0) NOT NULL,
+       status          TEXT NOT NULL CHECK (status IN ('planned','confirmed','failed','reconciled')),
+       tx_signature    TEXT,
+       reason          TEXT,
+       err             TEXT,
+       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_status_idx ON fee_wallet_sweeps(status) WHERE status = 'planned'`,
+    `CREATE INDEX IF NOT EXISTS fee_wallet_sweeps_created_idx ON fee_wallet_sweeps(created_at DESC)`,
+
+    // 2026-06-17 — Pending-arm queue (architectural fix for the race
+    // class that bit operator 3 times on loan 820, 826, 830). When
+    // armOrderBatch's 30s polling window expires without finding the
+    // loan, we store the signed envelope here and a background
+    // watcher retries every 10s while the envelope is fresh (5 min).
+    // User never has to re-sign. Schema captures the minimum to
+    // replay: parsed legs, intent_ids, source, and the envelope
+    // metadata for audit. The envelope IS valuable (replay-attack
+    // surface within 5min) — operator-only DB access + auto-purge
+    // post-expiry keep the blast radius bounded.
+    // See feedback_loan_830_full_postmortem_and_defenses.md.
+    `CREATE TABLE IF NOT EXISTS pending_arms (
+       id                   BIGSERIAL PRIMARY KEY,
+       user_id              INT NOT NULL,
+       signer_pubkey        TEXT NOT NULL,
+       wallet               TEXT NOT NULL,
+       loan_id_chain        TEXT NOT NULL,
+       legs                 JSONB NOT NULL,
+       intent_ids           BIGINT[],
+       source               TEXT NOT NULL,
+       arm_note_prefix      TEXT,
+       envelope_issued_at   TIMESTAMPTZ NOT NULL,
+       status               TEXT NOT NULL CHECK (status IN ('pending','armed','expired','failed')),
+       retry_count          INT NOT NULL DEFAULT 0,
+       last_retry_at        TIMESTAMPTZ,
+       last_retry_error     TEXT,
+       order_ids            BIGINT[],
+       created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_pending_idx ON pending_arms(status, envelope_issued_at) WHERE status = 'pending'`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_wallet_idx ON pending_arms(wallet, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS pending_arms_loan_id_idx ON pending_arms(loan_id_chain) WHERE status IN ('pending', 'armed')`,
+
+    // ─────────── UNIFIED DISTRIBUTION ACCOUNTING (2026-06-18) ───────────
+    // Operator-mandated 2026-06-18: every SOL distribution Magpie makes
+    // to stakeholders — holder rewards, governance ratifications, LP
+    // loyalty, yield, loan remediation — gets one row here. This is the
+    // canonical investor-facing roll-up sitting OVER the per-kind detail
+    // tables (which remain the source of truth for per-wallet payouts).
+    //
+    // Why a new table instead of extending magpie_holder_distributions:
+    // that table has a 6-field schema tightly coupled to holder-reward
+    // mechanics. A unified table needs to cover governance (weight-based
+    // denominator), LP-loyalty (share-seconds), yield (LP pro-rata), etc.
+    // Cleaner to ship a new layer than to retrofit.
+    //
+    // The per-kind tables stay as the source of truth for per-wallet
+    // detail (governance_distributions, lp_loyalty_rewards,
+    // magpie_holder_rewards, etc.). This table is the joinable summary.
+    //
+    // See feedback_unified_distribution_accounting.md.
+    `CREATE TABLE IF NOT EXISTS distribution_events (
+       id                              BIGSERIAL PRIMARY KEY,
+       kind                            TEXT NOT NULL CHECK (kind IN (
+                                         'holder_reward','governance','lp_loyalty','yield','loan_remediation'
+                                       )),
+       external_ref                    TEXT NOT NULL,
+       snapshot_at                     TIMESTAMPTZ NOT NULL,
+       paid_first_at                   TIMESTAMPTZ,
+       paid_last_at                    TIMESTAMPTZ,
+       pool_lamports                   NUMERIC(30,0),
+       distributed_lamports            NUMERIC(30,0) NOT NULL DEFAULT 0,
+       unpaid_lamports                 NUMERIC(30,0) NOT NULL DEFAULT 0,
+       eligible_wallet_count           INTEGER       NOT NULL DEFAULT 0,
+       paid_wallet_count               INTEGER       NOT NULL DEFAULT 0,
+       unpayable_wallet_count          INTEGER       NOT NULL DEFAULT 0,
+       denominator_kind                TEXT,
+       denominator_value               NUMERIC(40,0),
+       min_payout_lamports             NUMERIC(30,0),
+       max_payout_lamports             NUMERIC(30,0),
+       median_payout_lamports          NUMERIC(30,0),
+       source_borrow_fees_lamports     NUMERIC(30,0) NOT NULL DEFAULT 0,
+       source_liquidation_lamports     NUMERIC(30,0) NOT NULL DEFAULT 0,
+       source_other_lamports           NUMERIC(30,0) NOT NULL DEFAULT 0,
+       plan_hash                       TEXT,
+       snapshot_hash                   TEXT,
+       sample_tx_signatures            TEXT[],
+       notes                           TEXT,
+       status                          TEXT NOT NULL DEFAULT 'planned'
+                                         CHECK (status IN ('planned','partial','complete','verified')),
+       metadata                        JSONB,
+       created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (kind, external_ref)
+     )`,
+    `CREATE INDEX IF NOT EXISTS distribution_events_kind_at_idx
+       ON distribution_events(kind, snapshot_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS distribution_events_at_idx
+       ON distribution_events(snapshot_at DESC)`,
   ];
   for (const sql of patches) {
     try {

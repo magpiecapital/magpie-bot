@@ -56,12 +56,14 @@ import {
 } from "@solana/spl-token";
 import BN from "bn.js";
 import { query } from "../db/pool.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
+  PROGRAM_ID_V4,
   chooseProgramIdForCategory,
+  chooseProgramId,
   assertProgramMatchesCategory,
   getProgramForSigner,
 } from "../solana/program.js";
@@ -80,6 +82,28 @@ import { Keypair } from "@solana/web3.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
+
+// Throttled operator alerting for the V4 borrow kill switch. Mirrors the
+// cosign-borrow COSIGN_BORROW_DISABLED alert: a drain-safety pause that we
+// NEVER auto-re-enable must also never be silently left on. Re-alert at
+// most once per ~10 min (in-memory) so it stays visible until cleared.
+const KILL_SWITCH_ALERT_INTERVAL_MS = 10 * 60 * 1000; // ~10 min
+let _v4PausedLastAlertAt = 0;
+
+function alertV4PausedThrottled() {
+  const now = Date.now();
+  if (now - _v4PausedLastAlertAt < KILL_SWITCH_ALERT_INTERVAL_MS) return;
+  _v4PausedLastAlertAt = now;
+  // Fire-and-forget — the borrow response must not wait on a Telegram alert.
+  (async () => {
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        "PAUSED [agent-borrow] V4_BORROWS_PAUSED is ON — a new auto-sell borrow just bounced. This will keep alerting ~every 10 min until you clear V4_BORROWS_PAUSED. (Drain-safety control — never auto-re-enabled.)",
+      );
+    } catch {}
+  })();
+}
 
 // Legacy memecoin tier map — kept for back-compat callers that still
 // import TIERS directly. NEW code should use the category-aware
@@ -136,13 +160,28 @@ export async function findOrCreateAgentUser(walletPubkey) {
     [synthTg, `agent_${walletPubkey.slice(0, 8)}`],
   );
   const userId = rows[0].id;
-  // Ensure a wallets row exists for this pubkey (source='agent_x402')
-  await query(
-    `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
-     VALUES ($1, $2, '', '', '', 'agent_x402', TRUE)
-     ON CONFLICT (public_key) DO NOTHING`,
-    [userId, walletPubkey],
+  // Ensure a wallets row exists for this pubkey (source='agent_x402').
+  // wallets has NO unique constraint on public_key (pool.js drops it on
+  // every boot), so ON CONFLICT (public_key) throws "no unique or
+  // exclusion constraint". Use SELECT-then-INSERT with race-tolerance.
+  // Caught by audit 2026-06-17 PM same root cause as wallet-owner-resolver.
+  const existsCheck = await query(
+    `SELECT 1 FROM wallets WHERE public_key = $1 AND user_id = $2 LIMIT 1`,
+    [walletPubkey, userId],
   );
+  if (existsCheck.rowCount === 0) {
+    try {
+      await query(
+        `INSERT INTO wallets (user_id, public_key, encrypted_secret, nonce, auth_tag, source, is_active)
+         VALUES ($1, $2, '', '', '', 'agent_x402', TRUE)`,
+        [userId, walletPubkey],
+      );
+    } catch (raceErr) {
+      if (!/duplicate key|unique constraint/i.test(raceErr.message || "")) {
+        throw raceErr;
+      }
+    }
+  }
   return userId;
 }
 
@@ -166,6 +205,13 @@ export async function buildBorrowTx({
   tier,                  // 0 | 1 | 2
   userId,                // already resolved
   mintRow,               // already resolved from supported_mints
+  // V4-exclusive routing (2026-06-15): agents that ALSO plan to arm
+  // an exit (TP / SL / trailing / bracket / ladder) immediately after
+  // funding the loan should pass hasExitArming=true so the borrow
+  // lands on V4. Plain borrows (no exit) take the legacy V1/V2/V3
+  // category routing. Default false to preserve the pre-V4
+  // contract — callers must explicitly opt in to V4 routing.
+  hasExitArming = false,
 }) {
   // Category-aware tier resolution. RWA mints get the higher-LTV
   // schedule out of rwa_loan_tiers; memecoin falls back to TIERS.
@@ -218,11 +264,65 @@ export async function buildBorrowTx({
     };
   }
 
-  const programId = chooseProgramIdForCategory(mintRow.category);
+  // Exit-armed borrows force V4. Token-2022 + exits is BLOCKED until
+  // V4.x ships (operator-mandated V4 in-vault thesis 2026-06-15 PM —
+  // no V3 fallback because V3 uses the legacy fire-and-close model
+  // that the V4 thesis exists to replace). Plain borrows take the
+  // category path normally.
+  const { TOKEN_2022_PROGRAM_ID } = await import("@solana/spl-token");
+  const isToken2022 = mintRow.token_program === TOKEN_2022_PROGRAM_ID.toBase58();
+  let programId;
+  try {
+    programId = chooseProgramId(mintRow.category, { hasExitArming, isToken2022 });
+  } catch (err) {
+    // Distinguish the THREE block paths so callers can retry intelligently:
+    //   - V4_BORROWS_PAUSED (503 — retry later, will lift after V4 patch)
+    //   - TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED (422 — retry WITHOUT exit
+    //     or pick a different collateral, will lift after V4 patch)
+    //   - generic V4 not configured (503 — operational issue)
+    if (err.message?.startsWith("V4_BORROWS_PAUSED")) {
+      // Throttled recurring operator alert so the pause is never silently
+      // left on. We deliberately do NOT auto-re-enable the switch.
+      alertV4PausedThrottled();
+      return {
+        blocked: true,
+        status: 503,
+        body: {
+          error:
+            "We're holding new auto-sell borrows for a quick safety check — please try again in about a minute.",
+          retry_after_seconds: 60,
+          friendly: true,
+          paused: true,
+          // `detail` retains the V4_BORROWS_PAUSED-prefixed message for any
+          // caller that branches on it; not shown verbatim to end users.
+          detail: err.message,
+        },
+      };
+    }
+    if (err.message?.startsWith("TOKEN2022_EXIT_ARMING_TEMPORARILY_BLOCKED")) {
+      return { blocked: true, status: 422, body: { error: "token2022_exit_blocked", detail: err.message } };
+    }
+    return { blocked: true, status: 503, body: { error: "v4_not_available", detail: err.message } };
+  }
   try {
     assertProgramMatchesCategory(programId, mintRow.category);
   } catch (err) {
     return { blocked: true, status: 500, body: { error: "program_routing", detail: err.message } };
+  }
+
+  // P0 (2026-06-20): cap the collateral value to the on-chain attestation for
+  // the chosen program version so this x402 borrow can NEVER reject with
+  // CollateralValueExceedsAttestation. Fail-soft (returns unchanged on any
+  // error) — the multiplier clamp, cosign pre-flight sim, and the on-chain
+  // program remain as lower defense layers, so it never blocks a borrow.
+  {
+    const { capCollateralValueToAttestation } = await import("./safe-collateral-value.js");
+    collateralValLamports = await capCollateralValueToAttestation(collateralValLamports, {
+      mintStr: collateralMintStr,
+      decimals: Number(mintRow.decimals),
+      amountRaw: String(collateralAmountRaw),
+      programId,
+    });
   }
 
   let txB64, loanIdStr, loanAccountStr;
@@ -266,13 +366,22 @@ export async function buildBorrowTx({
       ),
     ];
 
+    // V3 and V4 take an extra `category` u8 arg (5 args); V1/V2 take 4.
+    // V4 inherits V3's dual-tier instruction shape with the new in-vault
+    // auto-sell semantics layered on top. See src/services/loans.js for
+    // the symmetric branch on the TG borrow path. Without this, V3/V4
+    // borrows fail with InstructionDidNotDeserialize.
+    const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
+    const programIdB58 = programId.toBase58();
+    const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
+    const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+    const needsCategoryArg = isV3 || isV4;
+    const categoryByte = RWA_CATEGORIES.has(mintRow.category) ? 1 : 0;
+    const ixArgs = needsCategoryArg
+      ? [new BN(collateralAmountRaw), Number(tier), new BN(collateralValLamports.toString()), loanId, categoryByte]
+      : [new BN(collateralAmountRaw), Number(tier), new BN(collateralValLamports.toString()), loanId];
     const ix = await program.methods
-      .requestAndFundLoan(
-        new BN(collateralAmountRaw),
-        Number(tier),
-        new BN(collateralValLamports.toString()),
-        loanId,
-      )
+      .requestAndFundLoan(...ixArgs)
       .accounts({
         pool: lendingPool,
         loanTokenVault,
@@ -328,7 +437,7 @@ export async function buildBorrowTx({
 }
 
 async function getMintTokenProgram(mintStr) {
-  const info = await connection.getAccountInfo(new PublicKey(mintStr));
+  const info = await withFailover((conn) => conn.getAccountInfo(new PublicKey(mintStr)));
   if (!info) throw new Error(`Mint ${mintStr} not found on-chain`);
   return info.owner.equals(TOKEN_2022_PROGRAM_ID)
     ? TOKEN_2022_PROGRAM_ID
@@ -413,7 +522,7 @@ export async function handleAgentBuildBorrow(req) {
   }
 
   // ── Validation ──
-  const { borrower_wallet, collateral_mint, collateral_amount, tier } = body ?? {};
+  const { borrower_wallet, collateral_mint, collateral_amount, tier, has_exit_arming } = body ?? {};
   if (!borrower_wallet || !collateral_mint || !collateral_amount || tier == null) {
     return {
       status: 400,
@@ -467,6 +576,7 @@ export async function handleAgentBuildBorrow(req) {
     tier: Number(tier),
     userId,
     mintRow: mint,
+    hasExitArming: has_exit_arming === true,
   });
   if (built.blocked) {
     return { status: built.status, body: built.body };

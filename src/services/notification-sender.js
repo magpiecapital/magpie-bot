@@ -80,45 +80,238 @@ function renderLimitCloseIntervention(p) {
 
 function renderLimitCloseArmed(p) {
   const agentLine = agentAttribution(p);
+  const direction = p.trigger_direction === "below" ? "stop" : "profit target";
   return [
-    `*Limit-close armed* — order #${p.order_id}`,
+    `*Auto-sell set up* — order #${p.order_id}`,
     ``,
     `Loan: #${p.loan_id_chain}`,
-    `Trigger: ${p.trigger_label}`,
-    `Slippage: ${(p.slippage_bps / 100).toFixed(2)}%`,
-    `Destination: ${p.sell_destination.toUpperCase()}`,
+    `${direction === "stop" ? "Stop at" : "Sell when"}: ${p.trigger_label}`,
+    `Slippage allowance: ${(p.slippage_bps / 100).toFixed(2)}%`,
+    `We pay you in: ${p.sell_destination.toUpperCase()}`,
     agentLine ? `` : null,
     agentLine,
     ``,
-    `I'll repay and sell automatically when the trigger fires.`,
+    `When the target hits, we'll repay your loan and send the proceeds to your wallet automatically.`,
   ].filter((s) => s !== null).join("\n");
+}
+
+/**
+ * Arm-attempt failure DM. Fired by limit-close-arm-core's wrapper on
+ * EVERY failed armOrder() call, regardless of source (site / tg /
+ * agent_x402). Forcing function: operator's 2026-06-15 V4 SPCX ladder
+ * incident — the user thought they armed a ladder, the strike was
+ * hit, no fire happened, no signal anywhere on the dashboard. Now
+ * they get the truth in their DMs within seconds.
+ */
+function renderLimitCloseArmFailed(p) {
+  // Human-readable explanation for known error codes. Falls back to
+  // the raw error_code + detail so we never silently drop info.
+  const why = humanizeArmFailure(p.error_code, p.error_detail);
+
+  // Format the target the user tried to arm, when we have enough to
+  // reconstruct it. Otherwise a generic "your auto-sell".
+  const target = formatAttemptedTarget(p);
+
+  const dirLabel = p.direction === "below" ? "stop-loss" : "take-profit";
+  const sliceTxt = p.slice_pct && p.slice_pct < 10000
+    ? ` (${(p.slice_pct / 100).toFixed(0)}% slice)`
+    : "";
+
+  return [
+    `*Auto-sell didn't arm*`,
+    ``,
+    `What you tried to set: ${target}${sliceTxt} — ${dirLabel}`,
+    p.loan_id_chain ? `Loan: #${p.loan_id_chain}` : null,
+    ``,
+    `Why it failed: ${why}`,
+    ``,
+    `Nothing is armed on the chain. Tap "Try again" in the dashboard or DM me ("/help") if you'd like a walk-through.`,
+  ].filter((s) => s !== null).join("\n");
+}
+
+function formatAttemptedTarget(p) {
+  if (!p.trigger_kind || p.trigger_value_micro == null) return "your auto-sell";
+  const n = Number(p.trigger_value_micro);
+  if (!Number.isFinite(n)) return "your auto-sell";
+  if (p.trigger_kind === "mc_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1e9) return `$${(usd / 1e9).toFixed(2)}B mc`;
+    if (usd >= 1e6) return `$${(usd / 1e6).toFixed(2)}M mc`;
+    if (usd >= 1e3) return `$${(usd / 1e3).toFixed(2)}K mc`;
+    return `$${usd.toFixed(2)} mc`;
+  }
+  if (p.trigger_kind === "price_usd") {
+    const usd = n / 1e6;
+    if (usd >= 1) return `$${usd.toFixed(2)}`;
+    if (usd >= 0.01) return `$${usd.toFixed(4)}`;
+    return `$${usd.toFixed(8)}`;
+  }
+  return `${(n / 1e9).toFixed(6)} SOL`;
+}
+
+function humanizeArmFailure(code, detail) {
+  switch (code) {
+    case "loan_not_found_for_user":
+      return "We couldn't find that loan on your account. If you just borrowed, give it ~5 seconds and try again — the loan may not have propagated yet.";
+    case "loan_not_active":
+      return "That loan isn't active anymore. It may have been repaid or liquidated.";
+    case "loan_below_minimum_size":
+      return "Loans under 1 SOL aren't eligible for auto-sells right now.";
+    case "collateral_not_enabled":
+      return "This collateral token is currently disabled for new auto-sells. Ping @MagpieLoans if you think this is a mistake.";
+    case "take_profit_already_armed":
+    case "stop_loss_already_armed":
+    case "loan_already_has_active_order":
+      return "You already have an active auto-sell on this loan in this direction. Cancel the existing one first if you want to change it.";
+    case "trigger_would_fire_immediately":
+      return "Your target is on the wrong side of the current price — it would fire as soon as it armed. Pick a target above the current price for take-profit (or below it for stop-loss).";
+    case "user_concurrency_cap_reached":
+      return "You've hit the per-user cap of 10 active auto-sells. Cancel an existing one and try again.";
+    case "invalid_slippage_bps":
+      return "The slippage allowance was outside the protocol bounds.";
+    case "invalid_slice_pct":
+      return "Ladder slice has to add up correctly — each leg between 0.01% and 100%, total ≤ 100%.";
+    case "invalid_trigger_value":
+    case "trigger_value_out_of_range":
+      return "The price target looked malformed. Try entering it as a USD value (e.g. \"180\") or a market-cap (\"145M mc\").";
+    case "invalid_trailing_distance_bps":
+      return "Trailing distance must be between 0.5% and 50%.";
+    case "trailing_only_valid_on_stop_loss":
+      return "Trailing distance only applies to stop-loss orders, not take-profit.";
+    case "insert_failed":
+      return `The database refused the order at the last step. Detail: ${detail || "(none provided)"}`;
+    case "exception":
+      return `An unexpected error happened on the server. Detail: ${detail || "(none provided)"}`;
+    default:
+      return code
+        ? `${code}${detail ? ` — ${detail}` : ""}`
+        : "Unknown failure (we logged it).";
+  }
+}
+
+/**
+ * V4 fire DM — fundamentally different message from legacy fire.
+ *
+ * Legacy V1/V3 fire: engine repaid loan + sold collateral + sent SOL to
+ * user wallet. Loan closed.
+ *
+ * V4 fire: engine converted slice_bps × original collateral in-vault.
+ * Loan STAYS ACTIVE. SOL accumulates in per-loan sol_proceeds_vault.
+ * User claims at repay (vault SOL + remaining SPL flow back atomically).
+ *
+ * Critical UX: don't tell the V4 user their loan closed. It didn't.
+ * Pip + dashboard + this DM all need to consistently teach the in-vault
+ * model.
+ */
+function renderLimitCloseV4Fired(p) {
+  const agentLine = agentAttribution(p);
+  const dirLabel = p.trigger_direction === "below"
+    ? "stop-loss"
+    : p.trigger_direction === "above"
+      ? "take-profit"
+      : "auto-sell";
+  const slicePct = p.slice_bps ? (p.slice_bps / 100).toFixed(0) : null;
+  const netSol = fmtSol(p.sol_received_net);
+  const feeSol = fmtSol(p.protocol_fee);
+  const cumSol = fmtSol(p.total_sol_proceeds);
+  const remainingSpl = p.remaining_collateral
+    ? `${p.remaining_collateral} raw (left in vault)`
+    : null;
+  const lines = [
+    `*${dirLabel.toUpperCase()} fired — V4 in-vault sale* (order #${p.order_id})`,
+    "",
+    slicePct
+      ? `Sold ${slicePct}% of original collateral. SOL deposited *inside your loan*, not your wallet.`
+      : `Slice sold. SOL deposited *inside your loan*, not your wallet.`,
+    "",
+    `*This leg:*  +${netSol} SOL (fee ${feeSol} · 1%)`,
+    `*Vault total (cumulative):*  ${cumSol} SOL`,
+    p.auto_sells_fired ? `*Auto-sells fired so far:*  ${p.auto_sells_fired}` : null,
+    p.tx_signature ? `[View tx](https://solscan.io/tx/${p.tx_signature})` : null,
+    "",
+    `Loan stays *Active* — you decide when to close. When you /repay, the vault SOL flows back to your wallet *along with* any remaining collateral, in the same tx.`,
+    "",
+    `_Heads up: V4 repay needs ~owed-amount liquid SOL in your wallet to fund the close. The vault SOL flows back in the same tx but doesn't pre-pay the loan._`,
+    agentLine ? "" : null,
+    agentLine,
+  ].filter((s) => s !== null);
+  return lines.join("\n");
 }
 
 function renderLimitCloseFired(p) {
   const agentLine = agentAttribution(p);
+  // Headline switches by direction so the user immediately knows whether
+  // their profit target or their stop hit. Falls back to the generic
+  // "Auto-sell done" if direction wasn't included in the payload.
+  let headline;
+  if (p.trigger_direction === "above") {
+    headline = `*Auto-sell DONE — profit target hit* (order #${p.order_id})`;
+  } else if (p.trigger_direction === "below") {
+    headline = `*Auto-sell DONE — stop triggered* (order #${p.order_id})`;
+  } else {
+    headline = `*Auto-sell DONE* — order #${p.order_id}`;
+  }
   return [
-    `*Limit-close FIRED* — order #${p.order_id}`,
+    headline,
     ``,
-    `Trigger: ${p.trigger_label} hit`,
-    `Repaid: ${fmtSol(p.loan_owed_lamports)} SOL · [tx](https://solscan.io/tx/${p.tx_repay})`,
-    `Sold: ${p.collateral_sold_human} ${p.collateral_symbol} → ${fmtSol(p.proceeds_lamports)} ${p.dest.toUpperCase()} · [tx](https://solscan.io/tx/${p.tx_swap})`,
-    `Fee: ${fmtSol(p.fee_lamports)} ${p.dest.toUpperCase()} (1%)`,
+    `Target: ${p.trigger_label}`,
+    `Repaid your loan: ${fmtSol(p.loan_owed_lamports)} SOL · [view tx](https://solscan.io/tx/${p.tx_repay})`,
+    `Sold ${p.collateral_sold_human} ${p.collateral_symbol} → ${fmtSol(p.proceeds_lamports)} ${p.dest.toUpperCase()} · [view tx](https://solscan.io/tx/${p.tx_swap})`,
+    `Protocol fee: ${fmtSol(p.fee_lamports)} ${p.dest.toUpperCase()} (1%)`,
     ``,
-    `Net to your wallet: *${fmtSol(p.net_to_user_lamports)} ${p.dest.toUpperCase()}*`,
+    `*You received: ${fmtSol(p.net_to_user_lamports)} ${p.dest.toUpperCase()}* — it's in your wallet now.`,
     agentLine ? `` : null,
     agentLine,
   ].filter((s) => s !== null).join("\n");
 }
 
+// Translates engine failure reason codes into one-line plain-language
+// explanations. Falls back to the raw code for unknown reasons so we
+// never silently drop information.
+function humanizeFailureReason(reason) {
+  switch (reason) {
+    case "max_retries_exceeded":
+      return "We retried for ~5 minutes, escalating slippage toward your cap each time, but couldn't fill within your limit. Usually means liquidity dried up.";
+    case "wallet_changed_since_borrow":
+      return "The wallet that opened this loan no longer holds the collateral. Limit orders only fire from the original borrower wallet.";
+    case "no_collateral_in_ata_post_repay":
+      return "The repay landed but the collateral wasn't where we expected at sell time — likely moved out mid-trigger.";
+    case "swap_failed_collateral_in_wallet":
+      return "The repay landed but the sell failed. The collateral is back in your wallet, ready to sell manually or via a fresh limit order.";
+    case "twap_window_exceeded":
+      return "We sliced the sell to fit your slippage cap, but the slow-trickle window ran out before all chunks filled.";
+    case "twap_window_exceeded_partial":
+      return "Some TWAP chunks filled, but the window expired before completing the rest. Check /positions for the partial state.";
+    case "wallet_changed_during_twap":
+      return "The wallet changed mid-TWAP. We stopped the slicing to protect remaining collateral.";
+    // V4-specific reasons (2026-06-15) — surface human copy instead of
+    // raw codes so V4 users aren't staring at v4_cross_source_*.
+    case "v4_quote_failed":
+      return "Jupiter routing for that slice failed — usually transient. We'll auto-retry on the next tick. No action needed.";
+    case "v4_cross_source_disagreement_at_fire_quote":
+      return "Two price sources disagreed at fire time, so we held off as a safety check. Likely a brief Jupiter routing imbalance. We'll re-check on the next tick.";
+    case "v4_cross_source_recheck_failed":
+      return "Couldn't get a clean cross-source price read at fire time. We're fail-closed on this — won't fire against a single source. Will retry shortly.";
+    case "v4_engine_program_id_mismatch":
+      return "The order's engine config doesn't match the loan's program — we refused to fire to avoid hitting the wrong pool. This needs operator review.";
+    case "v4_convert_failed":
+    case "v4_convert_failed_persistent":
+      return "The in-vault convert tx itself failed on-chain. Most often this is a slippage cap that's tighter than current market conditions. Widen the slippage or wait for a calmer window.";
+    default:
+      return null; // unknown — caller falls back to raw reason line
+  }
+}
+
 function renderLimitCloseFailed(p) {
   const agentLine = agentAttribution(p);
+  const friendly = humanizeFailureReason(p.reason);
   return [
-    `*Limit-close FAILED* — order #${p.order_id}`,
+    `*Auto-sell didn't go through* — order #${p.order_id}`,
     ``,
-    `Reason: ${p.reason}`,
+    friendly ? friendly : `Reason: ${p.reason}`,
     p.detail ? `Detail: ${p.detail}` : null,
     ``,
-    `Your loan is *unchanged*. Set a new order with /limitclose or close manually with /repay.`,
+    `Your loan is *unchanged*. You can set a new auto-sell with /limitclose, or repay manually with /repay.`,
     agentLine ? `` : null,
     agentLine,
   ].filter((s) => s !== null).join("\n");
@@ -154,10 +347,34 @@ function renderLimitCloseActionRequired(p) {
   ].filter(Boolean).join("\n");
 }
 
+// Transparency DM emitted by the engine the FIRST time it auto-escalates
+// slippage on an order. Users would otherwise see nothing happen between
+// trigger-hit and final fire/fail — this confirms the engine is actively
+// working and shows the new slippage so they can sanity-check it against
+// their cap. Subsequent escalations are silent (one DM per order).
+function renderLimitCloseRetrying(p) {
+  const prevPct = (Number(p.previous_slippage_bps) / 100).toFixed(2);
+  const newPct = (Number(p.new_slippage_bps) / 100).toFixed(2);
+  const capPct = p.max_slippage_bps_cap != null
+    ? (Number(p.max_slippage_bps_cap) / 100).toFixed(2)
+    : null;
+  return [
+    `*Working on your auto-sell — order #${p.order_id}*`,
+    "",
+    `Your target just hit. The first sell would have exceeded your slippage allowance, so we're retrying with a slightly wider one.`,
+    "",
+    `*Slippage:* ${prevPct}% → ${newPct}%${capPct ? ` _(your cap: ${capPct}%)_` : ""}`,
+    "",
+    `We auto-retry every ~30 seconds, stepping the slippage up each time until either the sell goes through or we hit your cap. No action needed — we'll DM you the receipt when it lands.`,
+    "",
+    `_If the price drops back below your target before we fill, the order stays armed and waits for the next move._`,
+  ].join("\n");
+}
+
 function renderLimitCloseCancelled(p) {
   const agentLine = agentAttribution(p);
   return [
-    `*Limit-close cancelled* — order #${p.order_id}`,
+    `*Auto-sell cancelled* — order #${p.order_id}`,
     ``,
     `Reason: ${p.reason}`,
     agentLine ? `` : null,
@@ -171,6 +388,23 @@ function renderLimitCloseCancelled(p) {
 // economic numbers + threshold copy without leaking renderer details.
 function renderPipUpsideAlert(p) {
   return p?.text || "";
+}
+
+function renderArmIntentStale(p) {
+  // p contains: intent_id, loan_id_chain, collateral_symbol,
+  // target_kind, target_value_micro, slice_pct_bps, direction,
+  // strike_label, recovery_command, recovery_callback, message_text
+  // The watcher pre-renders message_text so we just need to expose it.
+  if (typeof p.message_text === "string" && p.message_text.length > 0) {
+    return p.message_text;
+  }
+  const sym = p.collateral_symbol || "your loan";
+  const verb = p.direction === "above" ? "auto-sell" : "stop-loss";
+  return [
+    `Your ${verb} on ${sym} (loan #${p.loan_id_chain}) didn't finish arming — strike was *${p.strike_label || "the level you set"}*.`,
+    "",
+    `Tap to retry now or use /fixarm.`,
+  ].join("\n");
 }
 
 function renderLimitCloseStalenessNudge(p) {
@@ -189,15 +423,32 @@ function renderLimitCloseStalenessNudge(p) {
 function renderLimitCloseNearTrigger(p) {
   const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
   const moveDir  = p.trigger_direction === "below" ? "drops" : "moves up";
-  return [
+  const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+  const isV4 = !!v4ProgramId && p.engine_program_id === v4ProgramId;
+  const owedSol = p.owed_lamports
+    ? (Number(p.owed_lamports) / 1e9).toFixed(3)
+    : null;
+  const fireAction = isV4
+    ? "the engine will sell that slice on-chain and accumulate the SOL inside your loan"
+    : "the engine will repay the loan and sell your collateral";
+  const lines = [
     `*Your ${dirLabel} is close to firing*`,
     "",
-    `${p.collateral_symbol} is within ~${p.distance_pct}% of your trigger on order #${p.order_id}. If price ${moveDir} a touch more, the engine will repay the loan and sell automatically.`,
+    `${p.collateral_symbol} is within ~${p.distance_pct}% of your trigger on order #${p.order_id}. If price ${moveDir} a touch more, ${fireAction}.`,
+  ];
+  if (isV4 && owedSol) {
+    lines.push(
+      "",
+      `*Heads up:* this loan is on V4 (in-vault auto-sell). When you eventually decide to close, you'll need *~${owedSol} SOL liquid* in your wallet — the sell proceeds accumulate inside the loan and flow back to you at repay, but they don't pre-pay the loan itself.`,
+    );
+  }
+  lines.push(
     "",
     `If your plan changed, you can /modify ${p.order_id} (tighten or widen the trigger) or /cancel ${p.order_id} now. Otherwise sit tight — we've got it.`,
     "",
     `_One-time nudge per arm — you won't see this again until you re-arm or modify._`,
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 function renderEnginePreflightFailed(p) {
@@ -220,10 +471,14 @@ function renderEnginePreflightFailed(p) {
 
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
+  limit_close_arm_failed:   renderLimitCloseArmFailed,
+  arm_intent_stale:         renderArmIntentStale,
   limit_close_fired:           renderLimitCloseFired,
+  limit_close_v4_fired:        renderLimitCloseV4Fired,
   limit_close_failed:          renderLimitCloseFailed,
   limit_close_cancelled:       renderLimitCloseCancelled,
   limit_close_action_required: renderLimitCloseActionRequired,
+  limit_close_retrying:        renderLimitCloseRetrying,
   limit_close_intervention: renderLimitCloseIntervention,
   limit_close_staleness_nudge: renderLimitCloseStalenessNudge,
   limit_close_near_trigger:    renderLimitCloseNearTrigger,
@@ -287,6 +542,18 @@ async function tick(bot) {
           );
           if (!u?.telegram_id) {
             lastError = `user_has_no_telegram_id`;
+          } else if (Number(u.telegram_id) < 0) {
+            // Anonymous-wallet placeholder. Per operator rule
+            // [[feedback_anonymous_wallets_full_feature_parity_v4]],
+            // anonymous wallets get every V4 capability EXCEPT TG DMs.
+            // Mark terminal-failed immediately (no 5 retries) so we
+            // don't pump the TG API with chat-not-found 400s for every
+            // armed/fired/downside notification. The audit row stays
+            // for visibility; the row.attempt_count bump below
+            // (forced to MAX_ATTEMPTS) flips to status='failed'
+            // on the same tick.
+            lastError = `anonymous_wallet_no_dm`;
+            row.attempt_count = MAX_ATTEMPTS;
           } else {
             // Layer 3 — limit-close intervention needs an inline
             // keyboard so the borrower can tap a response. Keyboard
@@ -311,13 +578,102 @@ async function tick(bot) {
                 .text("Keep active", `lcstale:keep:${row.payload.order_id}`)
                 .text("Cancel order", `lcstale:cancel:${row.payload.order_id}`);
               extra = { reply_markup: kb };
+            } else if (row.kind === "arm_intent_stale") {
+              // One-tap retry: routes to the existing fixarm:intent
+              // callback in src/commands/limit-close.js so the same
+              // arm-via-intent path the dashboard uses lands here too.
+              const cbData = row.payload?.recovery_callback;
+              if (typeof cbData === "string" && cbData.length > 0 && cbData.length <= 64) {
+                const { InlineKeyboard } = await import("grammy");
+                const kb = new InlineKeyboard().text(
+                  `Retry ${row.payload.strike_label || "now"}`,
+                  cbData,
+                );
+                extra = { reply_markup: kb };
+              }
+            } else if (row.kind === "limit_close_retrying") {
+              // Lets the user bail mid-retry if they no longer want the
+              // engine to keep escalating. Cancel is hard-cancel — order
+              // moves to status='cancelled'. The callback handler is in
+              // src/index.js under bot.callbackQuery("lcret:cancel:...").
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard()
+                .text("Cancel this order", `lcret:cancel:${row.payload.order_id}`);
+              extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_arm_failed") {
+              // One-tap retry on every failure (operator-mandated rule
+              // feedback_tg_must_follow_v4_at_highest_level.md). When the
+              // breadcrumb writer left an intent_id behind, route the
+              // retry through the same fixarm:intent handler the
+              // dashboard banner uses. Otherwise just point the user at
+              // /fixarm so they can pick from their pending intents.
+              const intentId = row.payload?.intent_id;
+              const loanIdChain = row.payload?.loan_id_chain;
+              if (
+                intentId != null &&
+                typeof loanIdChain === "string" &&
+                loanIdChain.length > 0
+              ) {
+                const cbData = `fixarm:intent:${loanIdChain}:${intentId}`;
+                if (cbData.length <= 64) {
+                  const { InlineKeyboard } = await import("grammy");
+                  const kb = new InlineKeyboard().text("Retry now", cbData);
+                  extra = { reply_markup: kb };
+                }
+              }
+            } else if (row.kind === "limit_close_fired") {
+              // Receipt-confirmation keyboard. Solscan links are already
+              // inline in the body, but tap-once buttons are friendlier
+              // for verifying proceeds on phones. Dashboard button takes
+              // user to past-loans where they can see the full receipt.
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard();
+              if (row.payload?.tx_swap) {
+                kb.url("View sale tx", `https://solscan.io/tx/${row.payload.tx_swap}`);
+              }
+              if (row.payload?.tx_repay) {
+                kb.url("View repay tx", `https://solscan.io/tx/${row.payload.tx_repay}`);
+              }
+              kb.row().url("Open dashboard", "https://www.magpie.capital/dashboard");
+              extra = { reply_markup: kb };
+            } else if (row.kind === "limit_close_v4_fired") {
+              // V4 fire — single tx (convert_collateral_slice). User's
+              // primary action is to either keep waiting (more legs may
+              // fire) or repay now to claim the vault SOL. Give them a
+              // tap to verify the tx + a path to the loan management UI.
+              const { InlineKeyboard } = await import("grammy");
+              const kb = new InlineKeyboard();
+              if (row.payload?.tx_signature) {
+                kb.url("View tx", `https://solscan.io/tx/${row.payload.tx_signature}`);
+              }
+              kb.row().url("Open loan", "https://www.magpie.capital/dashboard");
+              extra = { reply_markup: kb };
             }
-            await bot.api.sendMessage(Number(u.telegram_id), text, {
-              parse_mode: "Markdown",
-              disable_web_page_preview: true,
-              ...extra,
-            });
-            success = true;
+            try {
+              await bot.api.sendMessage(Number(u.telegram_id), text, {
+                parse_mode: "Markdown",
+                disable_web_page_preview: true,
+                ...extra,
+              });
+              success = true;
+            } catch (sendErr) {
+              // Markdown parse error fallback: TG occasionally rejects
+              // bodies that look fine to us because of stray underscores
+              // in addresses / mints / loan IDs. The user is better off
+              // getting raw text (with literal asterisks) than losing
+              // the notification entirely.
+              if (
+                String(sendErr?.message || "").includes("can't parse entities")
+              ) {
+                await bot.api.sendMessage(Number(u.telegram_id), text, {
+                  disable_web_page_preview: true,
+                  ...extra,
+                });
+                success = true;
+              } else {
+                throw sendErr;
+              }
+            }
           }
         }
       }

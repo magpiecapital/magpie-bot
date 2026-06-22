@@ -33,14 +33,12 @@ export async function handleActivity(req, url) {
   }
   const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(url.searchParams.get("limit") || `${DEFAULT_LIMIT}`, 10)));
 
-  const { rows: [u] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [wallet],
-  );
-  if (!u) {
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(wallet);
+  if (!resolvedUserId) {
     return { status: 200, body: { linked: false, events: [] } };
   }
-  const userId = u.user_id;
+  const userId = resolvedUserId;
 
   // Pull each event type independently. Each query is O(few-hundred) at
   // worst given the table sizes, and the indexes on user_id make them
@@ -80,6 +78,13 @@ export async function handleActivity(req, url) {
     ),
     // auto_protect_actions doesn't have wallet info — join with loans
     // so we can filter the same way (by loan's borrower wallet).
+    //
+    // Activity feed is TRANSACTIONAL ONLY — operator-mandated 2026-06-17
+    // (feedback_activity_feed_transactional_only.md). Advisories like
+    // 'insufficient_funds_warning' / 'partial_repay_failed' clutter the
+    // feed and look like errors to users. Filter to tx-backed action_types
+    // here (signature IS NOT NULL guarantees a real on-chain action).
+    // Advisory rows stay in DB for admin debugging via /lc-perf etc.
     query(
       `SELECT ap.id, ap.loan_id, ap.action_type, ap.amount_lamports::text AS amount,
               ap.health_before, ap.health_after, ap.signature, ap.created_at,
@@ -87,6 +92,8 @@ export async function handleActivity(req, url) {
          FROM auto_protect_actions ap
          JOIN loans l ON l.id = ap.loan_id
         WHERE ap.user_id = $1
+          AND ap.signature IS NOT NULL
+          AND ap.action_type NOT IN ('insufficient_funds_warning', 'partial_repay_failed')
         ORDER BY ap.created_at DESC
         LIMIT $2`,
       [userId, limit],

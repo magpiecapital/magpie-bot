@@ -38,6 +38,7 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   Keypair,
+  SYSVAR_RENT_PUBKEY,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -50,10 +51,11 @@ import {
 } from "@solana/spl-token";
 import BN from "bn.js";
 import { query } from "../db/pool.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import {
   chooseProgramIdForLoan,
   getProgramForSigner,
+  PROGRAM_ID_V4,
 } from "../solana/program.js";
 import {
   lendingPoolPda,
@@ -83,7 +85,7 @@ async function readJsonBody(req) {
 }
 
 async function getMintTokenProgram(mintStr) {
-  const info = await connection.getAccountInfo(new PublicKey(mintStr));
+  const info = await withFailover((conn) => conn.getAccountInfo(new PublicKey(mintStr)));
   if (!info) throw new Error(`Mint ${mintStr} not found on-chain`);
   return info.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
 }
@@ -167,10 +169,9 @@ export async function handleAgentBuildRepay(req) {
   // Per-user lock check (defense-in-depth). Mirrors cosign-borrow +
   // agent-manage. Skip silently if we can't resolve a user_id.
   if (loan.borrower_wallet) {
-    const { rows: [walletRow] } = await query(
-      `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-      [loan.borrower_wallet],
-    );
+    const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+    const resolvedUserId = await resolveWalletOwner(loan.borrower_wallet);
+    const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
     if (walletRow?.user_id) {
       const lockReject = await rejectIfLocked(walletRow.user_id);
       if (lockReject) return lockReject;
@@ -179,6 +180,12 @@ export async function handleAgentBuildRepay(req) {
 
   // ── Build the tx (does NOT sign; agent signs with their wallet) ──
   let txB64, repayLamportsStr;
+  // Set by the pre-broadcast simulation below when the repay tx would
+  // definitively revert on-chain. We return a 4xx with the decoded reason
+  // instead of handing back a tx that's guaranteed to fail. An RPC/infra
+  // failure of the sim itself does NOT populate this (fail-open on infra —
+  // the lower defense layer is the on-chain program, which is authoritative).
+  let simRejection = null;
   try {
     const programId = chooseProgramIdForLoan(loan);
     const dummySigner = Keypair.generate();
@@ -237,6 +244,27 @@ export async function handleAgentBuildRepay(req) {
       ),
     ];
 
+    // V4's repayLoan requires sol_proceeds_vault + wsol_mint + system_program
+    // + rent so it can init_if_needed the vault for loans whose auto-sell
+    // never fired. Without these the V4 repay tx fails AccountNotEnoughKeys.
+    // V1/V3 paths unchanged. Mirrors the TG repay pattern in loans.js (task
+    // #267). Audit-mandated 2026-06-19 PM after full-protocol audit revealed
+    // agent-repay diverged from TG repay on V4 accounts.
+    const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+    let v4ExtraAccounts = {};
+    if (isV4) {
+      const [solProceedsVault] = PublicKey.findProgramAddressSync(
+        [Buffer.from("sol-proceeds"), loanPdaPk.toBuffer()],
+        programId,
+      );
+      v4ExtraAccounts = {
+        solProceedsVault,
+        wsolMint: NATIVE_MINT,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY,
+      };
+    }
+
     const ix = await program.methods
       .repayLoan()
       .accounts({
@@ -250,6 +278,7 @@ export async function handleAgentBuildRepay(req) {
         borrower: borrowerPk,
         tokenProgram: collateralTokenProgram,
         loanTokenProgram,
+        ...v4ExtraAccounts,
       })
       .preInstructions(preIxs)
       .postInstructions(postIxs)
@@ -261,11 +290,58 @@ export async function handleAgentBuildRepay(req) {
     const { blockhash } = await connection.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
 
+    // ── Pre-broadcast simulation (mirrors the TG executeRepay / site
+    // cosign-borrow pre-sim). REPAY MUST NEVER SIMULATE-FAIL: if the
+    // unsigned repay tx would revert on-chain, return a 4xx with the
+    // decoded reason rather than handing the agent a doomed tx.
+    // sigVerify:false so simulation reads the (still unsigned) tx.
+    // withFailover so a single-provider blip doesn't surface as an error.
+    // Fail-open on RPC/infra failure: only a definitive sim.value.err
+    // (i.e. the program itself rejected) blocks the response. The on-chain
+    // program is the authoritative lower defense layer.
+    try {
+      const sim = await withFailover((conn) =>
+        conn.simulateTransaction(tx, { sigVerify: false, commitment: "confirmed" }),
+      );
+      if (sim?.value?.err) {
+        const logs = (sim.value.logs || []).slice(-5).join(" | ").slice(0, 400);
+        const errStr = JSON.stringify(sim.value.err).slice(0, 200);
+        console.error(
+          "[agent/build-repay] pre-sim REVERT — loan_id=%s err=%s logs=%s",
+          loan?.loan_id,
+          errStr,
+          logs,
+        );
+        simRejection = {
+          status: 422,
+          body: {
+            error: "repay_would_fail",
+            detail: `Repay transaction would revert on-chain (pre-flight simulation rejected). err=${errStr}`,
+            sim_err: sim.value.err,
+            logs: sim.value.logs || [],
+          },
+        };
+      }
+    } catch (simErr) {
+      // RPC/infra failure of the simulation itself — do NOT block the repay.
+      // The on-chain program remains the final guard. Log loudly so the
+      // operator can see if sim infra is flaky, but proceed to serialize.
+      console.warn(
+        "[agent/build-repay] pre-sim RPC failed (failing open) — loan_id=%s detail=%s",
+        loan?.loan_id,
+        simErr?.message?.slice(0, 200),
+      );
+    }
+
     txB64 = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
   } catch (err) {
     console.error("[agent/build-repay] tx build failed:", err);
     return { status: 500, body: { error: "tx_build_failed", detail: err.message?.slice(0, 200) } };
   }
+
+  // A definitive pre-sim revert means we must not return a tx the agent
+  // would just waste a signature + fee on. Return the decoded reason.
+  if (simRejection) return simRejection;
 
   return {
     status: 200,

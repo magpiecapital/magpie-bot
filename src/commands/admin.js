@@ -61,6 +61,278 @@ export async function handleResume(ctx) {
   await ctx.reply("▶️ Borrowing resumed.");
 }
 
+/**
+ * /v4-status — V4-only health snapshot for the operator.
+ *
+ * Surfaces at a glance:
+ *   - On-chain pool TVL (total deposits, total borrowed, available)
+ *   - Active V4 loans count + total SOL owed
+ *   - Total accumulated vault SOL across all V4 loans (the spread sitting
+ *     inside loans waiting to be claimed at repay)
+ *   - Engine fire history: total fires, success rate, last fire
+ *   - First-V4-fire milestone state (celebrated yet? failure yet?)
+ *
+ * No on-chain writes; pure read. Safe to spam.
+ */
+export async function handleV4Status(ctx) {
+  if (!(await requireAdmin(ctx, "v4-status"))) return;
+
+  const { PROGRAM_ID_V4 } = await import("../solana/program.js");
+  if (!PROGRAM_ID_V4) {
+    return ctx.reply("V4 not configured (PROGRAM_ID_V4 env unset). Nothing to report.");
+  }
+
+  try {
+    const [poolSnap, dbLoans, dbFires, milestones] = await Promise.all([
+      (async () => {
+        // Inline pool snapshot — keeps this command self-contained.
+        // Mirrors fetchPoolSnapshot in commands/stats.js for V4.
+        try {
+          const { getReadOnlyProgram } = await import("../solana/program.js");
+          const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
+          const { connection } = await import("../solana/connection.js");
+          const { PublicKey } = await import("@solana/web3.js");
+          const program = getReadOnlyProgram(PROGRAM_ID_V4);
+          const lenderPubkey = new PublicKey(process.env.LENDER_PUBKEY);
+          const [poolPda] = lendingPoolPda(lenderPubkey, PROGRAM_ID_V4);
+          const pool = await program.account.lendingPool.fetch(poolPda);
+          const [vaultPda] = loanTokenVaultPda(poolPda, PROGRAM_ID_V4);
+          const vault = await connection.getTokenAccountBalance(vaultPda).catch(() => null);
+          const totalDeposits = BigInt(pool.totalDeposits.toString());
+          const totalBorrowed = BigInt(pool.totalBorrowed.toString());
+          const availableLiquidity = vault?.value?.amount
+            ? BigInt(vault.value.amount)
+            : (totalDeposits - totalBorrowed);
+          const utilizationRate = totalDeposits > 0n
+            ? Number(totalBorrowed) / Number(totalDeposits)
+            : 0;
+          return {
+            totalDeposits: totalDeposits.toString(),
+            totalBorrowed: totalBorrowed.toString(),
+            availableLiquidity: availableLiquidity.toString(),
+            utilizationRate,
+            paused: !!pool.paused,
+          };
+        } catch (err) {
+          return { error: err.message?.slice(0, 100) };
+        }
+      })(),
+      query(
+        `SELECT
+           COUNT(*)::int AS active_count,
+           COALESCE(SUM(original_loan_amount_lamports), 0)::text AS total_owed_lamports,
+           COALESCE(SUM(sol_proceeds_amount), 0)::text AS total_vault_lamports,
+           COUNT(*) FILTER (WHERE auto_sells_fired > 0)::int AS with_fires
+         FROM loans
+         WHERE program_id = $1
+           AND status = 'active'`,
+        [PROGRAM_ID_V4.toBase58()],
+      ),
+      query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'fired')::int AS fired,
+           COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+           COUNT(*) FILTER (WHERE status = 'armed')::int AS armed,
+           MAX(fired_at) AS last_fired_at,
+           COALESCE(SUM(proceeds_lamports) FILTER (WHERE status = 'fired'), 0)::text AS total_proceeds
+         FROM limit_close_orders
+         WHERE engine_program_id = $1`,
+        [PROGRAM_ID_V4.toBase58()],
+      ),
+      query(
+        `SELECT milestone_key, notified_at, reference_id
+           FROM engine_milestone_flags
+          WHERE milestone_key IN ('first_v4_fire', 'first_v4_fire_failure')`,
+      ),
+    ]);
+
+    const fmtSol = (lamportsStr) => (Number(lamportsStr) / 1e9).toFixed(4);
+    const loansRow = dbLoans.rows[0];
+    const firesRow = dbFires.rows[0];
+    const successPct = (firesRow.fired + firesRow.failed) > 0
+      ? ((firesRow.fired * 100) / (firesRow.fired + firesRow.failed)).toFixed(1)
+      : "n/a";
+    const firstFire = milestones.rows.find((r) => r.milestone_key === "first_v4_fire");
+    const firstFail = milestones.rows.find((r) => r.milestone_key === "first_v4_fire_failure");
+
+    const lines = [
+      "*V4 status*",
+      "",
+      `Program: \`${PROGRAM_ID_V4.toBase58().slice(0, 16)}…\``,
+      "",
+      "*Pool (on-chain):*",
+      poolSnap.error
+        ? `  read error: ${poolSnap.error}`
+        : [
+            `  total deposits:  \`${fmtSol(poolSnap.totalDeposits)} SOL\``,
+            `  total borrowed:  \`${fmtSol(poolSnap.totalBorrowed)} SOL\``,
+            `  available liq:   \`${fmtSol(poolSnap.availableLiquidity)} SOL\``,
+            `  utilization:     \`${(poolSnap.utilizationRate * 100).toFixed(1)}%\``,
+            poolSnap.paused ? `  *PAUSED*` : null,
+          ].filter(Boolean).join("\n"),
+      "",
+      "*Active V4 loans (DB):*",
+      `  count:           ${loansRow.active_count}`,
+      `  total owed:      \`${fmtSol(loansRow.total_owed_lamports)} SOL\``,
+      `  vault accrued:   \`${fmtSol(loansRow.total_vault_lamports)} SOL\``,
+      `  with auto-sells fired: ${loansRow.with_fires}`,
+      "",
+      "*Limit-close orders (V4):*",
+      `  armed:    ${firesRow.armed}`,
+      `  fired:    ${firesRow.fired}`,
+      `  failed:   ${firesRow.failed}`,
+      `  success%: ${successPct}`,
+      `  total proceeds (lifetime): \`${fmtSol(firesRow.total_proceeds)} SOL\``,
+      firesRow.last_fired_at
+        ? `  last fired: \`${new Date(firesRow.last_fired_at).toISOString().slice(0, 19)}Z\``
+        : `  last fired: never`,
+      "",
+      "*Milestones:*",
+      `  first_v4_fire:         ${firstFire?.notified_at ? "CELEBRATED " + new Date(firstFire.notified_at).toISOString().slice(0, 19) + "Z" : "pending"}`,
+      `  first_v4_fire_failure: ${firstFail?.notified_at ? "ALERTED " + new Date(firstFail.notified_at).toISOString().slice(0, 19) + "Z" : "none yet"}`,
+    ].filter(Boolean);
+
+    await logAdminCommand(ctx, "v4-status", { outcome: "success" });
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    await logAdminCommand(ctx, "v4-status", { outcome: "error", error: err.message });
+    await ctx.reply(`v4-status read failed: ${err.message?.slice(0, 200)}`);
+  }
+}
+
+/**
+ * /borrow-failures — show the rolling 1h snapshot of cosign-borrow
+ * failure classifications. The same in-memory counter the self-monitor
+ * probe reads, but on-demand for fast triage. Pairs with the CRIT DMs
+ * that fire when any class crosses the per-hour threshold.
+ *
+ * Per-klass guidance is included so operator gets the next-step in
+ * the same message.
+ */
+export async function handleBorrowFailures(ctx) {
+  if (!(await requireAdmin(ctx, "borrow-failures"))) return;
+  try {
+    const { getRecentBorrowFailures } = await import("../api/cosign-borrow.js");
+    const failures = getRecentBorrowFailures();
+    const klasses = Object.keys(failures);
+    if (klasses.length === 0) {
+      return ctx.reply("*cosign-borrow failures — last 1h*\n\nZero. Every borrow that reached cosign succeeded.", { parse_mode: "Markdown" });
+    }
+    const sorted = klasses.sort((a, b) => failures[b] - failures[a]);
+    const guidance = {
+      stale_blockhash: "users signing too late — site should refresh blockhash if signing >30s",
+      rpc_exhausted: "Helius + every backup failing simulateTransaction — check provider status",
+      sim_failed: "tx would fail on-chain — pull recent CRIT DMs for the inner reason",
+      unclassified: "new failure shape — pull recent CRIT DMs for the inner error",
+    };
+    const total = sorted.reduce((acc, k) => acc + failures[k], 0);
+    const lines = [
+      "*cosign-borrow failures — last 1h*",
+      "",
+      `Total: *${total}*`,
+      "",
+      "By classification:",
+    ];
+    for (const k of sorted) {
+      lines.push(`  \`${k}\` × ${failures[k]}`);
+      const hint = guidance[k];
+      if (hint) lines.push(`    -> ${hint}`);
+    }
+    lines.push("");
+    lines.push("Per-occurrence detail arrives via CRIT DMs as each failure fires.");
+    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("[/borrow-failures]:", err.message);
+    return ctx.reply(`Failed to read snapshot: ${err.message?.slice(0, 160)}`);
+  }
+}
+
+/* ──────────────── /conv-stats — conversion success rates ──────────────── */
+
+/**
+ * /conv-stats — per-path / per-mint / per-version success rates over
+ * 1h, 24h, 7d windows. Phase 1 of the conversion-reliability mandate
+ * [[feedback_user_retention_via_flawless_conversion]]. Reads from
+ * conversion_events table written by the path wrappers in
+ * cosign-borrow.js and (soon) the arm/repay paths.
+ *
+ * Without this, the operator only learns about failures from user
+ * complaints — too late. With it, any path / mint with degraded
+ * success rate is visible at a glance and the self-monitor probe
+ * pages the operator the moment a mint drops below 95%.
+ */
+export async function handleConvStats(ctx) {
+  if (!(await requireAdmin(ctx, "conv-stats"))) return;
+  try {
+    const { getConversionStats, getConversionFailureClasses, findDegradedConversionTargets } =
+      await import("../services/conversion-tracker.js");
+
+    const windows = [
+      { label: "1h", sec: 3600 },
+      { label: "24h", sec: 86400 },
+      { label: "7d", sec: 7 * 86400 },
+    ];
+
+    const lines = ["*Conversion success rates — by path*", ""];
+    for (const w of windows) {
+      const stats = await getConversionStats({ windowSec: w.sec, groupBy: "path" });
+      lines.push(`*Last ${w.label}*`);
+      if (stats.length === 0) {
+        lines.push("  no attempts");
+      } else {
+        for (const s of stats) {
+          const rate = s.success_rate === null ? "—" : (s.success_rate * 100).toFixed(2) + "%";
+          const marker = s.success_rate !== null && s.success_rate < 0.95 ? " *DEGRADED*" : "";
+          lines.push(`  \`${s.group_key}\` n=${s.attempts} ok=${s.successes} fail=${s.failures} rate=${rate}${marker}`);
+        }
+      }
+      lines.push("");
+    }
+
+    // Per-mint detail in last 1h (might be sparse during quiet hours)
+    const mintStats = await getConversionStats({ windowSec: 3600, groupBy: "path_mint" });
+    if (mintStats.length > 0) {
+      lines.push("*Last 1h — per path|mint (with ≥1 attempt)*");
+      for (const s of mintStats.slice(0, 12)) {
+        const rate = s.success_rate === null ? "—" : (s.success_rate * 100).toFixed(2) + "%";
+        const marker = s.success_rate !== null && s.success_rate < 0.95 && s.attempts >= 5 ? " *DEGRADED*" : "";
+        const [path, mint] = s.group_key.split("|");
+        const mintShort = mint && mint !== "<no-mint>" ? `${mint.slice(0, 8)}…` : "(no-mint)";
+        lines.push(`  ${path} ${mintShort} n=${s.attempts} ${rate}${marker}`);
+      }
+      lines.push("");
+    }
+
+    // Failure-class breakdown (all paths, last 1h)
+    const classes = await getConversionFailureClasses({ windowSec: 3600 });
+    if (classes.length > 0) {
+      lines.push("*Last 1h — failure classes*");
+      for (const c of classes.slice(0, 10)) {
+        lines.push(`  \`${c.klass}\` × ${c.n}`);
+      }
+      lines.push("");
+    }
+
+    // Degraded targets that should trigger probe alerts
+    const degraded = await findDegradedConversionTargets({ windowSec: 3600, minAttempts: 5, minSuccessRate: 0.95 });
+    if (degraded.length > 0) {
+      lines.push("*DEGRADED (last 1h, ≥5 attempts, <95% success)*");
+      for (const d of degraded) {
+        const mintShort = d.mint && d.mint !== "<no-mint>" ? `${d.mint.slice(0, 8)}…` : "(no-mint)";
+        const rate = (d.success_rate * 100).toFixed(2) + "%";
+        lines.push(`  ${d.path} ${mintShort} attempts=${d.attempts} rate=${rate}`);
+      }
+    } else {
+      lines.push("_No degraded mint/path pairs (last 1h)._");
+    }
+
+    return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("[/conv-stats]:", err.message);
+    return ctx.reply(`Failed to read conv-stats: ${err.message?.slice(0, 160)}`);
+  }
+}
+
 export async function handleAdminStatus(ctx) {
   if (!(await requireAdmin(ctx, "admin"))) return;
   const { getGlobalSiteState } = await import("../services/site-global.js");
@@ -748,6 +1020,7 @@ export async function handleTicket(ctx) {
             s.admin_reply, s.admin_replied_at,
             s.auto_resolved_at, s.last_user_followup_at, s.followup_count,
             s.closed_at, s.created_at,
+            s.pip_pre_analysis, s.pip_pre_analyzed_at,
             u.telegram_id, u.telegram_username, u.current_streak, u.created_at AS user_created_at,
             (SELECT COUNT(*) FROM loans WHERE user_id = u.id)::int AS total_loans,
             (SELECT COUNT(*) FROM loans WHERE user_id = u.id AND status = 'active')::int AS active_loans
@@ -780,6 +1053,20 @@ export async function handleTicket(ctx) {
 
   if (t.followup_count > 0) {
     lines.push("", `_${t.followup_count} follow-up(s) — see message above for full thread._`);
+  }
+
+  // Pip pre-analysis — what Pip looked at + what she thinks is going on.
+  // Surfaced prominently so the operator can /reply in seconds without
+  // having to repeat the investigation.
+  if (t.pip_pre_analysis) {
+    const ageMin = t.pip_pre_analyzed_at
+      ? Math.floor((Date.now() - new Date(t.pip_pre_analyzed_at).getTime()) / 60_000)
+      : null;
+    const ageLabel = ageMin == null
+      ? ""
+      : ageMin < 60 ? ` (${ageMin}m ago)` : ` (${Math.floor(ageMin / 60)}h ago)`;
+    lines.push("", `*Pip pre-analysis${ageLabel}:*`);
+    lines.push("```", t.pip_pre_analysis.slice(0, 2000), "```");
   }
 
   if (t.admin_reply) {
@@ -1005,13 +1292,19 @@ export async function handleFundPool(ctx) {
       "• `/fundpool 5` → 5 SOL into memecoin pool (v1)\n" +
       "• `/fundpool max v2` → all lender SOL (minus 0.2 reserve) into RWA pool\n" +
       "• `/fundpool 50% v2` → half of lender SOL into RWA pool\n" +
-      "• `/fundpool 2 v3` → 2 SOL into v3 pool (requires PROGRAM_ID_V3 env)",
+      "• `/fundpool 2 v3` → 2 SOL into v3 pool (requires PROGRAM_ID_V3 env)\n" +
+      "• `/fundpool 5 v4` → 5 SOL into v4 pool (requires PROGRAM_ID_V4 env)",
       { parse_mode: "Markdown" },
     );
   }
   const isV2 = ["v2", "v2b", "rwa", "rwas", "stocks"].includes(poolArg);
   const isV3 = ["v3"].includes(poolArg);
-  const poolLabel = isV3 ? "v3 pool" : (isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)");
+  const isV4 = ["v4", "exits", "exit", "limit", "limits"].includes(poolArg);
+  const poolLabel = isV4
+    ? "v4 pool (exits)"
+    : isV3
+      ? "v3 pool"
+      : isV2 ? "RWA pool (v2b)" : "memecoin pool (v1)";
 
   try {
     const { Keypair, PublicKey, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
@@ -1041,19 +1334,26 @@ export async function handleFundPool(ctx) {
     }
 
     const { connection } = await import("../solana/connection.js");
-    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3 } = await import("../solana/program.js");
+    const { getProgramForSigner, PROGRAM_ID, PROGRAM_ID_V2, PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
     const { lendingPoolPda, loanTokenVaultPda } = await import("../solana/pdas.js");
     const { parseAmountInput, clampToMax } = await import("../lib/amount-input.js");
 
-    // Route to v1 / v2b / v3 based on the pool arg. If v2 or v3 was
+    // Route to v1 / v2b / v3 / v4 based on the pool arg. If v2/v3/v4 was
     // requested but their PROGRAM_ID env isn't configured, fail clearly.
     if (isV2 && !PROGRAM_ID_V2) {
-      return ctx.reply("❌ v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
+      return ctx.reply("v2 pool requested but `PROGRAM_ID_V2` env not set. Configure it first.");
     }
     if (isV3 && !PROGRAM_ID_V3) {
-      return ctx.reply("❌ v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
+      return ctx.reply("v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
     }
-    const programId = isV3 ? PROGRAM_ID_V3 : (isV2 ? PROGRAM_ID_V2 : PROGRAM_ID);
+    if (isV4 && !PROGRAM_ID_V4) {
+      return ctx.reply("v4 pool requested but `PROGRAM_ID_V4` env not set. Set `PROGRAM_ID_V4=HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo` on Railway and redeploy.");
+    }
+    const programId = isV4
+      ? PROGRAM_ID_V4
+      : isV3
+        ? PROGRAM_ID_V3
+        : isV2 ? PROGRAM_ID_V2 : PROGRAM_ID;
     const program = getProgramForSigner(lender, programId);
 
     // Read actual on-chain balance, parse input against it (handles "max"/"50%"
@@ -1331,6 +1631,16 @@ export async function handleDistribute(ctx) {
     return ctx.reply(`❌ Flip failed: ${err.message?.slice(0, 200)}`);
   }
   client.release();
+
+  // Sync to distribution_events ledger — every status transition must
+  // propagate so the protocol-wide ledger stays current.
+  // [[feedback_distributions_must_be_kept_organized_synced]]
+  try {
+    const { syncMagpieHolderDistributionEvent } = await import("../services/magpie-holder-rewards.js");
+    await syncMagpieHolderDistributionEvent(distId);
+  } catch (syncErr) {
+    console.warn(`[admin /distribute] distribution_events sync failed for dist ${distId}:`, syncErr.message);
+  }
 
   const allocSol = (Number(totalAllocated) / 1e9).toFixed(6);
   await ctx.reply(

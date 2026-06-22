@@ -5,7 +5,7 @@ import { query } from "../db/pool.js";
 import { executeRepay, markLoanRepaid, getLiveOwedLamports, checkLoanOwnership } from "../services/loans.js";
 import { scopeLoansToActiveWallet } from "../services/wallet-scoped-loans.js";
 import { ensureWallet } from "../services/wallet.js";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { incrementRepaid } from "../services/reputation.js";
 import { translateTxError, errorActionKeyboard, renderWalletMismatchMessage } from "../services/tx-error-translator.js";
 import { formatLoanButtonLabel, totalOwedSol, countDueWithin } from "../services/loan-display.js";
@@ -24,11 +24,18 @@ export async function handleRepay(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
+  // Layer 5 defense — even if loans.user_id ever drifts (caught + repaired
+  // by wallet-attribution-sentinel + Layer 3 pre-write guard), the OR
+  // clause picks up any loan whose borrower_wallet is one of THIS user's
+  // wallets. The sentinel runs every 30 min; this closes the gap to ZERO
+  // for /repay. [[feedback_never_misattribute_loans]]
   const { rows } = await query(
     `SELECT l.*, sm.symbol
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-     WHERE l.user_id = $1 AND l.status = 'active'
+     WHERE l.status = 'active'
+       AND (l.user_id = $1
+            OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
@@ -118,7 +125,9 @@ export function registerRepayCallbacks(bot) {
       `SELECT l.*, sm.symbol
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-       WHERE l.id = $1 AND l.user_id = $2 AND l.status = 'active'`,
+       WHERE l.id = $1 AND l.status = 'active'
+         AND (l.user_id = $2
+              OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $2))`,
       [loanDbId, user.id],
     );
     const loan = rows[0];
@@ -154,7 +163,7 @@ export function registerRepayCallbacks(bot) {
     // actionable message. Check BEFORE we even build the tx.
     try {
       const { publicKey } = await ensureWallet(user.id);
-      const balanceLamports = BigInt(await connection.getBalance(new PublicKey(publicKey)));
+      const balanceLamports = BigInt(await withFailover((conn) => conn.getBalance(new PublicKey(publicKey))));
       const needed = owedNow + REPAY_GAS_BUFFER_LAMPORTS;
       if (balanceLamports < needed) {
         const short = needed - balanceLamports;
@@ -249,12 +258,30 @@ export function registerRepayCallbacks(bot) {
         }
       } catch { /* non-critical */ }
 
+      // V4 vault-SOL release line — operator-mandated
+      // (feedback_v4_in_vault_thesis_non_negotiable.md). For V4 loans
+      // with any sol_proceeds_amount, the repay tx releases that SOL
+      // back to the user alongside the SPL collateral. Show it
+      // explicitly so V4 users see the V4 thesis play out end-to-end.
+      // The loan row was fetched BEFORE the repay so its
+      // sol_proceeds_amount is the exact balance just released.
+      const v4ProgramIdRepay = process.env.PROGRAM_ID_V4 || null;
+      const isV4Repay = !!v4ProgramIdRepay && loan.program_id === v4ProgramIdRepay;
+      const vaultLamportsReleased = isV4Repay
+        ? BigInt(loan.sol_proceeds_amount || 0)
+        : 0n;
+      const vaultReleasedLine =
+        vaultLamportsReleased > 0n
+          ? `_Plus ${fmtSol(vaultLamportsReleased)} SOL released from your V4 loan's vault._`
+          : null;
+
       await ctx.editMessageText(
         [
           "*Loan repaid*",
           "",
           `${loan.symbol ?? "?"} loan · ${fmtSol(owedNow)} SOL`,
           "Collateral returned to your wallet.",
+          vaultReleasedLine,
           milestoneLine,
           `[View tx](https://solscan.io/tx/${result.signature})`,
         ].filter(Boolean).join("\n"),

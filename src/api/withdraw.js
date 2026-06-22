@@ -47,7 +47,7 @@ import {
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { loadKeypair } from "../services/wallet.js";
 import { alertWithdraw } from "../services/security-alerts.js";
@@ -125,7 +125,7 @@ async function readJsonBody(req) {
 }
 
 async function getMintTokenProgram(mint) {
-  const info = await connection.getAccountInfo(new PublicKey(mint));
+  const info = await withFailover((conn) => conn.getAccountInfo(new PublicKey(mint)));
   if (!info) throw new Error(`Mint ${mint} not found`);
   if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
   return TOKEN_PROGRAM_ID;
@@ -222,14 +222,18 @@ export async function handleSiteWithdraw(req) {
   }
 
   // ── Gate 5: ownership — signer must be a linked wallet ──
-  const { rows: [walletRow] } = await query(
-    `SELECT user_id FROM wallets WHERE public_key = $1 LIMIT 1`,
-    [signerPubkey],
-  );
+  // Prefer the TG-linked user_id when present so withdraw activity
+  // is attributed to the human's TG identity (matches /repay et al).
+  const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
+  const resolvedUserId = await resolveWalletOwner(signerPubkey);
+  const walletRow = resolvedUserId ? { user_id: resolvedUserId } : null;
   if (!walletRow) {
     return {
       status: 403,
-      body: { error: "Signer wallet is not linked to a Magpie account" },
+      body: {
+        error: "This wallet isn't linked to a Magpie account yet. Open Telegram and run /start with @magpie_capital_bot to link it.",
+        friendly: true,
+      },
     };
   }
   const userId = walletRow.user_id;
@@ -282,7 +286,13 @@ export async function handleSiteWithdraw(req) {
     );
   } catch (e) {
     if (e.code === "23505") {
-      return { status: 409, body: { error: "Nonce already used — re-sign a fresh message" } };
+      return {
+        status: 409,
+        body: {
+          error: "This request already went through — refresh the page to start fresh.",
+          friendly: true,
+        },
+      };
     }
     throw e;
   }
@@ -310,7 +320,7 @@ export async function handleSiteWithdraw(req) {
   // pattern as src/commands/withdraw.js. Float displays never enter.
   if (Asset === "SOL") {
     decimals = 9;
-    const bal = BigInt(await connection.getBalance(signer.publicKey));
+    const bal = BigInt(await withFailover((conn) => conn.getBalance(signer.publicKey)));
     maxLamports = bal > SOL_GAS_RESERVE_LAMPORTS ? bal - SOL_GAS_RESERVE_LAMPORTS : 0n;
   } else {
     let mintPk;
@@ -320,10 +330,10 @@ export async function handleSiteWithdraw(req) {
       return { status: 400, body: { error: "Asset must be SOL or a valid mint pubkey" } };
     }
     const tokenProgram = await getMintTokenProgram(Asset);
-    const mintInfo = await connection.getParsedAccountInfo(mintPk);
+    const mintInfo = await withFailover((conn) => conn.getParsedAccountInfo(mintPk));
     decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     const ata = getAssociatedTokenAddressSync(mintPk, signer.publicKey, false, tokenProgram);
-    const ataInfo = await connection.getTokenAccountBalance(ata).catch(() => null);
+    const ataInfo = await withFailover((conn) => conn.getTokenAccountBalance(ata)).catch(() => null);
     maxLamports = ataInfo ? BigInt(ataInfo.value.amount) : 0n;
   }
   if (rawAmount > maxLamports) {
@@ -396,7 +406,21 @@ export async function handleSiteWithdraw(req) {
       [auditId, (e.message || "unknown").slice(0, 500)],
     );
     console.error(`[site-withdraw] tx failed for user ${userId}:`, e.message);
-    return { status: 500, body: { error: "Withdraw transaction failed", detail: e.message?.slice(0, 200) } };
+    // Humanize the user-facing error. The raw e.message is usually a
+    // chain-of-Custom-N-error chain that means nothing to a borrower.
+    // [[feedback_loans_must_never_fail_no_regressions]]
+    const msg = (e.message || "").toLowerCase();
+    let friendly;
+    if (/insufficient.*funds|0x1$|0x1\b/.test(msg)) {
+      friendly = "Not enough balance to cover the withdraw + network fee. Reduce the amount slightly and try again.";
+    } else if (/blockhash.*not found|block height exceeded|expired/.test(msg)) {
+      friendly = "The transaction expired before it landed. Please try again in a few seconds.";
+    } else if (/timeout|timed out/.test(msg)) {
+      friendly = "The network is slow right now — your withdraw didn't confirm in time. Please retry in 10–15 seconds.";
+    } else {
+      friendly = "We couldn't complete the withdraw right now. Please refresh and try again in a few seconds.";
+    }
+    return { status: 500, body: { error: friendly, friendly: true, detail: e.message?.slice(0, 200) } };
   }
 
   await query(

@@ -9,6 +9,7 @@ import {
   countDueWithin,
   formatTimeToDue,
   formatHealthLabel,
+  hasV4MixedCollateral,
 } from "../services/loan-display.js";
 
 async function enrichWithHealth(loan, owedLamports) {
@@ -18,11 +19,23 @@ async function enrichWithHealth(loan, owedLamports) {
       [loan.collateral_mint],
     );
     if (!rows[0]) return null;
-    const currentLamports = await collateralValueLamports(
+    // V4 mixed loans: SPL side is the REMAINING balance (current_collateral_amount),
+    // not the original. After auto_sells fire, the original collateral_amount
+    // overstates the actual SPL still in vault by the converted slices.
+    const splAmountForValue = hasV4MixedCollateral(loan)
+      ? (loan.current_collateral_amount ?? loan.collateral_amount)
+      : loan.collateral_amount;
+    const splLamports = await collateralValueLamports(
       loan.collateral_mint,
-      loan.collateral_amount,
+      splAmountForValue,
       rows[0].decimals,
     );
+    // Add vault SOL to the collateral value — those proceeds are
+    // already SOL, so they're worth lamports 1:1 toward repayment. For
+    // V1/V2/V3 sol_proceeds_amount is always 0 (the column was added
+    // by migration 066 with that default).
+    const vaultSolLamports = Number(loan.sol_proceeds_amount ?? 0);
+    const currentLamports = Number(splLamports) + vaultSolLamports;
     const owed = Number(owedLamports ?? loan.original_loan_amount_lamports);
     const ratio = owed > 0 ? currentLamports / owed : 0;
     return { currentLamports, ratio, decimals: rows[0].decimals };
@@ -58,11 +71,16 @@ export async function handlePositions(ctx) {
 
   const user = await upsertUser(tgUser.id, tgUser.username);
 
+  // Layer 5 defense — OR-clause picks up loans whose borrower_wallet
+  // is one of THIS user's wallets, even if loans.user_id has drifted.
+  // [[feedback_never_misattribute_loans]]
   const { rows: rawRows } = await query(
     `SELECT l.*, sm.symbol, sm.decimals
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
-     WHERE l.user_id = $1 AND l.status = 'active'
+     WHERE l.status = 'active'
+       AND (l.user_id = $1
+            OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
     [user.id],
   );
@@ -161,8 +179,17 @@ export async function handlePositions(ctx) {
     // sent the user a DM but the user may have dismissed/missed it;
     // /loans reminds them they have a decision pending.
     const existing = orderByLoan.get(loan.id);
+    // V4-exclusive: only suggest /takeprofit when this loan is actually
+    // arm-eligible. V1/V3 loans under V4_EXIT_EXCLUSIVE_ENFORCE would
+    // refuse the arm with exits_require_v4_loan, so don't bait the user.
+    const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
+    const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
+    const canArmExits =
+      (!!v4ProgramId && loan.program_id === v4ProgramId) || !v4Enforced;
     if (!existing) {
-      lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+      if (canArmExits) {
+        lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);
+      }
     } else if (existing.status === "armed") {
       const trig = formatTriggerInline(existing.trigger_kind, existing.trigger_value_micro);
       const slip = (existing.slippage_bps / 100).toFixed(2);
