@@ -1627,6 +1627,8 @@ async function handleLeaderboard() {
 
 const PUBLIC_ROUTES = new Set([
   "/api/v1/health",
+  "/api/v1/livez",
+  "/healthz",
   "/api/v1/tokens",
   "/api/v1/loans",
   "/api/v1/wallet/balance",
@@ -1849,7 +1851,23 @@ async function router(req, res) {
     }
   }
 
-  // Health check (no auth) — real liveness probe
+  // Liveness probe (no auth, ZERO dependencies). Railway's healthcheckPath
+  // targets THIS — not /api/v1/health. It returns 200 the instant the event
+  // loop is responsive, regardless of DB / RPC / heartbeat state.
+  //
+  // Why a separate probe: /api/v1/health does a DB ping + heartbeat checks and
+  // 503s on a transient DB blip. Pointing Railway's healthcheck at that would
+  // (a) block zero-downtime deploy cutover whenever the DB hiccups and (b) risk
+  // a restart loop on a DB blip. /livez only fails when the process is genuinely
+  // dead or hung — exactly when Railway SHOULD restart it — and lets Railway gate
+  // deploy cutover on the new instance being live, eliminating the deploy-time
+  // 502 window. /api/v1/health stays the rich readiness/monitoring signal.
+  if (path === "/api/v1/livez" || path === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ live: true, ts: new Date().toISOString() }));
+  }
+
+  // Health check (no auth) — rich readiness/monitoring signal (DB + heartbeats)
   if (path === "/api/v1/health") {
     const checks = { db: "unknown", screener: "unknown", "token-health": "unknown" };
     const reasons = [];
