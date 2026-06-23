@@ -984,6 +984,37 @@ export async function applyStartupPatches() {
      VALUES ('MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1')
      ON CONFLICT DO NOTHING`,
 
+    // $QUEST — operator-trusted MANUAL approval (full approval 2026-06-23).
+    // pump.fun memecoin (Token-2022, mint + freeze authority both renounced,
+    // decimals=6, verified on-chain). category='memecoin' → routes V1 (no-exit) +
+    // V4 (with-exit). Manual approval bypasses the user-submission screener
+    // (operator rule). enabled + protected + hot so it's borrowable + can never
+    // be auto-disabled; ON CONFLICT re-asserts on every boot.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Et3nNiuGyhQxwVW3W8pLTvsMXcSKiyogHrNjdr4wpoke',
+             'QUEST', 'Quest', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'QUEST',
+       name = 'Quest',
+       category = 'memecoin',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Et3nNiuGyhQxwVW3W8pLTvsMXcSKiyogHrNjdr4wpoke')
+     ON CONFLICT DO NOTHING`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
