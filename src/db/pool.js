@@ -935,6 +935,39 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS idx_smtc_mint_created
        ON supported_mints_tier_changes (mint, created_at DESC)`,
 
+    // $MU — operator-trusted MANUAL approval (full authorization 2026-06-22).
+    // Permanently approved + protected + hot-tier, mirroring the $MAGPIE
+    // protocol-token pattern so it can NEVER be auto-disabled and its V1/V4
+    // price_feed PDAs are always pre-warmed (the boot + 30-min attestor
+    // pre-warm walks every enabled mint). decimals=6 + Token-2022 owner
+    // (TokenzQd…) verified on-chain for mint MUxEsUKSMAC…NGay1. ON CONFLICT
+    // re-asserts enabled+protected+hot on EVERY boot, so the hourly token-
+    // health watcher / screener can never take it off. Placed after the
+    // attestation_tier column patch above so the column exists.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1',
+             'MU', 'MU', 6, 'memecoin', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from ever re-processing $MU through the audit
+    // pipeline (which could otherwise flag/disable an operator-trusted mint).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1')
+     ON CONFLICT DO NOTHING`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
