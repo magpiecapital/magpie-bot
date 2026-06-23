@@ -532,18 +532,28 @@ async function armOrderImpl({
   // firing through their legacy path — we don't break in-flight
   // users mid-flight. This check only refuses NEW arms.
   //
-  // V4_EXIT_EXCLUSIVE_ENFORCE env gates the rollout: set to "true"
-  // to enforce, anything else (or unset) keeps legacy arming. Lets
-  // the operator stage the cut-over without a code redeploy.
-  if (process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true") {
+  // V4-in-vault exits are STRUCTURALLY exclusive for NEW arms — ALWAYS
+  // enforced, never gated ON by an env flag. (audit FIX 2.) Previously this
+  // whole block ran ONLY when V4_EXIT_EXCLUSIVE_ENFORCE==="true"; if that
+  // flag was ever unset on the host, an exit could arm on a V1/V3 loan and
+  // fire through the legacy fire-and-close path — violating the V4-in-vault
+  // mandate and the x402 pool-separation guarantee. The env now only
+  // RELAXES (V4_EXIT_LEGACY_ARMS_ALLOWED, for a documented migration) and
+  // defaults OFF, so the guarantee can't silently degrade. Existing
+  // V1/V2/V3 loans with already-armed orders keep firing through their
+  // legacy path — this gate refuses NEW arms only. See
+  // feedback_v4_in_vault_thesis_non_negotiable + feedback_x402_pool_separation_mandate.
+  const legacyArmsAllowed = process.env.V4_EXIT_LEGACY_ARMS_ALLOWED === "true";
+  if (!legacyArmsAllowed) {
     const v4ProgramIdStr = process.env.PROGRAM_ID_V4 ?? null;
     if (!v4ProgramIdStr) {
-      // Defensive: enforce-on without V4 deployed would silently break
-      // every arm. Refuse with a clear message instead.
+      // V4 not configured on this host — refuse rather than silently arm on
+      // a legacy pool. (During a deliberate migration without V4, set
+      // V4_EXIT_LEGACY_ARMS_ALLOWED=true to opt out, eyes open.)
       return {
         ok: false,
         error: "v4_not_configured",
-        detail: "V4_EXIT_EXCLUSIVE_ENFORCE is on but PROGRAM_ID_V4 isn't set on this host. Either deploy V4 first, or unset V4_EXIT_EXCLUSIVE_ENFORCE.",
+        detail: "PROGRAM_ID_V4 isn't set on this host, so an exit can't be guaranteed in-vault. Deploy V4, or set V4_EXIT_LEGACY_ARMS_ALLOWED=true to deliberately allow legacy arms during a migration.",
       };
     }
     if (loan.program_id && loan.program_id !== v4ProgramIdStr) {
