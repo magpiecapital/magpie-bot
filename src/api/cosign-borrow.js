@@ -36,6 +36,12 @@ import {
   Keypair,
   sendAndConfirmRawTransaction,
 } from "@solana/web3.js";
+import {
+  NATIVE_MINT,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+} from "@solana/spl-token";
 import bs58 from "bs58";
 import fs from "node:fs";
 import path from "node:path";
@@ -246,6 +252,62 @@ function loadLenderKeypair() {
   }
   const raw = JSON.parse(fs.readFileSync(kpPath, "utf-8"));
   return Keypair.fromSecretKey(new Uint8Array(raw));
+}
+
+/**
+ * Ensure the lender's fee-wallet wSOL ATA exists on-chain.
+ *
+ * The V1/V3 `request_and_fund_loan` ix takes `fee_wallet_token_account`
+ * (IDL idx 7) = the lender authority's wSOL ATA, a plain non-init account
+ * the program requires to PRE-exist. It auto-closes whenever its wSOL
+ * balance is swept to zero, and cosign-borrow adds NO pre-instructions, so
+ * a borrow tx whose builder didn't prepend the idempotent ATA-create would
+ * sim-fail `AccountNotInitialized`. This (re)creates it via a SEPARATE
+ * lender-signed idempotent tx — off the user's borrow tx, so it works on
+ * the cosign lane where we can't mutate the tx the user signs.
+ *
+ * Safe under "never affect existing user loans/collateral": it touches ONLY
+ * the protocol-owned fee ATA, never a borrower loan, collateral vault, or
+ * price feed. Fully idempotent (existence-checked first, idempotent create).
+ * Returns true if the ATA exists (or was created), false on infra failure.
+ */
+async function ensureLenderFeeWsolAta() {
+  try {
+    const ata = getAssociatedTokenAddressSync(
+      NATIVE_MINT, LENDER_PUBKEY, false, TOKEN_PROGRAM_ID,
+    );
+    const info = await withFailover((conn) => conn.getAccountInfo(ata));
+    if (info) return true; // already exists — no tx needed
+    const lender = loadLenderKeypair();
+    const ix = createAssociatedTokenAccountIdempotentInstruction(
+      LENDER_PUBKEY, ata, LENDER_PUBKEY, NATIVE_MINT, TOKEN_PROGRAM_ID,
+    );
+    const healTx = new Transaction().add(ix);
+    healTx.feePayer = LENDER_PUBKEY;
+    const { blockhash } = await withFailover((conn) =>
+      conn.getLatestBlockhash("confirmed"),
+    );
+    healTx.recentBlockhash = blockhash;
+    healTx.sign(lender);
+    await sendAndConfirmRawTransaction(connection, healTx.serialize(), {
+      commitment: "confirmed",
+      skipPreflight: false,
+    });
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        `[cosign-borrow] healed missing lender fee-wallet wSOL ATA ${ata
+          .toBase58()
+          .slice(0, 8)}… (idempotently re-created before a borrow). Root-cause class: AccountNotInitialized fee_wallet_token_account.`,
+      );
+    } catch {}
+    return true;
+  } catch (e) {
+    console.warn(
+      `[cosign-borrow] ensureLenderFeeWsolAta failed: ${e.message?.slice(0, 150)}`,
+    );
+    return false;
+  }
 }
 
 /**
@@ -1502,6 +1564,56 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
       }
       drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
     }
+
+    // Self-heal AccountNotInitialized (Anchor 3012 / 0xbc4): the borrow ix
+    // references a per-mint price_feed PDA and/or the lender fee-wallet wSOL
+    // ATA (V1/V3 idx 7) that isn't initialized yet. Both are protocol-owned,
+    // idempotent to create, and NEVER touch a borrower's loan/collateral.
+    // Init the missing account(s) and re-simulate (up to 2x) so we NEVER hand
+    // the user a tx that would fail with AccountNotInitialized — the #1
+    // borrow-conversion killer. Only ever runs when the sim is ALREADY
+    // failing, so a healthy borrow is untouched.
+    // [[feedback_borrow_accountnotinitialized_must_never_recur]]
+    let initHealRetries = 0;
+    while (
+      !drainCheck.ok &&
+      typeof drainCheck.detail === "string" &&
+      /AccountNotInitialized|0xbc4\b|"Custom":\s*3012\b/i.test(drainCheck.detail) &&
+      initHealRetries < 2
+    ) {
+      initHealRetries++;
+      console.warn(
+        `[cosign-borrow] Layer 2 sim hit AccountNotInitialized — self-healing (retry ${initHealRetries}/2)`,
+      );
+      try {
+        const magpieIxHeal = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
+        const healProgramId = magpieIxHeal?.programId;
+        const healMint = magpieIxHeal?.keys?.[4]?.pubkey?.toBase58();
+        // (a) per-mint price_feed PDA — idempotent init + a fresh attest so
+        //     the V3/V4 TWAP gate also has a sample.
+        if (healMint && healProgramId) {
+          const { initializePriceFeed, attestPrice } = await import(
+            "../services/price-attestor.js"
+          );
+          try { await initializePriceFeed(healMint, healProgramId); } catch {}
+          const { rows: [mr] } = await query(
+            `SELECT decimals FROM supported_mints WHERE mint = $1`,
+            [healMint],
+          );
+          if (mr) {
+            try { await attestPrice(healMint, Number(mr.decimals), undefined, healProgramId); } catch {}
+          }
+        }
+        // (b) lender fee-wallet wSOL ATA (V1/V3 idx 7) — idempotent re-create.
+        await ensureLenderFeeWsolAta();
+      } catch (healErr) {
+        console.warn(
+          `[cosign-borrow] init self-heal retry ${initHealRetries} threw: ${healErr.message?.slice(0, 120)}`,
+        );
+      }
+      drainCheck = await detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY);
+    }
+
     if (!drainCheck.ok) {
       // tx is now signed but we never broadcast — the lender signature
       // is wasted but the funds stay safe. The attacker learned nothing
@@ -1603,6 +1715,26 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
               error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.",
               oracle_warming: true,
               retry_after_seconds: 25,
+              detail,
+            },
+          };
+        }
+        // AccountNotInitialized (3012 / 0xbc4) survived the self-heal loop above
+        // — a protocol-owned price_feed PDA or the lender fee-wallet ATA couldn't
+        // be initialized within the window (RPC blip). Clean retry: the heal
+        // almost always lands on the next tap (the account is being created).
+        // The operator was already CRIT-DM'd above. NEVER show the raw
+        // "AccountNotInitialized" string to the user.
+        // [[feedback_borrow_accountnotinitialized_must_never_recur]]
+        if (/AccountNotInitialized|0xbc4\b|"Custom":\s*3012\b/i.test(detail)) {
+          recordBorrowFailure("account_not_initialized");
+          _recordBorrowConversionFailure(_convCtx, "account_not_initialized", { detail: detail?.slice(0, 220) });
+          return {
+            status: 503,
+            body: {
+              error: "We're finishing one-time setup for this token — please tap Borrow again in 10–15 seconds.",
+              oracle_warming: true,
+              retry_after_seconds: 12,
               detail,
             },
           };
