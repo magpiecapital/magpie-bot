@@ -64,15 +64,25 @@ export async function handleX402Record(req) {
   const payerPubkey = String(body?.payer_pubkey ?? "");
   const txSignature = String(body?.tx_signature ?? "");
   const nonce = body?.nonce ? String(body.nonce) : null;
+  // kind: "settled" (native SOL, default) | "reserve" (SPL rail pre-settle nonce
+  // gate, tx_signature = PENDING:<nonce>) | "settled-spl" (SPL settled, real sig).
+  const kind = body?.kind ? String(body.kind) : "settled";
+  const isReserve = kind === "reserve";
 
   // Cheap validation — failed records are dropped, not retried, so we
-  // don't want bad data accumulating.
+  // don't want bad data accumulating. A reserve marker carries a PENDING:<nonce>
+  // tx_signature + empty payer (the SPL rail's durable pre-settle nonce gate);
+  // every other record requires a real on-chain signature + payer.
+  const txOk = isReserve
+    ? /^PENDING:[A-Za-z0-9_+/=:-]{8,160}$/.test(txSignature)
+    : isValidTxSig(txSignature);
+  const payerOk = isReserve ? payerPubkey === "" || isValidPubkey(payerPubkey) : isValidPubkey(payerPubkey);
   if (
     !endpointPath || endpointPath.length > 256 ||
     !["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method) ||
     !/^\d+$/.test(amountLamports) ||
-    !isValidPubkey(payerPubkey) ||
-    !isValidTxSig(txSignature)
+    !payerOk || !txOk ||
+    (isReserve && !nonce)
   ) {
     return { status: 400, body: { error: "invalid_record_shape" } };
   }
@@ -112,7 +122,11 @@ export async function handleX402Record(req) {
   // the x402 leg without touching loan-fee accrual). Crucially the accrual
   // only credits a ledger obligation — it moves no SOL; distributions stay on
   // the existing governance/manual cadence.
-  if (inserted && process.env.X402_FEE_HOLDER_ACCRUAL !== "false") {
+  // Accrue ONLY for NATIVE-SOL settled payments (amount IS lamports). Skip
+  // reserve markers AND SPL settlements (kind "settled-spl"): their amount is a
+  // USDC/wSOL atomic, not lamports — accruing it as lamports would mis-credit the
+  // pool. The SPL->SOL sweep credits the holder pool after converting SPL->SOL.
+  if (inserted && kind === "settled" && process.env.X402_FEE_HOLDER_ACCRUAL !== "false") {
     try {
       const { accrueToHolderPool } = await import(
         "../services/magpie-holder-rewards.js"
