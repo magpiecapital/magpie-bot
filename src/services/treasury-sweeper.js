@@ -81,7 +81,17 @@ function envNumber(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// OPERATOR HARD PAUSE — 2026-06-23. The operator asked to halt autonomous
+// sweeps until they're comfortable with the posture (they were surprised a
+// manual top-up got swept). This in-code flag takes precedence over
+// TREASURY_SWEEP_ENABLED and the env kill switch, so the sweeper cannot
+// move funds regardless of Railway env state. To RESUME: set this to false
+// (or delete the block) and redeploy. Auditable + version-controlled on
+// purpose — a fund-mover should never be silently re-armable.
+const PAUSED_BY_OPERATOR = true;
+
 function isDisabled() {
+  if (PAUSED_BY_OPERATOR) return true;
   // Default to DISABLED until operator explicitly enables. Ship-safe
   // posture — the sweeper rolls out with the deploy but doesn't start
   // moving funds until TREASURY_SWEEP_ENABLED is set to a truthy value.
@@ -96,7 +106,12 @@ function isDisabled() {
 
 const INTERVAL_MS = envNumber("TREASURY_SWEEP_INTERVAL_MS", 6 * 60 * 60 * 1000);
 const FIRST_RUN_MS = envNumber("TREASURY_SWEEP_FIRST_RUN_MS", 5 * 60 * 1000);
-const RESERVE_SOL = envNumber("TREASURY_SWEEP_RESERVE_SOL", 5);
+// Operating reserve floor — raised 5 → 20 SOL on 2026-06-23 (operator
+// request) so manual top-ups to the lender wallet aren't swept away and
+// attestation gas keeps ~2+ weeks of runway. Env override still wins; if
+// TREASURY_SWEEP_RESERVE_SOL is set on Railway, clear it for this default
+// to apply.
+const RESERVE_SOL = envNumber("TREASURY_SWEEP_RESERVE_SOL", 20);
 const MIN_SOL = envNumber("TREASURY_SWEEP_MIN_SOL", 0.1);
 const CONSEC_FAIL_ALERT = envNumber("TREASURY_SWEEP_CONSEC_FAIL_ALERT", 3);
 
@@ -427,6 +442,21 @@ async function tickInner(bot) {
   });
   console.log(
     `[treasury-sweeper] swept ${(sweepAmount / LAMPORTS_PER_SOL).toFixed(4)} SOL to ${destPk.toBase58()} (sig: ${sig.slice(0, 10)}…)`,
+  );
+
+  // Notify the operator on EVERY successful sweep (2026-06-23). Previously
+  // only repeated FAILURES alerted — a successful sweep was completely
+  // silent, which is how a manual top-up moved without the operator
+  // knowing. A fund movement must never be invisible to them.
+  await alertOperator(
+    bot,
+    `💰 *Treasury sweep executed*\n\n` +
+      `Moved \`${(sweepAmount / LAMPORTS_PER_SOL).toFixed(4)}\` SOL from the lender wallet → treasury vault.\n\n` +
+      `• Lender balance before: \`${(lenderBal / LAMPORTS_PER_SOL).toFixed(4)}\` SOL\n` +
+      `• Operating reserve kept: \`${(reserveLamports / LAMPORTS_PER_SOL).toFixed(2)}\` SOL\n` +
+      `• Destination: \`${destPk.toBase58()}\`\n` +
+      `• Tx: \`${sig}\`\n\n` +
+      `_Halt anytime: set PAUSED_BY_OPERATOR=true (code) or TREASURY_SWEEP_DISABLED=true (Railway)._`,
   );
 }
 
