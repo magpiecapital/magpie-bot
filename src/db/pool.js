@@ -879,6 +879,12 @@ export async function applyStartupPatches() {
        nonce TEXT,
        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
+    // Standard x402 v2 SPL rail: distinguish native-SOL settlements (amount is
+    // lamports) from SPL settlements (amount is a USDC/wSOL atomic, NOT lamports)
+    // so the public revenue readout never sums SPL atomics as lamports. Default
+    // 'settled' backfills existing native rows correctly.
+    `ALTER TABLE x402_paid_calls ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'settled'`,
+    `ALTER TABLE x402_paid_calls ADD COLUMN IF NOT EXISTS asset TEXT`,
     `CREATE INDEX IF NOT EXISTS x402_paid_calls_recent_idx
        ON x402_paid_calls(recorded_at DESC)`,
     `CREATE INDEX IF NOT EXISTS x402_paid_calls_endpoint_idx
