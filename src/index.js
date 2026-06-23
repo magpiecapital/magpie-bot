@@ -190,6 +190,7 @@ import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startBorrowCanary } from "./services/borrow-canary.js";
 import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
+import { ensureX402DestinationAtas } from "./services/x402-destination-atas.js";
 import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
 import { startLoanProgramIdHealer } from "./services/loan-program-id-healer.js";
 import { startV4LoanHealthProbe } from "./services/v4-loan-health-probe.js";
@@ -988,6 +989,13 @@ bot.start({
     // against mints. Per V4 loan lifecycle mandate NN1 (operator-
     // mandated 2026-06-19 PM after user 948 incident).
     startBootV4FeedSync(bot);
+    // x402 standard-rail destination ATAs — idempotently ensure the payTo
+    // wallet's USDC + wSOL ATAs exist so the standard v2 SVM rail can settle
+    // (the x402 service is keyless; the bot owns the payTo == lender wallet).
+    // No-ops once they exist. +50s so the RPC + keypair are ready.
+    setTimeout(() => ensureX402DestinationAtas(bot).catch((e) =>
+      console.warn("[x402-atas] boot ensure threw:", e.message)
+    ), 50_000);
     // V4 feed readiness — priority-mint burst warmup on boot. After
     // a 30s settle window so DB pool + attestor are alive. State
     // surfaces on /api/v1/health.v4_feeds; the site reads it to gate
