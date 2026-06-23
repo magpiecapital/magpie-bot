@@ -935,15 +935,21 @@ export async function applyStartupPatches() {
     `CREATE INDEX IF NOT EXISTS idx_smtc_mint_created
        ON supported_mints_tier_changes (mint, created_at DESC)`,
 
-    // $MU — operator-trusted MANUAL approval (full authorization 2026-06-22).
-    // Permanently approved + protected + hot-tier, mirroring the $MAGPIE
-    // protocol-token pattern so it can NEVER be auto-disabled and its V1/V4
-    // price_feed PDAs are always pre-warmed (the boot + 30-min attestor
-    // pre-warm walks every enabled mint). decimals=6 + Token-2022 owner
-    // (TokenzQd…) verified on-chain for mint MUxEsUKSMAC…NGay1. ON CONFLICT
-    // re-asserts enabled+protected+hot on EVERY boot, so the hourly token-
-    // health watcher / screener can never take it off. Placed after the
-    // attestation_tier column patch above so the column exists.
+    // $MU — Micron Technology tokenized stock (Backpack Securities / Trek Labs,
+    // Token-2022), operator-trusted MANUAL approval (full authorization
+    // 2026-06-22). category='stock' so it (a) shows in the site's Tokenized
+    // Stocks column, (b) routes to V3 (no-exit) + V4 (with-exit) per
+    // chooseProgramId RWA routing, (c) is force-kept hot+protected by the
+    // stocks-rwa-protection-sentinel. Mirrors the $MAGPIE permanent-seed
+    // pattern so it can NEVER be auto-disabled and its V3/V4 price_feed PDAs
+    // are always pre-warmed (boot + 30-min attestor walks every enabled mint;
+    // hot tier keeps the 8-sample TWAP window filled — required for the V3/V4
+    // TWAP gate on low-liquidity xStocks). decimals=6 + Token-2022 owner +
+    // name "Micron Technology" verified on-chain; Jupiter prices it (~$1.95M
+    // liquidity) so the attestor can fill the TWAP window. ON CONFLICT
+    // re-asserts symbol/name/category/enabled/protected/hot on EVERY boot, so
+    // no health watcher / screener can ever take it off or mis-categorize it.
+    // Placed after the attestation_tier column patch above so the column exists.
     `INSERT INTO supported_mints
        (mint, symbol, name, decimals, category, image_url,
         liquidity_usd, holder_count, market_cap_usd,
@@ -951,12 +957,16 @@ export async function applyStartupPatches() {
         token_age_hours, auto_approved, screened_at, source,
         enabled, protected, attestation_tier)
      VALUES ('MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1',
-             'MU', 'MU', 6, 'memecoin', NULL,
+             'MU', 'Micron Technology', 6, 'stock', NULL,
              0, 0, 0,
              TRUE, TRUE, FALSE,
              0, FALSE, NOW(), 'operator_trusted',
              TRUE, TRUE, 'hot')
      ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'MU',
+       name = 'Micron Technology',
+       category = 'stock',
+       decimals = 6,
        enabled = TRUE,
        protected = TRUE,
        attestation_tier = 'hot',
