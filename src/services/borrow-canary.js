@@ -19,17 +19,58 @@
 import { withFailover } from "../solana/connection.js";
 import { recordConversionEvent } from "./conversion-tracker.js";
 import { getAdminId } from "./admin-notify.js";
+import { query } from "../db/pool.js";
 
 const TICK_INTERVAL_MS = Number(process.env.BORROW_CANARY_INTERVAL_MS) || 60_000;
 const FAIL_DEBOUNCE = Number(process.env.BORROW_CANARY_FAIL_DEBOUNCE) || 2;
 
-// Hot-warm V4 memecoin + stock mints to canary. Default to MAGPIE +
-// SPCX — both are heavily used and should always be attested. Override
-// via env if needed.
-const MEMECOIN_MINT = process.env.CANARY_MEMECOIN_MINT
-  || "M4GpieMEsRgVH3pSiNmRzbtkk4xKkEpW2YESMv7sQ8c"; // MAGPIE V4 collateral
-const STOCK_MINT = process.env.CANARY_STOCK_MINT
-  || "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"; // SPCX
+// Canary mints — pick a CURRENTLY-ENABLED memecoin + stock from supported_mints
+// so the canary always validates a REAL borrowable mint and AUTO-ADAPTS when a
+// mint is delisted. A hardcoded mint going stale was the root cause of the SPCX
+// false-positive class: after SPCX (XsbEhLAt…) was delisted, the canary kept
+// probing it, /api/v1/v4/twap returned 404 mint_not_supported forever, and it
+// alarmed "users would see this borrowing" — for a mint NO user can borrow.
+// An env override (CANARY_MEMECOIN_MINT / CANARY_STOCK_MINT) is honored ONLY
+// while it's still enabled; otherwise we auto-pick the most stable enabled mint
+// in the category (protected + hot first). Cached 5 min.
+let _canaryMints = null;
+let _canaryMintsAt = 0;
+const CANARY_MINTS_TTL_MS = 5 * 60_000;
+
+async function pickEnabledMint(categories, preferredEnv) {
+  // Honor the env override only if it is still an enabled supported_mint.
+  if (preferredEnv) {
+    try {
+      const { rows } = await query(
+        `SELECT 1 FROM supported_mints WHERE mint = $1 AND enabled = TRUE`,
+        [preferredEnv],
+      );
+      if (rows.length) return preferredEnv;
+    } catch { /* fall through to auto-pick */ }
+  }
+  try {
+    const { rows } = await query(
+      `SELECT mint FROM supported_mints
+         WHERE enabled = TRUE AND category = ANY($1)
+         ORDER BY protected DESC, (attestation_tier = 'hot') DESC, created_at ASC
+         LIMIT 1`,
+      [categories],
+    );
+    return rows.length ? rows[0].mint : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getCanaryMints() {
+  const now = Date.now();
+  if (_canaryMints && now - _canaryMintsAt < CANARY_MINTS_TTL_MS) return _canaryMints;
+  const memecoin = await pickEnabledMint(["memecoin"], process.env.CANARY_MEMECOIN_MINT);
+  const stock = await pickEnabledMint(["stock", "etf", "metal"], process.env.CANARY_STOCK_MINT);
+  _canaryMints = { memecoin, stock };
+  _canaryMintsAt = now;
+  return _canaryMints;
+}
 
 const BOT_INTERNAL_URL = process.env.BOT_INTERNAL_URL
   || `http://127.0.0.1:${process.env.PORT || 3000}`;
@@ -69,6 +110,15 @@ async function probeTwap(mint) {
     const res = await fetch(`${BOT_INTERNAL_URL}/api/v1/v4/twap?mint=${encodeURIComponent(mint)}`, { signal: ctl.signal });
     clearTimeout(t);
     if (!res.ok) {
+      // A delisted (404 mint_not_supported) or disabled (409 mint_disabled) mint
+      // is NOT user-borrowable, so it is NOT a user-facing borrow failure — never
+      // alarm on it (the next tick re-selects a live mint). Only a genuine route
+      // / infra / data error alarms. Distinguish via the error body.
+      let errBody = null;
+      try { errBody = await res.json(); } catch { /* body not json */ }
+      if (errBody?.error === "mint_not_supported" || errBody?.error === "mint_disabled") {
+        return { ok: true, latencyMs: Date.now() - start, skipped: errBody.error };
+      }
       throw new Error(`twap http_${res.status}`);
     }
     const body = await res.json();
@@ -154,19 +204,24 @@ async function recordAndMaybeAlert(bot, checkName, result, mint, programId) {
 }
 
 async function tick(bot) {
-  const [rpc, twapMeme, twapStock, health] = await Promise.all([
-    probeRpcBlockhash(),
-    probeTwap(MEMECOIN_MINT),
-    probeTwap(STOCK_MINT),
-    probeHealth(),
-  ]);
+  // Resolve the live mints to probe (dynamic — auto-adapts to delistings).
+  const { memecoin, stock } = await getCanaryMints();
 
-  await Promise.all([
-    recordAndMaybeAlert(bot, "rpc_blockhash", rpc, null, null),
-    recordAndMaybeAlert(bot, `twap_${MEMECOIN_MINT.slice(0, 4)}`, twapMeme, MEMECOIN_MINT, null),
-    recordAndMaybeAlert(bot, `twap_${STOCK_MINT.slice(0, 4)}`, twapStock, STOCK_MINT, null),
-    recordAndMaybeAlert(bot, "health", health, null, null),
-  ]);
+  // Always-on probes + a twap probe per live mint that exists. Stable check
+  // names ("twap_memecoin" / "twap_stock") so the consecutive-fail counter is
+  // tied to the CATEGORY, not a specific mint address — a delisting swaps the
+  // underlying mint without resetting/orphaning a per-address counter.
+  const probes = [
+    ["rpc_blockhash", probeRpcBlockhash(), null],
+    ["health", probeHealth(), null],
+  ];
+  if (memecoin) probes.push(["twap_memecoin", probeTwap(memecoin), memecoin]);
+  if (stock) probes.push(["twap_stock", probeTwap(stock), stock]);
+
+  const results = await Promise.all(probes.map(([, p]) => p));
+  await Promise.all(
+    probes.map(([name, , mint], i) => recordAndMaybeAlert(bot, name, results[i], mint, null)),
+  );
 }
 
 export function startBorrowCanary(bot) {
@@ -174,7 +229,7 @@ export function startBorrowCanary(bot) {
     console.log("[borrow-canary] disabled via BORROW_CANARY_DISABLED=true");
     return;
   }
-  console.log(`[borrow-canary] starting — every ${TICK_INTERVAL_MS}ms, debounce=${FAIL_DEBOUNCE}, mints=${MEMECOIN_MINT.slice(0, 6)}.. + ${STOCK_MINT.slice(0, 6)}..`);
+  console.log(`[borrow-canary] starting — every ${TICK_INTERVAL_MS}ms, debounce=${FAIL_DEBOUNCE}, mints=dynamic (live enabled memecoin + stock, auto-adapts to delistings)`);
   // Initial delayed run so the bot has time to bind the port.
   setTimeout(() => tick(bot).catch((e) => console.warn("[borrow-canary] tick err:", e.message)), 30_000);
   setInterval(() => tick(bot).catch((e) => console.warn("[borrow-canary] tick err:", e.message)), TICK_INTERVAL_MS);
