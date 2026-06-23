@@ -68,6 +68,8 @@ export async function handleX402Record(req) {
   // gate, tx_signature = PENDING:<nonce>) | "settled-spl" (SPL settled, real sig).
   const kind = body?.kind ? String(body.kind) : "settled";
   const isReserve = kind === "reserve";
+  // asset: the SPL mint for a settled-spl record (USDC/wSOL); null for native SOL.
+  const asset = body?.asset ? String(body.asset).slice(0, 64) : null;
 
   // Cheap validation — failed records are dropped, not retried, so we
   // don't want bad data accumulating. A reserve marker carries a PENDING:<nonce>
@@ -91,11 +93,11 @@ export async function handleX402Record(req) {
   try {
     const { rows } = await query(
       `INSERT INTO x402_paid_calls
-         (endpoint_path, method, amount_lamports, payer_pubkey, tx_signature, nonce)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (endpoint_path, method, amount_lamports, payer_pubkey, tx_signature, nonce, kind, asset)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (tx_signature) DO NOTHING
        RETURNING tx_signature`,
-      [endpointPath, method, amountLamports, payerPubkey, txSignature, nonce],
+      [endpointPath, method, amountLamports, payerPubkey, txSignature, nonce, kind, asset],
     );
     inserted = rows.length > 0;
   } catch (err) {
@@ -160,26 +162,44 @@ export async function handleX402Record(req) {
  * endpoint breakdown. No PII; payer wallets only surface in the
  * anonymized "top recipients" form via the existing leaderboard route.
  */
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
 export async function handleX402Metrics() {
+  // kind <> 'reserve' excludes pre-settle nonce gates (not real calls). Lamport
+  // revenue sums are FILTERED to kind = 'settled' (native SOL) — an SPL
+  // settled-spl amount is a USDC/wSOL atomic, NOT lamports, so summing it as
+  // lamports would corrupt the SOL revenue figure. SPL volume is reported
+  // separately per asset (in its own atomic units).
   const { rows: [agg] } = await query(`
     SELECT
-      COUNT(*)::int AS calls_24h,
-      COUNT(*) FILTER (WHERE recorded_at > NOW() - INTERVAL '1 hour')::int AS calls_1h,
-      COUNT(*) FILTER (WHERE recorded_at > NOW() - INTERVAL '7 days')::int AS calls_7d,
-      COALESCE(SUM(amount_lamports::numeric), 0)::text AS revenue_24h_lamports,
-      COALESCE(SUM(amount_lamports::numeric) FILTER
-                 (WHERE recorded_at > NOW() - INTERVAL '7 days'), 0)::text
-        AS revenue_7d_lamports,
-      COUNT(DISTINCT payer_pubkey)::int AS unique_payers_24h
+      COUNT(*) FILTER (WHERE kind <> 'reserve')::int AS calls_24h,
+      COUNT(*) FILTER (WHERE kind <> 'reserve' AND recorded_at > NOW() - INTERVAL '1 hour')::int AS calls_1h,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled'), 0)::text AS revenue_24h_lamports,
+      COUNT(*) FILTER (WHERE kind = 'settled-spl')::int AS spl_calls_24h,
+      COUNT(*) FILTER (WHERE kind = 'settled-spl' AND asset = $1)::int AS usdc_calls_24h,
+      COUNT(*) FILTER (WHERE kind = 'settled-spl' AND asset = $2)::int AS wsol_calls_24h,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled-spl' AND asset = $1), 0)::text AS usdc_atomic_24h,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled-spl' AND asset = $2), 0)::text AS wsol_lamports_24h,
+      COUNT(DISTINCT payer_pubkey) FILTER (WHERE kind <> 'reserve' AND payer_pubkey <> '')::int AS unique_payers_24h
     FROM x402_paid_calls
     WHERE recorded_at > NOW() - INTERVAL '24 hours'
+  `, [USDC_MINT, WSOL_MINT]);
+
+  const { rows: [w] } = await query(`
+    SELECT
+      COUNT(*) FILTER (WHERE kind <> 'reserve')::int AS calls_7d,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled'), 0)::text AS revenue_7d_lamports,
+      MAX(recorded_at) FILTER (WHERE kind = 'settled-spl') AS last_spl_at
+    FROM x402_paid_calls
+    WHERE recorded_at > NOW() - INTERVAL '7 days'
   `);
 
   const { rows: topEndpoints } = await query(`
     SELECT
       endpoint_path,
-      COUNT(*)::int AS calls,
-      COALESCE(SUM(amount_lamports::numeric), 0)::text AS revenue_lamports
+      COUNT(*) FILTER (WHERE kind <> 'reserve')::int AS calls,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled'), 0)::text AS revenue_lamports
     FROM x402_paid_calls
     WHERE recorded_at > NOW() - INTERVAL '24 hours'
     GROUP BY endpoint_path
@@ -193,10 +213,20 @@ export async function handleX402Metrics() {
       window: "24h",
       calls_1h: agg.calls_1h,
       calls_24h: agg.calls_24h,
-      calls_7d: agg.calls_7d,
+      calls_7d: w.calls_7d,
       revenue_24h_sol: Number(agg.revenue_24h_lamports) / 1e9,
-      revenue_7d_sol: Number(agg.revenue_7d_lamports) / 1e9,
+      revenue_7d_sol: Number(w.revenue_7d_lamports) / 1e9,
       unique_payers_24h: agg.unique_payers_24h,
+      // Standard SPL rail (USDC/wSOL) — reported in native atomic units (USDC 6dp,
+      // wSOL 9dp), NEVER folded into the SOL revenue above.
+      standard_rail: {
+        spl_calls_24h: agg.spl_calls_24h,
+        usdc_calls_24h: agg.usdc_calls_24h,
+        usdc_24h: Number(agg.usdc_atomic_24h) / 1e6,
+        wsol_calls_24h: agg.wsol_calls_24h,
+        wsol_sol_24h: Number(agg.wsol_lamports_24h) / 1e9,
+        last_settlement_at: w.last_spl_at || null,
+      },
       top_endpoints: topEndpoints.map((r) => ({
         path: r.endpoint_path,
         calls: r.calls,
