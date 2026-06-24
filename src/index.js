@@ -208,6 +208,7 @@ import { startAiAgentHealth } from "./services/ai-agent-health.js";
 import { startAutoTicketResolver } from "./services/auto-ticket-resolver.js";
 import { startTreasurySweeper } from "./services/treasury-sweeper.js";
 import { startLiquidationCollateralSweeper } from "./services/liquidation-collateral-sweeper.js";
+import { startX402FeeSweeper } from "./services/x402-fee-sweeper.js";
 import { startDormantReengagement, registerDormantCallbacks } from "./services/dormant-reengagement.js";
 import { startIdleSolNudge } from "./services/idle-sol-nudge.js";
 import { startWinbackAgent, registerWinbackCallbacks } from "./services/winback-agent.js";
@@ -1123,6 +1124,12 @@ bot.start({
     // doesn't hold drain-bait. See
     // feedback_cosign_borrow_token_drain_exploit_2026_06_18.
     setTimeout(() => startLiquidationCollateralSweeper(bot), 140_000);
+    // x402 USDC fee sweeper — converts accrued x402 API fees paid in USDC
+    // to SOL, credits the holder pool's governance share (idempotent), and
+    // routes the realized SOL to the distribution wallet. wSOL x402 fees
+    // already flow via the fee-wallet sweeper (shared canonical ATA).
+    // Disabled until X402_FEE_SWEEP_ENABLED=true. See x402-fee-sweeper.js.
+    setTimeout(() => startX402FeeSweeper(bot), 150_000);
     // Dormant Re-Engagement — every 6h, nudges users who hold approved
     // collateral but have never borrowed. One DM per user per 30 days.
     setTimeout(() => startDormantReengagement(bot), 135_000);
