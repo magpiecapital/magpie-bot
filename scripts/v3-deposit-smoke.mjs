@@ -25,14 +25,13 @@ const V3 = new PublicKey("B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP");
 const RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const conn = new Connection(RPC, "confirmed");
 
+const IDL_DIR = process.env.MAGPIE_IDL_DIR || "./src/solana/idl";
 const lender = Keypair.fromSecretKey(
   Uint8Array.from(
-    JSON.parse(readFileSync("/Users/bradleylubetkin/bagbank-bot/lender-keypair-v2.json", "utf8")),
+    JSON.parse(readFileSync(process.env.LENDER_KEYPAIR || "./lender-keypair-v2.json", "utf8")),
   ),
 );
-const idl = JSON.parse(
-  readFileSync("/Users/bradleylubetkin/bagbank-bot/src/solana/idl/magpie-v3.json", "utf8"),
-);
+const idl = JSON.parse(readFileSync(`${IDL_DIR}/magpie-v3.json`, "utf8"));
 const provider = new AnchorProvider(conn, new Wallet(lender), { commitment: "confirmed" });
 const program = new Program(idl, provider);
 
