@@ -285,6 +285,45 @@ export async function handleX402Metrics() {
     LIMIT 10
   `);
 
+  // x402-ORIGINATED BORROWS — READ-ONLY correlation. There is no origin column on
+  // loans and we deliberately do NOT add one (a write to the borrow critical path
+  // would risk existing loans + couple lanes). Instead we DERIVE the count: an x402
+  // borrow is a loan whose borrower_wallet paid for a `/api/v1/agent/build-borrow`
+  // call (the x402-ONLY endpoint, which cryptographically binds payer == borrower)
+  // shortly before the loan was funded. This is an INTERSECTION (paid AND funded),
+  // so it never counts paid-but-rejected attempts; the website/Telegram borrow flows
+  // never hit build-borrow, so a pure human borrow produces no match. It is a
+  // wallet+30-min-window heuristic — NOT exact — and the site captions it as such
+  // ("approximate"), so it never over-states. Wrapped in try/catch so a failure here
+  // can never break the rest of this public metrics endpoint.
+  let x402Borrows = {
+    x402_borrows_24h: 0,
+    x402_borrows_total: 0,
+    last_x402_borrow_at: null,
+    last_x402_borrow_tx: null,
+  };
+  try {
+    const { rows: [xb] } = await query(`
+      SELECT
+        COUNT(DISTINCT l.id) FILTER (WHERE l.start_timestamp > NOW() - INTERVAL '24 hours')::int AS x402_borrows_24h,
+        COUNT(DISTINCT l.id)::int AS x402_borrows_total,
+        MAX(l.start_timestamp) AS last_x402_borrow_at,
+        (ARRAY_AGG(l.tx_signature ORDER BY l.start_timestamp DESC))[1] AS last_x402_borrow_tx
+      FROM loans l
+      JOIN x402_paid_calls p
+        ON p.payer_pubkey = l.borrower_wallet
+       AND p.endpoint_path = $1
+       AND p.kind <> 'reserve'           -- native ('settled') + SPL ('settled-spl'); excludes pre-settle gates
+       AND p.payer_pubkey <> ''
+       AND l.borrower_wallet IS NOT NULL  -- old loans predate borrower_wallet → correctly excluded
+       AND l.start_timestamp >= p.recorded_at
+       AND l.start_timestamp <  p.recorded_at + INTERVAL '30 minutes'
+    `, ["/api/v1/agent/build-borrow"]);
+    if (xb) x402Borrows = xb;
+  } catch (err) {
+    console.warn("[x402-metrics] x402-borrows correlation failed (non-fatal):", err.message);
+  }
+
   return {
     status: 200,
     body: {
@@ -295,6 +334,13 @@ export async function handleX402Metrics() {
       revenue_24h_sol: Number(agg.revenue_24h_lamports) / 1e9,
       revenue_7d_sol: Number(w.revenue_7d_lamports) / 1e9,
       unique_payers_24h: agg.unique_payers_24h,
+      // x402-originated borrows (approximate; see correlation comment above). Counts
+      // loans funded by a wallet that paid for build-borrow within 30 min. Proof that
+      // agents are not just PAYING for calls but actually completing loans.
+      x402_borrows_24h: x402Borrows.x402_borrows_24h,
+      x402_borrows_total: x402Borrows.x402_borrows_total,
+      last_x402_borrow_at: x402Borrows.last_x402_borrow_at || null,
+      last_x402_borrow_tx: x402Borrows.last_x402_borrow_tx || null,
       // Standard SPL rail (USDC/wSOL) — reported in native atomic units (USDC 6dp,
       // wSOL 9dp), NEVER folded into the SOL revenue above.
       standard_rail: {
