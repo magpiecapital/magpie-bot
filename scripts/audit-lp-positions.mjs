@@ -9,9 +9,10 @@ const conn = new Connection(RPC, "confirmed");
 
 const LENDER = new PublicKey("4JSSSaG3xRomQsrxmdQEsahfyFjBVjvuoBKJUUZgzPAx");
 
+const IDL_DIR = process.env.MAGPIE_IDL_DIR || "./src/solana/idl";
 const TARGETS = [
-  ["V1", "/Users/USER/bagbank-bot/src/solana/idl/magpie_lending.json", "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh"],
-  ["V2", "/Users/USER/bagbank-bot/src/solana/idl/magpie_lending_v2.json", "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe"],
+  ["V1", `${IDL_DIR}/magpie_lending.json`, "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh"],
+  ["V2", `${IDL_DIR}/magpie_lending_v2.json`, "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe"],
 ];
 
 for (const [name, idlPath, programIdStr] of TARGETS) {
