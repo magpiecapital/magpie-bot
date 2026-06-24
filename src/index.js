@@ -155,6 +155,7 @@ import { setSecurityAlertBot } from "./services/security-alerts.js";
 import { setLenderAlarmBot } from "./api/lender-alarm-webhook.js";
 import { setNotifyBot } from "./services/admin-notify.js";
 import { startDailyOpsReport } from "./services/daily-ops-report.js";
+import { startX402DailyDigest } from "./services/x402-daily-digest.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
 import { startPriceAttestor } from "./services/price-attestor.js";
@@ -742,6 +743,7 @@ bot.start({
       m.startShadowPoolWatcher(),
     );
     setTimeout(() => startDailyOpsReport(bot), 60_000);
+    setTimeout(() => startX402DailyDigest(bot), 75_000);
     startUsedNoncesCleaner();
     // startDepositWatcher(bot);
     setTimeout(() => startLoanWatcher(bot), 5_000);
