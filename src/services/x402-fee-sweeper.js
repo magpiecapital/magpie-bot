@@ -70,10 +70,16 @@ function envNumber(name, fallback) {
 }
 
 function isDisabled() {
+  // Kill switch always wins.
   const killV = (process.env.X402_FEE_SWEEP_DISABLED || "").toLowerCase();
   if (killV === "1" || killV === "true" || killV === "yes") return true;
-  const enableV = (process.env.X402_FEE_SWEEP_ENABLED || "").toLowerCase();
-  return !(enableV === "1" || enableV === "true" || enableV === "yes");
+  // ENABLED by operator decision 2026-06-24 — x402 USDC fees now auto-convert
+  // to SOL and accrue to $MAGPIE holders. Previously gated behind
+  // X402_FEE_SWEEP_ENABLED (ship-safe off); the operator turned it on, so the
+  // default is now ON. Risk is bounded by: the 1-USDC threshold (won't act on
+  // dust), pre-flight sim on every swap, idempotent holder accrual, and the
+  // kill switch above. X402_FEE_SWEEP_ENABLED is kept as a no-op for back-compat.
+  return false;
 }
 
 const INTERVAL_MS = envNumber("X402_FEE_SWEEP_INTERVAL_MS", 60 * 60 * 1000); // 1h
