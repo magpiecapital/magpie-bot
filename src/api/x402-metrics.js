@@ -155,6 +155,84 @@ export async function handleX402Record(req) {
 }
 
 /**
+ * POST /api/v1/internal/x402/release
+ *
+ * Two-phase claim release (audit FIX 3). The x402 gateway claims a payment
+ * signature in x402_paid_calls BEFORE serving (single-use enforcement). If the
+ * downstream handler then fails for an INFRA reason (bot 5xx / timeout / threw),
+ * the agent paid but got nothing, and the consumed claim would otherwise block
+ * a retry (payment_already_consumed) — the agent loses its SOL with no recourse.
+ * The gateway calls this to RELEASE the claim so the SAME payment re-drives the
+ * handler within the 10-min nonce window. Idempotent: a repeat release is a
+ * clean no-op.
+ *
+ * Reverses BOTH the single-use claim AND the holder-pool accrual that
+ * handleX402Record made (the call was never delivered, so it must not earn
+ * holder rewards), each keyed on the signature so it's exact. Accrual is
+ * reversed FIRST so a partial failure can never leave a double-accrual on retry.
+ * Internal-token gated — only the gateway (which made the claim) calls it.
+ */
+export async function handleX402Release(req) {
+  if (!INTERNAL_API_TOKEN) {
+    return { status: 503, body: { error: "service_not_configured" } };
+  }
+  const presented = req.headers["x-internal-token"];
+  if (!constantTimeEqual(presented, INTERNAL_API_TOKEN)) {
+    return { status: 401, body: { error: "Invalid or missing API key" } };
+  }
+  let body;
+  try {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return { status: 400, body: { error: "Invalid JSON body" } };
+  }
+  const txSignature = String(body?.tx_signature ?? "");
+  if (!isValidTxSig(txSignature)) {
+    return { status: 400, body: { error: "invalid_signature" } };
+  }
+
+  // 1. Reverse the holder-pool accrual (if any) — atomic delete-credit +
+  //    decrement-pool in ONE statement so a retry is a clean no-op and the pool
+  //    can never drift from the ledger. Mirrors the accrual's idempotency.
+  let accrualReversed = false;
+  try {
+    const { rows } = await query(
+      `WITH del AS (
+         DELETE FROM pool_credit_events
+          WHERE source_type = 'x402_fee' AND source_id = $1 AND pool_kind = 'holder'
+         RETURNING lamports
+       )
+       UPDATE magpie_holder_pool
+          SET accrued_lamports = accrued_lamports - COALESCE((SELECT lamports FROM del), 0),
+              updated_at = NOW()
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM del)
+       RETURNING accrued_lamports`,
+      [txSignature],
+    );
+    accrualReversed = rows.length > 0;
+  } catch (err) {
+    console.warn("[x402-metrics] release accrual-reversal failed:", err.message?.slice(0, 200));
+  }
+
+  // 2. Un-claim the signature so the agent can retry the same payment.
+  let released = false;
+  try {
+    const { rows } = await query(
+      `DELETE FROM x402_paid_calls WHERE tx_signature = $1 RETURNING tx_signature`,
+      [txSignature],
+    );
+    released = rows.length > 0;
+  } catch (err) {
+    console.warn("[x402-metrics] release claim-delete failed:", err.message?.slice(0, 200));
+    return { status: 500, body: { error: "release_failed" } };
+  }
+
+  return { status: 200, body: { released, accrual_reversed: accrualReversed } };
+}
+
+/**
  * GET /api/v1/public/x402-metrics
  *
  * Free, public, cached upstream. Returns 24h-window aggregates for the
