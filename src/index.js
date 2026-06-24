@@ -190,6 +190,7 @@ import { registerLcRetryingCallbacks } from "./handlers/lc-retrying-callbacks.js
 import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startBorrowCanary } from "./services/borrow-canary.js";
+import { startX402PathCanary } from "./services/x402-path-canary.js";
 import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
 import { ensureX402DestinationAtas } from "./services/x402-destination-atas.js";
 import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
@@ -986,6 +987,17 @@ bot.start({
     // first success after a fail. Catches every "users would currently
     // see this class" degradation within 60s. Mandated 2026-06-19 PM.
     setTimeout(() => startBorrowCanary(bot), 110_000);
+    // x402-path canary — every ~5 min, drives the cross-service
+    // x402 → bot → cosign borrow CONTRACT (HOP1 x402 /health, HOP2 x402
+    // discovery doc, HOP3 inner build-borrow summary + x402 field-shape
+    // transform, HOP4 cosign field-name, HOP5 build-repay field-contract).
+    // BUILD-ONLY: never pays, signs, or cosigns — zero SOL, zero on-chain
+    // effect. Catches auth/PUBLIC_ROUTES omission, proxy field rename,
+    // summary-shape drift, and cosign field rename — the cross-service
+    // failure class borrow-canary cannot see. DMs operator on 2 consecutive
+    // fails per hop, recovery DM on first success, logs to
+    // conversion_events(path='x402_path_canary').
+    setTimeout(() => startX402PathCanary(bot), 115_000);
     // Boot-time V4 PriceFeed sync — at +90s, walk every enabled
     // supported_mints entry and ensure the V4 PriceFeed PDA exists.
     // Eliminates the AccountNotInitialized class for never-borrowed-
