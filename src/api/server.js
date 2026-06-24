@@ -1650,6 +1650,10 @@ const PUBLIC_ROUTES = new Set([
   // handler level (same pattern as the agent endpoints), so we list
   // it as "public" at the API-key layer to bypass the API-key gate.
   "/api/v1/internal/x402/record",
+  // Internal two-phase release (audit FIX 3) — un-claims a payment signature
+  // + reverses its holder accrual when the downstream handler failed, so the
+  // paid agent can retry. Same INTERNAL_API_TOKEN handler-level auth.
+  "/api/v1/internal/x402/release",
   // Internal agent-limit-close arm/read/cancel — same INTERNAL_API_TOKEN
   // model. The x402 service is the only legitimate caller; it has
   // already verified the agent's x402 payment and proven (via the
@@ -2001,6 +2005,11 @@ async function router(req, res) {
       case "/api/v1/internal/x402/record": {
         const { handleX402Record } = await import("./x402-metrics.js");
         result = await handleX402Record(req);
+        break;
+      }
+      case "/api/v1/internal/x402/release": {
+        const { handleX402Release } = await import("./x402-metrics.js");
+        result = await handleX402Release(req);
         break;
       }
       case "/api/v1/internal/agent/limit-close/arm": {
