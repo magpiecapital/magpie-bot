@@ -984,6 +984,46 @@ export async function applyStartupPatches() {
      VALUES ('MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1')
      ON CONFLICT DO NOTHING`,
 
+    // $SNDK — SanDisk tokenized stock (Backpack Securities, Token-2022),
+    // operator-trusted MANUAL approval (full authorization 2026-06-24).
+    // Identical profile to $MU: category='stock' so it (a) shows in the site's
+    // Tokenized Stocks column, (b) routes to V3 (no-exit) + V4 (with-exit) per
+    // chooseProgramId RWA routing, (c) is force-kept hot+protected by the
+    // stocks-rwa-protection-sentinel so it can NEVER be auto-disabled and its
+    // V3/V4 price_feed PDAs stay pre-warmed (boot + 30-min attestor walks every
+    // enabled mint; hot tier keeps the 8-sample TWAP window filled — required
+    // for the V3/V4 TWAP gate on low-liquidity xStocks). decimals=6 + Token-2022
+    // owner + name "Sandisk - Backpack Securities" verified on-chain; Jupiter
+    // prices it (~$1,938) so the attestor fills the TWAP window. ON CONFLICT
+    // re-asserts symbol/name/category/enabled/protected/hot on EVERY boot, so no
+    // health watcher / screener can ever take it off or mis-categorize it.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('SNDKbwMUQvZhnLnxLduradgLHG5KrPuKwpnrkkGRhfH',
+             'SNDK', 'SanDisk', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'SNDK',
+       name = 'SanDisk',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from ever re-processing $SNDK (operator-trusted, exempt).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('SNDKbwMUQvZhnLnxLduradgLHG5KrPuKwpnrkkGRhfH')
+     ON CONFLICT DO NOTHING`,
+
     // $QUEST — operator-trusted MANUAL approval (full approval 2026-06-23).
     // pump.fun memecoin (Token-2022, mint + freeze authority both renounced,
     // decimals=6, verified on-chain). category='memecoin' → routes V1 (no-exit) +
