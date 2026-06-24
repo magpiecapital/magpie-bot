@@ -1667,6 +1667,21 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/internal/agent/limit-close/list",
   "/api/v1/internal/agent/limit-close/delegations",
   "/api/v1/internal/agent/limit-close/eligible-loans",
+  // PAID agent endpoints (x402). The x402 service forwards to these with
+  // X-Internal-Token AFTER it has verified the agent's on-chain x402 payment;
+  // each handler enforces INTERNAL_API_TOKEN at the handler level (agent.js /
+  // agent-repay.js / agent-manage.js / agent-intents.js — same pattern as the
+  // internal endpoints above). They MUST bypass the external x-api-key gate
+  // (authenticateRequest) — otherwise the x402 service's internal token is
+  // rejected with "Invalid or missing API key" (401) and EVERY agent borrow/
+  // repay is charged-but-denied. ROOT-CAUSE FIX: these were never added here.
+  "/api/v1/agent/build-borrow",
+  "/api/v1/agent/build-repay",
+  "/api/v1/agent/build-extend",
+  "/api/v1/agent/build-topup",
+  "/api/v1/agent/build-partial-repay",
+  "/api/v1/agent/intent",
+  "/api/v1/agent/intents",
   // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
   // so the on-chain feed is fresh by the time the wallet simulates the
   // tx — closes the window where Phantom rejects with StalePriceAttestation
