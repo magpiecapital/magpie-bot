@@ -484,7 +484,17 @@ async function armOrderImpl({
         WHERE user_id = $1 AND loan_id = $2`,
       [userId, loanIdChain],
     );
-    if (rows.length > 0) {
+    if (rows.length > 1) {
+      // Defensive (audit low #8): (user_id, loan_id) is expected to resolve to
+      // exactly one row because loans.loan_id is globally UNIQUE. If that ever
+      // changes (per-program scoping), this lookup would be ambiguous and could
+      // arm an exit against the WRONG program. Refuse rather than guess at rows[0].
+      console.error(
+        `[limit-close-arm] CRIT ambiguous loan lookup: ${rows.length} rows for user=${userId} loan_id=${loanIdChain} — loans.loan_id uniqueness violated; refusing to arm`,
+      );
+      break; // exits with loan=null → clean failure path below
+    }
+    if (rows.length === 1) {
       loan = rows[0];
       break;
     }
