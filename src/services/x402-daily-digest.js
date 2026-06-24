@@ -83,6 +83,15 @@ async function buildDigest() {
     `💸 x402 fees collected (24h):  *${sol(x.fees_24h ?? 0)} SOL*`,
     `🏦 Protocol borrows (24h):  *${b.borrows_24h ?? 0}*  ·  *${sol(b.vol_24h ?? 0)} SOL*`,
     ``,
+    // At-a-glance net economics — the operator's question: does x402 raise daily
+    // cost? No: agents are the tx fee payer on their own borrows/repays, so the
+    // deployer/lender wallet spends 0 SOL of gas per agent loan, while every paid
+    // call earns the x402 fee above. Incremental infra is ~pennies of RPC/borrow;
+    // the real cost lever stays attestation (per-mint, tier-governed) — not x402.
+    `💵 *Net economics (24h)* — in: *${sol(x.fees_24h ?? 0)} SOL* x402 fees.`,
+    `   Deployer gas on agent loans: *0* (agents pay their own). ~pennies RPC/borrow;`,
+    `   attestation is per-mint + tier-governed. Each agent borrow earns > it costs → net-positive.`,
+    ``,
     `_7d — agents ${x.agents_7d ?? 0} · calls ${x.calls_7d ?? 0} · fees ${sol(x.fees_7d ?? 0)} SOL · borrows ${b.borrows_7d ?? 0}_`,
   ];
   if (c24 === 0) {
