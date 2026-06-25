@@ -428,18 +428,28 @@ export async function snapshotAndDistributeLpLoyalty() {
     console.warn("[lp-loyalty] lp_loyalty_exempt_wallets read failed (using empty exemption set):", err.message);
   }
 
-  // Compute weights
+  // Compute weights.
+  //
+  // EXEMPT WALLETS STAY IN THE DENOMINATOR but are NOT paid (operator decision
+  // 2026-06-25, "calculate the figure with my share taken out"). The operator's
+  // lender wallet is ~96% of LP weight; if it were dropped from the denominator
+  // too, the remaining third-party LPs would be re-normalized onto the FULL pool
+  // (a ~26x windfall over what they earned). Instead, each third-party LP gets
+  // ONLY its own proportional share (weight / totalWeight × pool), and the exempt
+  // wallet's proportional slice is left UNDISTRIBUTED — the pool is decremented by
+  // allocatedSum (below), so that slice carries forward in lp_loyalty_pool.
+  // See [[feedback_lender_wallet_exempt_from_lp_loyalty]].
   let totalWeight = 0n;
   const items = [];
   for (const r of rows) {
-    if (exempt.has(r.wallet_address)) continue;
     const shares = BigInt(r.shares);
     const seconds = BigInt(r.seconds_held ?? 0);
     if (seconds <= 0n) continue; // brand-new deposits get no loyalty this round
     const weight = shares * seconds;
     if (weight <= 0n) continue;
+    totalWeight += weight; // exempt counts toward the denominator…
+    if (exempt.has(r.wallet_address)) continue; // …but receives no payout row
     items.push({ wallet: r.wallet_address, shares, seconds, weight });
-    totalWeight += weight;
   }
   if (totalWeight === 0n || items.length === 0) return null;
 
