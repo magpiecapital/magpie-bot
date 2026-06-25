@@ -174,6 +174,15 @@ export const PROPOSALS = {
     question_id: "Vote",
     choices: ["A", "B", "C", "D", "ABSTAIN"],
     abstain_discretion_pct: 30.0, // ABSTAIN >= 30% of weight -> operator discretion among A-D
+    // Operator executes the winning option's Streamflow lock/burn MANUALLY (no
+    // Streamflow integration in the bot). At close the autopilot DMs the operator
+    // the winning option's exact instructions from this map (see pipeline.js).
+    per_option_execution: {
+      A: "PATIENCE — Re-lock 100% (~50M $MAGPIE) into a NEW Streamflow vesting contract: 36-month linear vest ending July 2029, same beneficiary, full unlocked balance, no cliff.",
+      B: "LOYALTY — Distribute 100% (~50M) to current $MAGPIE holders via a 24-month linear Streamflow vest, pro-rata by the close snapshot (governance_snapshot_weights snapshot_id 'MGP-003_close'), ~0.137%/day each.",
+      C: "BUILD — Move 100% (~50M) to the multi-sig Magpie Treasury, Streamflow-locked >= 24 months; spend only the pre-declared categories; log on /distributions.",
+      D: "DISCIPLINE + BUILD — (1) Burn 50% (~25M) permanently via SPL burn from the holding wallet; (2) lock the other 50% (~25M) in the Growth Treasury (Option C terms, 24-month).",
+    },
     implementation_plan: [
       {
         type: "manual_required",

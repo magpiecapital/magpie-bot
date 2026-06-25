@@ -406,6 +406,21 @@ export async function processProposal(proposal) {
     is_multi_choice: isMultiChoice,
   };
 
+  // Multi-choice winner → DM the operator the EXACT manual-execution instructions
+  // for the winning option (operator does the Streamflow lock / SPL burn by hand;
+  // this is a guided HANDOFF, not an autonomous on-chain fire).
+  if (isMultiChoice && winnerChoice && proposal.per_option_execution?.[winnerChoice]) {
+    await operatorDm(
+      `🏛️ ${proposalId} closed — WINNER: Option ${winnerChoice} (${winnerSharePct.toFixed(1)}% of cast).\n\n` +
+        `EXECUTE MANUALLY (within 14 days of the July 1 unlock):\n${proposal.per_option_execution[winnerChoice]}\n\n` +
+        `When done, confirm so the site can mark it executed.`,
+    );
+  } else if (isMultiChoice && outcome === "operator_discretion") {
+    await operatorDm(
+      `🏛️ ${proposalId} closed — NO CLEAR WINNER (ABSTAIN reached the discretion threshold, or an exact tie). Operator discretion: pick among A-D and execute manually.`,
+    );
+  }
+
   // ── STEP 4: PERSIST RESULT ──────────────────────────────────────
   {
     const t0 = Date.now();
@@ -490,18 +505,36 @@ export async function processProposal(proposal) {
     }
     const variables = buildVariables({ proposal, tally, outcome, snapshotHash });
     const renderedText = renderTemplate(proposal.announcement_template, variables);
-    const sendResult = await sendAnnouncement({
-      proposalId,
-      outcome,
-      chatId: COMMUNITY_CHAT_ID,
-      renderedText,
-      botToken: BOT_TOKEN,
-    });
-    await log("announce", sendResult.ok ? "ok" : "failed", sendResult.detail, null, Date.now() - t0);
-    await query(
-      `UPDATE governance_proposal_state SET announcement_status = $1, updated_at = NOW() WHERE proposal_id = $2`,
-      [sendResult.ok ? "sent" : "send_failed", proposalId],
-    );
+    // NO-AUTONOMOUS-GOVERNANCE-BROADCAST rule (feedback_no_autonomous_governance_broadcasts):
+    // by DEFAULT we do NOT auto-post the result to the community chat — we DM the
+    // rendered draft to the OPERATOR for approval. Only an explicit
+    // GOVERNANCE_AUTO_ANNOUNCE=true opts into auto-send.
+    if (process.env.GOVERNANCE_AUTO_ANNOUNCE === "true") {
+      const sendResult = await sendAnnouncement({
+        proposalId,
+        outcome,
+        chatId: COMMUNITY_CHAT_ID,
+        renderedText,
+        botToken: BOT_TOKEN,
+      });
+      await log("announce", sendResult.ok ? "ok" : "failed", sendResult.detail, null, Date.now() - t0);
+      await query(
+        `UPDATE governance_proposal_state SET announcement_status = $1, updated_at = NOW() WHERE proposal_id = $2`,
+        [sendResult.ok ? "sent" : "send_failed", proposalId],
+      );
+    } else {
+      await operatorDm(
+        `📋 GOVERNANCE RESULT — your approval needed before broadcast (NOT posted to the community).\n\n` +
+          `Proposal ${proposalId} closed · outcome: ${outcome}\n\n` +
+          `Draft announcement:\n${renderedText}\n\n` +
+          `Broadcast it yourself when ready (per the no-auto-broadcast rule).`,
+      );
+      await log("announce", "drafted_pending_operator", { outcome }, null, Date.now() - t0);
+      await query(
+        `UPDATE governance_proposal_state SET announcement_status = 'drafted_pending_operator', updated_at = NOW() WHERE proposal_id = $1`,
+        [proposalId],
+      );
+    }
   } else {
     await log("announce", "skipped", { reason: "no_template_or_chat_id_unset" }, null, 0);
   }
