@@ -122,10 +122,28 @@ async function probeTwap(mint) {
       throw new Error(`twap http_${res.status}`);
     }
     const body = await res.json();
-    if (!body || body.error || !body.twap_lamports_per_whole) {
-      throw new Error(body?.error || "twap_missing_field");
+    if (!body) throw new Error("twap_empty_response");
+    if (body.error) throw new Error(body.error);
+    // Key off the endpoint's STABLE contract — its `recommendation` enum — NOT a
+    // specific field name. (The old check looked for `twap_lamports_per_whole`,
+    // but the endpoint emits `twap_lamports_per_whole_token`; that field-name
+    // drift made the canary throw `twap_missing_field` on perfectly healthy
+    // responses. Keying off `recommendation` can't drift on a rename.)
+    //
+    // - use_precise_value  → healthy precise TWAP (verify the value is present).
+    // - wait_for_warmup    → FUNCTIONAL: the site falls back to fallback_multiplier
+    //                        (0.89) and the borrow still succeeds, so this is NOT a
+    //                        user-facing borrow failure. Pass it as a soft "warming"
+    //                        state (visible in logs, never alarms).
+    if (body.recommendation === "wait_for_warmup") {
+      return { ok: true, latencyMs: Date.now() - start, warming: body.reason || true };
     }
-    return { ok: true, latencyMs: Date.now() - start };
+    if (body.recommendation === "use_precise_value" && body.twap_lamports_per_whole_token) {
+      return { ok: true, latencyMs: Date.now() - start };
+    }
+    // 200 but neither a usable precise value nor a warmup fallback — a real data
+    // shape problem a borrower could actually hit.
+    throw new Error("twap_unexpected_shape");
   } catch (e) {
     return { ok: false, latencyMs: Date.now() - start, error: e, class: classifyError(e) };
   }
