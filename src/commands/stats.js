@@ -133,14 +133,38 @@ export async function handleStats(ctx) {
       if (hp?.accr) holderAccrued = BigInt(hp.accr);
     } catch { /* table absent in old deploys */ }
     try {
+      // SOL LPs = THIRD-PARTY net (operator's exempt lender wallet taken out) —
+      // gross pool × (non-exempt LP weight / total weight), weight = shares ×
+      // seconds_held. Mirrors the distributor + magpie.capital/stats so every
+      // surface shows the same number. See feedback_lender_wallet_exempt_from_lp_loyalty.
       const { rows: [lp] } = await query(
-        `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM lp_loyalty_pool WHERE id = 1`,
+        `SELECT COALESCE(
+           (SELECT accrued_lamports FROM lp_loyalty_pool WHERE id = 1)::numeric
+           * COALESCE(
+               (SELECT SUM(shares * EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)))
+                  FROM lp_positions
+                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0
+                   AND wallet_address NOT IN (SELECT wallet_address FROM lp_loyalty_exempt_wallets))
+               / NULLIF(
+               (SELECT SUM(shares * EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)))
+                  FROM lp_positions
+                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0), 0)
+             , 1)
+         , 0)::bigint::text AS accr`,
       );
       if (lp?.accr) lpAccrued = BigInt(lp.accr);
     } catch { /* */ }
     try {
+      // Protocol reserve = PER-CYCLE (accrued since the last $MAGPIE snapshot),
+      // resets to 0 each distribution — Snapshot-rewards numbers must not
+      // accumulate. Mirrors magpie.capital/stats. See
+      // feedback_stats_snapshot_rewards_reset_per_cycle.
       const { rows: [pr] } = await query(
-        `SELECT COALESCE(accrued_lamports, 0)::text AS accr FROM protocol_reserve_pool WHERE id = 1`,
+        `SELECT COALESCE((
+           SELECT SUM(reward_lamports) FROM protocol_reserve_events
+            WHERE created_at > COALESCE(
+              (SELECT MAX(created_at) FROM magpie_holder_distributions), '1970-01-01'::timestamptz)
+         ), 0)::text AS accr`,
       );
       if (pr?.accr) reserveAccrued = BigInt(pr.accr);
     } catch { /* migration 049 not yet applied */ }
