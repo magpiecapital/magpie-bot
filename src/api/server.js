@@ -1682,6 +1682,15 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/agent/build-partial-repay",
   "/api/v1/agent/intent",
   "/api/v1/agent/intents",
+  // PUBLIC risk reads. The x402 token-risk handler (magpie-x402 routes/token-risk.ts)
+  // forwards here WITHOUT an auth header after charging the agent 0.001 SOL, then
+  // passes our status straight through. Not in PUBLIC_ROUTES => the external x-api-key
+  // gate 401s => the agent is charged-but-denied and CANNOT obtain a risk score, so an
+  // autonomous agent can never clear its risk gate to borrow. These are read-only risk
+  // scores (no PII, no mutation), safe to serve publicly like /api/v1/public/*. Found
+  // LIVE 2026-06-24 (dry-run skips the paid risk call, so it was never exercised before).
+  "/api/v1/risk/token",
+  "/api/v1/risk/flagged",
   // Pre-borrow price refresh. Site calls this BEFORE buildBorrowTransaction
   // so the on-chain feed is fresh by the time the wallet simulates the
   // tx — closes the window where Phantom rejects with StalePriceAttestation
