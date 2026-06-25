@@ -138,6 +138,60 @@ export const PROPOSALS = {
     implementation_plan: [],
     announcement_template: null,
   },
+
+  /**
+   * MGP-003 — July 1, 2026 Streamflow unlock allocation (~5% of supply).
+   *
+   * Added to the canonical registry 2026-06-25 after it was found LIVE in the
+   * vote-submission registry (src/api/governance-api.js ACTIVE_PROPOSALS) ONLY —
+   * a split-brain. tally/voting-power/pipeline all read THIS file via
+   * getProposal()/listProposalIds(), so MGP-003 was invisible to them: live
+   * results 404'd ("Unknown proposal") and the vote would have gone nowhere at
+   * close. See feedback_governance_lifecycle_automation_mandate.
+   *
+   * Electorate model: CURRENT HOLDERS (close-time) — operator decision
+   * 2026-06-25. snapshot_mode 'at_close' => the pipeline re-snapshots holders at
+   * close (Jun 29) for the BINDING tally (snapshot_id 'MGP-003_close'). A
+   * full-holder 'MGP-003' snapshot is generated now (scripts/governance-live-snapshot.js)
+   * to power LIVE results during voting.
+   *
+   * Multi-choice ballot (A/B/C/D + ABSTAIN): plurality winner needs > 40% of
+   * cast; ABSTAIN >= 30% of weight -> operator discretion among A-D. NOTE: the
+   * generic pipeline tally is YES/NO; the plurality+abstain winner determination
+   * and the on-chain executor are tracked separately (do NOT auto-fire at close
+   * until built). implementation_plan is manual_required for now.
+   */
+  "MGP-003": {
+    id: "MGP-003",
+    title: "Allocation decision for the July 1, 2026 $MAGPIE Streamflow unlock (~5% of supply)",
+    proposal_type: "allocation_vote",
+    voting_started_at_iso: "2026-06-25T00:00:00Z",
+    voting_ends_at_iso: "2026-06-30T00:00:00Z",
+    quorum_pct: 7.5,
+    threshold_pct: 40.0, // plurality: winning option needs > 40% of cast votes
+    snapshot_id: "MGP-003",
+    snapshot_mode: "at_close",
+    question_id: "Vote",
+    choices: ["A", "B", "C", "D", "ABSTAIN"],
+    abstain_discretion_pct: 30.0, // ABSTAIN >= 30% of weight -> operator discretion among A-D
+    implementation_plan: [
+      {
+        type: "manual_required",
+        description:
+          "Execute the winning allocation option on-chain (A 36mo re-lock / B 24mo holder vest / C locked treasury / D 50% burn + 50% treasury). The autonomous executor is under construction; until it is wired + adversarially verified, the autopilot tallies + determines the winner + alerts, but does NOT fire the irreversible on-chain action.",
+        alert_text:
+          "MGP-003 closed. The on-chain execution (Streamflow re-lock / holder vest / treasury / burn) is pending the autonomous governance executor. Do NOT auto-fire.",
+      },
+    ],
+    announcement_template:
+      "MGP-003 — {{title}} — RESULT\n\n" +
+      "Winning option: {{outcome}}\n" +
+      "Participation: {{participation_pct}}% of eligible weight (quorum {{quorum_pct}}%)\n" +
+      "Winner share: {{winner_pct}}% of cast (plurality threshold {{threshold_pct}}%)\n\n" +
+      "{{outcome_message}}\n\n" +
+      "Full proposal: magpie.capital/governance/proposal/MGP-003\n" +
+      "Verifiable via snapshot hash {{snapshot_hash_short}}.",
+  },
 };
 
 /**
