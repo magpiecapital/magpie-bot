@@ -22,6 +22,14 @@
 import { readdirSync } from "node:fs";
 import { tallyProposal } from "../governance/tally.js";
 import { getProposal } from "../governance/registry.js";
+import { query } from "../db/pool.js";
+
+// A clean, FINAL outcome the site can flip a proposal to "completed" on. Error /
+// in-flight states (anomaly_held, pipeline_error, pending, in_progress, null) are
+// deliberately excluded — those must NOT auto-complete a proposal.
+function isFinalOutcome(o) {
+  return o === "passed" || o === "failed" || o === "operator_discretion" || /^[A-E]$/.test(o || "");
+}
 
 const SNAPSHOT_DIR = process.env.GOVERNANCE_SNAPSHOT_DIR || `${process.env.HOME}/.magpie-private/snapshots`;
 const CACHE_TTL_MS = 30_000;
@@ -121,6 +129,33 @@ export async function handleGovernanceTally(req, url) {
     computed_at: tally.computed_at,
     cap_fraction: tally.cap_fraction,
   };
+
+  // ── Final outcome (set by the autopilot at close) ──────────────────────────
+  // Once voting has ended and the pipeline has computed + persisted the result,
+  // expose it so the SITE can auto-flip the proposal to its final state (winning
+  // option / passed / failed / operator_discretion) with NO manual edit. Null
+  // while voting is open or before the autopilot has run.
+  const votingEnded =
+    proposal.voting_ends_at_iso && now >= Date.parse(proposal.voting_ends_at_iso);
+  if (votingEnded) {
+    try {
+      const { rows } = await query(
+        `SELECT outcome, closed_at, tally_json->'outcome_detail' AS outcome_detail
+           FROM governance_proposal_state WHERE proposal_id = $1`,
+        [proposalId],
+      );
+      const st = rows[0];
+      if (st && isFinalOutcome(st.outcome)) {
+        body.outcome = {
+          result: st.outcome, // "A" | "passed" | "failed" | "operator_discretion"
+          closed_at: st.closed_at,
+          ...(st.outcome_detail || {}),
+        };
+      }
+    } catch (err) {
+      console.error("[gov-tally] outcome read failed (non-fatal):", err.message);
+    }
+  }
 
   cache.set(proposalId, { expiresAt: now + CACHE_TTL_MS, body });
   return { status: 200, body };
