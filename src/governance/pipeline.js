@@ -337,9 +337,74 @@ export async function processProposal(proposal) {
   }
 
   // ── Compute outcome ─────────────────────────────────────────────
+  // Multi-choice (allocation_vote) ballots use PLURALITY + an ABSTAIN
+  // discretion gate; yes/no proposals keep the original threshold logic
+  // untouched (NEVER-BREAK-EXISTING). Detect multi-choice via the
+  // abstain_discretion_pct field (only set on allocation-style ballots) or a
+  // >3-option choice list.
   const quorumMet = tally.percentages.participation_pct >= proposal.quorum_pct;
-  const thresholdMet = tally.percentages.yes_share_of_cast_pct >= proposal.threshold_pct;
-  const outcome = (quorumMet && thresholdMet) ? "passed" : "failed";
+  let outcome;
+  let thresholdMet = false;
+  let winnerChoice = null;
+  let winnerSharePct = 0;
+  const isMultiChoice =
+    typeof proposal.abstain_discretion_pct === "number" ||
+    (Array.isArray(proposal.choices) && proposal.choices.length > 3);
+
+  if (isMultiChoice) {
+    const perChoice = tally.weights.per_choice || {};
+    const castWeight = BigInt(tally.weights.cast_weight || "0");
+    // ABSTAIN gate FIRST: if ABSTAIN is >= the discretion threshold as a share
+    // of CAST votes, defer to operator discretion among the options. (% of cast,
+    // not of total-eligible — with low participation, % of total could never
+    // reach the gate, making the fallback meaningless.)
+    const abstainRaw = BigInt(perChoice.ABSTAIN || tally.weights.abstain_weight || "0");
+    const abstainPctOfCast =
+      castWeight === 0n ? 0 : Number((abstainRaw * 1000000n) / castWeight) / 10000;
+    const abstainGate =
+      typeof proposal.abstain_discretion_pct === "number" ? proposal.abstain_discretion_pct : Infinity;
+
+    if (abstainPctOfCast >= abstainGate) {
+      outcome = "operator_discretion";
+    } else {
+      // Plurality among the non-ABSTAIN options.
+      let topWeight = -1n;
+      let tie = false;
+      for (const [choice, raw] of Object.entries(perChoice)) {
+        if (String(choice).toUpperCase() === "ABSTAIN") continue;
+        const w = BigInt(raw || "0");
+        if (w > topWeight) { topWeight = w; winnerChoice = choice; tie = false; }
+        else if (w === topWeight && w > 0n) { tie = true; }
+      }
+      winnerSharePct =
+        castWeight === 0n || topWeight <= 0n ? 0 : Number((topWeight * 1000000n) / castWeight) / 10000;
+      // Plurality needs a STRICT majority of the bar set by threshold_pct (40%).
+      thresholdMet = winnerSharePct > proposal.threshold_pct;
+      if (tie) {
+        outcome = "operator_discretion"; // exact tie → operator breaks it
+        winnerChoice = null;
+      } else if (quorumMet && thresholdMet) {
+        outcome = winnerChoice; // e.g. "A" — the winning option
+      } else {
+        outcome = "failed"; // quorum miss or no option cleared the plurality bar
+      }
+    }
+  } else {
+    // Original yes/no path — unchanged.
+    thresholdMet = tally.percentages.yes_share_of_cast_pct >= proposal.threshold_pct;
+    outcome = quorumMet && thresholdMet ? "passed" : "failed";
+  }
+
+  // Thread the winner detail into the persisted tally so the site + announcement
+  // can show "Option A won with 47% of cast" without recomputing.
+  tally.outcome_detail = {
+    outcome,
+    winner_choice: winnerChoice,
+    winner_share_pct: winnerSharePct,
+    quorum_met: quorumMet,
+    threshold_met: thresholdMet,
+    is_multi_choice: isMultiChoice,
+  };
 
   // ── STEP 4: PERSIST RESULT ──────────────────────────────────────
   {
