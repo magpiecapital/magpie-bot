@@ -1055,6 +1055,48 @@ export async function applyStartupPatches() {
      VALUES ('Et3nNiuGyhQxwVW3W8pLTvsMXcSKiyogHrNjdr4wpoke')
      ON CONFLICT DO NOTHING`,
 
+    // $DRAM — Roundhill Memory ETF (Backpack Securities, Token-2022),
+    // operator-trusted MANUAL approval + full authorization 2026-06-26.
+    // category='etf' so it (a) shows in the site's Tokenized Stocks / RWA
+    // group (marketplace page filters category IN stock|etf|metal), (b)
+    // routes to V3 (no-exit) + V4 (with-exit) per chooseProgramId RWA
+    // routing (RWA_CATEGORIES = {stock,etf,metal}; Token-2022 exits ride
+    // V4 in-vault), (c) is force-kept hot+protected by the
+    // stocks-rwa-protection-sentinel (extended this commit to cover
+    // etf/metal). decimals=6 + Token-2022 (mint+freeze authority held by
+    // Backpack) + name "Roundhill Memory ETF - Backpack Securities"
+    // verified on-chain; priced cross-source by Jupiter (~$73, Backpack
+    // feed) AND DexScreener (Raydium ~$73.3) so the attestor fills the
+    // 8-sample TWAP window. ON CONFLICT re-asserts
+    // symbol/name/category/enabled/protected/hot on EVERY boot, so no
+    // health watcher / screener can take it off or mis-categorize it.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('DRAMjSWR7HRfJKjRkvQWYL2bcaejaVhuxEcjf4pAY4Cw',
+             'DRAM', 'Roundhill Memory ETF', 6, 'etf', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'DRAM',
+       name = 'Roundhill Memory ETF',
+       category = 'etf',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from ever re-processing $DRAM (operator-trusted, exempt).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('DRAMjSWR7HRfJKjRkvQWYL2bcaejaVhuxEcjf4pAY4Cw')
+     ON CONFLICT DO NOTHING`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
