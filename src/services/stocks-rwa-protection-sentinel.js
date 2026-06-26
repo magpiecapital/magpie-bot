@@ -37,7 +37,7 @@ export async function enforceStocksRwaProtection(reason = "boot") {
           SET protected = TRUE,
               attestation_tier = 'hot'
         WHERE enabled = TRUE
-          AND category IN ('stock', 'rwa')
+          AND category IN ('stock', 'rwa', 'etf', 'metal')
           AND (protected = FALSE OR attestation_tier <> 'hot')
         RETURNING symbol, category, mint`,
     );
