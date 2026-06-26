@@ -39,7 +39,15 @@ import { query } from "../db/pool.js";
 export const URL_ALLOWLIST = new Set([
   "x.com/MagpieLoans",
   "twitter.com/MagpieLoans",
+  // Magpie's own properties — must never be auto-deleted as "not on allowlist".
+  // (The bare magpie.capital domain is allowed host-level in isAllowedUrl.)
+  "github.com/magpiecapital",
+  "t.me/magpie_capital_bot",
 ]);
+
+// Magpie-owned domains allowed at the DOMAIN level (any path) — links to the
+// official site should never be deleted by the link filter.
+export const OWN_DOMAINS = ["magpie.capital"];
 
 // Quarantine: new members can't post links/forwards and are rate-
 // limited for this many days. Captcha must still be passed before
@@ -91,6 +99,16 @@ function getVerifiedTgIds() {
   const s = new Set();
   const adminId = process.env.ADMIN_TG_ID;
   if (adminId) s.add(String(adminId));
+  // Operator-trusted community accounts exempt from ALL message moderation
+  // (the line-280 early-return in community-handlers). Comma-separated NUMERIC
+  // Telegram user IDs in MOD_EXEMPT_TG_IDS — IDs only, never usernames, so no
+  // handle is ever stored in code or env.
+  const exempt = process.env.MOD_EXEMPT_TG_IDS;
+  if (exempt) {
+    for (const id of exempt.split(",").map((x) => x.trim()).filter(Boolean)) {
+      if (/^\d{4,}$/.test(id)) s.add(String(id));
+    }
+  }
   // Bot itself: we'll add bot.botInfo.id dynamically at startup.
   // For now, leave caller to add it via setBotId() below.
   _verifiedTgIds = s;
@@ -307,6 +325,9 @@ export function isAllowedUrl(rawUrl) {
     }
     const parsed = new URL(u);
     const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    // Magpie's own domains are always allowed (any path) — official links
+    // (magpie.capital, docs.magpie.capital, …) must never be auto-deleted.
+    if (OWN_DOMAINS.some((d) => host === d || host.endsWith("." + d))) return true;
     // Twitter/X handles are case-insensitive (x.com/MagpieLoans ==
     // x.com/magpieloans on Twitter's side). Compare both sides
     // lowercased to avoid false rejects on case variants.
