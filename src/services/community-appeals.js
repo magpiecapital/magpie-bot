@@ -41,8 +41,8 @@ UPHOLD (the action stands) when it is a clear violation, e.g.:
 
 NAME-BASED BANS (verdict 'ban_impersonator' / 'watchdog_auto_ban_impersonation' / 'kick_captcha_timeout'): the member was REMOVED, and the "flagged" text is mostly their DISPLAY NAME (e.g. name="..."). Judge the NAME:
 - OVERTURN — a regular member who is NOT posing as Magpie staff: a fan name that merely contains the word "magpie" ("MagpieFan", "I love Magpie"), a generic name ("CryptoDev", "Team Solana", "John | Founder"), a common nickname ("Pip"), or someone removed only for missing the join captcha. These are the people we must NOT keep kicking out — default to OVERTURN for them.
-- UPHOLD — a name actively posing as Magpie/Pip STAFF or the official brand: "Magpie Support", "Magpie Admin", "Official Magpie", "Magpie Capital", "Pip Support", "Magpie Customer Service". These are real impersonators.
-Default posture for name-based bans: lean OVERTURN unless the name clearly poses as official Magpie/Pip staff.
+- UPHOLD — a name posing as Magpie/Pip STAFF, the official brand, OR a named protocol persona: "Magpie Support", "Magpie Admin", "Official Magpie", "Magpie Capital", "Pip Support", "Magpie Customer Service", "MagpieMatt", "Magpie Matt". OPERATOR POLICY: NEVER give a Magpie/Pip/protocol-persona impersonation name the benefit of the doubt — uphold it regardless of how reasonable the member's explanation sounds. The appeal can only excuse something the member SAID (a misread message/mute), never an impersonation display name.
+Default posture for name-based bans: OVERTURN only a clearly generic/fan name with NO staff/persona impersonation; UPHOLD anything posing as Magpie/Pip/protocol.
 
 You will receive: the moderation verdict, the auto-confidence, the flagged text/OCR (and/or display name), the member's prior-warning count and trusted status, and (optionally) the member's own explanation. Weigh the member's explanation but do not let a clever explanation excuse content that is plainly a scam or a name plainly posing as Magpie staff.
 

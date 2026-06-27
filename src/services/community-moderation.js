@@ -73,6 +73,13 @@ export const CAPTCHA_TIMEOUT_MS = 5 * 60 * 1000;
 // staff/official role, OR "Pip" used in a staff capacity. A brand word ALONE
 // or a generic role word ALONE is NOT enough. Residual edge cases self-heal
 // via the instant /appeal flow + the cleared-users memory.
+// Named Magpie protocol personas that must never be impersonated (e.g.
+// "MagpieMatt"). Env-extensible (comma-separated PROTECTED_PERSONA_NAMES) so a
+// new persona can be protected without a code change; "matt" is the default.
+const PROTECTED_PERSONA_NAMES = (process.env.PROTECTED_PERSONA_NAMES || "matt")
+  .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean);
+const PERSONA_ALT = (PROTECTED_PERSONA_NAMES.length ? PROTECTED_PERSONA_NAMES : ["matt"]).join("|");
+
 export const IMPERSONATION_PATTERNS = [
   // (Near-)exact brand name as the whole display name — no legitimate use.
   /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help))?\s*[.!]*$/i,
@@ -82,6 +89,9 @@ export const IMPERSONATION_PATTERNS = [
   /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|customer)\b/i,
   /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
   /\bofficial\s+magpie\b/i,
+  // Impersonating a named protocol persona — "MagpieMatt", "Magpie Matt".
+  new RegExp(`magpie[\\s._@-]*(${PERSONA_ALT})\\b`, "i"),
+  new RegExp(`\\b(${PERSONA_ALT})[\\s._@-]*magpie\\b`, "i"),
   // Posing as the in-chat assistant "Pip" in a staff/bot capacity (bare "Pip"
   // is a real nickname, so it alone no longer triggers a ban).
   /\bpip[\s._@-]*(support|admin|official|bot|team|mod|help)\b/i,
