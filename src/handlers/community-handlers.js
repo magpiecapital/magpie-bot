@@ -17,6 +17,7 @@
  */
 import { InlineKeyboard } from "grammy";
 import { isAdmin } from "../services/admin.js";
+import { query } from "../db/pool.js";
 import {
   isChatEnabled,
   isVerifiedAccount,
@@ -113,10 +114,29 @@ async function isChatAdmin(ctx, userId) {
 }
 
 /** Soft warning DM. If the user blocks the bot, falls back silent. */
-async function softWarn(ctx, userId, msg) {
+async function softWarn(ctx, userId, msg, replyMarkup) {
+  // The whole point of a soft-warn is that the user LEARNS why their message
+  // was actioned — so delivery must be reliable. Try Markdown for nice
+  // formatting; if the body has a stray markup char that 400s the parse, retry
+  // as plain text so the notice ALWAYS lands. Only a hard block (user never
+  // started the bot) is allowed to silently drop.
+  const base = { disable_web_page_preview: true };
+  if (replyMarkup) base.reply_markup = replyMarkup;
   try {
-    await ctx.api.sendMessage(userId, msg);
-  } catch { /* user blocked bot — silent */ }
+    await ctx.api.sendMessage(userId, msg, { ...base, parse_mode: "Markdown" });
+  } catch (e1) {
+    try {
+      await ctx.api.sendMessage(userId, msg, base);
+    } catch { /* user blocked bot / never opened DM — nothing we can do */ }
+  }
+}
+
+/** Inline keyboard offering a one-tap appeal that Pip reviews. The button
+ *  carries the originating mod-action id so the callback can pull full
+ *  context. Only attached to actions that actually restrict the user. */
+function appealKeyboard(modActionId) {
+  if (!modActionId) return undefined;
+  return new InlineKeyboard().text("⚖️ Appeal this decision", `appeal:${modActionId}`);
 }
 
 /* ────────────────── NEW MEMBER HANDLER ───────────────────── */
@@ -322,7 +342,7 @@ async function handleGroupMessage(ctx) {
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
         await notifyAdmin(
-          ctx.api,
+          { api: ctx.api },
           `🛡 *Magpie impersonator banned*\n\n` +
           `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
           `*ID:* \`${sender.id}\`\n` +
@@ -346,6 +366,7 @@ async function handleGroupMessage(ctx) {
         await recordModAction(ctx.chat.id, sender.id, "delete_link", "url not on allowlist", u);
         const count = await bumpWarnedCount(ctx.chat.id, sender.id);
         await softWarn(
+          ctx,
           sender.id,
           `Your message was removed from the Magpie community group because it contained a link.\n\n` +
           `*Only tweets from the official @MagpieLoans X account are allowed.* This is to keep scammers and phishing links out — almost every other "useful link" in a DeFi community turns out to be a scam.\n\n` +
@@ -366,6 +387,7 @@ async function handleGroupMessage(ctx) {
       await recordModAction(ctx.chat.id, sender.id, "delete_scam_pattern", scam, msg.text || msg.caption);
       const count = await bumpWarnedCount(ctx.chat.id, sender.id);
       await softWarn(
+        ctx,
         sender.id,
         `Your message was removed from the Magpie group — it matched a pattern we automatically flag (seed phrase requests, "send X SOL", "DM me", "claim airdrop", etc.). If this was a misunderstanding, just rephrase.` +
         (count >= 3 ? `\n\n#${count} warning. Repeated matches may result in a mute.` : ``),
@@ -387,6 +409,7 @@ async function handleGroupMessage(ctx) {
       );
       const count = await bumpWarnedCount(ctx.chat.id, sender.id);
       await softWarn(
+        ctx,
         sender.id,
         `Your message was removed because it referenced an unofficial Magpie-related handle (${impersonators.join(", ")}). The ONLY official Magpie accounts are *@MagpieLoans* on X and *@magpie_capital_bot* on Telegram. Anyone else claiming to be Magpie support is a scammer.` +
         (count >= 3 ? `\n\n#${count} warning. Repeated removals may result in a mute.` : ``),
@@ -408,6 +431,7 @@ async function handleGroupMessage(ctx) {
         await tryDelete(ctx, msg.message_id);
         await recordModAction(ctx.chat.id, sender.id, "delete_quarantine_media", "media/forward during quarantine", null);
         await softWarn(
+          ctx,
           sender.id,
           `Heads up — new members can't post images / videos / forwards for the first 7 days. This is to keep scammers out. Plain-text messages still work.`,
         );
@@ -514,14 +538,15 @@ async function maybeRunImageCheck(ctx, msg, sender) {
   if (decision.action === "delete") {
     await tryDelete(ctx, msg.message_id);
   }
-  await recordModAction(
+  const imageActionId = await recordModAction(
     ctx.chat.id, sender.id,
     `image_${result.verdict}`,
     `confidence=${result.confidence.toFixed(2)} reason=${result.reason}`,
     result.extractedText?.slice(0, 500) || null,
   );
 
-  if (decision.mute_sec > 0) {
+  const wasMuted = decision.mute_sec > 0;
+  if (wasMuted) {
     try {
       await ctx.api.restrictChatMember(ctx.chat.id, sender.id, {
         until_date: Math.floor(Date.now() / 1000) + decision.mute_sec,
@@ -540,9 +565,16 @@ async function maybeRunImageCheck(ctx, msg, sender) {
       nsfw_or_violence: "NSFW or violent imagery",
     }[result.verdict] || "policy violation";
 
+    // A mute is appealable (Pip re-reviews and can lift it). A delete-only
+    // warn has nothing to restore, so it gets no button.
+    const appealLine = wasMuted
+      ? ` If you think this was a mistake, tap *Appeal* below — Pip will re-review it and lift the mute if it was wrong.`
+      : ` If this was a mistake, post a plain-text follow-up explaining and someone will review.`;
     await softWarn(
+      ctx,
       sender.id,
-      `Your image was removed from the Magpie community — our vision moderator flagged it as a *${verdictLabel}*. If this was a mistake, post a plain-text follow-up explaining and someone will review.`,
+      `Your image was removed from the Magpie community — our vision moderator flagged it as a *${verdictLabel}*.${appealLine}`,
+      wasMuted ? appealKeyboard(imageActionId) : undefined,
     );
   }
 
@@ -550,7 +582,7 @@ async function maybeRunImageCheck(ctx, msg, sender) {
     try {
       const { notifyAdmin } = await import("../services/admin-notify.js");
       await notifyAdmin(
-        ctx.api,
+        { api: ctx.api },
         `🖼 *Community image flagged*\n\n` +
         `*Verdict:* ${escMd(result.verdict)} (conf ${result.confidence.toFixed(2)})\n` +
         `*From:* ${sender.username ? `@${escMd(sender.username)}` : escMd(sender.first_name || sender.id)}\n` +
@@ -642,12 +674,26 @@ async function maybeRunFudCheck(ctx, msg, sender) {
     const muteLine = wasMuted
       ? `\n\nYou've been muted for ${Math.round(action.mute_sec / 3600)}h. After it expires you're welcome back if the conversation stays civil.`
       : ``;
+    // When we mute, record an appealable action that captures the verdict +
+    // the flagged text so Pip has full context to re-review on appeal.
+    let appealActionId = null;
+    if (wasMuted) {
+      appealActionId = await recordModAction(
+        ctx.chat.id, sender.id,
+        `fud_${verdictObj.verdict}`,
+        verdictObj.reason || verdictObj.verdict,
+        JSON.stringify({ verdict: verdictObj.verdict, confidence: verdictObj.confidence, text: text.slice(0, 600) }),
+      );
+    }
+    const appealOrDmLine = wasMuted
+      ? `\n\nIf you think this was a mistake, tap *Appeal* below — Pip will re-review it thoroughly and lift the mute if it was wrong.`
+      : `\n\nIf this was a misread, DM @magpie_capital_bot and an operator will review.`;
     const warnText =
       `Your message was removed from the Magpie community — our moderator flagged it as *${verdictHuman}*.` +
       muteLine +
-      `\n\nIf this was a misread, DM @magpie_capital_bot and an operator will review.` +
+      appealOrDmLine +
       strikeFooter(strikeAction);
-    await softWarn(sender.id, warnText);
+    await softWarn(ctx, sender.id, warnText, wasMuted ? appealKeyboard(appealActionId) : undefined);
   }
   if (action.mute_sec > 0) {
     try {
@@ -813,6 +859,151 @@ async function tryDelete(ctx, messageId) {
   }
 }
 
+/* ─────────────────────── APPEALS ─────────────────────── */
+
+// Full posting permissions — used to LIFT a mute on an overturned appeal.
+const FULL_SEND_PERMS = {
+  can_send_messages: true,
+  can_send_audios: true,
+  can_send_documents: true,
+  can_send_photos: true,
+  can_send_videos: true,
+  can_send_video_notes: true,
+  can_send_voice_notes: true,
+  can_send_polls: true,
+  can_send_other_messages: true,
+  can_add_web_page_previews: true,
+  can_invite_users: true,
+  can_pin_messages: false,
+  can_change_info: false,
+};
+
+/** Page the operator only when Pip couldn't decide (model down / low
+ *  confidence). This is the ONLY path that still needs a human. */
+async function escalateAppealToOperator(ctx, modAction, review, flaggedText) {
+  try {
+    const { notifyAdmin } = await import("../services/admin-notify.js");
+    await notifyAdmin(
+      { api: ctx.api },
+      [
+        `⚖️ *Appeal needs your call* — Pip wasn't confident enough to auto-decide`,
+        ``,
+        `User: \`${escMd(String(modAction.user_id))}\``,
+        `Original verdict: *${escMd(modAction.action)}*`,
+        `Reason: ${escMd(modAction.reason || "—")}`,
+        review ? `Pip leaned: *${escMd(review.decision)}* (conf ${review.confidence.toFixed(2)}) — ${escMd(review.explanation)}` : `Pip: model unavailable`,
+        ``,
+        `Flagged content:`,
+        "```",
+        (flaggedText || "(image / no text)").slice(0, 600).replace(/```/g, "'''"),
+        "```",
+        ``,
+        `To lift: unmute the user in the group admin UI. To uphold: do nothing (a temporary mute expires on its own).`,
+      ].join("\n"),
+      { parse_mode: "Markdown" },
+    );
+  } catch (err) {
+    console.warn("[appeals] operator escalation failed:", err.message);
+  }
+}
+
+/** A member tapped "⚖️ Appeal" on a mute DM. Re-review the original action
+ *  with Pip and act: overturn → lift the mute; uphold → explain; unsure →
+ *  escalate to the operator. Idempotent per mod action. */
+async function handleAppeal(ctx) {
+  try {
+    const m = ctx.callbackQuery?.data?.match(/^appeal:(\d+)$/);
+    if (!m) return;
+    const modActionId = m[1];
+    const tapperId = ctx.from?.id;
+
+    const {
+      loadModAction, openAppeal, resolveAppeal, reviewAppealWithPip,
+      extractFlaggedText, APPEAL_ESCALATE_BELOW,
+    } = await import("../services/community-appeals.js");
+
+    const modAction = await loadModAction(modActionId);
+    if (!modAction) {
+      await ctx.answerCallbackQuery({ text: "This appeal link has expired.", show_alert: true });
+      return;
+    }
+    // Only the affected member may appeal their own action.
+    if (String(modAction.user_id) !== String(tapperId)) {
+      await ctx.answerCallbackQuery({ text: "Only the affected member can appeal this.", show_alert: true });
+      return;
+    }
+
+    const { row, isNew } = await openAppeal(modActionId, modAction.chat_id, modAction.user_id);
+    if (!isNew) {
+      const statusMsg = {
+        overturned: "✅ Already reviewed — your mute was lifted.",
+        upheld: "Already reviewed — the action stands.",
+        escalated: "Already with a human reviewer — hang tight.",
+        reviewing: "Your appeal is already being reviewed — hang tight.",
+      }[row?.status] || "Your appeal is already on file.";
+      await ctx.answerCallbackQuery({ text: statusMsg, show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "⚖️ Pip is reviewing your appeal now…" });
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { /* msg too old */ }
+
+    const member = await getMember(modAction.chat_id, modAction.user_id).catch(() => null);
+    const trusted = await isTrustedMember(modAction.user_id).catch(() => false);
+    const flaggedText = extractFlaggedText(modAction.payload);
+
+    const review = await reviewAppealWithPip({
+      verdict: modAction.action,
+      reason: modAction.reason,
+      flaggedText,
+      warnedCount: member?.warned_count ?? 0,
+      trusted,
+    });
+
+    // Model unavailable or genuinely unsure → a human makes the final call.
+    if (!review || review.confidence < APPEAL_ESCALATE_BELOW) {
+      await resolveAppeal(modActionId, {
+        status: "escalated",
+        decision: review?.decision || null,
+        reason: review?.explanation || "model unavailable / low confidence",
+        confidence: review?.confidence ?? null,
+      });
+      await escalateAppealToOperator(ctx, modAction, review, flaggedText);
+      await softWarn(ctx, modAction.user_id,
+        "Thanks — your appeal needs a closer look, so a human reviewer has been notified. You'll hear back here shortly.");
+      return;
+    }
+
+    if (review.decision === "overturn") {
+      let lifted = false;
+      try {
+        await ctx.api.restrictChatMember(modAction.chat_id, Number(modAction.user_id), { permissions: FULL_SEND_PERMS });
+        lifted = true;
+      } catch (err) {
+        console.warn("[appeals] unmute failed:", err.message);
+      }
+      await query(
+        `UPDATE community_members SET quarantine_until = NULL WHERE chat_id = $1 AND user_id = $2`,
+        [String(modAction.chat_id), String(modAction.user_id)],
+      ).catch(() => {});
+      await recordModAction(modAction.chat_id, modAction.user_id, "appeal_overturned", review.explanation, String(modActionId));
+      await resolveAppeal(modActionId, { status: "overturned", decision: "overturn", reason: review.explanation, confidence: review.confidence });
+      await softWarn(ctx, modAction.user_id,
+        `✅ *Appeal approved.* ${review.explanation}` +
+        (lifted ? `\n\nYou can post in the group again — sorry for the mix-up.` : `\n\nYour mute should lift momentarily.`));
+    } else {
+      await recordModAction(modAction.chat_id, modAction.user_id, "appeal_upheld", review.explanation, String(modActionId));
+      await resolveAppeal(modActionId, { status: "upheld", decision: "uphold", reason: review.explanation, confidence: review.confidence });
+      await softWarn(ctx, modAction.user_id,
+        `Your appeal was reviewed and the original action stands.\n\n${review.explanation}\n\n` +
+        `If your mute was temporary it will expire on its own. If you still believe this is wrong, DM @magpie_capital_bot and a human will take a final look.`);
+    }
+  } catch (err) {
+    console.warn("[appeals] handler error:", err.message);
+    try { await ctx.answerCallbackQuery({ text: "Something went wrong — please try again in a moment." }); } catch { /* ignore */ }
+  }
+}
+
 /* ─────────────────────── REGISTRATION ─────────────────────── */
 
 export function registerCommunityHandlers(bot) {
@@ -820,6 +1011,7 @@ export function registerCommunityHandlers(bot) {
   bot.on("message", handleGroupMessage);
   bot.on("edited_message", handleGroupMessage);
   bot.callbackQuery(/^comm:captcha:(-?\d+)$/, handleCaptchaCallback);
+  bot.callbackQuery(/^appeal:(\d+)$/, handleAppeal);
   console.log("[community] handlers registered");
 }
 

@@ -679,6 +679,23 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS community_mod_actions_chat_idx
        ON community_mod_actions(chat_id, created_at DESC)`,
+    // Pip-reviewed appeals against an auto-moderation action. One appeal per
+    // mod action (UNIQUE) makes a double-tap idempotent. status:
+    // reviewing | overturned | upheld | escalated.
+    `CREATE TABLE IF NOT EXISTS community_appeals (
+       id BIGSERIAL PRIMARY KEY,
+       mod_action_id BIGINT NOT NULL UNIQUE,
+       chat_id BIGINT NOT NULL,
+       user_id BIGINT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'reviewing',
+       decision TEXT,
+       reason TEXT,
+       confidence REAL,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       resolved_at TIMESTAMPTZ
+     )`,
+    `CREATE INDEX IF NOT EXISTS community_appeals_user_idx
+       ON community_appeals(user_id, created_at DESC)`,
     // Per-rule cooldown for operator anomaly DMs so a single incident
     // doesn't page the operator every 2-min watcher tick.
     `CREATE TABLE IF NOT EXISTS community_anomaly_alerts (
