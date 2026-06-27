@@ -597,8 +597,12 @@ registerFallbackCallbacks(bot);
 // other text-handling tries to process the message. Per-chat opt-in
 // (community_chats.enabled) means it's a no-op in any chat the
 // operator hasn't run /community_enable in.
-import { registerCommunityHandlers } from "./handlers/community-handlers.js";
+import { registerCommunityHandlers, handleAppealCommand } from "./handlers/community-handlers.js";
 import { setBotTgId } from "./services/community-moderation.js";
+// /appeal must be registered BEFORE the generic group message handler that
+// registerCommunityHandlers installs, so a DM /appeal from a removed user
+// reaches the command (the message handler early-returns on non-group chats).
+bot.command("appeal", handleAppealCommand);
 registerCommunityHandlers(bot);
 
 // Fallback: respond to any text message that isn't a command

@@ -59,37 +59,79 @@ export const QUARANTINE_RATE_LIMIT_MS = 30 * 1000; // 1 msg / 30s
 // Captcha timeout — fail to confirm in this window = auto-kick.
 export const CAPTCHA_TIMEOUT_MS = 5 * 60 * 1000;
 
-// Display-name / username substrings that smell like impersonation.
-// Match is case-insensitive. The check runs only on non-allowlisted
-// accounts (the verified-account check excludes the bot + operator).
+// Display-name / username patterns that indicate someone is posing as
+// official Magpie / Pip STAFF. Match is case-insensitive. The check runs only
+// on non-allowlisted accounts (verified-account check excludes the bot +
+// operator; cleared-user check excludes appeal winners).
 //
-// "magpie" intentionally has NO word boundaries because impersonator
-// usernames typically lack separators ("magpiesupport", "magpiemod",
-// "magpie_help"). The verified-account allowlist catches the legit bot
-// (@magpie_capital_bot) so this doesn't false-positive on us.
-//
-// Generic terms (support/admin/team/mod) keep word boundaries — too
-// many legit names contain "Sam" or "Adam" as substrings.
+// SCOPED DOWN 2026-06-27 (operator: "don't kick out regular users so freely").
+// The old list auto-PERMABANNED on any of: a bare "magpie" substring (caught
+// every fan — "MagpieFan42"), or a standalone generic word (support / admin /
+// team / mod / dev / founder / owner — caught "CryptoDev", "Team Solana",
+// real people). That nuked regular users. Now we ONLY flag clear BRAND
+// impersonation: the (near-)exact brand name, OR the brand word adjacent to a
+// staff/official role, OR "Pip" used in a staff capacity. A brand word ALONE
+// or a generic role word ALONE is NOT enough. Residual edge cases self-heal
+// via the instant /appeal flow + the cleared-users memory.
 export const IMPERSONATION_PATTERNS = [
-  /magpie/i,                       // any substring — catches magpiesupport, magpiemod
-  /\bsupport\b/i,
-  /\badmin\b/i,
-  /\bteam\b/i,
-  /\bmoderator\b/i,
-  /\bmod\b/i,
-  /\bhelp\s*desk\b/i,
-  // 2026-06-13: live impersonator joined with display name "Pip" (no
-  // "magpie" substring), slipped past the join-time filter. The bot's
-  // AI helper IS named Pip in the community chat, so anyone using
-  // that name is impersonating. The verified-account allowlist still
-  // exempts @magpie_capital_bot itself and the operator's account.
-  /\bpip\b/i,
-  // Also lock down "dev"/"founder"/"owner" which scammers love and
-  // which a legit member has no reason to put in their display name.
-  /\bdev\b/i,
-  /\bfounder\b/i,
-  /\bowner\b/i,
+  // (Near-)exact brand name as the whole display name — no legitimate use.
+  /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help))?\s*[.!]*$/i,
+  // Brand word adjacent (any separator) to a staff / official / support role.
+  // \b after the role so a FAN name ("Magpie Supporter", "Magpie Teammate")
+  // does NOT match while staff poses ("Magpie Support", "Magpie Admin") do.
+  /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|customer)\b/i,
+  /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
+  /\bofficial\s+magpie\b/i,
+  // Posing as the in-chat assistant "Pip" in a staff/bot capacity (bare "Pip"
+  // is a real nickname, so it alone no longer triggers a ban).
+  /\bpip[\s._@-]*(support|admin|official|bot|team|mod|help)\b/i,
+  /\b(support|admin|official)[\s._@-]*pip\b/i,
 ];
+
+// Homoglyphs / leetspeak an impersonator uses to dodge the brand filter
+// ("Mаgpie" with a Cyrillic а, "0fficial", "M4gpie"). Folded to ASCII before
+// matching. Ambiguous 1/l/i is deliberately left out to avoid mangling real
+// names; the unicode + despace + combined-field passes cover the common cases.
+const CONFUSABLE_MAP = {
+  "а": "a", "ӓ": "a", "@": "a", "4": "a", "е": "e", "ё": "e", "3": "e",
+  "о": "o", "ο": "o", "0": "o", "р": "p", "с": "c", "ѕ": "s", "$": "s", "5": "s",
+  "х": "x", "у": "y", "і": "i", "ӏ": "i", "т": "t", "к": "k", "н": "h", "м": "m",
+  "ԁ": "d", "ɡ": "g", "ⅼ": "l", "ӏ": "l",
+};
+function foldConfusables(s) {
+  let out = "";
+  for (const ch of s) out += CONFUSABLE_MAP[ch] ?? CONFUSABLE_MAP[ch.toLowerCase()] ?? ch;
+  return out;
+}
+
+/** Every textual variant of a user's name we test against the impersonation
+ *  patterns: each field + the COMBINED name (defeats split-across-fields like
+ *  first="Mag", last="pie Support"), each in raw / unicode-normalized /
+ *  homoglyph-folded / despaced form (defeats styled unicode, Cyrillic
+ *  homoglyphs, and spaced-out "M a g p i e  S u p p o r t"). */
+function impersonationVariants(user) {
+  const fields = [user.username || "", user.first_name || "", user.last_name || ""].filter(Boolean);
+  const bases = [...fields, fields.join(" ")].filter(Boolean);
+  const out = new Set();
+  for (const s of bases) {
+    const norm = normalizeUnicode(s);
+    const folded = foldConfusables(norm);
+    out.add(s);
+    out.add(norm);
+    out.add(folded);
+    out.add(folded.replace(/[\s._-]+/g, "")); // despaced
+  }
+  return [...out];
+}
+
+/** A stable, normalized key for a user's display name, used to SCOPE a
+ *  clearance to the name that was reviewed — so an appeal winner can't later
+ *  rename into "Magpie Support" and keep their immunity. */
+export function nameKey(user) {
+  if (!user) return "";
+  const raw = [user.username, user.first_name, user.last_name].filter(Boolean).join(" ");
+  return foldConfusables(normalizeUnicode(raw)).toLowerCase().replace(/\s+/g, " ").trim();
+}
 
 // Verified accounts that are allowed to use those words (the bot
 // itself + operator IDs from env). Populated lazily at startup.
@@ -354,12 +396,10 @@ export function isAllowedUrl(rawUrl) {
 
 export function isImpersonationName(user) {
   if (!user) return false;
-  const candidates = [
-    user.username || "",
-    user.first_name || "",
-    user.last_name || "",
-  ].filter(Boolean);
-  for (const c of candidates) {
+  // Test raw + unicode-normalized + homoglyph-folded + despaced + combined-field
+  // variants so "Mаgpie Support" (Cyrillic), "𝗠𝗮𝗴𝗽𝗶𝗲 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "M a g p i e
+  // Support", and first="Mag"/last="pie Support" are all caught.
+  for (const c of impersonationVariants(user)) {
     for (const re of IMPERSONATION_PATTERNS) {
       if (re.test(c)) return true;
     }
@@ -518,6 +558,58 @@ export async function recordModAction(chatId, userId, action, reason, payload) {
   // Returned so a caller (e.g. a mute) can offer a one-tap appeal that
   // references this exact action. Existing callers ignore it harmlessly.
   return res.rows?.[0]?.id ?? null;
+}
+
+/* ───────────────────────── CLEARED USERS (Pip's memory) ─────────────────────
+ * A user the moderator should NOT auto-remove again — appeal winners and
+ * operator /unban-s. The name-ban, captcha-kick, and impersonator watchdog all
+ * consult isUserCleared() and skip cleared accounts, so a re-admitted member
+ * can't be instantly re-banned for the same name. Behavioral moderation (scam
+ * links/phrases, FUD) still runs — clearance is NOT a pass to misbehave.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** Remember that this user has been cleared (idempotent UPSERT). `clearedName`
+ *  is the nameKey() that was reviewed — pass it for appeal clearances so the
+ *  clearance is SCOPED to that name; null = name-agnostic (operator /unban). */
+export async function markUserCleared(chatId, userId, by = "pip_appeal", reason = null, clearedName = null) {
+  await query(
+    `INSERT INTO community_cleared_users (chat_id, user_id, cleared_by, reason, cleared_name)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (chat_id, user_id) DO UPDATE
+       SET cleared_by = EXCLUDED.cleared_by, reason = EXCLUDED.reason,
+           cleared_name = EXCLUDED.cleared_name, cleared_at = NOW()`,
+    [String(chatId), String(userId), by, reason ? String(reason).slice(0, 300) : null,
+     clearedName ? String(clearedName).slice(0, 200) : null],
+  );
+}
+
+/** True if this user is cleared for the chat. Fail-open to false (a DB blip
+ *  must never cause a MISSED removal of a real scammer).
+ *  `currentNameKey`: when provided, a NAME-SCOPED clearance (cleared_name set)
+ *  is honored ONLY if the user's current name still matches the reviewed name —
+ *  so an appeal winner can't rename into "Magpie Support" and keep immunity.
+ *  Operator /unban clearances are name-agnostic (cleared_name NULL) and always
+ *  honored. Omit currentNameKey for paths where the name is irrelevant. */
+export async function isUserCleared(chatId, userId, currentNameKey = null) {
+  try {
+    if (currentNameKey == null) {
+      const r = await query(
+        `SELECT 1 FROM community_cleared_users WHERE chat_id = $1 AND user_id = $2 LIMIT 1`,
+        [String(chatId), String(userId)],
+      );
+      return r.rows.length > 0;
+    }
+    const r = await query(
+      `SELECT 1 FROM community_cleared_users
+        WHERE chat_id = $1 AND user_id = $2
+          AND (cleared_name IS NULL OR cleared_name = $3) LIMIT 1`,
+      [String(chatId), String(userId), currentNameKey],
+    );
+    return r.rows.length > 0;
+  } catch (err) {
+    console.warn("[community] isUserCleared check failed (treating as not-cleared):", err.message);
+    return false;
+  }
 }
 
 /** Recent mod-action stats for the operator dashboard / anomaly alerts. */

@@ -16,6 +16,7 @@ import {
   recentStats,
   URL_ALLOWLIST,
   listEnabledChats,
+  markUserCleared,
 } from "../services/community-moderation.js";
 
 /**
@@ -358,8 +359,11 @@ export async function handleCommunityUnban(ctx) {
     // Optional: also clear their strike history so they truly start fresh.
     const { clearStrikes } = await import("../services/community-strikes.js");
     const cleared = await clearStrikes(ctx.chat.id, ref.userId);
+    // Pip's memory: remember this clearance so the name-ban / captcha-kick /
+    // watchdog don't immediately re-remove them on their next message.
+    await markUserCleared(ctx.chat.id, ref.userId, "operator_unban", `manual /unban by operator`);
     await ctx.reply(
-      `✅ Unbanned ${ref.label} (user ${ref.userId}). Cleared ${cleared} prior strike(s) so they start fresh.\n\n` +
+      `✅ Unbanned ${ref.label} (user ${ref.userId}). Cleared ${cleared} prior strike(s) + added to Pip's cleared list so they won't be auto-removed for their name again.\n\n` +
       `They'll need to *re-join via the group invite link*. Consider sending it to them.`,
       { parse_mode: "Markdown" },
     );

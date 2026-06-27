@@ -34,6 +34,9 @@ import {
   quarantineRateLimit,
   bumpWarnedCount,
   recordModAction,
+  markUserCleared,
+  isUserCleared,
+  nameKey,
   CAPTCHA_TIMEOUT_MS,
 } from "../services/community-moderation.js";
 import { classifyImage, actionForImageVerdict } from "../services/community-image-ocr.js";
@@ -151,6 +154,10 @@ async function handleNewMembers(ctx) {
       if (m.is_bot && m.username === ctx.me?.username) continue;
       await recordNewMember(ctx.chat.id, m.id);
 
+      // Pip's memory: a previously-cleared member (same name) rejoining via
+      // their appeal invite is not re-shamed on join or captcha-kicked again.
+      if (await isUserCleared(ctx.chat.id, m.id, nameKey(m))) continue;
+
       // Impersonation check on join — fastest way to catch
       // fake-support accounts.
       if (isImpersonationName(m) && !isVerifiedAccount(m)) {
@@ -207,6 +214,9 @@ function scheduleCaptchaKick(ctx, userId, dmFailed) {
     try {
       const member = await getMember(ctx.chat.id, userId);
       if (member?.captcha_passed_at) return; // passed; do nothing
+      // Pip's memory: a previously-cleared member (appeal / operator unban)
+      // who rejoined is not re-kicked for missing the captcha.
+      if (await isUserCleared(ctx.chat.id, userId)) return;
       // Kick (= ban for 30s then unban, lets them rejoin if real)
       const until = Math.floor(Date.now() / 1000) + 30;
       await ctx.api.banChatMember(ctx.chat.id, userId, { until_date: until });
@@ -317,7 +327,12 @@ async function handleGroupMessage(ctx) {
     // Operator gets paged so they can /unban if it's a false positive
     // (e.g., a real user named "MagpieFan42"). False-positive recovery
     // is one tap; the cost of letting a scammer linger is much higher.
-    if (isImpersonationName(sender)) {
+    // Pip's MEMORY: a user already cleared by an appeal (or operator /unban)
+    // is never re-banned for their name — otherwise re-admitting them would be
+    // pointless (they'd be banned again on their next message). Name-scoped:
+    // if a cleared user RENAMES into a fresh impersonation pattern, the
+    // clearance no longer applies and the ban fires.
+    if (isImpersonationName(sender) && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
       await tryDelete(ctx, msg.message_id);
       try {
         await ctx.api.banChatMember(ctx.chat.id, sender.id);
@@ -328,6 +343,15 @@ async function handleGroupMessage(ctx) {
         ctx.chat.id, sender.id, "ban_impersonator",
         `name="${sender.username || sender.first_name || sender.id}"`,
         msg.text || msg.caption || null,
+      );
+      // Best-effort: tell the banned user how to appeal. Most impersonators
+      // never started the bot so this silently no-ops, but a real member
+      // caught by mistake gets an instant path back. softWarn handles the
+      // "user hasn't DM'd the bot" case gracefully.
+      await softWarn(
+        ctx, sender.id,
+        `You were removed from the Magpie community because your name matched our Magpie-staff impersonation filter.\n\n` +
+        `If you're a real member and this was a mistake, reply with /appeal and Pip will review it instantly and let you back in if it was wrong.`,
       );
       // Educational moment — turn every ban into a teachable post in
       // the group so members see Pip actively defending them. Templated
@@ -910,97 +934,199 @@ async function escalateAppealToOperator(ctx, modAction, review, flaggedText) {
 /** A member tapped "⚖️ Appeal" on a mute DM. Re-review the original action
  *  with Pip and act: overturn → lift the mute; uphold → explain; unsure →
  *  escalate to the operator. Idempotent per mod action. */
+function appealStatusMsg(status) {
+  return {
+    overturned: "✅ Already reviewed — you were cleared and let back in.",
+    upheld: "Already reviewed — the original action stands.",
+    escalated: "Already with a human reviewer — hang tight.",
+    reviewing: "Your appeal is already being reviewed — hang tight.",
+  }[status] || "Your appeal is already on file.";
+}
+
+/** Shared appeal engine: review with Pip + act. Used by BOTH the inline
+ *  Appeal button (mutes) and the /appeal DM command (bans/kicks/mutes). The
+ *  appeal row must already be opened ('reviewing'). DMs the user the outcome.
+ *   - overturned REMOVAL → unban + REMEMBER the clearance + single-use invite
+ *   - overturned MUTE    → lift the restriction + clear quarantine
+ *   - uphold             → explain; unsure/model-down → escalate to operator */
+async function applyAppealOutcome(ctx, modAction, userReason) {
+  const {
+    resolveAppeal, reviewAppealWithPip, extractFlaggedText,
+    APPEAL_ESCALATE_BELOW, REMOVAL_ACTIONS,
+  } = await import("../services/community-appeals.js");
+
+  const modActionId = String(modAction.id);
+  const isRemoval = REMOVAL_ACTIONS.has(modAction.action);
+  const member = await getMember(modAction.chat_id, modAction.user_id).catch(() => null);
+  const trusted = await isTrustedMember(modAction.user_id).catch(() => false);
+  // For a name-based ban the "flagged content" is mostly the NAME (in `reason`)
+  // plus any message text — give Pip both so it can tell "Magpie Support"
+  // (impersonator → uphold) from "MagpieFan"/"CryptoDev" (member → overturn).
+  const flaggedText = [modAction.reason, extractFlaggedText(modAction.payload)].filter(Boolean).join(" | ");
+
+  const review = await reviewAppealWithPip({
+    verdict: modAction.action,
+    reason: modAction.reason,
+    flaggedText,
+    warnedCount: member?.warned_count ?? 0,
+    trusted,
+    userReason,
+  });
+
+  // Defense-in-depth against prompt injection: re-admitting an IMPERSONATION
+  // ban grants a name-scoped clearance, so a low-confidence overturn there is
+  // routed to a human instead of auto-readmitting. Captcha-kicks (real people)
+  // keep the normal bar.
+  const isImpersonationBan =
+    modAction.action === "ban_impersonator" || modAction.action === "watchdog_auto_ban_impersonation";
+  const lowConfidenceOverturn =
+    review && review.decision === "overturn" && isImpersonationBan && review.confidence < 0.8;
+
+  // Model unavailable or genuinely unsure → a human makes the final call.
+  if (!review || review.confidence < APPEAL_ESCALATE_BELOW || lowConfidenceOverturn) {
+    await resolveAppeal(modActionId, {
+      status: "escalated",
+      decision: review?.decision || null,
+      reason: review?.explanation || "model unavailable / low confidence",
+      confidence: review?.confidence ?? null,
+    });
+    await escalateAppealToOperator(ctx, modAction, review, flaggedText);
+    await softWarn(ctx, modAction.user_id,
+      "Thanks — your appeal needs a closer look, so a human reviewer has been notified. You'll hear back here shortly.");
+    return;
+  }
+
+  if (review.decision === "overturn" && isRemoval) {
+    // Lift the ban, REMEMBER the clearance (so the name-ban won't instantly
+    // re-fire), and hand them a fresh single-use invite to rejoin.
+    try {
+      await ctx.api.unbanChatMember(modAction.chat_id, Number(modAction.user_id), { only_if_banned: true });
+    } catch (err) {
+      console.warn("[appeals] unban failed:", err.message);
+    }
+    // Scope the clearance to the name we just reviewed (ctx.from = the
+    // appealing user, current name) so they can't later rename into an
+    // impersonation handle and keep immunity.
+    await markUserCleared(modAction.chat_id, modAction.user_id, "pip_appeal", review.explanation, nameKey(ctx.from));
+    let invite = null;
+    try {
+      const link = await ctx.api.createChatInviteLink(modAction.chat_id, {
+        member_limit: 1,
+        expire_date: Math.floor(Date.now() / 1000) + 3600,
+        name: `appeal-${modAction.user_id}`.slice(0, 32),
+      });
+      invite = link?.invite_link || null;
+    } catch (err) {
+      console.warn("[appeals] invite link failed:", err.message);
+    }
+    await recordModAction(modAction.chat_id, modAction.user_id, "appeal_overturned", review.explanation, modActionId);
+    await resolveAppeal(modActionId, { status: "overturned", decision: "overturn", reason: review.explanation, confidence: review.confidence });
+    await softWarn(ctx, modAction.user_id,
+      `✅ *Appeal approved.* ${review.explanation}\n\n` +
+      (invite
+        ? `Here's your one-time invite back into the Magpie community (expires in 1 hour):\n${invite}\n\nYou won't be removed for your name again.`
+        : `You're cleared to rejoin via the group invite link. You won't be removed for your name again.`));
+  } else if (review.decision === "overturn") {
+    // Muted → lift the restriction + clear quarantine.
+    let lifted = false;
+    try {
+      await ctx.api.restrictChatMember(modAction.chat_id, Number(modAction.user_id), { permissions: FULL_SEND_PERMS });
+      lifted = true;
+    } catch (err) {
+      console.warn("[appeals] unmute failed:", err.message);
+    }
+    await query(
+      `UPDATE community_members SET quarantine_until = NULL WHERE chat_id = $1 AND user_id = $2`,
+      [String(modAction.chat_id), String(modAction.user_id)],
+    ).catch(() => {});
+    await recordModAction(modAction.chat_id, modAction.user_id, "appeal_overturned", review.explanation, modActionId);
+    await resolveAppeal(modActionId, { status: "overturned", decision: "overturn", reason: review.explanation, confidence: review.confidence });
+    await softWarn(ctx, modAction.user_id,
+      `✅ *Appeal approved.* ${review.explanation}` +
+      (lifted ? `\n\nYou can post in the group again — sorry for the mix-up.` : `\n\nYour mute should lift momentarily.`));
+  } else {
+    await recordModAction(modAction.chat_id, modAction.user_id, "appeal_upheld", review.explanation, modActionId);
+    await resolveAppeal(modActionId, { status: "upheld", decision: "uphold", reason: review.explanation, confidence: review.confidence });
+    await softWarn(ctx, modAction.user_id,
+      `Your appeal was reviewed and the original action stands.\n\n${review.explanation}\n\n` +
+      `If this action was temporary it will expire on its own. If you still believe this is wrong, reply here and a human will take a final look.`);
+  }
+}
+
+/** Inline "⚖️ Appeal" button on a mute DM. */
 async function handleAppeal(ctx) {
   try {
     const m = ctx.callbackQuery?.data?.match(/^appeal:(\d+)$/);
     if (!m) return;
     const modActionId = m[1];
     const tapperId = ctx.from?.id;
-
-    const {
-      loadModAction, openAppeal, resolveAppeal, reviewAppealWithPip,
-      extractFlaggedText, APPEAL_ESCALATE_BELOW,
-    } = await import("../services/community-appeals.js");
+    const { loadModAction, openAppeal } = await import("../services/community-appeals.js");
 
     const modAction = await loadModAction(modActionId);
     if (!modAction) {
       await ctx.answerCallbackQuery({ text: "This appeal link has expired.", show_alert: true });
       return;
     }
-    // Only the affected member may appeal their own action.
     if (String(modAction.user_id) !== String(tapperId)) {
       await ctx.answerCallbackQuery({ text: "Only the affected member can appeal this.", show_alert: true });
       return;
     }
-
-    const { row, isNew } = await openAppeal(modActionId, modAction.chat_id, modAction.user_id);
+    const { isNew, row } = await openAppeal(modActionId, modAction.chat_id, modAction.user_id);
     if (!isNew) {
-      const statusMsg = {
-        overturned: "✅ Already reviewed — your mute was lifted.",
-        upheld: "Already reviewed — the action stands.",
-        escalated: "Already with a human reviewer — hang tight.",
-        reviewing: "Your appeal is already being reviewed — hang tight.",
-      }[row?.status] || "Your appeal is already on file.";
-      await ctx.answerCallbackQuery({ text: statusMsg, show_alert: true });
+      await ctx.answerCallbackQuery({ text: appealStatusMsg(row?.status), show_alert: true });
       return;
     }
-
     await ctx.answerCallbackQuery({ text: "⚖️ Pip is reviewing your appeal now…" });
     try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { /* msg too old */ }
+    await applyAppealOutcome(ctx, modAction, null);
+  } catch (err) {
+    console.warn("[appeals] button handler error:", err.message);
+    try { await ctx.answerCallbackQuery({ text: "Something went wrong — please try again in a moment." }); } catch { /* ignore */ }
+  }
+}
 
-    const member = await getMember(modAction.chat_id, modAction.user_id).catch(() => null);
-    const trusted = await isTrustedMember(modAction.user_id).catch(() => false);
-    const flaggedText = extractFlaggedText(modAction.payload);
+/** /appeal in a DM — for REMOVED users (banned/kicked) who have no button.
+ *  Finds their most recent moderation action and reviews it instantly.
+ *  `/appeal <optional reason>` lets them state their case. */
+async function handleAppealCommand(ctx) {
+  try {
+    if (ctx.chat?.type !== "private") {
+      try { await ctx.reply("DM me /appeal in a private chat and Pip will review it instantly."); } catch { /* no perms */ }
+      return;
+    }
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const userReason = (ctx.message?.text || "").replace(/^\/appeal(@\w+)?/i, "").trim() || null;
 
-    const review = await reviewAppealWithPip({
-      verdict: modAction.action,
-      reason: modAction.reason,
-      flaggedText,
-      warnedCount: member?.warned_count ?? 0,
-      trusted,
-    });
-
-    // Model unavailable or genuinely unsure → a human makes the final call.
-    if (!review || review.confidence < APPEAL_ESCALATE_BELOW) {
-      await resolveAppeal(modActionId, {
-        status: "escalated",
-        decision: review?.decision || null,
-        reason: review?.explanation || "model unavailable / low confidence",
-        confidence: review?.confidence ?? null,
-      });
-      await escalateAppealToOperator(ctx, modAction, review, flaggedText);
-      await softWarn(ctx, modAction.user_id,
-        "Thanks — your appeal needs a closer look, so a human reviewer has been notified. You'll hear back here shortly.");
+    // Light per-user cooldown: stop a re-kick loop (rejoin → fail captcha →
+    // new kick row → /appeal) from spamming paid LLM reviews.
+    const recent = await query(
+      `SELECT created_at FROM community_appeals WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [String(userId)],
+    ).catch(() => ({ rows: [] }));
+    if (recent.rows[0] && (Date.now() - new Date(recent.rows[0].created_at).getTime()) < 90_000) {
+      await ctx.reply("Pip just reviewed an appeal for you — give it a minute, then send /appeal again.");
       return;
     }
 
-    if (review.decision === "overturn") {
-      let lifted = false;
-      try {
-        await ctx.api.restrictChatMember(modAction.chat_id, Number(modAction.user_id), { permissions: FULL_SEND_PERMS });
-        lifted = true;
-      } catch (err) {
-        console.warn("[appeals] unmute failed:", err.message);
-      }
-      await query(
-        `UPDATE community_members SET quarantine_until = NULL WHERE chat_id = $1 AND user_id = $2`,
-        [String(modAction.chat_id), String(modAction.user_id)],
-      ).catch(() => {});
-      await recordModAction(modAction.chat_id, modAction.user_id, "appeal_overturned", review.explanation, String(modActionId));
-      await resolveAppeal(modActionId, { status: "overturned", decision: "overturn", reason: review.explanation, confidence: review.confidence });
-      await softWarn(ctx, modAction.user_id,
-        `✅ *Appeal approved.* ${review.explanation}` +
-        (lifted ? `\n\nYou can post in the group again — sorry for the mix-up.` : `\n\nYour mute should lift momentarily.`));
-    } else {
-      await recordModAction(modAction.chat_id, modAction.user_id, "appeal_upheld", review.explanation, String(modActionId));
-      await resolveAppeal(modActionId, { status: "upheld", decision: "uphold", reason: review.explanation, confidence: review.confidence });
-      await softWarn(ctx, modAction.user_id,
-        `Your appeal was reviewed and the original action stands.\n\n${review.explanation}\n\n` +
-        `If your mute was temporary it will expire on its own. If you still believe this is wrong, DM @magpie_capital_bot and a human will take a final look.`);
+    const { findRecentAppealableAction, openAppeal } = await import("../services/community-appeals.js");
+    const modAction = await findRecentAppealableAction(userId);
+    if (!modAction) {
+      await ctx.reply(
+        "I don't see any recent Magpie moderation action on your account. If you were removed, make sure you're messaging from the same Telegram account that was affected.",
+      );
+      return;
     }
+    const { isNew, row } = await openAppeal(String(modAction.id), modAction.chat_id, modAction.user_id);
+    if (!isNew) {
+      await ctx.reply(appealStatusMsg(row?.status));
+      return;
+    }
+    await ctx.reply("⚖️ Pip is reviewing your appeal now…");
+    await applyAppealOutcome(ctx, modAction, userReason);
   } catch (err) {
-    console.warn("[appeals] handler error:", err.message);
-    try { await ctx.answerCallbackQuery({ text: "Something went wrong — please try again in a moment." }); } catch { /* ignore */ }
+    console.warn("[appeals] /appeal command error:", err.message);
+    try { await ctx.reply("Something went wrong — please try again in a moment."); } catch { /* ignore */ }
   }
 }
 
@@ -1016,4 +1142,4 @@ export function registerCommunityHandlers(bot) {
 }
 
 /** Convenience exposed for the admin-command module to verify state. */
-export { isAdmin };
+export { isAdmin, handleAppealCommand };
