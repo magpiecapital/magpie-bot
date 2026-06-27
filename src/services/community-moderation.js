@@ -510,11 +510,14 @@ export async function quarantineRateLimit(chatId, userId) {
 }
 
 export async function recordModAction(chatId, userId, action, reason, payload) {
-  await query(
+  const res = await query(
     `INSERT INTO community_mod_actions (chat_id, user_id, action, reason, payload)
-     VALUES ($1, $2, $3, $4, $5)`,
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [String(chatId), String(userId), action, reason || null, payload?.slice?.(0, 2000) || null],
   );
+  // Returned so a caller (e.g. a mute) can offer a one-tap appeal that
+  // references this exact action. Existing callers ignore it harmlessly.
+  return res.rows?.[0]?.id ?? null;
 }
 
 /** Recent mod-action stats for the operator dashboard / anomaly alerts. */
