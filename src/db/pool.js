@@ -714,6 +714,28 @@ export async function applyStartupPatches() {
     // it seq-scans community_mod_actions.
     `CREATE INDEX IF NOT EXISTS community_mod_actions_user_idx
        ON community_mod_actions(user_id, created_at DESC)`,
+    // User POINTS ledger (truth) + fast-read balance. Idempotent per
+    // (source_type, source_id); points are forward-only/positive. Read-side
+    // derivation over activity — never touches loan/collateral state. Canonical
+    // DDL also in src/services/points.js for standalone backfill/reconciler runs.
+    `CREATE TABLE IF NOT EXISTS points_events (
+       id          BIGSERIAL PRIMARY KEY,
+       user_id     BIGINT      NOT NULL,
+       source_type TEXT        NOT NULL,
+       source_id   TEXT        NOT NULL,
+       category    TEXT        NOT NULL,
+       points      BIGINT      NOT NULL CHECK (points > 0),
+       metadata    JSONB,
+       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       UNIQUE (source_type, source_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS points_events_user_created_idx ON points_events(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS points_events_user_cat_idx ON points_events(user_id, category)`,
+    `CREATE TABLE IF NOT EXISTS user_points_balance (
+       user_id      BIGINT PRIMARY KEY,
+       total_points BIGINT NOT NULL DEFAULT 0 CHECK (total_points >= 0),
+       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
     // Per-rule cooldown for operator anomaly DMs so a single incident
     // doesn't page the operator every 2-min watcher tick.
     `CREATE TABLE IF NOT EXISTS community_anomaly_alerts (

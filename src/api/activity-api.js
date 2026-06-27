@@ -36,7 +36,7 @@ export async function handleActivity(req, url) {
   const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");
   const resolvedUserId = await resolveWalletOwner(wallet);
   if (!resolvedUserId) {
-    return { status: 200, body: { linked: false, events: [] } };
+    return { status: 200, body: { ok: true, linked: false, events: [], total_points: 0 } };
   }
   const userId = resolvedUserId;
 
@@ -322,6 +322,11 @@ export async function handleActivity(req, url) {
   return {
     status: 200,
     body: {
+      // The dashboard gates its state update on `d.ok`; without this field the
+      // points counter (and anything else reading this response) silently stays
+      // at 0. (The points NUMBER now comes from /api/v1/points, but keep this
+      // honest so the activity feed + any legacy consumer work.)
+      ok: true,
       linked: true,
       events: events.slice(0, limit),
       // Total credit points across the user's entire history. Surfaced

@@ -98,6 +98,7 @@ import { handleDistributionQuery } from "./governance-distribution-api.js";
 import { handleDistributionsListQuery } from "./governance-distributions-list-api.js";
 import { handleGovernanceTally } from "./governance-tally-api.js";
 import { handleActivity } from "./activity-api.js";
+import { handlePoints } from "./points-api.js";
 import { handleAiChat } from "./ai-chat.js";
 import { handlePipSession } from "./pip-session.js";
 import { handleMeExport } from "./me-export.js";
@@ -1797,6 +1798,7 @@ const PUBLIC_ROUTES = new Set([
   // Unified activity feed (borrows, repays, auto-protect, withdraws,
   // referral payouts, holder rewards). Same risk envelope as /loans.
   "/api/v1/activity",
+  "/api/v1/points",
   // Ephemeral AI chat — signed message OR Bearer session token.
   "/api/v1/ai/chat",
   // Mint a Pip chat session — sign once, chat for 24h.
@@ -2335,6 +2337,9 @@ async function router(req, res) {
         break;
       case "/api/v1/activity":
         result = await handleActivity(req, url);
+        break;
+      case "/api/v1/points":
+        result = await handlePoints(req, url);
         break;
       case "/api/v1/ai/chat":
         result = await handleAiChat(req);
