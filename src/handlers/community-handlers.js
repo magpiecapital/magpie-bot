@@ -957,6 +957,24 @@ async function applyAppealOutcome(ctx, modAction, userReason) {
 
   const modActionId = String(modAction.id);
   const isRemoval = REMOVAL_ACTIONS.has(modAction.action);
+
+  // OPERATOR POLICY (hard gate, no LLM, no benefit of the doubt): a user whose
+  // CURRENT display name impersonates Magpie / Pip / a protocol persona
+  // ("Magpie Support", "MagpieMatt", etc.) is NEVER appealed back in. Appeals
+  // exist for BEHAVIOURAL misreads (something they SAID), not to launder an
+  // impostor name. They're welcome back only with a clean name.
+  if (isImpersonationName(ctx.from)) {
+    await recordModAction(modAction.chat_id, modAction.user_id, "appeal_upheld",
+      "impersonation display name — no benefit of the doubt", modActionId);
+    await resolveAppeal(modActionId, {
+      status: "upheld", decision: "uphold",
+      reason: "display name impersonates Magpie/protocol", confidence: 1,
+    });
+    await softWarn(ctx, modAction.user_id,
+      `Your appeal was reviewed and the removal stands.\n\nYour display name impersonates official Magpie / Pip / protocol staff, which is never allowed here. If you're a genuine member, change your display name so it no longer resembles Magpie, MagpieMatt, or any protocol/staff name, and you're welcome to rejoin.`);
+    return;
+  }
+
   const member = await getMember(modAction.chat_id, modAction.user_id).catch(() => null);
   const trusted = await isTrustedMember(modAction.user_id).catch(() => false);
   // For a name-based ban the "flagged content" is mostly the NAME (in `reason`)
