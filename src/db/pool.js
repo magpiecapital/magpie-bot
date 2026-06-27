@@ -696,6 +696,24 @@ export async function applyStartupPatches() {
      )`,
     `CREATE INDEX IF NOT EXISTS community_appeals_user_idx
        ON community_appeals(user_id, created_at DESC)`,
+    // Pip's MEMORY of users it should NOT auto-remove again: appeal winners +
+    // operator /unban- s. The name-ban, captcha-kick, and impersonator
+    // watchdog all skip anyone listed here, so a re-admitted member can't be
+    // instantly re-banned for the same name. Behavioral moderation (scam
+    // links/phrases, FUD) still applies — clearance ≠ a free pass to misbehave.
+    `CREATE TABLE IF NOT EXISTS community_cleared_users (
+       chat_id BIGINT NOT NULL,
+       user_id BIGINT NOT NULL,
+       cleared_by TEXT NOT NULL DEFAULT 'pip_appeal',
+       reason TEXT,
+       cleared_name TEXT,
+       cleared_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (chat_id, user_id)
+     )`,
+    // /appeal looks up a user's most recent mod action by user_id; without this
+    // it seq-scans community_mod_actions.
+    `CREATE INDEX IF NOT EXISTS community_mod_actions_user_idx
+       ON community_mod_actions(user_id, created_at DESC)`,
     // Per-rule cooldown for operator anomaly DMs so a single incident
     // doesn't page the operator every 2-min watcher tick.
     `CREATE TABLE IF NOT EXISTS community_anomaly_alerts (

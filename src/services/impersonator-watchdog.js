@@ -33,7 +33,7 @@
  * detection path specifically.
  */
 import { query } from "../db/pool.js";
-import { isImpersonationName, isVerifiedAccount, recordModAction } from "./community-moderation.js";
+import { isImpersonationName, isVerifiedAccount, recordModAction, isUserCleared, nameKey } from "./community-moderation.js";
 
 const SCAN_INTERVAL_MS = Number(process.env.IMPERSONATOR_SCAN_INTERVAL_MS) || 30 * 60_000; // 30 min default
 const SCAN_WINDOW_HOURS = Number(process.env.IMPERSONATOR_SCAN_WINDOW_HOURS) || 24;
@@ -98,6 +98,9 @@ async function scanChat(bot, chatId) {
     if (isVerifiedAccount(u)) continue;
     if (member.status === "left" || member.status === "kicked") continue;
     if (!isImpersonationName(u)) continue;
+    // Pip's memory: never re-ban a member already cleared via appeal/operator
+    // (name-scoped — a rename into a fresh impersonation handle is NOT cleared).
+    if (await isUserCleared(chatId, row.user_id, nameKey(u))) continue;
 
     // HIT — auto-kick (matches on-join handler's action on a flagged
     // joiner that also failed captcha). The exact "warn vs. ban"
@@ -130,6 +133,16 @@ async function scanChat(bot, chatId) {
           { parse_mode: "Markdown" },
         );
       } catch { /* permission issue / chat-permissions block — skip */ }
+      // Best-effort: tell the removed user how to appeal (no-ops if they never
+      // DM'd the bot). The self-heal is useless if false positives never learn
+      // /appeal exists.
+      try {
+        await bot.api.sendMessage(
+          Number(row.user_id),
+          `You were removed from the Magpie community because your name matched our Magpie-staff impersonation filter.\n\n` +
+          `If you're a real member and this was a mistake, reply with /appeal and Pip will review it instantly and let you back in if it was wrong.`,
+        );
+      } catch { /* user never started the bot — nothing we can do */ }
     } catch (err) {
       console.warn(`[impersonator-watch] ban failed for ${row.user_id}:`, err.message?.slice(0, 100));
     }
