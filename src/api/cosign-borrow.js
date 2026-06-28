@@ -1076,6 +1076,43 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
           // what enforces "V4 loans are the only ones that can host
           // exits"; this endpoint just signs the borrow.
           const isV4Borrow = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID);
+
+          // ── CRITICAL: validate the on-chain LTV-tier `category` byte ──────
+          // (2026-06-28 security audit.) V3/V4 request_and_fund_loan takes a
+          // `category u8` at instruction-data offset 33 that the PROGRAM uses
+          // to pick the LTV ladder: 0 = memecoin (≤30%), 1 = RWA (up to 70%).
+          // The program only checks `category <= 1` and TRUSTS this cosign
+          // authority to ensure the byte matches the real mint. If we sign
+          // without checking, an attacker self-builds a memecoin V4 borrow
+          // with the byte flipped to 1 and draws ~2.3x the safe loan (RWA LTV
+          // on a volatile memecoin) → direct pool loss, repeatable. The byte
+          // is an UNCHECKED attacker lever; the attestation only caps VALUE,
+          // not the LTV multiplier. So: for any program that takes the arg,
+          // the byte MUST equal the mint's canonical category. V4 is NOT
+          // exempt. (offset = 8 disc + 8 amount + 1 option + 8 value + 8 loan_id.)
+          const programTakesCategoryArg =
+            isV4Borrow || (V3_PROGRAM_ID && ixProgramId.equals(V3_PROGRAM_ID));
+          if (programTakesCategoryArg) {
+            const CATEGORY_OFFSET = 8 + 8 + 1 + 8 + 8; // = 33
+            if (data.length < CATEGORY_OFFSET + 1) {
+              return {
+                status: 400,
+                body: { error: "malformed_borrow_tx", detail: "Borrow instruction is missing the category byte — refusing to co-sign." },
+              };
+            }
+            const categoryByte = data.readUInt8(CATEGORY_OFFSET);
+            const expectedCategoryByte = isRwaMint ? 1 : 0;
+            if (categoryByte !== expectedCategoryByte) {
+              return {
+                status: 400,
+                body: {
+                  error: "category_byte_mismatch",
+                  detail: `Borrow tx declares LTV category=${categoryByte}, but ${mintRow.symbol || collateralMintStr} is '${mintRow.category}' (canonical category=${expectedCategoryByte}). Refusing to co-sign a mismatched LTV tier.`,
+                },
+              };
+            }
+          }
+
           if (!isV4Borrow) {
             // V1/V2/V3 category gates — plain borrows still follow category routing.
             let expectedRwaProgram = V2_PROGRAM_ID;
