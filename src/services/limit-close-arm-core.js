@@ -1339,9 +1339,16 @@ async function armOrderBatchImpl({
   if (loan.enabled === false) {
     return { ok: false, error: "collateral_not_enabled" };
   }
+  // Exits are V4-ONLY — "no exceptions" (operator mandate). Enforce this
+  // STRUCTURALLY on the batch/ladder arm path too (audit 2026-06-28 P2 #6),
+  // not behind an off-by-default env flag: an exit armed on a V1/V2/V3 loan
+  // would fire through the legacy fire-and-close model, breaking the in-vault
+  // thesis. The single-arm path already enforces this structurally; this makes
+  // the highest-traffic batch path consistent. (V4_EXIT_EXCLUSIVE_ENFORCE is
+  // retained only as an explicit OVERRIDE to disable, never as the default.)
   const v4Pid = process.env.PROGRAM_ID_V4 ?? null;
-  const v4EnforceOn = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
-  if (v4EnforceOn && v4Pid && loan.program_id && loan.program_id !== v4Pid) {
+  const v4EnforceDisabled = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "false";
+  if (!v4EnforceDisabled && v4Pid && loan.program_id && loan.program_id !== v4Pid) {
     return { ok: false, error: "exits_require_v4_loan" };
   }
 

@@ -454,10 +454,15 @@ export async function handleSiteLimitCloseList(req, url) {
               cancellation_reason
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
-          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled','failed','max_retries_exceeded')
+          -- 'partial_fired' MUST be included (audit 2026-06-28 P1 #3): a TWAP/
+          -- chunked exit that sold SOME collateral into the vault lands in
+          -- 'partial_fired'. Omitting it dropped the order from the dashboard
+          -- entirely → the banner showed "No exit set" despite real proceeds.
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','partial_fired','cancelled','failed','max_retries_exceeded')
         ORDER BY
-          -- Active states sort first by armed_at DESC, history by fired_at DESC
-          CASE WHEN status IN ('fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
+          -- Active states sort first by armed_at DESC, history by fired_at DESC.
+          -- partial_fired is a FIRED (terminal) state → sort with history.
+          CASE WHEN status IN ('fired','partial_fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
           armed_at DESC`,
       [loanIds],
     );
