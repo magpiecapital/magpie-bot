@@ -29,6 +29,7 @@
 
 import { query } from "../db/pool.js";
 import { getAdminId, notifyAdmin } from "./admin-notify.js";
+import { markCycle } from "../lib/heartbeat.js";
 
 // Cadence tightened from 30min -> 5min 2026-06-18 PM. With Layer 4
 // auto-repair (PR #393), the sentinel now FIXES drift inline, so a
@@ -163,6 +164,7 @@ export function startWalletAttributionSentinel(bot) {
   setTimeout(async function tick() {
     try {
       await runOneCycle(bot);
+      markCycle("wallet-attr-sentinel"); // audit P2 — provable on /health heartbeats
     } catch (err) {
       console.error("[wallet-attr-sentinel] tick failed:", err?.message?.slice(0, 200));
     } finally {

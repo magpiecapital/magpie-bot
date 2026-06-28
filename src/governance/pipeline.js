@@ -370,8 +370,18 @@ export async function processProposal(proposal) {
       // Plurality among the non-ABSTAIN options.
       let topWeight = -1n;
       let tie = false;
+      // Constrain winner math to choices ACTUALLY on the ballot (audit
+      // 2026-06-28 P3): an off-ballot / stale vote bucket (e.g. a legacy 'E'
+      // cast before the API rejected invalid choices) must never enter the
+      // plurality. Symmetric to the submission-side choices.includes(vote)
+      // guard; empty/absent proposal.choices falls back to prior behavior.
+      const ballotChoices = new Set(
+        (Array.isArray(proposal.choices) ? proposal.choices : []).map((c) => String(c).toUpperCase()),
+      );
       for (const [choice, raw] of Object.entries(perChoice)) {
-        if (String(choice).toUpperCase() === "ABSTAIN") continue;
+        const cu = String(choice).toUpperCase();
+        if (cu === "ABSTAIN") continue;
+        if (ballotChoices.size > 0 && !ballotChoices.has(cu)) continue;
         const w = BigInt(raw || "0");
         if (w > topWeight) { topWeight = w; winnerChoice = choice; tie = false; }
         else if (w === topWeight && w > 0n) { tie = true; }

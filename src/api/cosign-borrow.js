@@ -571,6 +571,12 @@ function classifyBorrowOutcome(result) {
   if (result.status === 503 && b.paused === true) {
     return { outcome: "failure", klass: "killswitch" };
   }
+  // Security-relevant rejections get their OWN failure_class (audit 2026-06-28
+  // P3): the cosign LTV category-byte guard + malformed-tx refusal would
+  // otherwise bucket into generic bad_request, so adversarial probing of the
+  // on-chain LTV byte wasn't alertable. Per the proactive-error-prevention rule.
+  if (b.error === "category_byte_mismatch") return { outcome: "failure", klass: "category_byte_mismatch" };
+  if (b.error === "malformed_borrow_tx") return { outcome: "failure", klass: "malformed_borrow_tx" };
   if (result.status === 400) return { outcome: "failure", klass: "bad_request" };
   if (result.status === 503) return { outcome: "failure", klass: "unavailable" };
   if (result.status === 500) return { outcome: "failure", klass: "server_error" };
@@ -1065,7 +1071,11 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
           // refusal is the structural guarantee: even with stale client
           // code, a wrong-program borrow CANNOT be signed by the lender.
           // The user sees a clear error and is forced to refresh.
-          const isRwaMint = ["stock", "etf", "metal"].includes(mintRow.category);
+          // Includes 'rwa' (audit 2026-06-28 P3): unify the RWA-category set with
+          // the rest of the codebase (token-catalog-announcer, engine carve-outs)
+          // so a category='rwa' mint is consistently treated as RWA for the LTV
+          // category byte. Fail-closed today, but the divergence was a latent footgun.
+          const isRwaMint = ["stock", "etf", "metal", "rwa"].includes(mintRow.category);
           const ixProgramId = magpieIx.programId;
           // V4-exclusive routing (2026-06-15): V4 is the only pool that
           // services exit-armed borrows, regardless of category. Routing
