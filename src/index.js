@@ -702,6 +702,12 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
+    // Token-catalog → @MagpieLoans auto-announce — reconciliation worker that
+    // diffs supported_mints.enabled and tweets when a token is added/removed
+    // from the approved-collateral catalog (the /tokens page). No-op posting
+    // until X_API_KEY/SECRET + X_ACCESS_TOKEN/SECRET are set; seeds state
+    // meanwhile so it never backlog-dumps. See token-catalog-announcer.js.
+    import("./services/token-catalog-announcer.js").then((m) => m.startTokenCatalogAnnouncer());
     // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
     // upstream instances die constantly and the X API requires a paid
     // bearer token; alerts about "data sources offline" were noise.
