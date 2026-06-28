@@ -485,6 +485,16 @@ async function addMint(mint, symbol, name, decimals, category, candidate) {
        screened_at = NOW()`,
     [mint, symbol, name, decimals, category, candidate.liquidity],
   );
+  // WARM-ON-ENABLE (operator 2026-06-28): a newly-enabled RWA must be
+  // V4-borrow-ready in seconds, not after the next 90s feed-init sweep. Kick
+  // feed-init + on-demand attestation NOW. RWAs especially need this — the
+  // 8-sample/5-min V4 TWAP can't fill JIT for thin xStocks. Best-effort.
+  try {
+    const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+    await warmMintForBorrow(mint, "rwa_screener");
+  } catch (e) {
+    console.warn(`[rwa-screener] warm-on-enable ${mint} failed (sweeps backstop): ${e.message?.slice(0, 100)}`);
+  }
 }
 
 async function disableMint(mint, reason) {
