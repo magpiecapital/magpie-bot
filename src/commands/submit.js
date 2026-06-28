@@ -12,6 +12,7 @@
 import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
+import { ensureMintFeedsInitialized } from "../services/price-attestor.js";
 import { InlineKeyboard } from "grammy";
 import {
   checkSellable,
@@ -367,6 +368,16 @@ export async function handleSubmit(ctx) {
       `INSERT INTO token_screen_seen (mint) VALUES ($1) ON CONFLICT DO NOTHING`,
       [mint],
     );
+
+    // IMMEDIATELY initialize the on-chain price-feed PDA(s) so the token is
+    // borrowable the instant it's approved — never AccountNotInitialized for a
+    // freshly-approved token. Best-effort: the boot/90s feed-init sweep retries
+    // if this throws. (operator P0 2026-06-27, $ANSEM)
+    try {
+      await ensureMintFeedsInitialized(mint);
+    } catch (e) {
+      console.warn(`[submit] price-feed init for ${mint} failed (sweep will retry): ${e.message?.slice(0, 120)}`);
+    }
 
     const kb = new InlineKeyboard()
       .text("💰 Borrow", "start:borrow")
