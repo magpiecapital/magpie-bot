@@ -7,6 +7,7 @@ import {
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
+import { ensureMintFeedsInitialized } from "../services/price-attestor.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
 import {
@@ -383,8 +384,19 @@ async function executeEnableMint(ctx, args) {
              enabled = TRUE`,
       [mint, symbol.toUpperCase(), name, decimals],
     );
+    // IMMEDIATELY initialize the price-feed PDA(s) so it's borrowable at once —
+    // never AccountNotInitialized. The boot/90s feed-init sweep retries on error.
+    let feedNote = "";
+    try {
+      const feeds = await ensureMintFeedsInitialized(mint);
+      const created = feeds.filter((f) => f.signature).length;
+      feedNote = created ? ` Initialized ${created} price feed(s).` : " Price feeds already initialized.";
+    } catch (e) {
+      feedNote = " ⚠️ Price-feed init failed — the sweep will retry within ~90s.";
+      console.warn(`[enablemint] feed init for ${mint} failed: ${e.message?.slice(0, 120)}`);
+    }
     await logAdminCommand(ctx, "enablemint", { outcome: "success", args: `${symbol.toUpperCase()} ${mint}` });
-    await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).`);
+    await ctx.reply(`✅ ${symbol.toUpperCase()} enabled (decimals=${decimals}, verified on-chain).${feedNote}`);
     return { ok: true };
   } catch (err) {
     await logAdminCommand(ctx, "enablemint", { outcome: "error", args: `${symbol} ${mint}`, error: err.message });
