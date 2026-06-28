@@ -414,6 +414,34 @@ export async function requestMintWarm(mintStr) {
   return { ok: true, ...readiness };
 }
 
+/**
+ * WARM-ON-ENABLE (operator 2026-06-28, CRITICAL): make a just-enabled token
+ * IMMEDIATELY V4-borrow-ready instead of waiting for a periodic sweep. Called
+ * synchronously by EVERY path that flips supported_mints.enabled=TRUE (screener
+ * auto-approve, RWA screener, review-queue promote, web/TG submit). It (1) inits
+ * the on-chain price-feed PDAs so a borrow never hits AccountNotInitialized, and
+ * (2) pushes the mint onto the on-demand warm queue so attestation starts within
+ * ~3s — filling the V4 TWAP window (8 samples) in ~24s instead of ~140s. New
+ * mints default to attestation_tier='hot', so the continuous attestor then keeps
+ * the window full. Best-effort (the 90s feed-init sweep + 20s attestor still
+ * backstop) — never blocks/aborts the approval. See
+ * feedback_new_token_immediately_v4_borrowable.
+ */
+export async function warmMintForBorrow(mintStr, source = "enable") {
+  try {
+    const { ensureMintFeedsInitialized } = await import("./price-attestor.js");
+    await ensureMintFeedsInitialized(mintStr);
+  } catch (e) {
+    console.warn(`[warm-on-enable] feed-init ${mintStr} failed (sweep backstops): ${e.message?.slice(0, 100)}`);
+  }
+  try {
+    await requestMintWarm(mintStr);
+  } catch (e) {
+    console.warn(`[warm-on-enable] requestMintWarm ${mintStr} failed: ${e.message?.slice(0, 100)}`);
+  }
+  console.log(`[warm-on-enable] kicked feed-init + on-demand attestation for ${mintStr} (source=${source})`);
+}
+
 async function onDemandLoop(lenderPk, programIdV4) {
   // Pull mints requested in the last hot window. Drop expired entries
   // so the map stays small.

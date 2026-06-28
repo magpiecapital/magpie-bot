@@ -1114,6 +1114,17 @@ async function autoApproveToken(mint, onChain, market, holderCount, ageHours, ca
       rwa, // RWAs are auto-protected from health monitor delisting
     ],
   );
+  // WARM-ON-ENABLE (operator 2026-06-28): the screener auto-approve path
+  // previously did NOT kick feed-init/attestation (only the user /submit path
+  // did) — so a screener-approved token wasn't V4-borrow-ready for ~90-200s.
+  // Now it warms immediately: feed-init (no AccountNotInitialized) + on-demand
+  // attestation so the V4 TWAP window fills in ~24s. Best-effort.
+  try {
+    const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+    await warmMintForBorrow(mint, "screener_auto_approve");
+  } catch (e) {
+    console.warn(`[screener] warm-on-enable ${mint} failed (sweeps backstop): ${e.message?.slice(0, 100)}`);
+  }
 }
 
 async function queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category) {
@@ -1426,6 +1437,11 @@ export function registerScreenerCallbacks(bot) {
         t.has_mint_authority, t.has_freeze_authority, t.token_age_hours,
       ],
     );
+    // WARM-ON-ENABLE (operator 2026-06-28): manual approve → V4-borrow-ready now.
+    try {
+      const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+      await warmMintForBorrow(t.mint, "review_approve");
+    } catch (e) { console.warn(`[screener] warm-on-enable ${t.mint} failed: ${e.message?.slice(0, 100)}`); }
 
     await query(
       `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,
@@ -1635,6 +1651,11 @@ async function processReviewQueue(bot) {
         liveMarket.liquidity, liveHolderCount, liveMarket.marketCap, t.token_age_hours,
       ],
     );
+    // WARM-ON-ENABLE (operator 2026-06-28): queue-promote → V4-borrow-ready now.
+    try {
+      const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+      await warmMintForBorrow(t.mint, "review_auto_promote");
+    } catch (e) { console.warn(`[screener] warm-on-enable ${t.mint} failed: ${e.message?.slice(0, 100)}`); }
 
     await query(
       `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,
