@@ -708,6 +708,11 @@ bot.start({
     // until X_API_KEY/SECRET + X_ACCESS_TOKEN/SECRET are set; seeds state
     // meanwhile so it never backlog-dumps. See token-catalog-announcer.js.
     import("./services/token-catalog-announcer.js").then((m) => m.startTokenCatalogAnnouncer(bot));
+    // Points reconciler — self-heals the points ledger (backstop to the inline
+    // forward-sync in loans.js) AND clears the historical backlog of loans
+    // opened after the 2026-06-27 manual backfill. Idempotent; audit 2026-06-28
+    // P0/P1 (points were frozen — new loans accrued zero). See points-reconciler.js.
+    import("./services/points-reconciler.js").then((m) => m.startPointsReconciler());
     // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
     // upstream instances die constantly and the X API requires a paid
     // bearer token; alerts about "data sources offline" were noise.

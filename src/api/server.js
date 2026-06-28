@@ -493,7 +493,7 @@ async function handleTransparency() {
     `SELECT
        (SELECT accrued_lamports::text FROM magpie_holder_pool WHERE id = 1) AS current_pool_lamports,
        (SELECT COUNT(*)::int FROM magpie_holder_distributions) AS lifetime_distributions,
-       (SELECT total_distributed_lamports::text FROM magpie_holder_distributions
+       (SELECT pool_lamports::text FROM magpie_holder_distributions
           ORDER BY id DESC LIMIT 1) AS last_distribution_lamports,
        (SELECT created_at FROM magpie_holder_distributions ORDER BY id DESC LIMIT 1)
          AS last_distribution_at`,
