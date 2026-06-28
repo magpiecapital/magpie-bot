@@ -27,11 +27,17 @@
  */
 import { query } from "../db/pool.js";
 import { postTweet, xPosterConfigured } from "./x-poster.js";
+import { crosspostTweet } from "./community-x-crosspost.js";
 
 const POLL_MS = Number(process.env.TOKEN_ANNOUNCE_POLL_MS || 5 * 60_000);
 const MAX_PER_TICK = Number(process.env.TOKEN_ANNOUNCE_MAX_PER_TICK || 3);
 const ANNOUNCE_REMOVALS = process.env.TOKEN_ANNOUNCE_REMOVALS !== "false";
 const TOKENS_URL = "https://www.magpie.capital/tokens";
+
+// Bot API handle — set by startTokenCatalogAnnouncer(bot). When present,
+// every tweet we post is ALSO autonomously cross-posted into the Magpie
+// community TG chats via the shared /crosspost primitive (operator 2026-06-28).
+let _botApi = null;
 
 /** Strip a token symbol to a tweet-safe token. Removes anything that could
  *  hijack the post (newlines, @, #, $, URLs, control chars) and caps length.
@@ -139,6 +145,32 @@ async function tick() {
       res.tweetId ?? null,
     );
     if (res.ok) posted++;
+
+    // AUTONOMOUS TG ANNOUNCEMENT (operator 2026-06-28): the community MUST get
+    // every catalog change in MagPie Talk REGARDLESS of X's state. The X
+    // account can be credit-depleted (402 CreditsDepleted) — and we never want
+    // that to silence the TG announcement. So this is DECOUPLED from the tweet:
+    //   • tweet succeeded → cross-post its card (richer, renders inline)
+    //   • tweet failed/skipped (no creds, 402, rate-limit) → post the
+    //     announcement TEXT directly so MagPie Talk still gets it.
+    // Best-effort: a TG failure never blocks the announce loop or state write.
+    if (_botApi) {
+      try {
+        if (res.ok && res.tweetId) {
+          await crosspostTweet(
+            _botApi,
+            `https://x.com/MagpieLoans/status/${res.tweetId}`,
+            "auto",
+          );
+        } else {
+          await postAnnouncementToCommunity(_botApi, text);
+        }
+      } catch (e) {
+        console.warn(
+          `[token-announcer] TG announce failed: ${e.message?.slice(0, 120)}`,
+        );
+      }
+    }
   }
 
   if (transitions.length > 0) {
@@ -149,7 +181,30 @@ async function tick() {
   }
 }
 
-export function startTokenCatalogAnnouncer() {
+/** Post the announcement TEXT directly to the enabled community chats
+ *  (MagPie Talk). Used as the fallback when the tweet didn't post (X
+ *  credit-depleted / rate-limited / no creds) so the community is never
+ *  starved of a catalog change. Plain text (no parse_mode) so a token
+ *  symbol containing a Markdown char can never break or hijack the post;
+ *  Telegram still auto-links the /tokens URL and renders its preview. */
+async function postAnnouncementToCommunity(botApi, text) {
+  const { listEnabledChats } = await import("./community-moderation.js");
+  let chats = [];
+  try { chats = await listEnabledChats(); } catch (e) {
+    console.warn(`[token-announcer] listEnabledChats failed: ${e.message?.slice(0, 90)}`);
+    return;
+  }
+  for (const c of chats) {
+    try {
+      await botApi.sendMessage(Number(c.chat_id), text, { disable_web_page_preview: false });
+    } catch (e) {
+      console.warn(`[token-announcer] TG send to ${c.chat_id} failed: ${e.message?.slice(0, 90)}`);
+    }
+  }
+}
+
+export function startTokenCatalogAnnouncer(bot) {
+  _botApi = bot?.api ?? null;
   // Run the loop even WITHOUT X creds so the state table tracks the catalog
   // (seeding). Then the day creds are added, only FUTURE changes announce —
   // never a backlog dump of everything that changed while creds were absent.
@@ -162,6 +217,7 @@ export function startTokenCatalogAnnouncer() {
   console.log(
     `[token-announcer] armed — polls every ${Math.round(POLL_MS / 1000)}s; ` +
       `X posting ${xPosterConfigured() ? "ENABLED" : "disabled (no creds — seeding only)"}; ` +
+      `TG mirror ${_botApi ? "ENABLED (MagPie Talk always gets the post, even if X is depleted)" : "disabled (no bot)"}; ` +
       `removals ${ANNOUNCE_REMOVALS ? "on" : "off"}`,
   );
 }
