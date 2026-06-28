@@ -146,10 +146,19 @@ const ipRateLimitStore = new Map();
 const PUBLIC_IP_LIMIT_RPM = parseInt(process.env.PUBLIC_IP_LIMIT_RPM || "240", 10);
 
 function extractClientIp(req) {
-  // Trust the leftmost x-forwarded-for value when behind Railway's proxy.
+  // SECURITY (audit 2026-06-28): the LEFTMOST x-forwarded-for value is
+  // client-SUPPLIED and therefore spoofable — trusting xff[0] let an attacker
+  // rotate it to defeat the per-IP rate limit (e.g. spam /v4/warm-mint). Trust
+  // only the hop our OWN infra appended: Railway's edge appends the real
+  // connecting IP as the rightmost entry, so take the PUBLIC_TRUSTED_PROXY_HOPS-th
+  // hop from the right (default 1 = the rightmost).
   const xff = req.headers["x-forwarded-for"];
   if (typeof xff === "string" && xff.length > 0) {
-    return xff.split(",")[0].trim();
+    const hops = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    if (hops.length) {
+      const trusted = Math.max(1, parseInt(process.env.PUBLIC_TRUSTED_PROXY_HOPS || "1", 10));
+      return hops[Math.max(0, hops.length - trusted)];
+    }
   }
   return req.socket?.remoteAddress ?? "unknown";
 }
