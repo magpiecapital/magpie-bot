@@ -303,6 +303,46 @@ async function reconcileTick() {
           console.warn("[loan-reconciler] due_timestamp update failed:", err.message);
         }
       }
+
+      // 4. V4 display-mirror sync — keep the dashboard EXACTLY aligned with
+      //    on-chain (operator mandate 2026-06-28: every display item must
+      //    reflect exactly what happened). The V4 loan account stores
+      //    current_collateral_amount / sol_proceeds_amount / auto_sells_fired
+      //    DIRECTLY, so a fired auto-sell (TP / SL / ladder) that converted
+      //    collateral into the per-loan vault is reflected here every cycle —
+      //    even if the engine's own post-fire mirror write failed (e.g. the
+      //    collateral_sold_raw column bug). This is what makes the loan card
+      //    show "X SOL in vault (+ Y remaining)" instead of the stale pre-fire
+      //    collateral. V1/V2/V3 loan accounts don't carry these fields
+      //    (undefined → skipped). IS DISTINCT FROM makes it a no-op when the
+      //    mirror is already in sync, so it only writes on genuine drift.
+      if (onChain.currentCollateralAmount !== undefined && onChain.solProceedsAmount !== undefined) {
+        try {
+          const ccA = onChain.currentCollateralAmount.toString();
+          const spA = onChain.solProceedsAmount.toString();
+          const asf = Number(onChain.autoSellsFired ?? 0);
+          const upd = await query(
+            `UPDATE loans
+                SET current_collateral_amount = $2::numeric,
+                    sol_proceeds_amount        = $3::numeric,
+                    auto_sells_fired           = $4,
+                    updated_at                 = NOW()
+              WHERE id = $1
+                AND (current_collateral_amount IS DISTINCT FROM $2::numeric
+                  OR sol_proceeds_amount        IS DISTINCT FROM $3::numeric
+                  OR auto_sells_fired           IS DISTINCT FROM $4)`,
+            [dbLoan.id, ccA, spA, asf],
+          );
+          if (upd.rowCount > 0) {
+            console.log(
+              `[loan-reconciler] Loan ${dbLoan.id} (#${dbLoan.loan_id}) V4 display-mirror synced from chain: collateral=${ccA} proceeds=${spA} auto_sells=${asf}`,
+            );
+            fixed++;
+          }
+        } catch (err) {
+          console.warn("[loan-reconciler] V4 mirror sync failed:", err.message);
+        }
+      }
     }
   }
 
