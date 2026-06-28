@@ -42,6 +42,7 @@
  */
 import { query } from "../db/pool.js";
 import { notifyAdmin } from "./admin-notify.js";
+import { markCycle } from "../lib/heartbeat.js";
 
 const INTERVAL_MS = Number(
   process.env.PENDING_ARM_WATCHER_INTERVAL_MS || 10_000,
@@ -59,20 +60,21 @@ export function startPendingArmRetryWatcher(bot) {
     console.log("[pending-arm] DISABLED via PENDING_ARM_WATCHER_DISABLED env");
     return;
   }
-  // First tick after 30s so the boot storm settles.
+  // First tick after 30s so the boot storm settles. markCycle on each
+  // successful run → provable on /health heartbeats (audit 2026-06-28 P2).
   setTimeout(() => {
-    runOnce(bot).catch((e) =>
-      console.warn(`[pending-arm] first tick failed: ${e.message?.slice(0, 160)}`),
-    );
+    runOnce(bot)
+      .then(() => markCycle("pending-arm-watcher"))
+      .catch((e) => console.warn(`[pending-arm] first tick failed: ${e.message?.slice(0, 160)}`));
     _timer = setInterval(() => {
       if (_running) {
         // Previous tick still in flight — skip this one so we don't
         // pile up overlapping iterations during slow DB queries.
         return;
       }
-      runOnce(bot).catch((e) =>
-        console.warn(`[pending-arm] tick failed: ${e.message?.slice(0, 160)}`),
-      );
+      runOnce(bot)
+        .then(() => markCycle("pending-arm-watcher"))
+        .catch((e) => console.warn(`[pending-arm] tick failed: ${e.message?.slice(0, 160)}`));
     }, INTERVAL_MS);
   }, 30_000);
   console.log(

@@ -41,27 +41,43 @@ export async function accrueToProtocolReserve({ loanDbId, feeLamports, eventType
   if (reward <= 0n) return null;
 
   try {
-    // Insert the event idempotently first. If the unique constraint
-    // catches a duplicate, the pool counter must NOT bump again.
-    const ins = await query(
-      `INSERT INTO protocol_reserve_events
-         (loan_db_id, event_type, fee_lamports, reward_lamports, reward_bps)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (loan_db_id, event_type) DO NOTHING
-       RETURNING id`,
-      [loanDbId, eventType, fee.toString(), reward.toString(), liveBps],
-    );
-    if (ins.rows.length === 0) return null; // duplicate — already accrued
-
-    await query(
-      `UPDATE protocol_reserve_pool
-          SET accrued_lamports = accrued_lamports + $1::numeric,
+    // ATOMIC idempotent accrual (audit 2026-06-28 P2): previously this was TWO
+    // separate statements (INSERT event, then UPDATE pool), so a crash between
+    // them could record the event but skip the pool bump. Now ONE statement:
+    //   - protocol_reserve_events (UNIQUE(loan_db_id,event_type)) is the
+    //     idempotency GUARD — kept so existing accruals (not yet in
+    //     pool_credit_events) are never re-credited;
+    //   - a forward dual-write into the CANONICAL pool_credit_events ledger
+    //     happens ONLY when the event was newly inserted (matches the
+    //     creditProtocolReserveDirect pattern — pool-credit idempotency mandate);
+    //   - the pool UPDATE gates on EXISTS(the new event) so it can never
+    //     double-bump.
+    const sourceId = `loan:${loanDbId}:${eventType}`;
+    const { rows } = await query(
+      `WITH ev AS (
+         INSERT INTO protocol_reserve_events
+           (loan_db_id, event_type, fee_lamports, reward_lamports, reward_bps)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (loan_db_id, event_type) DO NOTHING
+         RETURNING id
+       ),
+       pce AS (
+         INSERT INTO pool_credit_events (source_type, source_id, pool_kind, lamports, metadata)
+         SELECT 'protocol_reserve_accrual', $6, 'protocol_reserve', $4::numeric,
+                jsonb_build_object('loan_db_id', $1, 'event_type', $2)
+         FROM ev
+         ON CONFLICT (source_type, source_id, pool_kind) DO NOTHING
+         RETURNING id
+       )
+       UPDATE protocol_reserve_pool
+          SET accrued_lamports = accrued_lamports + $4::numeric,
               last_accrual_at = NOW(),
               updated_at = NOW()
-        WHERE id = 1`,
-      [reward.toString()],
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM ev)
+        RETURNING accrued_lamports::text AS new_total`,
+      [loanDbId, eventType, fee.toString(), reward.toString(), liveBps, sourceId],
     );
-    return reward;
+    return rows.length > 0 ? reward : null;
   } catch (err) {
     console.error("[protocol-reserve] accrual failed:", err.message);
     return null;

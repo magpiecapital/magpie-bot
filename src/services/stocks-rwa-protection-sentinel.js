@@ -25,6 +25,7 @@
  * the drift the moment it happens.
  */
 import { query } from "../db/pool.js";
+import { markCycle } from "../lib/heartbeat.js";
 
 const PERIODIC_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -90,9 +91,12 @@ export function startStocksRwaProtectionSentinel() {
   console.log(
     "[stocks-rwa-sentinel] starting — boot enforcement now, then every 5 min",
   );
-  enforceStocksRwaProtection("boot");
+  // markCycle on each successful enforcement → provable "doing its job" on
+  // /api/v1/health heartbeats (audit 2026-06-28 P2). Reported only, does not
+  // gate overall health status. enforceStocksRwaProtection never throws.
+  enforceStocksRwaProtection("boot").then(() => markCycle("stocks-rwa-sentinel"));
   setInterval(
-    () => enforceStocksRwaProtection("periodic"),
+    () => enforceStocksRwaProtection("periodic").then(() => markCycle("stocks-rwa-sentinel")),
     PERIODIC_INTERVAL_MS,
   );
 }
