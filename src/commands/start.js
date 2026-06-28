@@ -65,6 +65,36 @@ export async function handleStart(ctx) {
 
   const startArg = typeof ctx.match === "string" ? ctx.match.trim() : "";
 
+  // Community captcha verification deep-link from a group join:
+  //   t.me/<bot>?start=cap_<chatId>_<userId>
+  // The in-group welcome post (community-handlers.js) carries this link so the
+  // new member verifies privately in their OWN DM. The payload is id-scoped —
+  // only the member it was issued to can pass it; anyone else who taps the
+  // group link just lands here as a normal new user. Verifying = marking
+  // captcha_passed (the kick timer checks that flag and stands down) + clearing
+  // the in-group post. Wrapped so a telemetry/clear hiccup never blocks verify.
+  const capMatch = startArg.match(/^cap_(-?\d+)_(\d+)$/);
+  if (capMatch) {
+    const capChatId = capMatch[1];
+    const capUserId = Number(capMatch[2]);
+    if (ctx.from?.id === capUserId) {
+      try {
+        const mod = await import("../services/community-moderation.js");
+        await mod.markCaptchaPassed(capChatId, capUserId);
+        await mod.recordModAction(capChatId, capUserId, "captcha_pass", "verified via DM deep-link", null).catch(() => {});
+        const comm = await import("../handlers/community-handlers.js");
+        await comm.clearGroupCaptcha(ctx.api, capChatId, capUserId).catch(() => {});
+      } catch (e) {
+        console.warn("[start] captcha verify failed:", e.message);
+      }
+      await ctx.reply("✅ You're verified! Head back to the Magpie group and start chatting. Welcome aboard. 🐦").catch(() => {});
+      return;
+    }
+    // A different user tapped someone else's verify link — just greet them.
+    await ctx.reply("👋 Welcome to Magpie! That verify link was for another member. Tap /start to set up your own wallet and borrow SOL against your tokens.").catch(() => {});
+    return;
+  }
+
   // Deep link from dashboard: t.me/magpie_capital_bot?start=loan
   if (startArg === "loan") {
     const msg = [
