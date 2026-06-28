@@ -35,11 +35,14 @@ const TOKENS_URL = "https://www.magpie.capital/tokens";
 
 /** Strip a token symbol to a tweet-safe token. Removes anything that could
  *  hijack the post (newlines, @, #, $, URLs, control chars) and caps length.
- *  Returns "" if nothing safe remains (caller falls back to neutral copy). */
+ *  Returns "" if nothing safe remains (caller falls back to neutral copy).
+ *  SECURITY (audit 2026-06-28): also drop '.' and spaces — an attacker-controlled
+ *  symbol like "evilsite.com" otherwise survives and X AUTO-LINKIFIES it into a
+ *  clickable phishing link on the verified @MagpieLoans feed. Charset is now
+ *  strictly [A-Za-z0-9_-], which cannot form a linkifiable URL/handle/cashtag. */
 function safeSymbol(raw) {
   return String(raw || "")
-    .replace(/[^A-Za-z0-9 ._-]/g, "")
-    .trim()
+    .replace(/[^A-Za-z0-9_-]/g, "")
     .slice(0, 16);
 }
 
