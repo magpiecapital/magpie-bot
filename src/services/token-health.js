@@ -99,11 +99,21 @@ async function getMarketData(mints) {
       const existing = result.get(addr);
       if (existing && (existing.liquidity ?? 0) >= liq) continue;
 
+      // Sanity floor on the stored market cap: a single mis-priced DexScreener
+      // pair can report a TRILLIONS fdv (JUP showed $3.7T from a thin pool).
+      // No real token is near $1T, so anything above that can only be bad
+      // single-pair data — store 0 (unknown) rather than persist an absurd
+      // figure that the /tokens detail page would render raw. The full
+      // Jupiter cross-source correction lives site-side (TokensClient
+      // robustMcap); this is the bot-side floor so the DB never holds a fake
+      // trillions mcap. See feedback_token_display_must_cross_source_market_cap.
+      const MAX_SANE_MCAP_USD = 1_000_000_000_000; // $1T
+      const rawMcap = p.marketCap ?? p.fdv ?? 0;
       result.set(addr, {
         symbol: p.baseToken?.symbol || "???",
         liquidity: liq,
         volume24h: p.volume?.h24 ?? 0,
-        marketCap: p.marketCap ?? p.fdv ?? 0,
+        marketCap: rawMcap > 0 && rawMcap <= MAX_SANE_MCAP_USD ? rawMcap : 0,
       });
     }
   }
