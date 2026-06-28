@@ -31,7 +31,12 @@ import { crosspostTweet } from "./community-x-crosspost.js";
 
 const POLL_MS = Number(process.env.TOKEN_ANNOUNCE_POLL_MS || 5 * 60_000);
 const MAX_PER_TICK = Number(process.env.TOKEN_ANNOUNCE_MAX_PER_TICK || 3);
-const ANNOUNCE_REMOVALS = process.env.TOKEN_ANNOUNCE_REMOVALS !== "false";
+// Removals are NOT announced (operator 2026-06-28: "only post about new
+// approvals" — a "$X is no longer accepted" post like $SPETTRO reads as bad
+// news and isn't wanted). Default OFF; opt back in with
+// TOKEN_ANNOUNCE_REMOVALS=true. When off, a disabled mint is recorded silently
+// (no X tweet, no TG post) so the catalog state still tracks it.
+const ANNOUNCE_REMOVALS = process.env.TOKEN_ANNOUNCE_REMOVALS === "true";
 const TOKENS_URL = "https://www.magpie.capital/tokens";
 
 // Bot API handle — set by startTokenCatalogAnnouncer(bot). When present,
