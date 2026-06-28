@@ -175,24 +175,52 @@ async function handleNewMembers(ctx) {
         } catch { /* permission issue — skip */ }
       }
 
-      // Send a captcha DM (deep-link). If the user blocks the bot, we
-      // can't DM, so the kick timer still applies after 5 min.
+      // Captcha. Post it IN THE GROUP so the new member can actually SEE
+      // and pass it. Most new joiners have NOT started the bot, so a
+      // DM-only captcha silently fails (dmFailed) and they get booted
+      // having never seen a captcha — the #1 false-kick / churn source and
+      // exactly why real users complain they "got kicked for no reason."
+      // The button is scoped to THIS user's id so only they can pass it;
+      // we auto-delete it on pass/timeout to keep the group tidy. A DM is
+      // still attempted as a bonus for users who have started the bot.
+      const escHtml = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
       const kb = new InlineKeyboard()
-        .text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}`);
-      const captchaMsg = [
-        `👋 Welcome to the Magpie group.`,
-        ``,
-        `To keep scammers out, tap the button below in the next ${CAPTCHA_TIMEOUT_MS / 60000} minutes. If you don't, you'll be removed and can rejoin.`,
-      ].join("\n");
-      let dmFailed = false;
-      try {
-        await ctx.api.sendMessage(m.id, captchaMsg, { reply_markup: kb });
-      } catch {
-        dmFailed = true;
-      }
+        .text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}:${m.id}`);
+      const mins = CAPTCHA_TIMEOUT_MS / 60000;
+      const mention = `<a href="tg://user?id=${m.id}">${escHtml(m.first_name || m.username || "there")}</a>`;
+      const groupCaptcha =
+        `👋 Welcome ${mention}! Tap "✅ I'm not a bot" within ${mins} min to verify you're human and start chatting — this just keeps scammers out.`;
+      const dmCaptcha =
+        `👋 Welcome to the Magpie group.\n\nTap the button below within ${mins} minutes to verify you're human. If you miss it you'll be briefly removed and can rejoin any time.`;
 
-      // Schedule the kick. Cancelled in-memory if captcha is passed.
-      scheduleCaptchaKick(ctx, m.id, dmFailed);
+      let groupPosted = false;
+      try {
+        const sent = await ctx.api.sendMessage(ctx.chat.id, groupCaptcha, {
+          reply_markup: kb,
+          parse_mode: "HTML",
+          reply_to_message_id: ctx.message?.message_id,
+        });
+        captchaGroupMsgs.set(kickKey(ctx.chat.id, m.id), sent.message_id);
+        groupPosted = true;
+      } catch (err) {
+        console.warn("[community] in-group captcha post failed:", err.message);
+      }
+      let dmOk = false;
+      try {
+        await ctx.api.sendMessage(m.id, dmCaptcha, { reply_markup: kb });
+        dmOk = true;
+      } catch { /* expected for users who haven't started the bot */ }
+
+      // Fail-OPEN: only schedule a kick if the member actually had a way to
+      // see the captcha (in-group post or a delivered DM). If we couldn't
+      // reach them at all, booting them is hostile and pointless — message
+      // moderation + the impersonator ban still cover real abuse. Growing
+      // the community beats over-zealous gatekeeping.
+      if (groupPosted || dmOk) {
+        scheduleCaptchaKick(ctx, m.id, !dmOk);
+      } else {
+        console.warn(`[community] captcha unreachable for ${m.id} — failing open (no kick).`);
+      }
     }
   } catch (err) {
     console.warn("[community] new-member handler failed (fail-open):", err.message);
@@ -203,8 +231,20 @@ async function handleNewMembers(ctx) {
 // bot process — that's fine. New members on a restart would just need
 // to re-join. Memory-bounded by Set of timers we clear after firing.
 const pendingKicks = new Map(); // key: `${chatId}:${userId}` → timeout
+// In-group captcha message ids, so we can delete the captcha post once the
+// member passes or is timed out — keeps the group clean. key → message_id.
+const captchaGroupMsgs = new Map();
 
 function kickKey(chatId, userId) { return `${chatId}:${userId}`; }
+
+/** Delete the in-group captcha post for a member (best-effort, idempotent). */
+async function clearGroupCaptcha(api, chatId, userId) {
+  const key = kickKey(chatId, userId);
+  const msgId = captchaGroupMsgs.get(key);
+  if (msgId == null) return;
+  captchaGroupMsgs.delete(key);
+  try { await api.deleteMessage(chatId, msgId); } catch { /* already gone */ }
+}
 
 function scheduleCaptchaKick(ctx, userId, dmFailed) {
   const key = kickKey(ctx.chat.id, userId);
@@ -213,13 +253,14 @@ function scheduleCaptchaKick(ctx, userId, dmFailed) {
     pendingKicks.delete(key);
     try {
       const member = await getMember(ctx.chat.id, userId);
-      if (member?.captcha_passed_at) return; // passed; do nothing
+      if (member?.captcha_passed_at) { await clearGroupCaptcha(ctx.api, ctx.chat.id, userId); return; } // passed
       // Pip's memory: a previously-cleared member (appeal / operator unban)
       // who rejoined is not re-kicked for missing the captcha.
-      if (await isUserCleared(ctx.chat.id, userId)) return;
+      if (await isUserCleared(ctx.chat.id, userId)) { await clearGroupCaptcha(ctx.api, ctx.chat.id, userId); return; }
       // Kick (= ban for 30s then unban, lets them rejoin if real)
       const until = Math.floor(Date.now() / 1000) + 30;
       await ctx.api.banChatMember(ctx.chat.id, userId, { until_date: until });
+      await clearGroupCaptcha(ctx.api, ctx.chat.id, userId);
       await recordModAction(
         ctx.chat.id, userId, "kick_captcha_timeout",
         dmFailed ? "no_dm_response (DM blocked)" : "captcha not solved in time",
@@ -236,17 +277,26 @@ function scheduleCaptchaKick(ctx, userId, dmFailed) {
 
 async function handleCaptchaCallback(ctx) {
   try {
-    const data = ctx.callbackQuery.data; // "comm:captcha:<chat_id>"
-    const m = data.match(/^comm:captcha:(-?\d+)$/);
+    const data = ctx.callbackQuery.data; // "comm:captcha:<chat_id>[:<user_id>]"
+    const m = data.match(/^comm:captcha:(-?\d+)(?::(\d+))?$/);
     if (!m) return;
     const chatId = m[1];
+    const targetUserId = m[2] ? Number(m[2]) : null;
     const userId = ctx.callbackQuery.from.id;
+    // The in-group captcha is scoped to one specific new member — only THEY
+    // can pass it. If another member taps it, gently decline (don't pass them,
+    // and crucially don't cancel/trigger anyone's kick).
+    if (targetUserId != null && userId !== targetUserId) {
+      try { await ctx.answerCallbackQuery({ text: "This welcome check isn't for you 🙂", show_alert: false }); } catch { /* silent */ }
+      return;
+    }
     await markCaptchaPassed(chatId, userId);
     const key = kickKey(chatId, userId);
     if (pendingKicks.has(key)) {
       clearTimeout(pendingKicks.get(key));
       pendingKicks.delete(key);
     }
+    await clearGroupCaptcha(ctx.api, chatId, userId);
     await ctx.answerCallbackQuery({
       text: "Welcome to Magpie! You can chat in the group now.",
       show_alert: false,
