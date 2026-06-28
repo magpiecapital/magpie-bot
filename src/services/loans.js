@@ -785,6 +785,36 @@ export async function recordLoan({
     console.error("[loans.recordLoan] credit event failed (non-fatal):", err.message);
   }
 
+  // POINTS forward-sync (audit 2026-06-28 P0): credit borrow + first-loan points
+  // the SAME turn the loan lands. Previously creditPoints was only ever called by
+  // the one-shot backfill, so every loan opened after 2026-06-27 accrued ZERO
+  // points (the "dashboard reads 0" regression the points mandate forbids). Uses
+  // the SAME deterministic source_ids as the backfill (borrow:<loan_pda>,
+  // first_loan:<user_id>) so live + backfill/reconciler stay idempotent. The
+  // first_loan credit is keyed on user_id, so calling it on every borrow lands
+  // exactly once (ON CONFLICT). Best-effort — never delays/fails the loan record.
+  try {
+    const { creditPoints, borrowPoints, FIRST_LOAN_BONUS } = await import("./points.js");
+    await creditPoints({
+      userId,
+      sourceType: "borrow",
+      sourceId: `borrow:${loanPda}`,
+      category: "lending",
+      points: borrowPoints({ loanLamports: loanAmountLamports, durationDays }),
+      metadata: { loan_pda: loanPda, duration_days: durationDays },
+    });
+    await creditPoints({
+      userId,
+      sourceType: "first_loan",
+      sourceId: `first_loan:${userId}`,
+      category: "bonus",
+      points: FIRST_LOAN_BONUS,
+      metadata: { loan_pda: loanPda },
+    });
+  } catch (err) {
+    console.error("[loans.recordLoan] points credit failed (non-fatal):", err.message);
+  }
+
   // Bump the user's lifetime-borrowed counter. Also previously TG-only.
   try {
     await query(
@@ -864,7 +894,7 @@ export async function recordLoan({
  */
 export async function markLoanRepaid(loanDbId, txSignature) {
   const { rows: [loan] } = await query(
-    `SELECT user_id, due_timestamp FROM loans WHERE id = $1`,
+    `SELECT user_id, due_timestamp, loan_pda, loan_amount_lamports, duration_days FROM loans WHERE id = $1`,
     [loanDbId],
   );
 
@@ -885,6 +915,26 @@ export async function markLoanRepaid(loanDbId, txSignature) {
       await recordCreditEvent(loan.user_id, eventType, loanDbId);
     } catch (err) {
       console.error("[loans] recordCreditEvent failed on repay:", err.message);
+    }
+    // POINTS forward-sync (audit 2026-06-28 P0): repay bonus (early +25% /
+    // on-time +10% of the loan's base borrow points), one per loan, SAME
+    // source_id as the backfill (repay:<loan_pda>) so live + reconciler stay
+    // idempotent. Late repays earn 0 (no row). Best-effort.
+    if (eventType === "repay_early" || eventType === "repay_ontime") {
+      try {
+        const { creditPoints, borrowPoints, repayBonusPoints } = await import("./points.js");
+        const base = borrowPoints({ loanLamports: loan.loan_amount_lamports, durationDays: loan.duration_days });
+        await creditPoints({
+          userId: loan.user_id,
+          sourceType: "repay",
+          sourceId: `repay:${loan.loan_pda}`,
+          category: "repayment",
+          points: repayBonusPoints(base, eventType),
+          metadata: { loan_pda: loan.loan_pda, variant: eventType },
+        });
+      } catch (err) {
+        console.error("[loans] repay points credit failed (non-fatal):", err.message);
+      }
     }
     // Streak tracking — increment on on-time, reset on late.
     try {
