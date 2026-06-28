@@ -707,7 +707,7 @@ bot.start({
     // from the approved-collateral catalog (the /tokens page). No-op posting
     // until X_API_KEY/SECRET + X_ACCESS_TOKEN/SECRET are set; seeds state
     // meanwhile so it never backlog-dumps. See token-catalog-announcer.js.
-    import("./services/token-catalog-announcer.js").then((m) => m.startTokenCatalogAnnouncer());
+    import("./services/token-catalog-announcer.js").then((m) => m.startTokenCatalogAnnouncer(bot));
     // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
     // upstream instances die constantly and the X API requires a paid
     // bearer token; alerts about "data sources offline" were noise.
