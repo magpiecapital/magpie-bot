@@ -5,7 +5,7 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import "dotenv/config";
 import { getPriceInSol, getPricesInSolBatch } from "./price.js";
-import { getProgramForSigner, chooseProgramIdForCategory } from "../solana/program.js";
+import { getProgramForSigner, chooseProgramIdForCategory, PROGRAM_ID_V4 } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
@@ -158,7 +158,13 @@ export async function getV4TwapSampleCount(mintStr, windowSec = 300, programIdOv
     const SAMPLES_OFFSET = 112;
     const STRIDE = 16; // price(8) + timestamp(8)
     const SLOTS = 32;
-    const slotsPopulated = Math.min(totalCount, SLOTS);
+    // Clamp to what the on-chain buffer ACTUALLY holds. A freshly-initialized /
+    // still-growing PriceHistory can report totalCount>=1 before its data has
+    // realloc'd to fit that many sample slots; reading past the end throws
+    // "offset out of range", which broke this readiness check and left brand-new
+    // tokens (e.g. $ANSEM) stuck "warming up" forever. Only read samples that fit.
+    const maxSlotsInBuffer = Math.max(0, Math.floor((info.data.length - SAMPLES_OFFSET) / STRIDE));
+    const slotsPopulated = Math.min(totalCount, SLOTS, maxSlotsInBuffer);
     const nowSec = Math.floor(Date.now() / 1000);
     const cutoff = nowSec - windowSec;
     let inWindow = 0;
@@ -329,6 +335,71 @@ export async function initializePriceFeed(mintStr, programIdOverride = null) {
 
   console.log(`Price feed initialized for ${mintStr}: ${sig}`);
   return { signature: sig, priceFeed: priceFeed.toBase58() };
+}
+
+// Mints whose feeds we've CONFIRMED initialized this process — so the sweep
+// doesn't re-check every enabled mint on every tick (only new/unconfirmed ones).
+const _feedsConfirmed = new Set();
+
+/**
+ * Ensure a mint's on-chain price-feed PDA exists for EVERY program a user could
+ * borrow it on — its category pool (memecoin→V1, RWA→V3) AND V4 (in-vault
+ * exits), each of which has its own feed PDA. Idempotent (initializePriceFeed
+ * no-ops when the feed already exists). This is the FUNCTIONAL fix for the
+ * AccountNotInitialized borrow class: a freshly-approved token must never be
+ * borrowable before its feed(s) exist. Call it the moment a token is approved,
+ * and on a periodic sweep. See feedback_init_price_feed_pda_on_token_approval.
+ */
+export async function ensureMintFeedsInitialized(mintStr) {
+  const category = await resolveCategory(mintStr);
+  const defaultPid = chooseProgramIdForCategory(category);
+  const programs = [];
+  if (defaultPid) programs.push(defaultPid);
+  if (PROGRAM_ID_V4 && !programs.some((p) => p.equals(PROGRAM_ID_V4))) programs.push(PROGRAM_ID_V4);
+
+  const out = [];
+  let allExist = true;
+  for (const pid of programs) {
+    try {
+      const r = await initializePriceFeed(mintStr, pid);
+      out.push({ program: pid.toBase58(), ...r });
+      if (r.signature) allExist = false; // we just created it (so it didn't exist)
+    } catch (e) {
+      allExist = false;
+      out.push({ program: pid.toBase58(), error: e.message?.slice(0, 140) });
+    }
+  }
+  if (allExist) _feedsConfirmed.add(mintStr);
+  return out;
+}
+
+/**
+ * Sweep every enabled mint and ensure its feeds are initialized. Cheap on
+ * steady state (skips mints already confirmed this process; the rest is one
+ * getAccountInfo per program). Run at boot (heals any token already in the
+ * AccountNotInitialized state, like $ANSEM was) and on a short interval so a
+ * newly-approved token is covered even if an approval-path hook is missed.
+ */
+export async function ensureAllEnabledFeedsInitialized({ log = console.log } = {}) {
+  const { rows } = await query(`SELECT mint, symbol FROM supported_mints WHERE enabled = TRUE`);
+  let checked = 0;
+  let initialized = 0;
+  for (const r of rows) {
+    if (_feedsConfirmed.has(r.mint)) continue;
+    checked++;
+    try {
+      const res = await ensureMintFeedsInitialized(r.mint);
+      const created = res.filter((x) => x.signature).length;
+      if (created) {
+        initialized += created;
+        log(`[feed-init-sweep] ${r.symbol} (${r.mint.slice(0, 8)}…): initialized ${created} missing price feed(s)`);
+      }
+    } catch (e) {
+      log(`[feed-init-sweep] ${r.symbol}: ${e.message?.slice(0, 80)}`);
+    }
+  }
+  if (initialized) log(`[feed-init-sweep] ${initialized} feed(s) initialized across ${checked} unconfirmed mint(s)`);
+  return { checked, initialized };
 }
 
 /**

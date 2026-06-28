@@ -158,7 +158,7 @@ import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startX402DailyDigest } from "./services/x402-daily-digest.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
 import { startCreditOraclePublisher } from "./services/credit-oracle-publisher.js";
-import { startPriceAttestor } from "./services/price-attestor.js";
+import { startPriceAttestor, ensureAllEnabledFeedsInitialized } from "./services/price-attestor.js";
 import {
   startExploitDetector,
   registerExploitDetectorCallbacks,
@@ -893,6 +893,13 @@ bot.start({
     // Operator hit it 2026-06-17 PM. Forensic: scripts/diagnose-spcx-twap-lag.mjs
     const PRICE_ATTESTOR_TICK_MS = Number(process.env.PRICE_ATTESTOR_TICK_MS) || 20_000;
     setTimeout(() => startPriceAttestor(PRICE_ATTESTOR_TICK_MS), 35_000);
+    // FEED-INIT SWEEP — guarantees every enabled mint's price-feed PDA(s) exist
+    // (category pool + V4) so a user can NEVER hit AccountNotInitialized on a
+    // borrow, especially for a freshly-approved token. Boot heals any token
+    // already in that state (e.g. $ANSEM was); the 90s tick covers new approvals
+    // even if an approval-path hook is missed. Cheap (skips confirmed mints).
+    setTimeout(() => ensureAllEnabledFeedsInitialized().catch((e) => console.warn("[feed-init-sweep] boot failed:", e.message?.slice(0, 120))), 45_000);
+    setInterval(() => ensureAllEnabledFeedsInitialized().catch((e) => console.warn("[feed-init-sweep] tick failed:", e.message?.slice(0, 120))), 90_000);
     // RWA screener — discovers Backed Finance xStocks + similar via DexScreener
     // search every 4h. Auto-adds new mints meeting liquidity/volume thresholds.
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
