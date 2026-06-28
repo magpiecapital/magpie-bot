@@ -228,13 +228,21 @@ async function showEngine(ctx) {
   // most recent one's overall_ok + which checks failed (if any).
   let canaryLines = [];
   try {
+    // Filter to the V4 program's canary specifically (audit 2026-06-28 P2 #11):
+    // the engine writes one row PER program per tick, so an unfiltered "latest"
+    // surfaces whichever program wrote last and dilutes the V4 pass-rate. V4 is
+    // the in-vault exit product, so show ITS health. Falls back to any program
+    // when PROGRAM_ID_V4 is unset.
+    const v4Pid = process.env.PROGRAM_ID_V4 || null;
     const { rows: [c] } = await query(
       `SELECT run_at, overall_ok, duration_ms, checks, jupiter_ok,
               dexscreener_ok, cross_source_ok, program_ok
          FROM engine_canary_runs
         WHERE service = 'limit_close_watcher'
+          AND ($1::text IS NULL OR COALESCE(program_id, 'legacy') = $1)
         ORDER BY run_at DESC
         LIMIT 1`,
+      [v4Pid],
     );
     if (c) {
       const tag = c.overall_ok ? "passed" : "*FAILED*";
