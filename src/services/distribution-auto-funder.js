@@ -124,8 +124,14 @@ const INTERVAL_FLOOR_MS = 3 * 60 * 1000;
 const INTERVAL_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_INTERVAL_MS", 15 * 60 * 1000));
 const FIRST_RUN_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_FIRST_RUN_MS", 4 * 60 * 1000));
 // Operational reserve kept on the lender wallet so cosign-borrow gas,
-// attestations and admin tx fees never run dry.
-const LENDER_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_LENDER_RESERVE_SOL", 1.5));
+// attestations and admin tx fees NEVER run dry — loan execution is the #1
+// priority and the lender (4JSSSa…) is the gas wallet for those flows. Default
+// 5 SOL (multiple weeks of gas runway). The treasury-sweeper keeps 20 SOL on
+// this same wallet; this funder is gap-bounded AND the lender refills from
+// continuous borrow fees, so it oscillates above this floor rather than pinning
+// to it — but we still keep a generous buffer so a fee lull can never starve
+// gas. Env-tunable (raise toward 20 to be even more conservative).
+const LENDER_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_LENDER_RESERVE_SOL", 5));
 // Safety buffer held in the distribution wallet on top of `payableOwed`.
 const SAFETY_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_DIST_RESERVE_SOL", 0.1));
 // Don't bother for dust gaps.
