@@ -498,12 +498,17 @@ export async function snapshotAndDistributeLpLoyalty() {
     const nextDelay = pickNextDistributionDelay();
     await client.query(
       `UPDATE lp_loyalty_pool
-          SET accrued_lamports = accrued_lamports - $1::numeric,
+          SET accrued_lamports = GREATEST(0, accrued_lamports - $1::numeric),
               last_distribution_at = NOW(),
               next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
               updated_at = NOW()
         WHERE id = 1`,
-      [allocatedSum.toString(), Math.floor(nextDelay).toString()],
+      // Decrement by the FULL snapshotted pool, NOT just the third-party
+      // allocatedSum: the operator-exempt slice is FORGONE on distribution so
+      // the LP "rewards snapshot" resets to ~0 (like the holder pool) instead
+      // of carrying the exempt slice forward as a phantom figure. Only accruals
+      // that landed AFTER the snapshot (concurrent borrow fees) carry forward.
+      [pool.toString(), Math.floor(nextDelay).toString()],
     );
 
     await client.query("COMMIT");
