@@ -124,7 +124,11 @@ function solToLamports(sol) {
 // the time the next tick runs, the prior tx has either landed (gap shrinks) or
 // expired (safe to re-fund). An operator can't lower it into the re-send window.
 const INTERVAL_FLOOR_MS = 3 * 60 * 1000;
-const INTERVAL_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_INTERVAL_MS", 15 * 60 * 1000));
+// 5 min (above the 3-min no-double-fund floor) — frequent enough that the
+// window in which a fresh fee accrual could outrun CHCAM's balance is small.
+// The operator's hard invariant is CHCAM native >= the displayed snapshot at
+// ALL times; a short interval + the lead-buffer below keep it true.
+const INTERVAL_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_INTERVAL_MS", 5 * 60 * 1000));
 const FIRST_RUN_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_FIRST_RUN_MS", 4 * 60 * 1000));
 // Operational reserve kept on the lender wallet so cosign-borrow gas,
 // attestations and admin tx fees NEVER run dry — loan execution is the #1
@@ -136,7 +140,12 @@ const FIRST_RUN_MS = Math.max(INTERVAL_FLOOR_MS, envNum("DIST_FUNDER_FIRST_RUN_M
 // gas. Env-tunable (raise toward 20 to be even more conservative).
 const LENDER_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_LENDER_RESERVE_SOL", 5));
 // Safety buffer held in the distribution wallet on top of `payableOwed`.
-const SAFETY_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_DIST_RESERVE_SOL", 0.1));
+// CHCAM is funded to (payableOwed + this LEAD buffer). 0.5 SOL keeps the wallet
+// comfortably AHEAD of the displayed snapshot so a fresh fee accrual between
+// funder ticks can't make the snapshot momentarily exceed the wallet balance
+// (the operator's hard invariant). Over-parking is bounded + harmless; the only
+// constraint is the lender's 5-SOL gas reserve, above which the funder routes.
+const SAFETY_RESERVE_LAMPORTS = solToLamports(envNum("DIST_FUNDER_DIST_RESERVE_SOL", 0.5));
 // Don't bother for dust gaps.
 const MIN_FUND_LAMPORTS = solToLamports(envNum("DIST_FUNDER_MIN_SOL", 0.02));
 // HARD per-tick ceiling, independent of `owed`. The real circuit breaker
