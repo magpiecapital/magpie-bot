@@ -1,73 +1,55 @@
 /**
- * Fee wallet → distribution wallet auto-sweeper.
+ * Fee-wallet wSOL → lender NATIVE unwrapper.
  *
- * Operator-mandated 2026-06-17
+ * Operator-mandated 2026-06-17, REARCHITECTED 2026-06-29
  * (feedback_distribution_wallet_must_be_auto_funded.md).
  *
- * THE PROBLEM
- * ───────────
- * Borrow fees physically transfer 1% upfront to the on-chain
- * fee_wallet (a wSOL ATA owned by the lender pubkey 4JSSSaG3…). The
- * distribution wallet CHCAMWtn… is what pays out holder / LP-loyalty /
- * referral / protocol-reserve snapshots. There is no automated flow
- * between these two wallets. Operator was manually moving SOL before
- * each snapshot. Without auto-sweep, the existing
- * magpie-holder-rewards.js line 638 check ('distributor < pool')
- * silently skips distributions when the gap is negative.
+ * THE PROBLEM (and the 2026-06-29 root-cause fix)
+ * ───────────────────────────────────────────────
+ * Borrow fees physically transfer 1% upfront to the on-chain fee_wallet (a
+ * wSOL ATA owned by the lender pubkey 4JSSSaG3…). The rewards distribution
+ * wallet CHCAMWtn… pays out holder / LP-loyalty snapshots in NATIVE SOL.
  *
- * On 2026-06-17 the gap was 27.27 SOL owed vs 12.07 SOL in CHCAMWtn —
- * the next snapshot would have silently skipped.
+ * The ORIGINAL sweeper sent the fee wSOL straight to CHCAM's wSOL ATA — where
+ * it STRANDED, because the native-SOL distributors can't see wrapped SOL and
+ * the bot (correctly) can't sign for CHCAM to unwrap it. That stranding is the
+ * exact reason the operator had to hand-fund CHCAM repeatedly.
  *
- * WHAT THIS DOES
- * ──────────────
- * Every FEE_WALLET_SWEEP_INTERVAL_MS (default 1 hour):
- *   1. Read fee_wallet's wSOL balance.
- *   2. If balance > MIN_SWEEP_LAMPORTS, plan a sweep of
- *      (balance - MIN_RESERVE_LAMPORTS) to the distribution wallet.
- *   3. Write an audit row to fee_wallet_sweeps with status='planned'
- *      BEFORE the tx is broadcast (idempotency anchor).
- *   4. Build a tx: createSyncNative if any native lamports linger,
- *      transferChecked wSOL → CHCAMWtn's wSOL ATA (create if missing),
- *      OR close the fee_wallet's wSOL ATA via closeAccount and have
- *      the SOL flow to CHCAMWtn directly. We use the closeAccount +
- *      reopen pattern because it cleanly converts wSOL back to native
- *      SOL in one shot, and re-creates the fee_wallet ATA for the
- *      next borrow.
- *   5. Broadcast + confirm. On success, update audit row with
- *      tx_signature + status='confirmed'. On failure, mark 'failed'
- *      with the err.message — caller (the sweeper loop) can retry on
- *      the next tick.
- *   6. notifyAdmin DM with the sweep amount.
+ * WHAT THIS DOES NOW
+ * ──────────────────
+ * Every FEE_WALLET_SWEEP_INTERVAL_MS (default 1 hour), under the SHARED lender
+ * spend lock:
+ *   1. Read the lender's OWN fee wSOL ATA balance.
+ *   2. If > MIN_SWEEP, atomically `closeAccount(feeWalletAta → lender,
+ *      authority=lender)` (returns wSOL + ATA rent as NATIVE SOL into 4JSS)
+ *      + idempotently re-create the empty fee ATA in the SAME tx so the next
+ *      borrow's fee-routing target exists.
+ *   3. The value is now NATIVE in the lender. The distribution-auto-funder is
+ *      the SOLE writer that routes lender native → CHCAM. This sweeper NEVER
+ *      touches CHCAM — so no wSOL can ever strand there again.
  *
- * SAFETY INVARIANTS — every sweep tx MUST satisfy:
- *   - Idempotency: re-running cannot double-spend. The audit row
- *     'planned' is written FIRST. If we see a non-confirmed row from
- *     a prior tick, we don't plan a new sweep until that one is
- *     resolved (status='confirmed' or 'failed').
- *   - Atomicity: audit row → tx broadcast → confirm → update audit.
- *     A crash at any step leaves an auditable trail (the 'planned'
- *     row + optionally the tx_signature) that the operator can
- *     reconcile on-chain.
- *   - Reserve floor: never drain fee_wallet below MIN_RESERVE
- *     (covers rent + small operational headroom). Default 0.05 SOL.
- *   - Sweep threshold: only fire if balance - MIN_RESERVE >
- *     MIN_SWEEP. Default 0.1 SOL. Avoids tx-fee drain on dust.
- *   - Operator pause: env var FEE_WALLET_SWEEPER_DISABLED=true halts
- *     immediately, no restart needed.
- *   - Logged: every sweep produces an admin DM AND a Railway log
- *     line. Silent operation is forbidden.
- *
- * Counterpart pieces (separate files):
- *   - distribution_gap_monitor.js — admin-DMs P0 if pool > distributor
- *     at any point, BEFORE the snapshot would skip silently.
- *   - migration: fee_wallet_sweeps audit ledger table.
+ * SAFETY INVARIANTS
+ *   - Bot CAN sign this (lender owns the fee ATA + authority); never needs
+ *     CHCAM's key. CHCAM is not a destination anywhere here.
+ *   - Idempotent: close+reopen is self-healing — if a prior (unrecorded) tx
+ *     already ran, the fee ATA reads empty next tick and we skip; if it
+ *     didn't, the wSOL is still there and we unwrap it. So a stuck 'planned'
+ *     row is auto-resolved after the blockhash expires (~3 min) and re-running
+ *     is always safe.
+ *   - The close DESTINATION is a runtime-asserted constant = the lender
+ *     pubkey, never an env value; privileged-sign-guard additionally rejects
+ *     any closeAccount to a non-signer.
+ *   - Shared lender lock → at most one lender-spending tx in flight across all
+ *     services, so the 5-SOL gas reserve holds. (The close INCREASES lender
+ *     native, so it never threatens the reserve — but it still takes the lock
+ *     to stay serialized with the funder/x402 spends.)
+ *   - FEE_WALLET_SWEEPER_DISABLED=true halts immediately.
+ *   - Every unwrap → admin DM + Railway log.
  */
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Connection, Keypair, Transaction } from "@solana/web3.js";
 import {
   createCloseAccountInstruction,
   createAssociatedTokenAccountIdempotentInstruction,
-  createSyncNativeInstruction,
-  createTransferInstruction,
   getAccount,
   getAssociatedTokenAddress,
   NATIVE_MINT,
@@ -77,27 +59,22 @@ import bs58 from "bs58";
 import { query } from "../db/pool.js";
 import { notifyAdmin } from "./admin-notify.js";
 import { withFailover } from "../solana/connection.js";
+import { withLenderSpendLock } from "./lender-spend-lock.js";
 
 const SWEEP_INTERVAL_MS = Number(
   process.env.FEE_WALLET_SWEEP_INTERVAL_MS || 60 * 60 * 1000, // 1 hour
 );
+// Only unwrap if the fee ATA holds more than this — avoids burning a tx fee on
+// dust. The whole balance is unwrapped (the ATA is closed + reopened empty).
 const MIN_SWEEP_LAMPORTS = BigInt(
   process.env.FEE_WALLET_MIN_SWEEP_LAMPORTS || 100_000_000, // 0.1 SOL
 );
-const MIN_RESERVE_LAMPORTS = BigInt(
-  process.env.FEE_WALLET_MIN_RESERVE_LAMPORTS || 50_000_000, // 0.05 SOL
-);
+// A 'planned' row older than this is auto-resolved (blockhash long expired, so
+// any in-flight tx is dead; close+reopen is idempotent so re-running is safe).
+const STUCK_PLANNED_MS = Number(process.env.FEE_WALLET_STUCK_PLANNED_MS || 3 * 60 * 1000);
 const RPC_URL = process.env.SOLANA_RPC_URL || process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 
-// Lender pubkey (also the owner of the fee_wallet wSOL ATA).
 const LENDER_PUBKEY = process.env.LENDER_PUBKEY || "4JSSSaG3xRomQsrxmdQEsahfyFjBVjvuoBKJUUZgzPAx";
-
-// Distribution wallet — funds holder / LP-loyalty / referral / protocol-
-// reserve payouts via the magpie-holder-rewards distributor. Operator-set
-// as REWARDS_DISTRIBUTOR_PUBKEY; falls back to the historical CHCAM
-// address for safety / observability.
-const DISTRIBUTION_WALLET_PUBKEY =
-  process.env.REWARDS_DISTRIBUTOR_PUBKEY || "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac";
 
 let _timer = null;
 
@@ -113,7 +90,6 @@ export function startFeeWalletSweeper(bot) {
     );
     return;
   }
-  // First run after 2 min so the boot storm settles.
   setTimeout(() => {
     runOnce(bot).catch((e) =>
       console.warn(`[fee-wallet-sweeper] first run failed: ${e.message?.slice(0, 160)}`),
@@ -125,24 +101,33 @@ export function startFeeWalletSweeper(bot) {
     }, SWEEP_INTERVAL_MS);
   }, 120_000);
   console.log(
-    `[fee-wallet-sweeper] armed — first run in 2 min, then every ${SWEEP_INTERVAL_MS / 60_000} min. ` +
-      `MIN_SWEEP=${Number(MIN_SWEEP_LAMPORTS) / 1e9} SOL, MIN_RESERVE=${Number(MIN_RESERVE_LAMPORTS) / 1e9} SOL`,
+    `[fee-wallet-sweeper] armed (lender-side unwrap) — first run in 2 min, then every ${SWEEP_INTERVAL_MS / 60_000} min. ` +
+      `MIN_SWEEP=${Number(MIN_SWEEP_LAMPORTS) / 1e9} SOL`,
   );
 }
 
 async function runOnce(bot) {
-  // Idempotency anchor: bail if a prior planned sweep is still
-  // unresolved. Operator can investigate via /distgap or
-  // fee_wallet_sweeps query.
+  // Auto-resolve a stuck 'planned' row: after STUCK_PLANNED_MS the blockhash
+  // has expired so any in-flight tx is dead; close+reopen is idempotent, so the
+  // next balance read self-corrects. Mark it stale and proceed (never a
+  // permanent halt — the original code skipped forever).
   const { rows: stuck } = await query(
     `SELECT id, created_at FROM fee_wallet_sweeps
-      WHERE status = 'planned'
-      ORDER BY id ASC LIMIT 1`,
+      WHERE status = 'planned' ORDER BY id ASC LIMIT 1`,
   );
   if (stuck.length > 0) {
-    const ageMin = Math.round((Date.now() - new Date(stuck[0].created_at).getTime()) / 60_000);
-    console.warn(`[fee-wallet-sweeper] skipping — sweep #${stuck[0].id} still in 'planned' state (${ageMin} min old). Resolve manually.`);
-    return;
+    const ageMs = Date.now() - new Date(stuck[0].created_at).getTime();
+    if (ageMs < STUCK_PLANNED_MS) {
+      console.warn(
+        `[fee-wallet-sweeper] skipping — sweep #${stuck[0].id} still 'planned' (${Math.round(ageMs / 1000)}s old, < ${Math.round(STUCK_PLANNED_MS / 1000)}s).`,
+      );
+      return;
+    }
+    await query(
+      `UPDATE fee_wallet_sweeps SET status = 'failed', err = $2, updated_at = NOW() WHERE id = $1 AND status = 'planned'`,
+      [stuck[0].id, "auto-resolved: stale 'planned' row past blockhash expiry; idempotent close+reopen makes re-run safe"],
+    );
+    console.warn(`[fee-wallet-sweeper] auto-resolved stale 'planned' sweep #${stuck[0].id} — proceeding.`);
   }
 
   const lenderKp = Keypair.fromSecretKey(bs58.decode(process.env.LENDER_PRIVATE_KEY));
@@ -154,218 +139,198 @@ async function runOnce(bot) {
   }
 
   const connection = new Connection(RPC_URL, "confirmed");
-  const feeWalletAta = await getAssociatedTokenAddress(
-    NATIVE_MINT,
-    lenderKp.publicKey,
-  );
-  const distributionPk = new PublicKey(DISTRIBUTION_WALLET_PUBKEY);
-  const distributionAta = await getAssociatedTokenAddress(
-    NATIVE_MINT,
-    distributionPk,
-  );
+  const feeWalletAta = await getAssociatedTokenAddress(NATIVE_MINT, lenderKp.publicKey);
 
   // Read current fee_wallet wSOL balance.
   let acct;
   try {
     acct = await getAccount(connection, feeWalletAta, "confirmed", TOKEN_PROGRAM_ID);
-  } catch (err) {
-    // ATA might not exist if no borrow has happened yet — nothing to sweep.
+  } catch {
     console.log(`[fee-wallet-sweeper] fee_wallet ATA not found or empty — skipping`);
     return;
   }
-  const wsolBalance = acct.amount; // bigint (wSOL has 9 decimals; 1 unit = 1 lamport)
-  const sweepable = wsolBalance > MIN_RESERVE_LAMPORTS ? wsolBalance - MIN_RESERVE_LAMPORTS : 0n;
-
-  if (sweepable < MIN_SWEEP_LAMPORTS) {
+  const wsolBalance = acct.amount; // bigint
+  if (wsolBalance < MIN_SWEEP_LAMPORTS) {
     console.log(
-      `[fee-wallet-sweeper] fee_wallet balance ${Number(wsolBalance) / 1e9} SOL; sweepable ${Number(sweepable) / 1e9} below MIN_SWEEP ${Number(MIN_SWEEP_LAMPORTS) / 1e9} — skipping`,
+      `[fee-wallet-sweeper] fee_wallet wSOL ${Number(wsolBalance) / 1e9} SOL < MIN_SWEEP ${Number(MIN_SWEEP_LAMPORTS) / 1e9} — skipping`,
     );
     return;
   }
 
-  // Phase 1 — Write 'planned' audit row BEFORE broadcast. This is the
-  // idempotency anchor: if the process dies between here and confirm,
-  // the operator finds an unresolved 'planned' row and can investigate
-  // on-chain whether the tx landed.
+  // Everything that signs with the lender key serializes on the ONE shared
+  // lock so the 5-SOL gas reserve holds across all writers.
+  const locked = await withLenderSpendLock(async () => {
+    await unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance);
+  });
+  if (locked.skipped) {
+    console.log(`[fee-wallet-sweeper] skipped tick — ${locked.reason}`);
+  }
+}
+
+async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) {
+  // Phase 1 — 'planned' audit anchor BEFORE broadcast. dest is the lender's
+  // OWN native (the close returns value to the lender); CHCAM is NOT involved.
   const { rows: [auditRow] } = await query(
     `INSERT INTO fee_wallet_sweeps
        (source_pubkey, dest_pubkey, amount_lamports, status, reason)
-     VALUES ($1, $2, $3::numeric, 'planned', 'periodic_auto_sweep')
+     VALUES ($1, $2, $3::numeric, 'planned', 'lender_side_unwrap')
      RETURNING id`,
-    [feeWalletAta.toBase58(), distributionAta.toBase58(), sweepable.toString()],
+    [feeWalletAta.toBase58(), lenderKp.publicKey.toBase58(), wsolBalance.toString()],
   );
   const sweepId = auditRow.id;
 
-  // Phase 2 — Build and broadcast the tx.
-  //
-  // Strategy: transferChecked wSOL → distribution wallet's wSOL ATA.
-  // We use createAssociatedTokenAccountIdempotentInstruction so we can
-  // safely re-run; if the dest ATA already exists, it's a no-op.
-  // We avoid the closeAccount path because closing the fee_wallet ATA
-  // would break the next borrow's fee-routing — the V4 program expects
-  // the ATA to exist.
+  // Phase 2 — atomic close (unwrap to lender native) + idempotent reopen.
   const tx = new Transaction();
   tx.add(
-    createAssociatedTokenAccountIdempotentInstruction(
-      lenderKp.publicKey,           // payer
-      distributionAta,              // ata to ensure
-      distributionPk,               // owner of the ata
-      NATIVE_MINT,                  // mint
+    createCloseAccountInstruction(
+      feeWalletAta,            // account to close (the fee wSOL ATA)
+      lenderKp.publicKey,      // destination — the lender's OWN native (asserted below)
+      lenderKp.publicKey,      // authority
+      [],
+      TOKEN_PROGRAM_ID,
     ),
   );
   tx.add(
-    createTransferInstruction(
-      feeWalletAta,
-      distributionAta,
-      lenderKp.publicKey,           // ATA authority
-      sweepable,
+    createAssociatedTokenAccountIdempotentInstruction(
+      lenderKp.publicKey,      // payer
+      feeWalletAta,            // ata to (re)create
+      lenderKp.publicKey,      // owner
+      NATIVE_MINT,             // mint
     ),
   );
-  // Sync the dest ATA so its lamport balance reflects the deposit
-  // (downstream code reading SOL on the ATA sees the right number).
-  tx.add(createSyncNativeInstruction(distributionAta));
 
   let sig;
   let guardAuditId = null;
   try {
-    // Hard allowlist + universal sign guard. Operator-mandated
-    // 2026-06-18 PM follow-up to the cosign-borrow exploit defense —
-    // every privileged-keypair signing path must go through the guard
-    // so a misconfigured env var can't redirect funds and an unauth'd
-    // balance decrease on the lender wallet fails sim before broadcast.
-    // See feedback_cosign_borrow_token_drain_exploit_2026_06_18.md.
-    const { assertAllowedDestination } = await import("./privileged-destinations.js");
     const { runPrivilegedSign, recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
-    assertAllowedDestination("fee-wallet-sweeper", distributionPk);
 
-    // Use withFailover for all on-chain RPC calls so a 429 / 5xx on the
-    // primary endpoint automatically falls through to the backup RPC
-    // instead of failing the sweep. The bot's V4 continuous loop +
-    // boot pre-warm spike RPC traffic, and Helius can throttle even paid
-    // tier under bursts. Operator-mandated 2026-06-19 PM after sweep #8
-    // failed with 429.
-    //
-    // Wrapped in an outer retry-with-backoff loop (3 attempts: 0s, 5s, 15s)
-    // so transient throttling across BOTH primary + backup is survivable
-    // without operator intervention.
     const RETRY_DELAYS_MS = [0, 5_000, 15_000];
-    let lastSweepErr = null;
-    let sweepSucceeded = false;
+    let lastErr = null;
+    let ok = false;
+    // Pair each BROADCAST sig with the audit row that produced it, so a
+    // confirm-timeout reconcile in the catch attributes the right row (the
+    // per-attempt re-sign advances guardAuditId, which would otherwise be
+    // mismatched against an earlier attempt's sig).
+    let broadcastSig = null;
+    let broadcastAuditId = null;
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
-      if (RETRY_DELAYS_MS[attempt] > 0) {
-        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
-      }
+      if (RETRY_DELAYS_MS[attempt] > 0) await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
       try {
-        const { blockhash, lastValidBlockHeight } = await withFailover((c) =>
-          c.getLatestBlockhash("confirmed"),
-        );
+        const { blockhash, lastValidBlockHeight } = await withFailover((c) => c.getLatestBlockhash("confirmed"));
         tx.recentBlockhash = blockhash;
         tx.feePayer = lenderKp.publicKey;
 
-        // runPrivilegedSign only validates + signs — no RPC inside.
-        // Only sign once (first attempt) to avoid re-signing on retry.
-        if (!guardAuditId) {
-          const guard = await runPrivilegedSign({
-            service: "fee-wallet-sweeper",
-            tx,
-            signers: [lenderKp],
-            allowedDeltas: [
-              {
-                pubkey: feeWalletAta,
-                kind: "token",
-                mint: NATIVE_MINT,
-                maxDecrease: BigInt(sweepable),
-              },
-              {
-                pubkey: lenderKp.publicKey,
-                kind: "sol",
-                maxDecrease: 10_000_000n,
-              },
-            ],
-          });
-          guardAuditId = guard.auditId;
-        }
-
-        sig = await withFailover((c) =>
-          c.sendRawTransaction(tx.serialize(), { skipPreflight: false }),
-        );
-        await withFailover((c) =>
-          c.confirmTransaction(
-            { signature: sig, blockhash, lastValidBlockHeight },
-            "confirmed",
-          ),
-        );
-        await recordPrivilegedSignResult({
-          auditId: guardAuditId,
-          status: "confirmed",
-          txSig: sig,
+        // Re-sign for THIS attempt's fresh blockhash on EVERY attempt. Gating
+        // the sign to attempt 0 would leave attempts 2-3 carrying a signature
+        // for an expired blockhash → tx.serialize() throws "signature
+        // verification failed" before broadcast, silently killing the retry.
+        // partialSign recomputes over the new compiled message (incl. the new
+        // blockhash) and replaces the lender's signature slot. A fresh audit
+        // row per attempt is acceptable and keeps a paper trail per broadcast.
+        const guard = await runPrivilegedSign({
+          service: "fee-wallet-sweeper",
+          tx,
+          signers: [lenderKp],
+          // The close NETS lender native POSITIVE (wSOL + close rent in,
+          // reopen rent + tx fee out). Declare the fee ATA token full
+          // decrease + a tiny lender SOL fee headroom defensively.
+          allowedDeltas: [
+            { pubkey: feeWalletAta, kind: "token", mint: NATIVE_MINT, maxDecrease: BigInt(wsolBalance) },
+            { pubkey: lenderKp.publicKey, kind: "sol", maxDecrease: 10_000n },
+          ],
+          // The only close destination permitted is the lender itself.
+          allowedCloseDestinations: [lenderKp.publicKey],
         });
-        sweepSucceeded = true;
+        guardAuditId = guard.auditId;
+
+        sig = await withFailover((c) => c.sendRawTransaction(tx.serialize(), { skipPreflight: false }));
+        broadcastSig = sig;            // pair the broadcast sig with THIS attempt's audit row
+        broadcastAuditId = guardAuditId;
+        await withFailover((c) => c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"));
+        await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
+        ok = true;
         break;
       } catch (innerErr) {
-        lastSweepErr = innerErr;
-        const isRateLimited = /429|rate.?limit|-32429/i.test(innerErr?.message || "");
-        const isLastAttempt = attempt === RETRY_DELAYS_MS.length - 1;
+        lastErr = innerErr;
+        const isLast = attempt === RETRY_DELAYS_MS.length - 1;
         console.warn(
-          `[fee-wallet-sweeper] sweep #${sweepId} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length} failed: ${innerErr?.message?.slice(0, 120)}${isRateLimited && !isLastAttempt ? " — retrying after backoff" : ""}`,
+          `[fee-wallet-sweeper] unwrap #${sweepId} attempt ${attempt + 1}/${RETRY_DELAYS_MS.length} failed: ${innerErr?.message?.slice(0, 120)}`,
         );
-        if (!isLastAttempt) continue;
+        if (!isLast) continue;
         throw innerErr;
       }
     }
-    if (!sweepSucceeded) {
-      throw lastSweepErr || new Error("Sweep failed after all retries");
-    }
+    if (!ok) throw lastErr || new Error("unwrap failed after all retries");
   } catch (err) {
+    // Reconcile before declaring failure: a confirm-timeout / RPC blip on a tx
+    // that ACTUALLY LANDED must not be mis-recorded as failed (false alarm +
+    // audit drift on a money path). If we broadcast a sig, ask the cluster.
+    if (broadcastSig) {
+      try {
+        const st = await withFailover((c) =>
+          c.getSignatureStatuses([broadcastSig], { searchTransactionHistory: true }),
+        );
+        const v = st?.value?.[0];
+        if (v && !v.err && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
+          if (broadcastAuditId) {
+            try {
+              const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
+              await recordPrivilegedSignResult({ auditId: broadcastAuditId, status: "confirmed", txSig: broadcastSig });
+            } catch { /* best-effort */ }
+          }
+          await query(
+            `UPDATE fee_wallet_sweeps SET status = 'confirmed', tx_signature = $2, updated_at = NOW() WHERE id = $1`,
+            [sweepId, broadcastSig],
+          );
+          console.log(
+            `[fee-wallet-sweeper] unwrap #${sweepId} reconciled CONFIRMED (confirm-timeout but tx landed), sig=${broadcastSig.slice(0, 20)}…`,
+          );
+          try {
+            await notifyAdmin(
+              bot,
+              `✅ Fee-wallet unwrap #${sweepId} CONFIRMED (reconciled after a confirm-timeout)\n` +
+                `Converted: ${(Number(wsolBalance) / 1e9).toFixed(6)} wSOL → NATIVE in the lender.\n` +
+                `Tx: https://solscan.io/tx/${broadcastSig}`,
+            );
+          } catch {}
+          return;
+        }
+      } catch { /* fall through to the failure path */ }
+    }
     if (guardAuditId) {
       try {
         const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
-        await recordPrivilegedSignResult({
-          auditId: guardAuditId,
-          status: "failed",
-          error: err.message?.slice(0, 200),
-        });
+        await recordPrivilegedSignResult({ auditId: guardAuditId, status: "failed", error: err.message?.slice(0, 200) });
       } catch { /* best-effort */ }
     }
-    // Phase 2 failure — mark audit row 'failed', alert operator. The
-    // next tick will try again from clean state.
     const msg = err?.message?.slice(0, 240) || String(err).slice(0, 240);
-    await query(
-      `UPDATE fee_wallet_sweeps SET status = 'failed', err = $2, updated_at = NOW() WHERE id = $1`,
-      [sweepId, msg],
-    );
-    console.error(`[fee-wallet-sweeper] sweep #${sweepId} failed: ${msg}`);
+    await query(`UPDATE fee_wallet_sweeps SET status = 'failed', err = $2, updated_at = NOW() WHERE id = $1`, [sweepId, msg]);
+    console.error(`[fee-wallet-sweeper] unwrap #${sweepId} failed: ${msg}`);
     try {
       await notifyAdmin(
         bot,
-        `🚨 Fee-wallet sweep #${sweepId} FAILED.\n` +
-          `Amount: ${(Number(sweepable) / 1e9).toFixed(6)} SOL\n` +
-          `Error: ${msg}\n` +
-          `Investigate on Solscan + check fee_wallet balance. Next tick will retry.`,
+        `🚨 Fee-wallet unwrap #${sweepId} FAILED.\n` +
+          `Amount: ${(Number(wsolBalance) / 1e9).toFixed(6)} SOL\nError: ${msg}\nNext tick retries.`,
       );
     } catch {}
     return;
   }
 
-  // Phase 3 — confirmed. Update audit row to 'confirmed' + tx sig.
   await query(
-    `UPDATE fee_wallet_sweeps
-        SET status = 'confirmed', tx_signature = $2, updated_at = NOW()
-      WHERE id = $1`,
+    `UPDATE fee_wallet_sweeps SET status = 'confirmed', tx_signature = $2, updated_at = NOW() WHERE id = $1`,
     [sweepId, sig],
   );
 
-  const solAmt = (Number(sweepable) / 1e9).toFixed(6);
+  const solAmt = (Number(wsolBalance) / 1e9).toFixed(6);
   console.log(
-    `[fee-wallet-sweeper] sweep #${sweepId} CONFIRMED — ${solAmt} SOL fee_wallet → distribution_wallet, sig=${sig.slice(0, 20)}…`,
+    `[fee-wallet-sweeper] unwrap #${sweepId} CONFIRMED — ${solAmt} wSOL → native in lender, sig=${sig.slice(0, 20)}…`,
   );
   try {
     await notifyAdmin(
       bot,
-      `✅ Fee-wallet sweep #${sweepId} CONFIRMED\n` +
-        `Amount: ${solAmt} SOL\n` +
-        `From: ${feeWalletAta.toBase58().slice(0, 12)}… (fee wallet wSOL ATA)\n` +
-        `To: ${distributionAta.toBase58().slice(0, 12)}… (distribution wallet wSOL ATA)\n` +
+      `✅ Fee-wallet unwrap #${sweepId} CONFIRMED\n` +
+        `Converted: ${solAmt} wSOL → NATIVE in the lender wallet.\n` +
+        `The distribution-auto-funder routes lender native → CHCAM (no wSOL ever lands in CHCAM).\n` +
         `Tx: https://solscan.io/tx/${sig}`,
     );
   } catch {}
