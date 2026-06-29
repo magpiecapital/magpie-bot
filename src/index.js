@@ -177,6 +177,7 @@ import { startEngineHeartbeatWatcher } from "./services/engine-heartbeat-watcher
 import { startAutoProtect } from "./services/auto-protect.js";
 import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
 import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
+import { startDistributionAutoFunder } from "./services/distribution-auto-funder.js";
 import { startPendingArmRetryWatcher } from "./services/pending-arm-retry-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
@@ -1114,6 +1115,15 @@ bot.start({
     // accruals vs distributor on-chain balance, admin-DMs if the
     // next snapshot would skip (P0 if > 5 SOL deficit).
     setTimeout(() => startDistributionGapMonitor(bot), 130_000);
+    // Distribution-wallet AUTO-FUNDER — every 15 min closes the gap the
+    // monitor above only alerts on: tops the distribution wallet up to
+    // (owed across pools + reserve) by moving EXACTLY the gap from the
+    // lender wallet's native fee revenue. Gap-bounded + reserve-protected
+    // + guarded + allowlisted + audited (distribution_funding_events).
+    // Eliminates manual funding. Operator-mandated 2026-06-28.
+    // See src/services/distribution-auto-funder.js +
+    // memory feedback_distribution_wallet_must_be_auto_funded.
+    setTimeout(() => startDistributionAutoFunder(bot), 135_000);
     // Pending-arm retry watcher — Tier-2 architectural fix for the
     // arm-race failure class. When arm-core's 30s phase-1 polling
     // window expires, the arm is queued to pending_arms with the

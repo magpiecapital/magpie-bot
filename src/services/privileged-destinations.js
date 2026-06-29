@@ -70,10 +70,32 @@ const LIQUIDATION_DISTRIBUTION_ALLOWED = new Set([
   "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
 ]);
 
+// ─────────────────────────────────────────────────────────────────
+// distribution-auto-funder
+//
+// Demand-driven top-up of the rewards-distribution wallet. Moves
+// EXACTLY the funding gap (owed across holder/LP/protocol pools +
+// reserve, minus the wallet's spendable native SOL) off the hot lender
+// wallet (4JSSSa…) so holder/LP/referral snapshots are always payable
+// without the operator hand-carrying SOL each week. The funder is
+// gap-bounded and reserve-protected — it can never overshoot the owed
+// amount nor drain the lender's operational reserve.
+//
+// Allowed destinations:
+//   CHCAMWtn… — REWARDS_DISTRIBUTOR_PUBKEY. The exact wallet the
+//                holder-rewards / LP-loyalty / referral distributors
+//                pay holders from (native SOL via SystemProgram.transfer).
+//                Same wallet as fee-wallet-sweeper + liquidation-distribution.
+// ─────────────────────────────────────────────────────────────────
+const DISTRIBUTION_FUNDER_ALLOWED = new Set([
+  "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
+]);
+
 const ALLOWLISTS = {
   "treasury-sweeper": TREASURY_SWEEPER_ALLOWED,
   "fee-wallet-sweeper": FEE_WALLET_SWEEPER_ALLOWED,
   "liquidation-distribution-watcher": LIQUIDATION_DISTRIBUTION_ALLOWED,
+  "distribution-auto-funder": DISTRIBUTION_FUNDER_ALLOWED,
 };
 
 /**
