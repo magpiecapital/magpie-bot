@@ -273,6 +273,15 @@ export async function handleX402Metrics() {
     WHERE recorded_at > NOW() - INTERVAL '7 days'
   `);
 
+  // Lifetime totals (all-time, no time window) — operator 2026-06-28: the /stats
+  // page shows TOTAL x402 fee revenue, not just the last 24h.
+  const { rows: [tot] } = await query(`
+    SELECT
+      COUNT(*) FILTER (WHERE kind <> 'reserve')::int AS calls_total,
+      COALESCE(SUM(amount_lamports::numeric) FILTER (WHERE kind = 'settled'), 0)::text AS revenue_total_lamports
+    FROM x402_paid_calls
+  `);
+
   const { rows: topEndpoints } = await query(`
     SELECT
       endpoint_path,
@@ -333,6 +342,8 @@ export async function handleX402Metrics() {
       calls_7d: w.calls_7d,
       revenue_24h_sol: Number(agg.revenue_24h_lamports) / 1e9,
       revenue_7d_sol: Number(w.revenue_7d_lamports) / 1e9,
+      revenue_total_sol: Number(tot.revenue_total_lamports) / 1e9,
+      calls_total: tot.calls_total,
       unique_payers_24h: agg.unique_payers_24h,
       // x402-originated borrows (approximate; see correlation comment above). Counts
       // loans funded by a wallet that paid for build-borrow within 30 min. Proof that
