@@ -91,11 +91,44 @@ const DISTRIBUTION_FUNDER_ALLOWED = new Set([
   "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
 ]);
 
+// ─────────────────────────────────────────────────────────────────
+// x402-fee-sweeper
+//
+// Swaps accrued x402 USDC fees → SOL on the lender wallet, then delivers
+// the holder/LP share as NATIVE SOL to the rewards-distribution wallet.
+// Brought under the destination allowlist + privileged-sign-guard +
+// shared lender lock as part of the 2026-06-29 autonomous-funding hardening
+// (it was previously a live, default-enabled, unguarded lender-key spend).
+//
+// Allowed destinations:
+//   CHCAMWtn… — REWARDS_DISTRIBUTOR_PUBKEY, same as fee-wallet-sweeper.
+// ─────────────────────────────────────────────────────────────────
+const X402_FEE_SWEEPER_ALLOWED = new Set([
+  "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
+]);
+
+// ─────────────────────────────────────────────────────────────────
+// lp-excess-sweeper
+//
+// Closes excess wSOL out of the lender LP position to native; the close
+// destination is hardcoded to the rewards-distribution wallet here so an
+// env flip can never redirect it (it was previously env-derived + unguarded).
+// Default-off via LP_EXCESS_AUTO_SWEEP_ENABLED.
+//
+// Allowed destinations:
+//   CHCAMWtn… — REWARDS_DISTRIBUTOR_PUBKEY.
+// ─────────────────────────────────────────────────────────────────
+const LP_EXCESS_SWEEPER_ALLOWED = new Set([
+  "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
+]);
+
 const ALLOWLISTS = {
   "treasury-sweeper": TREASURY_SWEEPER_ALLOWED,
   "fee-wallet-sweeper": FEE_WALLET_SWEEPER_ALLOWED,
   "liquidation-distribution-watcher": LIQUIDATION_DISTRIBUTION_ALLOWED,
   "distribution-auto-funder": DISTRIBUTION_FUNDER_ALLOWED,
+  "x402-fee-sweeper": X402_FEE_SWEEPER_ALLOWED,
+  "lp-excess-sweeper": LP_EXCESS_SWEEPER_ALLOWED,
 };
 
 /**
