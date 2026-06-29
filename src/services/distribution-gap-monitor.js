@@ -97,7 +97,12 @@ async function runOnce(bot) {
   const holderOwed = BigInt(holderRows[0]?.amt || 0);
   const lpOwed = BigInt(lpRows[0]?.amt || 0);
   const protocolOwed = BigInt(protocolRows[0]?.amt || 0);
-  const totalOwed = holderOwed + lpOwed + protocolOwed;
+  // PAYABLE owed = holder + lp only. protocol_reserve_pool has NO auto-payout
+  // path from the distribution wallet and is never decremented, so including
+  // it would inflate the gap forever (over-report a deficit that the
+  // distribution wallet should not actually hold SOL for). Keep protocolOwed
+  // for the breakdown display only. Matches distribution-auto-funder.js.
+  const totalOwed = holderOwed + lpOwed;
 
   // 2. Read distributor on-chain balance.
   const connection = new Connection(RPC_URL, "confirmed");
@@ -149,10 +154,10 @@ async function runOnce(bot) {
   const dmText =
     `${emoji} Distribution wallet GAP detected (${level.toUpperCase()})\n` +
     `\n` +
-    `Owed: ${(Number(totalOwed) / 1e9).toFixed(4)} SOL\n` +
+    `Payable owed (holder+LP): ${(Number(totalOwed) / 1e9).toFixed(4)} SOL\n` +
     `  - magpie_holder_pool: ${(Number(holderOwed) / 1e9).toFixed(4)} SOL\n` +
     `  - lp_loyalty_pool: ${(Number(lpOwed) / 1e9).toFixed(4)} SOL\n` +
-    `  - protocol_reserve_pool: ${(Number(protocolOwed) / 1e9).toFixed(4)} SOL\n` +
+    `  - protocol_reserve_pool: ${(Number(protocolOwed) / 1e9).toFixed(4)} SOL (excluded — no auto-payout)\n` +
     `Distributor on-chain: ${(Number(distBalance) / 1e9).toFixed(4)} SOL\n` +
     `Required (owed + 0.1 reserve): ${(Number(required) / 1e9).toFixed(4)} SOL\n` +
     `\n` +
