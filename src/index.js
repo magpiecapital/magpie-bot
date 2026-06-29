@@ -154,7 +154,7 @@ import { startApiServer } from "./api/server.js";
 import { initGovernanceSchema } from "./api/governance-api.js";
 import { setSecurityAlertBot } from "./services/security-alerts.js";
 import { setLenderAlarmBot } from "./api/lender-alarm-webhook.js";
-import { setNotifyBot } from "./services/admin-notify.js";
+import { setNotifyBot, notifyAdmin } from "./services/admin-notify.js";
 import { startDailyOpsReport } from "./services/daily-ops-report.js";
 import { startX402DailyDigest } from "./services/x402-daily-digest.js";
 import { startUsedNoncesCleaner } from "./services/used-nonces-cleaner.js";
@@ -179,6 +179,7 @@ import { startAutoProtect } from "./services/auto-protect.js";
 import { startFeeWalletSweeper } from "./services/fee-wallet-sweeper.js";
 import { startDistributionGapMonitor } from "./services/distribution-gap-monitor.js";
 import { startDistributionAutoFunder } from "./services/distribution-auto-funder.js";
+import { assertDistributorKeyDiscipline } from "./services/distributor-keypair.js";
 import { startPendingArmRetryWatcher } from "./services/pending-arm-retry-watcher.js";
 import { startAiConversationDigest } from "./services/ai-conversation-digest.js";
 import { startTicketAgingWatcher } from "./services/ticket-aging-watcher.js";
@@ -1125,6 +1126,24 @@ bot.start({
     // Eliminates manual funding. Operator-mandated 2026-06-28.
     // See src/services/distribution-auto-funder.js +
     // memory feedback_distribution_wallet_must_be_auto_funded.
+    // Boot-time custody discipline: the bot MUST run in lender-fallback mode —
+    // it must NEVER hold CHCAM's private key (off-Railway custody minimizes
+    // blast radius; distributions are operator-initiated LOCAL ops). CRIT-log +
+    // admin-alert (NOT a hard throw, so a misconfig can never block boot /
+    // loan execution — the #1 priority) if REWARDS_DISTRIBUTOR_PRIVATE_KEY is
+    // ever set or the pubkey drifts from the canonical CHCAM.
+    try {
+      const disc = assertDistributorKeyDiscipline({ hard: false });
+      if (!disc.ok) {
+        notifyAdmin(
+          bot,
+          `🚨 *Distributor key discipline violated*\n${disc.issues.join("\n")}\n\nThe bot must NOT hold CHCAM's key. Unset REWARDS_DISTRIBUTOR_PRIVATE_KEY on Railway.`,
+          { parse_mode: "Markdown" },
+        ).catch(() => {});
+      }
+    } catch (e) {
+      console.error("[boot] distributor key-discipline check failed:", e.message);
+    }
     setTimeout(() => startDistributionAutoFunder(bot), 135_000);
     // Pending-arm retry watcher — Tier-2 architectural fix for the
     // arm-race failure class. When arm-core's 30s phase-1 polling
