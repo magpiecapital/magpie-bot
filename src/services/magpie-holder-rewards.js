@@ -1261,6 +1261,15 @@ export function startHolderDistributor(bot) {
     }
   }
 
-  setTimeout(tick, 60 * 60 * 1000); // first check 1h after boot
+  // First check shortly after boot so an OVERDUE + funded distribution fires
+  // promptly instead of waiting a full hour. tick() is self-gating
+  // (next_distribution_at in the past + distributor funded) and idempotent —
+  // after a fire it reschedules next_distribution_at to a future window, so a
+  // subsequent boot inside that window won't re-fire. Env-tunable.
+  const firstCheckMs = Math.max(
+    30 * 1000,
+    Number(process.env.HOLDER_DISTRIBUTOR_FIRST_CHECK_MS) || 3 * 60 * 1000,
+  );
+  setTimeout(tick, firstCheckMs); // first check ~3min after boot
   setInterval(tick, 6 * 60 * 60 * 1000); // then every 6h
 }
