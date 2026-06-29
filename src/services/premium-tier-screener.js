@@ -103,18 +103,18 @@ export async function screenPremiumBorrow(opts) {
   const gateStart = Date.now();
   const gateTimes = {};
 
-  // ── Gate 0: Friday-close cutoff ───────────────────────────────────
-  // Refuse to ORIGINATE new premium-tier loans during the weekend window.
-  // Cheap to evaluate (no DB / RPC) so it short-circuits before the rest.
-  // Existing premium loans roll through the weekend unaffected.
-  const at = opts.now ? new Date(opts.now * 1000) : new Date();
-  if (isInWeekendCutoff(at)) {
-    const reopens = nextWeekendOpenIso(at);
-    return refused(
-      "weekend_cutoff",
-      `New premium-tier borrows pause Friday ${PREMIUM_TIER_WEEKEND_CLOSE_HOUR_UTC.toString().padStart(2, "0")}:00 UTC → Monday ${PREMIUM_TIER_WEEKEND_OPEN_HOUR_UTC.toString().padStart(2, "0")}:${PREMIUM_TIER_WEEKEND_OPEN_MINUTE_UTC.toString().padStart(2, "0")} UTC so US-equity peg + oracle data stay reliable. Existing premium loans are unaffected — repay/extend/topup remain available. New borrows reopen ${reopens}.`,
-    );
-  }
+  // ── No weekend / market-hours block on origination (operator 2026-06-29) ──
+  // Magpie operates 24/7/365. Collateral here is an ON-CHAIN tokenized stock
+  // trading around the clock on Jupiter — the on-chain price IS the live
+  // (after-hours/weekend) price. A user must NEVER be unable to open a loan at
+  // any hour of any day, just as they must always be able to repay or have an
+  // exit order fill. The old Friday-close → Monday-open origination gate was
+  // REMOVED. Weekend-peg drift (~3-5%) is absorbed by the protections that
+  // remain below — the tier-aware max-LTV cap (Gate 2b), the robust
+  // cross-sourced collateral price, and the on-chain attestation cap — NOT by
+  // blocking the borrow. (The arm path's weekend slippage *bump* in
+  // limit-close-arm-core.js is intentionally kept: it only widens headroom
+  // within the user's own cap to help off-hours fills succeed — it never blocks.)
 
   // ── Gate 1: category gate ────────────────────────────────────────
   let t = Date.now();
