@@ -214,23 +214,28 @@ async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) 
         tx.recentBlockhash = blockhash;
         tx.feePayer = lenderKp.publicKey;
 
-        if (!guardAuditId) {
-          const guard = await runPrivilegedSign({
-            service: "fee-wallet-sweeper",
-            tx,
-            signers: [lenderKp],
-            // The close NETS lender native POSITIVE (wSOL + close rent in,
-            // reopen rent + tx fee out). Declare the fee ATA token full
-            // decrease + a tiny lender SOL fee headroom defensively.
-            allowedDeltas: [
-              { pubkey: feeWalletAta, kind: "token", mint: NATIVE_MINT, maxDecrease: BigInt(wsolBalance) },
-              { pubkey: lenderKp.publicKey, kind: "sol", maxDecrease: 10_000n },
-            ],
-            // The only close destination permitted is the lender itself.
-            allowedCloseDestinations: [lenderKp.publicKey],
-          });
-          guardAuditId = guard.auditId;
-        }
+        // Re-sign for THIS attempt's fresh blockhash on EVERY attempt. Gating
+        // the sign to attempt 0 would leave attempts 2-3 carrying a signature
+        // for an expired blockhash → tx.serialize() throws "signature
+        // verification failed" before broadcast, silently killing the retry.
+        // partialSign recomputes over the new compiled message (incl. the new
+        // blockhash) and replaces the lender's signature slot. A fresh audit
+        // row per attempt is acceptable and keeps a paper trail per broadcast.
+        const guard = await runPrivilegedSign({
+          service: "fee-wallet-sweeper",
+          tx,
+          signers: [lenderKp],
+          // The close NETS lender native POSITIVE (wSOL + close rent in,
+          // reopen rent + tx fee out). Declare the fee ATA token full
+          // decrease + a tiny lender SOL fee headroom defensively.
+          allowedDeltas: [
+            { pubkey: feeWalletAta, kind: "token", mint: NATIVE_MINT, maxDecrease: BigInt(wsolBalance) },
+            { pubkey: lenderKp.publicKey, kind: "sol", maxDecrease: 10_000n },
+          ],
+          // The only close destination permitted is the lender itself.
+          allowedCloseDestinations: [lenderKp.publicKey],
+        });
+        guardAuditId = guard.auditId;
 
         sig = await withFailover((c) => c.sendRawTransaction(tx.serialize(), { skipPreflight: false }));
         await withFailover((c) => c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"));
@@ -249,6 +254,41 @@ async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) 
     }
     if (!ok) throw lastErr || new Error("unwrap failed after all retries");
   } catch (err) {
+    // Reconcile before declaring failure: a confirm-timeout / RPC blip on a tx
+    // that ACTUALLY LANDED must not be mis-recorded as failed (false alarm +
+    // audit drift on a money path). If we broadcast a sig, ask the cluster.
+    if (sig) {
+      try {
+        const st = await withFailover((c) =>
+          c.getSignatureStatuses([sig], { searchTransactionHistory: true }),
+        );
+        const v = st?.value?.[0];
+        if (v && !v.err && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
+          if (guardAuditId) {
+            try {
+              const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
+              await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
+            } catch { /* best-effort */ }
+          }
+          await query(
+            `UPDATE fee_wallet_sweeps SET status = 'confirmed', tx_signature = $2, updated_at = NOW() WHERE id = $1`,
+            [sweepId, sig],
+          );
+          console.log(
+            `[fee-wallet-sweeper] unwrap #${sweepId} reconciled CONFIRMED (confirm-timeout but tx landed), sig=${sig.slice(0, 20)}…`,
+          );
+          try {
+            await notifyAdmin(
+              bot,
+              `✅ Fee-wallet unwrap #${sweepId} CONFIRMED (reconciled after a confirm-timeout)\n` +
+                `Converted: ${(Number(wsolBalance) / 1e9).toFixed(6)} wSOL → NATIVE in the lender.\n` +
+                `Tx: https://solscan.io/tx/${sig}`,
+            );
+          } catch {}
+          return;
+        }
+      } catch { /* fall through to the failure path */ }
+    }
     if (guardAuditId) {
       try {
         const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
