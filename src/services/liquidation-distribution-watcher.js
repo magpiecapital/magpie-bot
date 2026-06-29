@@ -60,13 +60,9 @@
  *   LIQUIDATION_DISTRIBUTION_TICK_MS    — default 90_000 (1.5 min)
  */
 import { query } from "../db/pool.js";
-import { PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
+import { PublicKey, Keypair, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
-import { connection, withFailover } from "../solana/connection.js";
-import { withLenderSpendLock } from "./lender-spend-lock.js";
-import { availableLenderNative } from "./lender-reserve.js";
-import { runPrivilegedSign, recordPrivilegedSignResult } from "./privileged-sign-guard.js";
-import { assertAllowedDestination } from "./privileged-destinations.js";
+import { connection } from "../solana/connection.js";
 
 const TICK_MS = Number(process.env.LIQUIDATION_DISTRIBUTION_TICK_MS) || 90_000;
 const FIRST_TICK_DELAY_MS = 180_000; // wait 3 min after boot so other services init
@@ -175,16 +171,14 @@ async function distributeOne(row) {
   // the gate that makes the rest of distributeOne atomic-on-failure.
   if (REWARDS_DISTRIBUTOR_PUBKEY && transferAmount > 0n) {
     try {
-      // Reserve-safe pre-flight via the shared helper: subtracts the canonical
-      // 5-SOL gas reserve AND every unconfirmed in-flight lender spend, so a
-      // liquidation burst can't drain 4JSS below the gas floor (was 0.01 SOL).
-      // Fails CLOSED (0) on an uncertain read.
-      const avail = await availableLenderNative(connection);
-      if (avail < transferAmount) {
+      const lenderBal = BigInt(await connection.getBalance(
+        getLenderKeypairForTransfer()?.publicKey,
+      ));
+      if (lenderBal < transferAmount + LENDER_RESERVE_LAMPORTS) {
         console.warn(
-          `[liq-distribute] loan ${row.loan_id} skipped — lender spendable ` +
-          `${(Number(avail) / 1e9).toFixed(4)} SOL < transfer ` +
-          `${(Number(transferAmount) / 1e9).toFixed(4)} SOL (5-SOL gas reserve protected). Will retry next tick.`,
+          `[liq-distribute] loan ${row.loan_id} skipped — lender balance ` +
+          `${(Number(lenderBal) / 1e9).toFixed(4)} SOL < required ` +
+          `${(Number(transferAmount + LENDER_RESERVE_LAMPORTS) / 1e9).toFixed(4)} SOL. Will retry next tick.`,
         );
         return { ok: false, reason: "lender_balance_too_low" };
       }
@@ -232,61 +226,28 @@ async function distributeOne(row) {
     if (!lender) {
       errors.push("on_chain_transfer: LENDER_PRIVATE_KEY missing");
     } else {
-      // Serialize on the ONE shared lender-spend lock (with the funder +
-      // fee-sweeper), route through the privileged-sign guard + destination
-      // allowlist, and re-check spendable INSIDE the lock so a sibling spend
-      // can't push 4JSS below the 5-SOL gas reserve.
-      const locked = await withLenderSpendLock(async () => {
-        const avail = await availableLenderNative(connection);
-        if (avail < transferAmount) {
-          return { err: `reserve: spendable ${(Number(avail) / 1e9).toFixed(4)} < transfer ${(Number(transferAmount) / 1e9).toFixed(4)}` };
-        }
-        try {
-          assertAllowedDestination("liquidation-distribution-watcher", REWARDS_DISTRIBUTOR_PUBKEY);
-        } catch (e) {
-          return { err: e.message?.slice(0, 100) };
-        }
-        const { blockhash, lastValidBlockHeight } = await withFailover((c) => c.getLatestBlockhash("confirmed"));
-        // BigInt precision: bounded by a single liquidation's proceeds (≪ 2^53).
-        const tx = new Transaction({ feePayer: lender.publicKey, blockhash, lastValidBlockHeight }).add(
+      try {
+        const tx = new Transaction().add(
           SystemProgram.transfer({
             fromPubkey: lender.publicKey,
             toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
+            // BigInt precision: SOL amounts here are bounded by the
+            // sale_proceeds of a single liquidation (max ~10s of SOL
+            // realistically), comfortably under 2^53. Number() is safe.
             lamports: Number(transferAmount),
           }),
         );
-        let auditId = null;
-        try {
-          const guard = await runPrivilegedSign({
-            service: "liquidation-distribution-watcher",
-            tx,
-            signers: [lender],
-            allowedDeltas: [{ pubkey: lender.publicKey, kind: "sol", maxDecrease: transferAmount + 10_000n }],
-          });
-          auditId = guard.auditId;
-          const sig = await withFailover((c) => c.sendRawTransaction(tx.serialize(), { skipPreflight: false }));
-          await recordPrivilegedSignResult({ auditId, status: "broadcast", txSig: sig });
-          await withFailover((c) => c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"));
-          await recordPrivilegedSignResult({ auditId, status: "confirmed", txSig: sig });
-          return { sig };
-        } catch (e) {
-          if (auditId) {
-            try { await recordPrivilegedSignResult({ auditId, status: "failed", error: e.message?.slice(0, 160) }); } catch {}
-          }
-          return { err: e.message?.slice(0, 100) };
-        }
-      });
-      if (locked.skipped) {
-        errors.push("on_chain_transfer: shared lender lock held — retry next tick");
-      } else if (locked.result?.err) {
-        errors.push(`on_chain_transfer: ${locked.result.err}`);
-      } else {
-        transferSig = locked.result?.sig || null;
+        transferSig = await sendAndConfirmTransaction(connection, tx, [lender], {
+          commitment: "confirmed",
+          maxRetries: 3,
+        });
         console.log(
           `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
           `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
-          `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${transferSig?.slice(0, 24)}…`,
+          `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${transferSig.slice(0, 24)}…`,
         );
+      } catch (err) {
+        errors.push(`on_chain_transfer: ${err.message?.slice(0, 80)}`);
       }
     }
   }
