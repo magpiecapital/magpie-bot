@@ -34,8 +34,6 @@
  */
 import {
   PublicKey,
-  SystemProgram,
-  Transaction,
   Keypair,
   VersionedTransaction,
 } from "@solana/web3.js";
@@ -88,6 +86,11 @@ const FIRST_RUN_MS = envNumber("X402_FEE_SWEEP_FIRST_RUN_MS", 8 * 60 * 1000); //
 // slippage. Default 1 USDC.
 const MIN_USDC_ATOMIC = envNumber("X402_FEE_SWEEP_MIN_USDC_ATOMIC", 1_000_000);
 const SLIPPAGE_BPS = envNumber("X402_FEE_SWEEP_SLIPPAGE_BPS", 100); // 1%
+// Defense-in-depth: an x402 fee sweep yielding more SOL than this is implausible
+// (would require a very large USDC fee balance). Cap the quote's claimed output
+// so a manipulated/compromised Jupiter quote can't inject an implausible value
+// that over-credits the holder pool. Default 5 SOL.
+const MAX_SWEEP_SOL_LAMPORTS = envNumber("X402_FEE_SWEEP_MAX_SOL_LAMPORTS", 5_000_000_000);
 
 // ─── Lender keypair (env-first, no CWD fallback) ──────────────────
 let _lenderKp = null;
@@ -220,40 +223,24 @@ async function finalizeSweep(rowId, swapSig, solLamports, lender, bot, usdcAtomi
     await query(`UPDATE x402_fee_sweeps SET accrued = TRUE, updated_at = NOW() WHERE id = $1`, [rowId]);
   }
 
-  // 2. Transfer realized SOL to the distribution wallet so it backs the
-  //    accrual. Keep a small buffer for the network fee.
-  const transferLamports = Math.max(0, Number(solLamports) - 10_000);
-  let transferSig = null;
-  if (transferLamports > 0) {
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-    const tx = new Transaction({ feePayer: lender.publicKey, blockhash, lastValidBlockHeight }).add(
-      SystemProgram.transfer({
-        fromPubkey: lender.publicKey,
-        toPubkey: DISTRIBUTION_WALLET,
-        lamports: transferLamports,
-      }),
-    );
-    tx.sign(lender);
-    const sim = await connection.simulateTransaction(tx);
-    if (sim.value.err) {
-      throw new Error(`transfer sim rejected: ${JSON.stringify(sim.value.err).slice(0, 120)}`);
-    }
-    transferSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction({ signature: transferSig, blockhash, lastValidBlockHeight }, "confirmed");
-  }
-
+  // 2. The swap (wrapAndUnwrapSol) ALREADY delivered native SOL to the lender.
+  //    We do NOT transfer to CHCAM here — the distribution-auto-funder is the
+  //    SOLE writer that routes lender native -> CHCAM, sized to owed. Removing
+  //    this leg eliminates a previously-unguarded lender->CHCAM spend (no
+  //    reserve clamp, no sign-guard) and the double-move-on-reconcile bug. The
+  //    holder accrual above raised owed, so the funder backs it on its next tick.
   await query(
-    `UPDATE x402_fee_sweeps SET status = 'confirmed', transfer_sig = $2, updated_at = NOW() WHERE id = $1`,
-    [rowId, transferSig],
+    `UPDATE x402_fee_sweeps SET status = 'confirmed', updated_at = NOW() WHERE id = $1`,
+    [rowId],
   );
 
   await alertOperator(
     bot,
     `🪙 *x402 USDC fee sweep*\n\n` +
-      `Swapped \`${(Number(usdcAtomic) / 10 ** USDC_DECIMALS).toFixed(4)}\` USDC → \`${(Number(solLamports) / LAMPORTS_PER_SOL).toFixed(4)}\` SOL.\n` +
-      `• Holder pool credited: \`${(holderLamports / LAMPORTS_PER_SOL).toFixed(4)}\` SOL (governance share)\n` +
-      `• Sent to distributor: \`${(transferLamports / LAMPORTS_PER_SOL).toFixed(4)}\` SOL\n` +
-      `• Swap: \`${swapSig}\`${transferSig ? `\n• Transfer: \`${transferSig}\`` : ""}`,
+      `Swapped \`${(Number(usdcAtomic) / 10 ** USDC_DECIMALS).toFixed(4)}\` USDC → \`${(Number(solLamports) / LAMPORTS_PER_SOL).toFixed(4)}\` SOL (now native in the lender).\n` +
+      `• Holder pool credited: \`${(holderLamports / LAMPORTS_PER_SOL).toFixed(4)}\` SOL\n` +
+      `• The distribution-auto-funder routes lender native → CHCAM (no separate transfer).\n` +
+      `• Swap: \`${swapSig}\``,
   );
 }
 
@@ -298,6 +285,11 @@ async function tickInner(bot) {
       amount: usdc.toString(),
       slippageBps: SLIPPAGE_BPS,
     });
+    if (Number(quote.outAmount) > MAX_SWEEP_SOL_LAMPORTS) {
+      throw new Error(
+        `implausible quote output ${(Number(quote.outAmount) / LAMPORTS_PER_SOL).toFixed(4)} SOL > cap ${(MAX_SWEEP_SOL_LAMPORTS / LAMPORTS_PER_SOL).toFixed(2)} — refusing to swap/credit`,
+      );
+    }
     const swapTxB64 = await getJupiterSwapTx({ quoteResponse: quote, userPublicKey: lender.publicKey.toBase58() });
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTxB64, "base64"));
     tx.sign([lender]);
