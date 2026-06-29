@@ -93,7 +93,7 @@ import {
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import fs from "node:fs";
-import { query, getClient } from "../db/pool.js";
+import { query } from "../db/pool.js";
 import { withFailover } from "../solana/connection.js";
 import { notifyAdmin } from "./admin-notify.js";
 import { assertAllowedDestination } from "./privileged-destinations.js";
@@ -102,6 +102,9 @@ import {
   recordPrivilegedSignResult,
 } from "./privileged-sign-guard.js";
 import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
+import { readPayableOwed } from "./distribution-owed.js";
+import { withLenderSpendLock } from "./lender-spend-lock.js";
+import { availableLenderNative } from "./lender-reserve.js";
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
@@ -157,7 +160,6 @@ const DISTRIBUTION_PUBKEY = new PublicKey(
     "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
 );
 
-const ADVISORY_LOCK_KEY = 73_002_606_280_628n; // unique to this service
 
 let _timer = null;
 let _running = false; // in-process reentrancy guard
@@ -307,38 +309,14 @@ async function tick(bot) {
       await record({ outcome: "skip_disabled", notes: "no lender key configured" });
       return;
     }
-    // Pin ONE connection for the whole tick so the advisory lock (session-
-    // scoped) is acquired AND released on the same backend — otherwise it
-    // leaks across pooled connections and silently halts funding.
-    const client = await getClient();
-    let lockHeld = false;
-    let unlocked = false;
-    try {
-      const { rows } = await client.query(`SELECT pg_try_advisory_lock($1::bigint) AS got`, [
-        String(ADVISORY_LOCK_KEY),
-      ]);
-      if (rows[0]?.got !== true) {
-        await record({ outcome: "skip_locked", notes: "advisory lock held by another tick" });
-        return;
-      }
-      lockHeld = true;
-      try {
-        await tickInner(bot);
-      } finally {
-        try {
-          await client.query(`SELECT pg_advisory_unlock($1::bigint)`, [String(ADVISORY_LOCK_KEY)]);
-          unlocked = true;
-        } catch (e) {
-          console.error(`[dist-funder] advisory unlock failed — will evict client to force lock release: ${e.message?.slice(0, 120)}`);
-        }
-      }
-    } finally {
-      // pg_try_advisory_lock is SESSION-scoped — client.release() alone does
-      // NOT drop it. If we held the lock but couldn't confirm the unlock, pass
-      // an Error so pg-pool destroys the backend connection; Postgres then
-      // releases the session lock on disconnect, preventing a silent funding
-      // halt where a re-pooled lock-holding connection makes every tick skip.
-      client.release(lockHeld && !unlocked ? new Error("dist-funder: advisory unlock unconfirmed") : undefined);
+    // ONE shared lender-spend lock across EVERY 4JSS-signing service (funder,
+    // fee-wallet-sweeper, x402-fee-sweeper, …) so at most one lender-spending
+    // tx is ever in flight and the 5-SOL gas reserve holds ACROSS writers, not
+    // just per-tick. The lock helper owns the session-pinned-client +
+    // evict-on-unlock-failure discipline that used to live here.
+    const locked = await withLenderSpendLock(() => tickInner(bot));
+    if (locked.skipped) {
+      await record({ outcome: "skip_locked", notes: `shared lender lock: ${locked.reason}` });
     }
   } finally {
     _running = false;
@@ -348,8 +326,10 @@ async function tick(bot) {
 async function tickInner(bot) {
   const connection = new Connection(RPC_URL, "confirmed");
 
-  // 1. Payable reward liability (holder + lp only; protocol reserve excluded).
-  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readOwed();
+  // 1. Payable reward liability via the ONE canonical helper (holder + LP
+  //    third-party-NET; protocol reserve excluded) so DISPLAY == MONITORED ==
+  //    FUNDED — the funded native exactly matches the stats "allotted" figure.
+  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readPayableOwed();
 
   const baseRow = {
     owed: payableOwed, holderOwed, lpOwed, protocolOwed,
@@ -388,11 +368,11 @@ async function tickInner(bot) {
     return;
   }
 
-  // 5. What the lender can safely provide right now.
-  const lenderAvail =
-    lenderNative > LENDER_RESERVE_LAMPORTS + TX_FEE_HEADROOM
-      ? lenderNative - LENDER_RESERVE_LAMPORTS - TX_FEE_HEADROOM
-      : 0n;
+  // 5. What the lender can safely provide right now — via the shared helper,
+  //    which subtracts the canonical 5-SOL reserve AND every UNCONFIRMED
+  //    in-flight lender spend (so a sibling service's in-flight tx can't push
+  //    4JSS below the gas floor). Fails CLOSED (0) if the read is uncertain.
+  const lenderAvail = await availableLenderNative(connection);
   if (lenderAvail < MIN_FUND_LAMPORTS) {
     await record({ ...baseRow, outcome: "skip_lender_low",
       notes: `lenderAvail=${fmt(lenderAvail)} < min; gap=${fmt(gap)} unmet` });
@@ -586,7 +566,9 @@ export function stopDistributionAutoFunder() {
 // ─── Status (for admin command / observability) ───────────────────
 export async function getDistributionFunderStatus() {
   const connection = new Connection(RPC_URL, "confirmed");
-  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readOwed().catch(() => ({
+  // Use the SAME canonical owed source the funding path uses so the status
+  // readout never shows a higher (gross) figure than what actually gets funded.
+  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readPayableOwed().catch(() => ({
     holderOwed: 0n, lpOwed: 0n, protocolOwed: 0n, payableOwed: 0n,
   }));
   const [distNative, lenderNative, recent] = await Promise.all([
