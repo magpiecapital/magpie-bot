@@ -24,7 +24,11 @@ import {
 import {
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
+  NATIVE_MINT,
   getAssociatedTokenAddressSync,
+  getAccount,
+  createCloseAccountInstruction,
+  createAssociatedTokenAccountIdempotentInstruction,
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import fs from "node:fs";
@@ -705,6 +709,81 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
   });
 }
 
+// The dedicated rewards wallet (CHCAM). Borrow/x402 fees sweep in as wSOL;
+// holder payouts move NATIVE SOL via SystemProgram.transfer, so a native
+// pre-flight can't "see" wSOL and would skip a fully-funded distribution.
+// We unwrap the distributor's OWN wSOL ATA (close → reopen idempotent) right
+// before the balance check. GUARDED to the dedicated wallet only: if the
+// distributor is in lender-fallback mode (env key not set) the pubkeys won't
+// match and we no-op, so this never touches the lender/gas wallet's wSOL.
+const REWARDS_DISTRIBUTOR_PUBKEY =
+  process.env.REWARDS_DISTRIBUTOR_PUBKEY ||
+  "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac";
+
+async function unwrapDistributorWsolBestEffort() {
+  let distributor;
+  try {
+    distributor = getRewardsDistributorKeypair();
+  } catch {
+    return 0n;
+  }
+  // Only ever unwrap the DEDICATED rewards wallet, never the lender/gas wallet.
+  if (distributor.publicKey.toBase58() !== REWARDS_DISTRIBUTOR_PUBKEY) {
+    return 0n;
+  }
+  const ata = getAssociatedTokenAddressSync(
+    NATIVE_MINT,
+    distributor.publicKey,
+    false,
+    TOKEN_PROGRAM_ID,
+  );
+  let acct;
+  try {
+    acct = await getAccount(connection, ata, "confirmed", TOKEN_PROGRAM_ID);
+  } catch {
+    return 0n; // no wSOL ATA → nothing to unwrap
+  }
+  if (acct.amount <= 0n) return 0n;
+  const amount = acct.amount;
+  try {
+    const tx = new Transaction();
+    // Closing the ATA unwraps its wSOL to the OWNER's native SOL (no external
+    // destination — zero drain surface), then reopen idempotently so future
+    // fee sweeps still have an ATA to land in.
+    tx.add(
+      createCloseAccountInstruction(
+        ata,
+        distributor.publicKey,
+        distributor.publicKey,
+        [],
+        TOKEN_PROGRAM_ID,
+      ),
+    );
+    tx.add(
+      createAssociatedTokenAccountIdempotentInstruction(
+        distributor.publicKey,
+        ata,
+        distributor.publicKey,
+        NATIVE_MINT,
+        TOKEN_PROGRAM_ID,
+      ),
+    );
+    const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
+      commitment: "confirmed",
+    });
+    console.log(
+      `[holder-rewards] unwrapped ${Number(amount) / 1e9} wSOL → native in distributor before distribution (sig ${sig.slice(0, 12)}…)`,
+    );
+    return amount;
+  } catch (err) {
+    // Best-effort: a failed unwrap must never block the distribution attempt.
+    console.warn(
+      `[holder-rewards] pre-distribution wSOL unwrap skipped: ${err.message?.slice(0, 140)}`,
+    );
+    return 0n;
+  }
+}
+
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
@@ -736,6 +815,10 @@ export async function snapshotAndDistribute() {
   // falls back to the lender wallet, preserving prior behaviour.
   const distributor = getRewardsDistributorKeypair();
   if (!snapshotOnly) {
+    // Make any stranded wSOL (fees sweep in wrapped) spendable BEFORE the
+    // native-balance pre-flight, so a fully-funded distribution never skips
+    // just because its SOL is wrapped. Best-effort + guarded to CHCAM.
+    await unwrapDistributorWsolBestEffort().catch(() => 0n);
     const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
     if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
       console.warn(
@@ -872,14 +955,14 @@ export async function snapshotAndDistribute() {
     for (const r of batch) {
       tx.add(
         SystemProgram.transfer({
-          fromPubkey: lender.publicKey,
+          fromPubkey: distributor.publicKey,
           toPubkey: new PublicKey(r.wallet_address),
           lamports: BigInt(r.reward_lamports),
         }),
       );
     }
     try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [lender], {
+      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
         commitment: "confirmed",
       });
       await query(
