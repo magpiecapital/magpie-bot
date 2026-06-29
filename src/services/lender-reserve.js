@@ -52,35 +52,44 @@ export const TX_FEE_HEADROOM = 10_000n;
  * forever (a real in-flight tx lands or expires well within that window).
  */
 export async function inFlightLenderSpendLamports() {
-  try {
-    const { rows: [r] } = await query(
-      `SELECT COALESCE(SUM((d->>'max_decrease')::numeric), 0)::text AS inflight
-         FROM privileged_sign_audit a,
-              LATERAL jsonb_array_elements(a.expected_deltas) d
-        WHERE a.signer_pubkey = $1
-          AND a.status IN ('pending', 'sim_passed', 'broadcast')
-          AND a.created_at > NOW() - interval '15 minutes'
-          AND d->>'pubkey' = $1
-          AND d->>'kind' = 'sol'`,
-      [LENDER_PUBKEY.toBase58()],
-    );
-    return BigInt(r?.inflight || 0);
-  } catch {
-    // If the audit table/shape isn't available, fail CLOSED by assuming a
-    // conservative in-flight buffer rather than 0 (never under-count).
-    return 0n;
-  }
+  // THROWS on DB/shape failure — callers MUST treat that as "cannot prove the
+  // reserve is safe" and fail CLOSED (availableLenderNative returns 0n). We do
+  // NOT silently return 0n here: that would under-count in-flight spend and let
+  // a caller draw toward/past the gas reserve. Code + contract now agree.
+  const { rows: [r] } = await query(
+    `SELECT COALESCE(SUM((d->>'max_decrease')::numeric), 0)::text AS inflight
+       FROM privileged_sign_audit a,
+            LATERAL jsonb_array_elements(a.expected_deltas) d
+      WHERE a.signer_pubkey = $1
+        AND a.status IN ('pending', 'sim_passed', 'broadcast')
+        AND a.created_at > NOW() - interval '15 minutes'
+        AND d->>'pubkey' = $1
+        AND d->>'kind' = 'sol'`,
+    [LENDER_PUBKEY.toBase58()],
+  );
+  return BigInt(r?.inflight || 0);
 }
 
 /**
  * Native lamports the lender can safely spend RIGHT NOW without breaching the
  * gas reserve, accounting for unconfirmed in-flight spends. Always >= 0n.
  *
+ * FAILS CLOSED: if the confirmed balance read OR the in-flight accounting
+ * throws, we cannot prove the reserve is safe, so we return 0n (no spend
+ * permitted this tick) rather than over-report headroom.
+ *
  * @param {import('@solana/web3.js').Connection} connection
  */
 export async function availableLenderNative(connection) {
-  const confirmed = BigInt(await connection.getBalance(LENDER_PUBKEY, "confirmed"));
-  const inFlight = await inFlightLenderSpendLamports();
-  const avail = confirmed - LENDER_RESERVE_LAMPORTS - TX_FEE_HEADROOM - inFlight;
-  return avail > 0n ? avail : 0n;
+  try {
+    const confirmed = BigInt(await connection.getBalance(LENDER_PUBKEY, "confirmed"));
+    const inFlight = await inFlightLenderSpendLamports();
+    const avail = confirmed - LENDER_RESERVE_LAMPORTS - TX_FEE_HEADROOM - inFlight;
+    return avail > 0n ? avail : 0n;
+  } catch (err) {
+    console.error(
+      `[lender-reserve] availableLenderNative failed — failing CLOSED (0 spendable): ${err.message?.slice(0, 140)}`,
+    );
+    return 0n;
+  }
 }
