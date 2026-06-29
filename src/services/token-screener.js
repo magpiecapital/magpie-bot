@@ -1516,6 +1516,19 @@ const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min (retained for compat)
  * Tokens that fall into manual-review-only territory stay there
  * permanently until the operator decides. That is the entire point.
  */
+// Autonomous review-determination policy (operator 2026-06-28: "we CANNOT leave
+// pending tokens in limbo... agents use best determination to APPROVE, with the
+// mindset that our offering needs to EXPAND" — while protecting downside against
+// high-rug tokens). A pending token that passes the full scam gauntlet (not
+// high-rug) and meets a collateral-VIABILITY floor is AUTO-APPROVED even if it
+// missed the strict fast-track quality bar — instead of sitting in manual limbo.
+// Concentration is relaxed from the strict 40% fast-track cap to a high-rug line
+// (genuine rug-setup territory) so moderate concentration doesn't block growth;
+// honeypot/rug/authority/extension/impersonation stay HARD rejects. All env-tunable.
+const REVIEW_AUTO_MAX_TOP10_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP10_PCT) || 65;
+const REVIEW_AUTO_MAX_TOP20_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP20_PCT) || 85;
+const REVIEW_VIABILITY_MIN_LIQ_USD = Number(process.env.REVIEW_VIABILITY_MIN_LIQ_USD) || 15000;
+
 async function processReviewQueue(bot) {
   const { rows } = await query(
     `SELECT * FROM token_screen_queue
@@ -1557,7 +1570,10 @@ async function processReviewQueue(bot) {
         const [sell, ext, conc, rug] = await Promise.all([
           checkSellable(t.mint, onChain.decimals),
           auditTokenExtensions(t.mint, { fresh: true }),
-          checkHolderConcentration(t.mint, { fresh: true }),
+          // Relaxed concentration for the autonomous expand-path: reject only
+          // genuine rug-setup concentration, not the strict 40% fast-track cap
+          // (operator wants moderate concentration to NOT block growth).
+          checkHolderConcentration(t.mint, { fresh: true, maxTop10Pct: REVIEW_AUTO_MAX_TOP10_PCT, maxTop20Pct: REVIEW_AUTO_MAX_TOP20_PCT }),
           rugcheckRisk(t.mint, { fresh: true }),
         ]);
         scamReason =
@@ -1610,35 +1626,48 @@ async function processReviewQueue(bot) {
     );
 
     if (liveVerdict !== "auto_approve") {
-      // Still doesn't meet the auto-approve bar — leave queued for
-      // manual operator review. Update the queue row with the freshest
-      // observations so /reviewtokens shows current state.
-      await query(
-        `UPDATE token_screen_queue
-            SET liquidity_usd = $2,
-                volume_24h_usd = $3,
-                market_cap_usd = $4,
-                holder_count = $5,
-                fail_reasons = $6
-          WHERE mint = $1`,
-        [
-          t.mint,
-          liveMarket.liquidity,
-          liveMarket.volume24h,
-          liveMarket.marketCap,
-          liveHolderCount,
-          liveFails,
-        ],
-      );
-      console.log(
-        `[screener] Review-queue token ${t.symbol} aged but still not auto-approvable ` +
-        `(${liveVerdict}) — leaving for manual review. Live: liq=$${Math.floor(liveMarket.liquidity)}, ` +
-        `holders=${liveHolderCount}, vol24=$${Math.floor(liveMarket.volume24h)}`,
-      );
-      continue;
+      // AUTONOMOUS DETERMINATION — NO LIMBO (operator 2026-06-28: "we CANNOT
+      // leave pending tokens in limbo; agents use best determination to APPROVE
+      // with the mindset that our offering needs to EXPAND" — while protecting
+      // downside against high-rug tokens). By reaching here the token already
+      // PASSED the full scam gauntlet above (not high-rug: sellable, no mint/
+      // freeze authority, safe extensions, not a rug, not impersonation,
+      // concentration within the relaxed high-rug line). It only missed the
+      // strict fast-track QUALITY bar. So DECIDE NOW — never leave it pending:
+      //   • meets the collateral-VIABILITY floor (liquid enough to be sold on
+      //     liquidation / V4 exit) → APPROVE (expand the offering).
+      //   • below the floor → REJECT (too illiquid to be safe collateral).
+      if (!(Number(liveMarket.liquidity) >= REVIEW_VIABILITY_MIN_LIQ_USD)) {
+        await query(
+          `UPDATE token_screen_queue
+              SET status = 'rejected', reviewed_at = NOW(),
+                  liquidity_usd = $2, volume_24h_usd = $3, market_cap_usd = $4,
+                  holder_count = $5,
+                  fail_reasons = $6
+            WHERE mint = $1`,
+          [
+            t.mint, liveMarket.liquidity, liveMarket.volume24h, liveMarket.marketCap, liveHolderCount,
+            [`insufficient liquidity for collateral ($${Math.floor(liveMarket.liquidity)} < $${REVIEW_VIABILITY_MIN_LIQ_USD} floor)`],
+          ],
+        );
+        if (t.submitted_by && bot) {
+          try {
+            await bot.api.sendMessage(
+              t.submitted_by,
+              `Your submitted token *${t.symbol}* wasn't approved — its liquidity ($${Math.floor(liveMarket.liquidity).toLocaleString()}) is below the minimum needed to safely accept it as collateral.`,
+              { parse_mode: "Markdown" },
+            );
+          } catch { /* user may have blocked bot */ }
+        }
+        console.log(`[screener] Review auto-REJECTED ${t.symbol} — below collateral viability floor (liq=$${Math.floor(liveMarket.liquidity)} < $${REVIEW_VIABILITY_MIN_LIQ_USD})`);
+        continue;
+      }
+      // Gauntlet-clean + viable → APPROVE (expand). Fall through to the promote
+      // below; nothing is left pending.
+      console.log(`[screener] Review auto-APPROVING ${t.symbol} (expand-mindset, no limbo) — gauntlet-clean + viable: liq=$${Math.floor(liveMarket.liquidity)}, holders=${liveHolderCount}, fast-track-verdict was '${liveVerdict}'`);
     }
 
-    // Token now meets the FULL auto-approve bar — promote it.
+    // Token is gauntlet-clean + viable (or hit the FULL auto-approve bar) — promote it.
     await query(
       `INSERT INTO supported_mints
          (mint, symbol, name, decimals, category, image_url, liquidity_usd,
