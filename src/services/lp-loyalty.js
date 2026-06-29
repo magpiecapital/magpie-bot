@@ -390,14 +390,14 @@ export async function snapshotAndDistributeLpLoyalty() {
   // Sync from chain so positions are current
   await syncOnChainPositions();
 
-  // Pre-flight distributor balance (REWARDS_DISTRIBUTOR_PRIVATE_KEY,
-  // with backward-compat fallback to LENDER_PRIVATE_KEY).
+  // Distributor (REWARDS_DISTRIBUTOR_PRIVATE_KEY, fallback LENDER_PRIVATE_KEY).
+  // NOTE: the balance pre-flight is DEFERRED until after allocatedSum is known
+  // (below). Exempt wallets (the operator's ~96% LP seed) stay in the
+  // denominator so only the third-party slice is actually paid; gating here on
+  // the FULL pool would wrongly skip a correctly-sized run whenever most LP
+  // weight is the operator's exempt seed. We check against the real payout.
   const distributor = getRewardsDistributorKeypair();
   const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
-  if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn(`[lp-loyalty] Skipped: distributor balance too low for pool ${pool}`);
-    return null;
-  }
 
   // Pull eligible LPs
   const { rows } = await query(
@@ -452,6 +452,21 @@ export async function snapshotAndDistributeLpLoyalty() {
     items.push({ wallet: r.wallet_address, shares, seconds, weight });
   }
   if (totalWeight === 0n || items.length === 0) return null;
+
+  // Deferred pre-flight: gate on the ACTUAL third-party payout (allocatedSum),
+  // not the full pool. Exempt seed stays in the denominator, so the real spend
+  // is (sum of third-party weight / totalWeight) × pool — typically a small
+  // slice. Requiring the full pool here was an over-block that stranded
+  // correctly-sized runs. [[feedback_lender_wallet_exempt_from_lp_loyalty]]
+  let previewAlloc = 0n;
+  for (const it of items) previewAlloc += (pool * it.weight) / totalWeight;
+  if (previewAlloc <= 0n) return null;
+  if (distributorBalance < previewAlloc + MIN_LENDER_RESERVE_LAMPORTS) {
+    console.warn(
+      `[lp-loyalty] Skipped: distributor balance ${distributorBalance} < payout ${previewAlloc} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+    );
+    return null;
+  }
 
   // Phase 1: insert distribution row + reward rows (transactional)
   const { pool: dbPool } = await import("../db/pool.js");
