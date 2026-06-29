@@ -1,0 +1,13 @@
+-- 092: liquidation distribution transfer breadcrumb (double-transfer guard)
+--
+-- The liquidation-distribution-watcher moves a per-liquidation (holder+lp+ref)
+-- share from the lender to CHCAM. On a confirm-timeout (tx landed but the RPC
+-- timed out) or a crash mid-distribution, the prior code reverted the claim and
+-- re-transferred the SAME fixed amount on the next tick -> double-transfer.
+--
+-- This breadcrumb persists the broadcast signature on the row BEFORE confirm, so
+-- a re-entry can do a history-aware landed-check (getSignatureStatuses with
+-- searchTransactionHistory) and SKIP re-transferring a tx that already landed.
+-- The DB ledger credits are idempotent (pool_credit_events / event_type uniques)
+-- so re-crediting is safe; only the on-chain transfer must never repeat.
+ALTER TABLE liquidation_economics ADD COLUMN IF NOT EXISTS transfer_sig TEXT;
