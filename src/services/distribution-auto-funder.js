@@ -93,7 +93,7 @@ import {
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import fs from "node:fs";
-import { query, getClient } from "../db/pool.js";
+import { query } from "../db/pool.js";
 import { withFailover } from "../solana/connection.js";
 import { notifyAdmin } from "./admin-notify.js";
 import { assertAllowedDestination } from "./privileged-destinations.js";
@@ -160,7 +160,6 @@ const DISTRIBUTION_PUBKEY = new PublicKey(
     "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
 );
 
-const ADVISORY_LOCK_KEY = 73_002_606_280_628n; // unique to this service
 
 let _timer = null;
 let _running = false; // in-process reentrancy guard
@@ -567,7 +566,9 @@ export function stopDistributionAutoFunder() {
 // ─── Status (for admin command / observability) ───────────────────
 export async function getDistributionFunderStatus() {
   const connection = new Connection(RPC_URL, "confirmed");
-  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readOwed().catch(() => ({
+  // Use the SAME canonical owed source the funding path uses so the status
+  // readout never shows a higher (gross) figure than what actually gets funded.
+  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readPayableOwed().catch(() => ({
     holderOwed: 0n, lpOwed: 0n, protocolOwed: 0n, payableOwed: 0n,
   }));
   const [distNative, lenderNative, recent] = await Promise.all([
