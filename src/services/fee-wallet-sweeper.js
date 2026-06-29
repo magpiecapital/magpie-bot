@@ -207,6 +207,12 @@ async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) 
     const RETRY_DELAYS_MS = [0, 5_000, 15_000];
     let lastErr = null;
     let ok = false;
+    // Pair each BROADCAST sig with the audit row that produced it, so a
+    // confirm-timeout reconcile in the catch attributes the right row (the
+    // per-attempt re-sign advances guardAuditId, which would otherwise be
+    // mismatched against an earlier attempt's sig).
+    let broadcastSig = null;
+    let broadcastAuditId = null;
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
       if (RETRY_DELAYS_MS[attempt] > 0) await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
       try {
@@ -238,6 +244,8 @@ async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) 
         guardAuditId = guard.auditId;
 
         sig = await withFailover((c) => c.sendRawTransaction(tx.serialize(), { skipPreflight: false }));
+        broadcastSig = sig;            // pair the broadcast sig with THIS attempt's audit row
+        broadcastAuditId = guardAuditId;
         await withFailover((c) => c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"));
         await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
         ok = true;
@@ -257,32 +265,32 @@ async function unwrapOnce(bot, connection, lenderKp, feeWalletAta, wsolBalance) 
     // Reconcile before declaring failure: a confirm-timeout / RPC blip on a tx
     // that ACTUALLY LANDED must not be mis-recorded as failed (false alarm +
     // audit drift on a money path). If we broadcast a sig, ask the cluster.
-    if (sig) {
+    if (broadcastSig) {
       try {
         const st = await withFailover((c) =>
-          c.getSignatureStatuses([sig], { searchTransactionHistory: true }),
+          c.getSignatureStatuses([broadcastSig], { searchTransactionHistory: true }),
         );
         const v = st?.value?.[0];
         if (v && !v.err && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
-          if (guardAuditId) {
+          if (broadcastAuditId) {
             try {
               const { recordPrivilegedSignResult } = await import("./privileged-sign-guard.js");
-              await recordPrivilegedSignResult({ auditId: guardAuditId, status: "confirmed", txSig: sig });
+              await recordPrivilegedSignResult({ auditId: broadcastAuditId, status: "confirmed", txSig: broadcastSig });
             } catch { /* best-effort */ }
           }
           await query(
             `UPDATE fee_wallet_sweeps SET status = 'confirmed', tx_signature = $2, updated_at = NOW() WHERE id = $1`,
-            [sweepId, sig],
+            [sweepId, broadcastSig],
           );
           console.log(
-            `[fee-wallet-sweeper] unwrap #${sweepId} reconciled CONFIRMED (confirm-timeout but tx landed), sig=${sig.slice(0, 20)}…`,
+            `[fee-wallet-sweeper] unwrap #${sweepId} reconciled CONFIRMED (confirm-timeout but tx landed), sig=${broadcastSig.slice(0, 20)}…`,
           );
           try {
             await notifyAdmin(
               bot,
               `✅ Fee-wallet unwrap #${sweepId} CONFIRMED (reconciled after a confirm-timeout)\n` +
                 `Converted: ${(Number(wsolBalance) / 1e9).toFixed(6)} wSOL → NATIVE in the lender.\n` +
-                `Tx: https://solscan.io/tx/${sig}`,
+                `Tx: https://solscan.io/tx/${broadcastSig}`,
             );
           } catch {}
           return;
