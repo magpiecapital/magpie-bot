@@ -713,12 +713,10 @@ bot.start({
     // opened after the 2026-06-27 manual backfill. Idempotent; audit 2026-06-28
     // P0/P1 (points were frozen — new loans accrued zero). See points-reconciler.js.
     import("./services/points-reconciler.js").then((m) => m.startPointsReconciler());
-    // Overdue-loan sentinel — surfaces NON-DUST loans that are past due + still
-    // active. The keeper is a separate, operator-gated service; if it isn't
-    // running, a real default would be silent. READ-ONLY — it DMs the operator
-    // to decide on liquidation, never seizes collateral itself. See
-    // overdue-loan-sentinel.js (verification follow-up 2026-06-28).
-    import("./services/overdue-loan-sentinel.js").then((m) => m.startOverdueLoanSentinel());
+    // Overdue-loan sentinel REMOVED 2026-06-28 per operator ("I don't want an
+    // alarm") — superseded by the fair-liquidation build (default handling will
+    // be automatic + fair on-chain, so no alert is needed). File kept dormant
+    // (not started). See feedback_fair_liquidation_return_excess_mandate.
     // Raid monitor — DISABLED 2026-06-12 per operator. The Nitter
     // upstream instances die constantly and the X API requires a paid
     // bearer token; alerts about "data sources offline" were noise.
