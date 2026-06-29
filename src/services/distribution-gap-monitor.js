@@ -40,8 +40,11 @@
  * Mandated by [[feedback_distribution_wallet_must_be_auto_funded]].
  */
 import { Connection, PublicKey } from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_PROGRAM_ID, getAssociatedTokenAddress, getAccount } from "@solana/spl-token";
 import { query } from "../db/pool.js";
 import { notifyAdmin } from "./admin-notify.js";
+import { withFailover } from "../solana/connection.js";
+import { readPayableOwed } from "./distribution-owed.js";
 
 const INTERVAL_MS = Number(
   process.env.DIST_GAP_MONITOR_INTERVAL_MS || 10 * 60 * 1000, // 10 min
@@ -83,36 +86,30 @@ export function startDistributionGapMonitor(bot) {
 }
 
 async function runOnce(bot) {
-  // 1. Read DB notional totals.
-  const { rows: holderRows } = await query(
-    `SELECT COALESCE(accrued_lamports, 0)::numeric AS amt FROM magpie_holder_pool WHERE id = 1`,
-  );
-  const { rows: lpRows } = await query(
-    `SELECT COALESCE(accrued_lamports, 0)::numeric AS amt FROM lp_loyalty_pool WHERE id = 1`,
-  ).catch(() => ({ rows: [] }));
-  const { rows: protocolRows } = await query(
-    `SELECT COALESCE(accrued_lamports, 0)::numeric AS amt FROM protocol_reserve_pool WHERE id = 1`,
-  ).catch(() => ({ rows: [] }));
+  // 1. PAYABLE owed via the ONE canonical helper (holder + LP third-party-NET;
+  //    protocol reserve excluded) — the SAME source the funder + /stats use, so
+  //    the monitored gap matches the displayed + funded numbers exactly.
+  const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readPayableOwed();
+  const totalOwed = payableOwed;
 
-  const holderOwed = BigInt(holderRows[0]?.amt || 0);
-  const lpOwed = BigInt(lpRows[0]?.amt || 0);
-  const protocolOwed = BigInt(protocolRows[0]?.amt || 0);
-  // PAYABLE owed = holder + lp only. protocol_reserve_pool has NO auto-payout
-  // path from the distribution wallet and is never decremented, so including
-  // it would inflate the gap forever (over-report a deficit that the
-  // distribution wallet should not actually hold SOL for). Keep protocolOwed
-  // for the breakdown display only. Matches distribution-auto-funder.js.
-  const totalOwed = holderOwed + lpOwed;
-
-  // 2. Read distributor on-chain balance.
+  // 2. Read distributor on-chain balances via failover. Surface wSOL too: with
+  //    the native-only-sink design CHCAM shouldn't hold wSOL, but if any is
+  //    present it's spendable-after-unwrap, so it should not read as a native
+  //    P0 deficit.
   const connection = new Connection(RPC_URL, "confirmed");
-  const distBalance = BigInt(
-    await connection.getBalance(new PublicKey(DISTRIBUTION_WALLET_PUBKEY), "confirmed"),
-  );
+  const distPk = new PublicKey(DISTRIBUTION_WALLET_PUBKEY);
+  const distBalance = BigInt(await withFailover((c) => c.getBalance(distPk, "confirmed")));
+  let distWsol = 0n;
+  try {
+    const ata = await getAssociatedTokenAddress(NATIVE_MINT, distPk, false, TOKEN_PROGRAM_ID);
+    const acct = await getAccount(connection, ata, "confirmed", TOKEN_PROGRAM_ID);
+    distWsol = acct.amount;
+  } catch { /* no wSOL ATA */ }
 
-  // 3. Compute the gap.
+  // 3. Compute the gap against spendable native + any wSOL (unwrappable).
   const required = totalOwed + SAFETY_RESERVE_LAMPORTS;
-  const gap = required > distBalance ? required - distBalance : 0n;
+  const distSpendable = distBalance + distWsol;
+  const gap = required > distSpendable ? required - distSpendable : 0n;
 
   if (gap === 0n) {
     // healthy — log occasionally so the operator can see the watcher is alive
@@ -158,7 +155,8 @@ async function runOnce(bot) {
     `  - magpie_holder_pool: ${(Number(holderOwed) / 1e9).toFixed(4)} SOL\n` +
     `  - lp_loyalty_pool: ${(Number(lpOwed) / 1e9).toFixed(4)} SOL\n` +
     `  - protocol_reserve_pool: ${(Number(protocolOwed) / 1e9).toFixed(4)} SOL (excluded — no auto-payout)\n` +
-    `Distributor on-chain: ${(Number(distBalance) / 1e9).toFixed(4)} SOL\n` +
+    `Distributor on-chain: ${(Number(distBalance) / 1e9).toFixed(4)} SOL native` +
+    (distWsol > 0n ? ` + ${(Number(distWsol) / 1e9).toFixed(4)} wSOL (unwrappable, counted as spendable)` : "") + `\n` +
     `Required (owed + 0.1 reserve): ${(Number(required) / 1e9).toFixed(4)} SOL\n` +
     `\n` +
     `*DEFICIT: ${(Number(gap) / 1e9).toFixed(4)} SOL*\n` +
