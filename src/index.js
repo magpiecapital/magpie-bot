@@ -127,6 +127,7 @@ import {
   handleFundPool,
   handleSnapshotOnly,
   handleDistribute,
+  handleRewardsRecon,
   handleReconcile,
   handleReply,
   handleTickets,
@@ -372,6 +373,7 @@ bot.command("reviewtokens", handleReviewTokens);
 bot.command("fundpool", handleFundPool);
 bot.command("snapshotonly", handleSnapshotOnly);
 bot.command("distribute", handleDistribute);
+bot.command("rewardsrecon", handleRewardsRecon); // read-only Option-A reconciliation
 bot.command("reconcile", handleReconcile);
 bot.command("reply", handleReply);
 bot.command("tickets", handleTickets);
