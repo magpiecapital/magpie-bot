@@ -15,6 +15,19 @@ import { constantTimeEqual } from "./auth-utils.js";
 
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || "";
 
+// Per-call holder-accrual ceiling (defense-in-depth, 2026-06-28 security audit).
+// A single legit x402 fee is sub-0.01 SOL; an amount above this means a
+// misconfigured/compromised caller and must NOT poison the holder pool (which
+// feeds the distribution auto-funder's SOL movement). Parsed ONCE at load with
+// validation so a malformed env falls back to the default instead of throwing
+// per-request (which would mask the misconfig as a generic "accrual failed").
+const X402_MAX_ACCRUAL_LAMPORTS = (() => {
+  const raw = process.env.X402_FEE_MAX_ACCRUAL_LAMPORTS;
+  if (raw && /^\d+$/.test(raw)) return BigInt(raw);
+  if (raw) console.error(`[x402-metrics] invalid X402_FEE_MAX_ACCRUAL_LAMPORTS="${raw}" — using 1 SOL default`);
+  return 1_000_000_000n; // 1 SOL
+})();
+
 function isValidPubkey(s) {
   return typeof s === "string" && s.length >= 32 && s.length <= 44 &&
     /^[1-9A-HJ-NP-Za-km-z]+$/.test(s);
@@ -130,6 +143,19 @@ export async function handleX402Record(req) {
   // pool. The SPL->SOL sweep credits the holder pool after converting SPL->SOL.
   if (inserted && kind === "settled" && process.env.X402_FEE_HOLDER_ACCRUAL !== "false") {
     try {
+      // Defense-in-depth (2026-06-28 security audit): the caller-declared
+      // amount feeds the holder pool, which feeds the auto-funder's lender→
+      // distribution SOL movement. A single legit x402 call fee is tiny
+      // (sub-0.01 SOL); a value above the per-call ceiling indicates a
+      // misconfigured/compromised caller poisoning `owed`. Record the metric
+      // but REFUSE to accrue it (the funder also caps at OWED_SANITY_CEILING +
+      // a per-tick ceiling, but stopping it at the source is cheapest). The
+      // ceiling is parsed/validated once at module load (X402_MAX_ACCRUAL_LAMPORTS).
+      if (BigInt(amountLamports) > X402_MAX_ACCRUAL_LAMPORTS) {
+        console.warn(
+          `[x402-metrics] REFUSING accrual — amount ${amountLamports} lamports exceeds per-call ceiling ${X402_MAX_ACCRUAL_LAMPORTS}; recorded metric only (possible poisoned record, sig ${String(txSignature).slice(0, 12)}…)`,
+        );
+      } else {
       const { accrueToHolderPool } = await import(
         "../services/magpie-holder-rewards.js"
       );
@@ -137,6 +163,7 @@ export async function handleX402Record(req) {
         sourceType: "x402_fee",
         sourceId: txSignature,
       });
+      }
     } catch (err) {
       console.warn(
         "[x402-metrics] holder accrual failed (non-fatal):",
