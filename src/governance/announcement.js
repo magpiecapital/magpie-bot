@@ -33,19 +33,60 @@ export function renderTemplate(template, variables) {
  * live" vs "did not pass — economics unchanged").
  */
 export function buildVariables({ proposal, tally, outcome, snapshotHash }) {
-  const yesPct = tally.percentages.yes_share_of_cast_pct.toFixed(2);
-  const noPct = (100 - tally.percentages.yes_share_of_cast_pct).toFixed(2);
-  const participationPct = tally.percentages.participation_pct.toFixed(2);
-  const yesSol = (Number(tally.weights.yes_weight) / 1e6).toLocaleString(undefined, { maximumFractionDigits: 0 });
-  const outcomeMessage = outcome === "passed"
-    ? "Changes ratified. The autopilot has applied DB-config updates immediately and opened pull requests for any code-level changes. Operator follow-up required for on-chain program deploys (if applicable). Full implementation status available at magpie.capital/governance/audit."
-    : "Proposal did not meet quorum + threshold. Current economics remain in force.";
-  const outcomeEmoji = outcome === "passed" ? "PASSED" : "DID NOT PASS";
+  // outcome_detail is threaded by the pipeline for BOTH binary + multi-choice
+  // (pipeline.js ~L410): { winner_choice, winner_share_pct, quorum_met, threshold_met, is_multi_choice }.
+  const det = (tally && tally.outcome_detail) || {};
+
+  // PASS determination that works for binary ("passed") AND multi-choice (a
+  // winning option letter like "C" with quorum+threshold both met). The old
+  // code keyed off `outcome === "passed"`, so a multi-choice winner ("C")
+  // rendered the FAILED message — fixed here.
+  const didPass =
+    outcome === "passed" ||
+    (det.quorum_met === true &&
+      det.threshold_met === true &&
+      outcome !== "failed" &&
+      outcome !== "operator_discretion" &&
+      outcome !== "anomaly_held");
+
+  const participationPct = Number(tally?.percentages?.participation_pct ?? 0).toFixed(2);
+
+  // Winner share: multi-choice → outcome_detail.winner_share_pct; binary → yes share.
+  // (Old code never populated {{winner_pct}}, so the MGP-003 template rendered it literally.)
+  const yesShare = Number(tally?.percentages?.yes_share_of_cast_pct ?? 0);
+  const winnerSharePct = det.winner_share_pct != null ? Number(det.winner_share_pct) : yesShare;
+  const winnerPct = winnerSharePct.toFixed(2);
+  const yesPct = yesShare.toFixed(2);
+  const noPct = (100 - yesShare).toFixed(2);
+  const yesSol = (Number(tally?.weights?.yes_weight ?? 0) / 1e6).toLocaleString(undefined, { maximumFractionDigits: 0 });
+
+  // Display a winning option letter with its human label when the proposal
+  // provides one (registry `option_labels`), e.g. "Option C — Build (...)".
+  const label = proposal.option_labels && outcome ? proposal.option_labels[outcome] : null;
+  const outcomeDisplay = label ? `Option ${outcome} — ${label}` : outcome;
+
+  let outcomeMessage;
+  if (didPass) {
+    // Proposal-specific copy wins (e.g. MGP-003's operator-gated treasury move);
+    // otherwise an accurate generic that does NOT falsely claim auto-application.
+    outcomeMessage =
+      proposal.result_message_passed ||
+      "Result ratified. Any autonomous config changes are applied immediately; on-chain or operator-gated actions are staged for execution and tracked publicly on magpie.capital/distributions.";
+  } else if (outcome === "operator_discretion") {
+    outcomeMessage =
+      "No option reached the required margin (or ABSTAIN reached the discretion threshold). The operator decides among the options per the proposal's rules.";
+  } else {
+    outcomeMessage = "Proposal did not meet quorum + threshold. Current economics remain in force.";
+  }
+  const outcomeEmoji = didPass ? "PASSED" : outcome === "operator_discretion" ? "OPERATOR DISCRETION" : "DID NOT PASS";
+
   return {
     title: proposal.title,
-    outcome,
+    outcome: outcomeDisplay,
+    outcome_raw: outcome,
     outcome_emoji: outcomeEmoji,
     outcome_message: outcomeMessage,
+    winner_pct: winnerPct,
     yes_pct: yesPct,
     no_pct: noPct,
     yes_sol: yesSol,
