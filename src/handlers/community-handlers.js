@@ -23,6 +23,7 @@ import {
   isVerifiedAccount,
   isImpersonationName,
   matchesScamPattern,
+  matchesDmSolicitation,
   findImpersonatingHandles,
   extractUrls,
   isAllowedUrl,
@@ -450,6 +451,43 @@ async function handleGroupMessage(ctx) {
       }
     }
 
+    // ── Screenshot + "DM me" → PERMANENT BAN (operator-mandated 2026-06-30) ──
+    // A photo whose caption solicits a DM ("DM me to claim", "message admin")
+    // is the canonical screenshot-phishing setup: an image for credibility +
+    // a redirect to a scammer DM. Unlike a plain-text "DM me" (deleted + warned
+    // below), the screenshot form is a deliberate scam → delete + PERMANENT
+    // ban. (In-image text with no caption is caught by the vision classifier.)
+    {
+      const hasImage = !!(msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || "")));
+      const dmSolicit = hasImage ? matchesDmSolicitation(msg.caption || msg.text || "") : null;
+      if (dmSolicit && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+        await tryDelete(ctx, msg.message_id);
+        try { await ctx.api.banChatMember(ctx.chat.id, sender.id); }
+        catch (err) { console.warn("[community] screenshot-DM ban failed:", err.message); }
+        await recordModAction(
+          ctx.chat.id, sender.id, "ban_screenshot_dm_solicitation",
+          dmSolicit, msg.caption || msg.text || null,
+        );
+        await softWarn(
+          ctx, sender.id,
+          `You were removed from the Magpie community for posting a screenshot soliciting DMs — a classic phishing pattern. If this was a genuine mistake, reply /appeal and Pip will review it.`,
+        );
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            { api: ctx.api },
+            `🛡 *Screenshot-DM scammer banned*\n\n` +
+            `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
+            `*ID:* \`${sender.id}\`\n` +
+            `*Caption:* ${(msg.caption || msg.text || "(none)").slice(0, 200)}\n\n` +
+            `Auto-deleted + banned. \`/unban ${sender.id}\` if a false positive.`,
+            { parse_mode: "Markdown" },
+          );
+        } catch { /* silent */ }
+        return;
+      }
+    }
+
     // ── Scam pattern (non-impersonator users) ──────────────
     // Impersonators are already banned above, so anyone reaching here
     // is a regular user posting a phishing-shaped phrase. Delete +
@@ -577,6 +615,41 @@ async function maybeRunImageCheck(ctx, msg, sender) {
   // pattern as the text/FUD path.
   const member = await getMember(ctx.chat.id, sender.id);
   const trusted = await isTrustedMember(sender.id);
+
+  // Operator-mandated 2026-06-30: a HIGH-confidence phishing / Magpie-
+  // impersonation screenshot (e.g. a "DM me to claim" solicitation INSIDE the
+  // image) is a deliberate scam → delete + PERMANENT ban, bypassing the strike
+  // ladder. Conservative bar: confidence >= 0.95 AND not a trusted member (real
+  // borrowers fall through to delete + warn), so a vision misread can't ban a
+  // genuine user; /unban recovers a false positive either way.
+  if (!trusted && result.confidence >= 0.95 &&
+      (result.verdict === "scam_screenshot" || result.verdict === "impersonation_screenshot")) {
+    await tryDelete(ctx, msg.message_id);
+    try { await ctx.api.banChatMember(ctx.chat.id, sender.id); }
+    catch (err) { console.warn("[image-mod] screenshot scam ban failed:", err.message); }
+    await recordModAction(
+      ctx.chat.id, sender.id, `ban_image_${result.verdict}`,
+      `confidence=${result.confidence.toFixed(2)} reason=${result.reason}`,
+      result.extractedText?.slice(0, 500) || null,
+    );
+    await softWarn(
+      ctx, sender.id,
+      `You were removed from the Magpie community — your image was flagged as a phishing / impersonation screenshot. If this was a genuine mistake, reply /appeal and Pip will review it.`,
+    );
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        { api: ctx.api },
+        `🛡 *Scam-screenshot scammer banned* (vision ${result.confidence.toFixed(2)})\n\n` +
+        `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
+        `*ID:* \`${sender.id}\`\n*Verdict:* ${result.verdict}\n\n` +
+        `Auto-deleted + banned. \`/unban ${sender.id}\` if a false positive.`,
+        { parse_mode: "Markdown" },
+      );
+    } catch { /* silent */ }
+    return;
+  }
+
   const baseDecision = actionForImageVerdict(result, {
     warned_count: member?.warned_count ?? 0,
   });

@@ -82,13 +82,24 @@ const PERSONA_ALT = (PROTECTED_PERSONA_NAMES.length ? PROTECTED_PERSONA_NAMES : 
 
 export const IMPERSONATION_PATTERNS = [
   // (Near-)exact brand name as the whole display name — no legitimate use.
-  /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help))?\s*[.!]*$/i,
+  // Includes the GROUP name "Magpie Talk" + news/announcement/dev/exec poses.
+  /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help|talk|news|bot|dev(?:eloper)?|cto|ceo|announce(?:ment)?s?))?\s*[.!]*$/i,
   // Brand word adjacent (any separator) to a staff / official / support role.
   // \b after the role so a FAN name ("Magpie Supporter", "Magpie Teammate")
   // does NOT match while staff poses ("Magpie Support", "Magpie Admin") do.
-  /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|customer)\b/i,
+  /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|cto|dev(?:eloper)?|customer|talk|news|announce(?:ment)?s?|bot)\b/i,
   /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
   /\bofficial\s+magpie\b/i,
+  // STANDALONE staff/team/exec role anywhere in the name — operator-mandated
+  // 2026-06-30. Scammers join with a clean name, then RENAME to "$Merlin CTO" /
+  // "John Dev" / "Crypto Admin" and post fake-support; the brand-adjacent
+  // patterns above miss any name WITHOUT "magpie". In the Magpie community a
+  // non-team account carrying a staff/exec role word IS impersonation — this
+  // finally implements the long-documented "named Support/Admin/Team/Moderator/
+  // etc." policy. Whole-word so real names ("Devon", "David") stay safe;
+  // verified accounts + chat admins are exempt upstream; a false positive is
+  // one /unban tap, while an uncaught impersonator drains a real user.
+  /\b(?:dev|developer|cto|ceo|cfo|coo|founder|co-?founder|admin(?:istrator)?|moderator|support|help\s*desk|customer\s*service|official|staff)\b/i,
   // Impersonating a named protocol persona — "MagpieMatt", "Magpie Matt".
   new RegExp(`magpie[\\s._@-]*(${PERSONA_ALT})\\b`, "i"),
   new RegExp(`\\b(${PERSONA_ALT})[\\s._@-]*magpie\\b`, "i"),
@@ -447,6 +458,27 @@ export function matchesScamPattern(text) {
     if (hasObfuscatedUnicode(text, 8)) {
       return "[obfuscated text — math/styled unicode characters]";
     }
+  }
+  return null;
+}
+
+/**
+ * Narrow DM-solicitation matcher for the screenshot-scam ban (operator
+ * 2026-06-30): a PHOTO whose caption/text solicits a DM ("DM me", "message
+ * us", "hit me up", "contact admin") is the canonical "DM me to claim/recover"
+ * phishing setup — that gets BANNED, not merely warned. Tests raw +
+ * unicode-normalized so math-bold/Cyrillic obfuscation can't dodge it.
+ */
+export function matchesDmSolicitation(text) {
+  if (!text) return null;
+  const pats = [
+    /\b(?:dm|direct\s*message|pm|private\s*message|message|msg|text|contact|reach)\s*(?:me|us|out|admin|support|the\s*team)\b/i,
+    /\bhit\s+me\s+up\b/i,
+    /\bsend\s+me\s+a\s+(?:dm|message|pm)\b/i,
+  ];
+  for (const t of [text, normalizeUnicode(text)]) {
+    if (!t) continue;
+    for (const re of pats) if (re.test(t)) return re.source;
   }
   return null;
 }
