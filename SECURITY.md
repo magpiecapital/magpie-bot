@@ -40,6 +40,7 @@ please do not treat the absence of a published report as a completed review.
 | **Hashlock** | Invited (read-only access); engagement in progress. |
 | **QuillAudits** | Invited (read-only access); engagement in progress. |
 | **OtterSec** | Invited to audit; awaiting response. |
+| **Neodyme** | Invited to audit; awaiting response. |
 
 The audit-target program, `magpiecapital/magpie-v4`, is kept **private** during
 pre-audit review, and every engaged firm is granted **read-only** access.
