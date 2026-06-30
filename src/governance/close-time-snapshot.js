@@ -48,7 +48,7 @@
  * votes.
  */
 import { Connection, PublicKey } from "@solana/web3.js";
-import { getAccount, getAssociatedTokenAddress, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getAccount, getAssociatedTokenAddress, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import crypto from "node:crypto";
 import { query } from "../db/pool.js";
 
@@ -70,11 +70,14 @@ const PROTOCOL_EXCLUDED_WALLETS = (process.env.GOV_EXCLUDED_WALLETS || "")
  * or has zero balance — those are voters who legitimately don't
  * hold any tokens at close.
  */
-async function fetchMagpieBalance(connection, walletStr, mintPk) {
+async function fetchMagpieBalance(connection, walletStr, mintPk, tokenProgram) {
   try {
     const owner = new PublicKey(walletStr);
-    const ata = await getAssociatedTokenAddress(mintPk, owner);
-    const acct = await getAccount(connection, ata, "confirmed", TOKEN_PROGRAM_ID);
+    // tokenProgram MUST match the mint's owning program. $MAGPIE is Token-2022;
+    // deriving/reading the CLASSIC SPL ATA returns 0 for a Token-2022 holder,
+    // which silently zeroed every voter's wallet-held weight (3-wallet bug).
+    const ata = await getAssociatedTokenAddress(mintPk, owner, false, tokenProgram);
+    const acct = await getAccount(connection, ata, "confirmed", tokenProgram);
     return BigInt(acct.amount.toString());
   } catch {
     // ATA not initialized = wallet currently holds zero tokens.
@@ -99,6 +102,13 @@ export async function takeCloseTimeSnapshot({ proposalId, totalCirculatingRaw = 
   const connection = new Connection(SOLANA_RPC, "confirmed");
   const mintPk = new PublicKey(MAGPIE_MINT);
 
+  // Detect the mint's owning token program ONCE (classic SPL vs Token-2022) so
+  // every balance read uses the correct ATA. $MAGPIE is Token-2022
+  // (TokenzQdB…); reading classic-SPL ATAs zeroed all wallet-held weight.
+  const mintInfo = await connection.getAccountInfo(mintPk, "confirmed");
+  const tokenProgram =
+    mintInfo && mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+
   // 1. Distinct voters from governance_votes for this proposal.
   const { rows: voterRows } = await query(
     `SELECT DISTINCT voter_pubkey FROM governance_votes WHERE proposal_id = $1`,
@@ -120,7 +130,7 @@ export async function takeCloseTimeSnapshot({ proposalId, totalCirculatingRaw = 
       // Exclude protocol-controlled wallets from the voter set entirely.
       // Their votes don't count even if they happened to be submitted.
       if (PROTOCOL_EXCLUDED_WALLETS.includes(w)) return [w, 0n];
-      const bal = await fetchMagpieBalance(connection, w, mintPk);
+      const bal = await fetchMagpieBalance(connection, w, mintPk, tokenProgram);
       return [w, bal];
     }));
     for (const [w, bal] of results) balances.set(w, bal);
