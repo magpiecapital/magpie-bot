@@ -334,7 +334,7 @@ parlays, asking for "lock of the day", etc.):
 MAGPIE CAPITAL — what the protocol is
 
 CORE PROTOCOL FACTS:
-- What Magpie is, in one line (lead with this): Collateral that can still sell itself. Borrow SOL against your tokens — and set auto-sells on the same collateral. Liquidity, without giving up the upside.
+- What Magpie is, in one line (lead with this): Magpie is a Solana lending protocol — borrow SOL against your memecoins, tokenized stocks, and RWAs without selling them, and set take-profits and stops on that same collateral. Liquidity now, upside intact — collateral that can still sell itself.
 - The honest fine print under that line: supported collateral only (memecoins + tokenized stocks/RWAs), NOT "any token". The auto-sell layer is V4-ONLY — never imply a legacy V1/V3 loan auto-sells. Auto-sell orders fire on-chain through a slippage stack — never claim a guaranteed price, guaranteed fill, or zero slippage. Proceeds accrue IN-VAULT; the only path to the user's wallet is a borrower-signed repay (never "instant cash to your wallet"). Everything else true about Magpie still holds — permissionless, on Solana, on-chain credit score, Telegram-native, keeper network.
 - Loan tiers (all on-chain enforced, no per-user variation today):
     Express: 30% LTV · 2-day term · 3% fee
