@@ -90,16 +90,14 @@ export const IMPERSONATION_PATTERNS = [
   /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|cto|dev(?:eloper)?|customer|talk|news|announce(?:ment)?s?|bot)\b/i,
   /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
   /\bofficial\s+magpie\b/i,
-  // STANDALONE staff/team/exec role anywhere in the name — operator-mandated
-  // 2026-06-30. Scammers join with a clean name, then RENAME to "$Merlin CTO" /
-  // "John Dev" / "Crypto Admin" and post fake-support; the brand-adjacent
-  // patterns above miss any name WITHOUT "magpie". In the Magpie community a
-  // non-team account carrying a staff/exec role word IS impersonation — this
-  // finally implements the long-documented "named Support/Admin/Team/Moderator/
-  // etc." policy. Whole-word so real names ("Devon", "David") stay safe;
-  // verified accounts + chat admins are exempt upstream; a false positive is
-  // one /unban tap, while an uncaught impersonator drains a real user.
-  /\b(?:dev|developer|cto|ceo|cfo|coo|founder|co-?founder|admin(?:istrator)?|moderator|support|help\s*desk|customer\s*service|official|staff)\b/i,
+  // NOTE (operator 2026-06-30, "calm down on kicks"): we deliberately do NOT
+  // name-ban a STANDALONE role word ("CTO", "Dev", "Support") with no "magpie"
+  // — that over-banned real members (a "$Merlin CTO" / "Dev Dan" who never
+  // impersonated Magpie). The rename attack the operator hit is specifically
+  // "Magpie Talk" / "Magpie Dev" style (brand + role), which the brand-adjacent
+  // patterns above already catch. A non-brand account that ACTUALLY scams
+  // (DM-solicitation, screenshot, phishing link) is still caught + banned by
+  // the behavior pipeline in handleGroupMessage — intent, not just a role word.
   // Impersonating a named protocol persona — "MagpieMatt", "Magpie Matt".
   new RegExp(`magpie[\\s._@-]*(${PERSONA_ALT})\\b`, "i"),
   new RegExp(`\\b(${PERSONA_ALT})[\\s._@-]*magpie\\b`, "i"),

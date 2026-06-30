@@ -1276,7 +1276,12 @@ export function registerCommunityHandlers(bot) {
   bot.on("message:new_chat_members", handleNewMembers);
   bot.on("message", handleGroupMessage);
   bot.on("edited_message", handleGroupMessage);
-  bot.callbackQuery(/^comm:captcha:(-?\d+)$/, handleCaptchaCallback);
+  // NOTE: the button data is `comm:captcha:<chat>:<user>` (user-scoped), so the
+  // registration regex MUST allow the optional :<user> suffix — otherwise the
+  // `$` after the chat id makes grammY's .test() fail and the callback NEVER
+  // fires (tap does nothing → user kicked at timeout despite verifying). Keep
+  // this in sync with the parser regex in handleCaptchaCallback.
+  bot.callbackQuery(/^comm:captcha:(-?\d+)(?::(\d+))?$/, handleCaptchaCallback);
   bot.callbackQuery(/^appeal:(\d+)$/, handleAppeal);
   console.log("[community] handlers registered");
 }
