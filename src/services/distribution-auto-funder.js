@@ -155,6 +155,13 @@ const MAX_FUND_LAMPORTS = solToLamports(envNum("DIST_FUNDER_MAX_SOL", 8));
 // NOTHING and alert. Far above any legitimate weekly liability.
 const OWED_SANITY_CEILING_LAMPORTS = solToLamports(envNum("DIST_FUNDER_OWED_CEILING_SOL", 50));
 const TX_FEE_HEADROOM = 10_000n;
+// In-tick lender-wSOL unwrap floor — only unwrap the lender's fee wSOL ATA
+// when it holds at least this much (else the tx fee isn't worth it). Borrow
+// fees land as wSOL in the lender's OWN NATIVE_MINT ATA; the hourly
+// fee-wallet-sweeper normally unwraps them, but that up-to-1h lag is exactly
+// why CHCAM read "short" — the revenue was present, just wrapped + invisible
+// to the native-only funder. This funder unwraps in-tick when a gap needs it.
+const MIN_INTICK_UNWRAP_LAMPORTS = solToLamports(envNum("DIST_FUNDER_MIN_INTICK_UNWRAP_SOL", 0.05));
 
 const RPC_URL =
   process.env.SOLANA_RPC_URL ||
@@ -172,6 +179,7 @@ const DISTRIBUTION_PUBKEY = new PublicKey(
 
 let _timer = null;
 let _running = false; // in-process reentrancy guard
+let _lastTickStartedMs = 0; // for the kick's no-double-fund start floor
 
 // ─── Lender keypair (signs the lender→distribution transfer) ──────
 function loadLenderKeypair() {
@@ -305,10 +313,107 @@ async function unwrapDistributionWsol(connection) {
   }
 }
 
+// ─── In-tick: unwrap the LENDER's stranded fee wSOL → lender native ──
+// Root-cause latency fix. Borrow fees land as wSOL in the lender's OWN
+// NATIVE_MINT ATA. The hourly fee-wallet-sweeper unwraps them, but until it
+// runs (up to 1h) that revenue is wrapped + invisible to this native-only
+// funder, so CHCAM reads "short" even though the protocol HAS the money. When
+// a tick finds a gap the lender's native alone can't close, we unwrap the
+// lender's fee wSOL HERE so CHCAM tops up within the 5-min funder cadence
+// instead of waiting on the hourly sweeper.
+//
+// SAFETY: lender-OWN-wSOL → lender-OWN-native — no external destination, nets
+// the lender POSITIVE (so it never threatens the gas reserve). Runs under the
+// SHARED lender lock already held by tickInner (so it can't race the
+// fee-wallet-sweeper's close of the same ATA), is guard-simulated with the
+// close destination pinned to the lender, and is idempotent (close+reopen — if
+// the sweeper already unwrapped, the ATA reads empty and we skip). Audited to
+// fee_wallet_sweeps (reason 'funder_intick_unwrap') so the gap-monitor's "last
+// sweep" reflects it. Returns lamports unwrapped (0 on skip/error).
+async function unwrapLenderFeeWsol(bot, connection, lenderKp) {
+  const feeAta = await getAssociatedTokenAddress(NATIVE_MINT, lenderKp.publicKey, false, TOKEN_PROGRAM_ID);
+  let wsol = 0n;
+  try {
+    const acct = await getAccount(connection, feeAta, "confirmed", TOKEN_PROGRAM_ID);
+    wsol = acct.amount;
+  } catch {
+    return 0n; // no fee ATA / unreadable → nothing to unwrap
+  }
+  if (wsol < MIN_INTICK_UNWRAP_LAMPORTS) return 0n; // dust — not worth a tx fee
+
+  // Audit anchor (best-effort; the close is idempotent so a missing anchor is
+  // never a correctness problem — it just means one fewer paper-trail row).
+  let sweepId = null;
+  try {
+    const { rows: [a] } = await query(
+      `INSERT INTO fee_wallet_sweeps (source_pubkey, dest_pubkey, amount_lamports, status, reason)
+       VALUES ($1, $2, $3::numeric, 'planned', 'funder_intick_unwrap') RETURNING id`,
+      [feeAta.toBase58(), lenderKp.publicKey.toBase58(), wsol.toString()],
+    );
+    sweepId = a.id;
+  } catch { /* audit table optional — proceed */ }
+
+  try {
+    const tx = new Transaction();
+    tx.add(createCloseAccountInstruction(feeAta, lenderKp.publicKey, lenderKp.publicKey, [], TOKEN_PROGRAM_ID));
+    tx.add(
+      createAssociatedTokenAccountIdempotentInstruction(
+        lenderKp.publicKey, feeAta, lenderKp.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID,
+      ),
+    );
+    const { blockhash, lastValidBlockHeight } = await withFailover((c) => c.getLatestBlockhash("confirmed"));
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = lenderKp.publicKey;
+    const guard = await runPrivilegedSign({
+      service: "distribution-auto-funder:intick-unwrap",
+      tx,
+      signers: [lenderKp],
+      // The close NETS the lender POSITIVE (wSOL + close rent in; reopen rent +
+      // tx fee out). Declare the fee ATA's full token decrease + a tiny lender
+      // SOL fee headroom; pin the close destination to the lender itself.
+      allowedDeltas: [
+        { pubkey: feeAta, kind: "token", mint: NATIVE_MINT, maxDecrease: wsol },
+        { pubkey: lenderKp.publicKey, kind: "sol", maxDecrease: 10_000n },
+      ],
+      allowedCloseDestinations: [lenderKp.publicKey],
+    });
+    const sig = await withFailover((c) => c.sendRawTransaction(tx.serialize(), { skipPreflight: false }));
+    await withFailover((c) => c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"));
+    await recordPrivilegedSignResult({ auditId: guard.auditId, status: "confirmed", txSig: sig });
+    if (sweepId) {
+      await query(
+        `UPDATE fee_wallet_sweeps SET status = 'confirmed', tx_signature = $2, updated_at = NOW() WHERE id = $1`,
+        [sweepId, sig],
+      ).catch(() => {});
+    }
+    console.log(`[dist-funder] in-tick unwrapped ${fmt(wsol)} lender wSOL → native (sig ${sig.slice(0, 12)}…)`);
+    return wsol;
+  } catch (err) {
+    if (sweepId) {
+      await query(
+        `UPDATE fee_wallet_sweeps SET status = 'failed', err = $2, updated_at = NOW() WHERE id = $1`,
+        [sweepId, err.message?.slice(0, 200)],
+      ).catch(() => {});
+    }
+    console.warn(`[dist-funder] in-tick lender unwrap skipped: ${err.message?.slice(0, 120)}`);
+    return 0n;
+  }
+}
+
 // ─── One tick ─────────────────────────────────────────────────────
-async function tick(bot) {
+async function tick(bot, opts = {}) {
   if (_running) return; // in-process reentrancy guard
+  // NO-DOUBLE-FUND START FLOOR: never START two ticks closer than the interval
+  // floor (3 min > a blockhash's ~90s validity). The scheduled timer is
+  // already 5 min so it never trips this; the guard exists for event KICKS,
+  // which could otherwise fire a tick seconds after a funding broadcast —
+  // before the prior tx lands — and double-fund. Gating tick START preserves
+  // the no-double-fund invariant for EVERY trigger, not just the timer.
+  if (opts.source === "kick" && Date.now() - _lastTickStartedMs < INTERVAL_FLOOR_MS) {
+    return; // too soon after the last tick — the scheduled tick covers it
+  }
   _running = true;
+  _lastTickStartedMs = Date.now();
   try {
     if (isDisabled()) {
       await record({ outcome: "skip_disabled", notes: "DIST_FUNDER_DISABLED set" });
@@ -377,25 +482,8 @@ async function tickInner(bot) {
     return;
   }
 
-  // 5. What the lender can safely provide right now — via the shared helper,
-  //    which subtracts the canonical 5-SOL reserve AND every UNCONFIRMED
-  //    in-flight lender spend (so a sibling service's in-flight tx can't push
-  //    4JSS below the gas floor). Fails CLOSED (0) if the read is uncertain.
-  const lenderAvail = await availableLenderNative(connection);
-  if (lenderAvail < MIN_FUND_LAMPORTS) {
-    await record({ ...baseRow, outcome: "skip_lender_low",
-      notes: `lenderAvail=${fmt(lenderAvail)} < min; gap=${fmt(gap)} unmet` });
-    await alertLenderLow(bot, { gap, lenderNative, owed: payableOwed });
-    return;
-  }
-
-  // 6. fundAmount = min(gap, lenderAvail, HARD CEILING). The ceiling is the
-  //    real bound — independent of `owed` — so no counter value can move more
-  //    than MAX_FUND per tick even if everything else is wrong.
-  let fundAmount = gap;
-  if (lenderAvail < fundAmount) fundAmount = lenderAvail;
-  if (MAX_FUND_LAMPORTS < fundAmount) fundAmount = MAX_FUND_LAMPORTS;
-
+  // 5. Load the lender key now — needed both for the in-tick wSOL unwrap and
+  //    the funding transfer.
   let lenderKp;
   try {
     lenderKp = loadLenderKeypair();
@@ -409,6 +497,40 @@ async function tickInner(bot) {
       error: `lender key ${lenderKp.publicKey.toBase58().slice(0, 10)}… ≠ ${LENDER_PUBKEY.toBase58().slice(0, 10)}…` });
     return;
   }
+
+  // 6. What the lender can safely provide right now — via the shared helper,
+  //    which subtracts the canonical 5-SOL reserve AND every UNCONFIRMED
+  //    in-flight lender spend (so a sibling service's in-flight tx can't push
+  //    4JSS below the gas floor). Fails CLOSED (0) if the read is uncertain.
+  let lenderAvail = await availableLenderNative(connection);
+
+  // 6b. IN-TICK LENDER wSOL UNWRAP — if the lender's NATIVE alone can't close
+  //     the gap, the missing revenue is most likely sitting as wSOL in the
+  //     lender's fee ATA that the hourly sweeper hasn't unwrapped yet. Unwrap
+  //     it NOW (under the shared lock we already hold) so CHCAM tops up this
+  //     5-min cadence instead of waiting ≤1h. Fires ONLY when actually needed
+  //     (lender native can't cover the gap) and the wSOL is material.
+  if (lenderAvail < gap) {
+    const unwrapped = await unwrapLenderFeeWsol(bot, connection, lenderKp).catch(() => 0n);
+    if (unwrapped > 0n) {
+      lenderAvail = await availableLenderNative(connection); // re-read post-unwrap
+      baseRow.lenderNative = BigInt(await withFailover((c) => c.getBalance(LENDER_PUBKEY, "confirmed")));
+    }
+  }
+
+  if (lenderAvail < MIN_FUND_LAMPORTS) {
+    await record({ ...baseRow, outcome: "skip_lender_low",
+      notes: `lenderAvail=${fmt(lenderAvail)} < min; gap=${fmt(gap)} unmet (after in-tick unwrap attempt)` });
+    await alertLenderLow(bot, { gap, lenderNative: baseRow.lenderNative, owed: payableOwed });
+    return;
+  }
+
+  // 7. fundAmount = min(gap, lenderAvail, HARD CEILING). The ceiling is the
+  //    real bound — independent of `owed` — so no counter value can move more
+  //    than MAX_FUND per tick even if everything else is wrong.
+  let fundAmount = gap;
+  if (lenderAvail < fundAmount) fundAmount = lenderAvail;
+  if (MAX_FUND_LAMPORTS < fundAmount) fundAmount = MAX_FUND_LAMPORTS;
 
   try {
     assertAllowedDestination("distribution-auto-funder", DISTRIBUTION_PUBKEY);
@@ -572,6 +694,29 @@ export function stopDistributionAutoFunder() {
   if (_timer) { clearInterval(_timer); _timer = null; }
 }
 
+/**
+ * Event-driven nudge — fire an immediate, out-of-band funder tick (e.g. the
+ * gap-monitor's self-heal when it spots a gap between scheduled ticks). This
+ * is what turns the funder from "every 5 min" into "tops up within seconds of
+ * a detected gap" without coupling to the hot loan/fee-accrual path.
+ *
+ * FULLY SAFE TO CALL FROM ANYWHERE, AT ANY RATE:
+ *   • fire-and-forget — never awaits, never throws into the caller.
+ *   • the tick-start floor in tick() guarantees a kick can NEVER run a tick
+ *     within INTERVAL_FLOOR_MS (3 min) of the prior one, so the no-double-fund
+ *     invariant holds no matter how often this is called.
+ *   • the in-process reentrancy guard + shared lender lock still serialize it
+ *     against the scheduled tick and every other lender-spending service.
+ */
+export function kickDistributionFunder(bot, reason = "kick") {
+  if (isDisabled()) return;
+  setTimeout(() => {
+    tick(bot, { source: "kick" }).catch((e) =>
+      console.warn(`[dist-funder] kick(${reason}) tick: ${e.message?.slice(0, 140)}`),
+    );
+  }, 0);
+}
+
 // ─── Status (for admin command / observability) ───────────────────
 export async function getDistributionFunderStatus() {
   const connection = new Connection(RPC_URL, "confirmed");
@@ -580,9 +725,13 @@ export async function getDistributionFunderStatus() {
   const { holderOwed, lpOwed, protocolOwed, payableOwed } = await readPayableOwed().catch(() => ({
     holderOwed: 0n, lpOwed: 0n, protocolOwed: 0n, payableOwed: 0n,
   }));
-  const [distNative, lenderNative, recent] = await Promise.all([
+  const [distNative, distWsol, lenderNative, lenderAvail, recent] = await Promise.all([
     connection.getBalance(DISTRIBUTION_PUBKEY, "confirmed").then(BigInt).catch(() => null),
+    getAssociatedTokenAddress(NATIVE_MINT, DISTRIBUTION_PUBKEY, false, TOKEN_PROGRAM_ID)
+      .then((ata) => getAccount(connection, ata, "confirmed", TOKEN_PROGRAM_ID))
+      .then((a) => a.amount).catch(() => 0n),
     connection.getBalance(LENDER_PUBKEY, "confirmed").then(BigInt).catch(() => null),
+    availableLenderNative(connection).catch(() => null),
     query(
       `SELECT id, outcome, initiated_at, funded_lamports::text AS funded,
               gap_lamports::text AS gap, tx_signature, notes, error_message
@@ -591,17 +740,42 @@ export async function getDistributionFunderStatus() {
     ).catch(() => ({ rows: [] })),
   ]);
   const target = payableOwed + SAFETY_RESERVE_LAMPORTS;
+  // CHCAM "spendable" = native + any wSOL (the funder unwraps CHCAM's own wSOL
+  // in-tick, so it's effectively spendable). Gap is measured against native —
+  // the conservative figure the funder actually targets.
+  const spendable = distNative == null ? null : distNative + distWsol;
+  const gapLamports = distNative == null ? null : (target > distNative ? target - distNative : 0n);
+
+  // VERDICT — the whole point of surfacing this: a transient lag must NOT read
+  // as a "shortfall" the operator hand-funds. Classify it honestly:
+  //   • paused        — funder disabled
+  //   • healthy       — CHCAM already covers owed+reserve
+  //   • catching_up   — a gap exists BUT the lender can cover it → the funder
+  //                     auto-tops-up within ~5 min; do NOT hand-fund.
+  //   • lender_limited— a gap exists AND the lender can't cover it → real fee
+  //                     revenue is below the accrued obligation; investigate,
+  //                     still do NOT hand-fund.
+  let verdict = "unknown";
+  if (isDisabled()) verdict = "paused";
+  else if (gapLamports == null) verdict = "unknown";
+  else if (gapLamports < MIN_FUND_LAMPORTS) verdict = "healthy";
+  else if (lenderAvail != null && lenderAvail >= gapLamports) verdict = "catching_up";
+  else verdict = "lender_limited";
+
   return {
     disabled: isDisabled(),
     interval_min: INTERVAL_MS / 60_000,
+    verdict,
     payable_owed_sol: Number(payableOwed) / LAMPORTS_PER_SOL,
     holder_owed_sol: Number(holderOwed) / LAMPORTS_PER_SOL,
     lp_owed_sol: Number(lpOwed) / LAMPORTS_PER_SOL,
     protocol_reserve_owed_sol: Number(protocolOwed) / LAMPORTS_PER_SOL, // excluded from gap
     distribution_native_sol: distNative == null ? null : Number(distNative) / LAMPORTS_PER_SOL,
+    distribution_wsol_sol: Number(distWsol) / LAMPORTS_PER_SOL,
+    distribution_spendable_sol: spendable == null ? null : Number(spendable) / LAMPORTS_PER_SOL,
     lender_native_sol: lenderNative == null ? null : Number(lenderNative) / LAMPORTS_PER_SOL,
-    current_gap_sol:
-      distNative == null ? null : Math.max(0, Number(target - distNative) / LAMPORTS_PER_SOL),
+    lender_available_sol: lenderAvail == null ? null : Number(lenderAvail) / LAMPORTS_PER_SOL,
+    current_gap_sol: gapLamports == null ? null : Number(gapLamports) / LAMPORTS_PER_SOL,
     lender_reserve_sol: Number(LENDER_RESERVE_LAMPORTS) / LAMPORTS_PER_SOL,
     per_tick_ceiling_sol: Number(MAX_FUND_LAMPORTS) / LAMPORTS_PER_SOL,
     recent: recent.rows,
