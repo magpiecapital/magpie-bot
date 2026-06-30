@@ -116,6 +116,9 @@ export async function handleStart(ctx) {
   const msg = [
     "🏦 *Welcome to Magpie*",
     "",
+    "*Collateral that can still sell itself\\.*",
+    "Borrow SOL against your tokens — and set auto\\-sells on the same collateral\\. Liquidity, without giving up the upside\\.",
+    "",
     "_I'm Pip — Magpie's AI agent. I'll help you borrow SOL against your memecoin bags, manage loans, and answer questions along the way._",
     "",
     ...walletSection,
