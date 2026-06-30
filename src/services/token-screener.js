@@ -529,20 +529,39 @@ async function getMarketData(mints) {
       const addr = p.baseToken?.address;
       if (!addr) continue;
 
-      const liq = p.liquidity?.usd ?? 0;
+      const liq = Number(p.liquidity?.usd) || 0;
       const existing = result.get(addr);
-      if (existing && (existing.liquidity ?? 0) >= liq) continue;
-
-      result.set(addr, {
-        symbol: p.baseToken?.symbol || "???",
-        name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
-        price: p.priceUsd ? parseFloat(p.priceUsd) : null,
-        liquidity: liq,
-        volume24h: p.volume?.h24 ?? 0,
-        marketCap: p.marketCap ?? p.fdv ?? 0,
-        pairCreatedAt: p.pairCreatedAt ?? null,
-        imageUrl: p.info?.imageUrl ?? null,
-      });
+      if (!existing) {
+        result.set(addr, {
+          symbol: p.baseToken?.symbol || "???",
+          name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
+          price: p.priceUsd ? parseFloat(p.priceUsd) : null,
+          // AGGREGATE: liquidity is the SUM across ALL of this token's pools (a
+          // sell routes via Jupiter across every pool). Single-pool under-read
+          // wrongly blocked a borrow on a multi-pool token ($ANSEM 2026-06-30);
+          // the cached liquidity_usd the borrow gate floors against must be the
+          // TOTAL depth. Price/symbol/metadata come from the LARGEST pool.
+          liquidity: liq,
+          _topPoolLiq: liq,
+          volume24h: p.volume?.h24 ?? 0,
+          marketCap: p.marketCap ?? p.fdv ?? 0,
+          pairCreatedAt: p.pairCreatedAt ?? null,
+          imageUrl: p.info?.imageUrl ?? null,
+        });
+      } else {
+        existing.liquidity += liq; // sum every pool for this token
+        if (liq > (existing._topPoolLiq ?? 0)) {
+          // larger pool → take its price + metadata as the representative
+          existing._topPoolLiq = liq;
+          existing.symbol = p.baseToken?.symbol || existing.symbol;
+          existing.name = p.baseToken?.name || existing.name;
+          existing.price = p.priceUsd ? parseFloat(p.priceUsd) : existing.price;
+          existing.volume24h = p.volume?.h24 ?? existing.volume24h;
+          existing.marketCap = p.marketCap ?? p.fdv ?? existing.marketCap;
+          existing.pairCreatedAt = p.pairCreatedAt ?? existing.pairCreatedAt;
+          existing.imageUrl = p.info?.imageUrl ?? existing.imageUrl;
+        }
+      }
     }
   }
   return result;
