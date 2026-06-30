@@ -258,9 +258,15 @@ function scheduleCaptchaKick(ctx, userId, dmFailed) {
       // Pip's memory: a previously-cleared member (appeal / operator unban)
       // who rejoined is not re-kicked for missing the captcha.
       if (await isUserCleared(ctx.chat.id, userId)) { await clearGroupCaptcha(ctx.api, ctx.chat.id, userId); return; }
-      // Kick (= ban for 30s then unban, lets them rejoin if real)
-      const until = Math.floor(Date.now() / 1000) + 30;
-      await ctx.api.banChatMember(ctx.chat.id, userId, { until_date: until });
+      // Kick the captcha-misser but DO NOT leave them banned — a real member
+      // who missed it must be able to rejoin and retry. CRITICAL BUG (fixed
+      // 2026-06-30): a short until_date is unsafe — Telegram treats a ban of
+      // < 30s (or > 366 days) as PERMANENT, so the old `now + 30` silently
+      // PERMABANNED users under any processing latency (it false-permabanned 11
+      // real members, incl. @Jmackbjm). Ban-then-unban is the reliable "kick":
+      // it removes them with NO lingering ban so the invite link works on retry.
+      await ctx.api.banChatMember(ctx.chat.id, userId);
+      await ctx.api.unbanChatMember(ctx.chat.id, userId, { only_if_banned: true });
       await clearGroupCaptcha(ctx.api, ctx.chat.id, userId);
       await recordModAction(
         ctx.chat.id, userId, "kick_captcha_timeout",
