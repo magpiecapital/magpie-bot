@@ -49,6 +49,22 @@ export const URL_ALLOWLIST = new Set([
 // official site should never be deleted by the link filter.
 export const OWN_DOMAINS = ["magpie.capital"];
 
+// Well-known platforms a legit user naturally references when asking product
+// questions (app stores, official Solana / Seeker, the major wallets, the
+// router Magpie sells through, common explorers). These are NOT phishing
+// vectors, so a question like "are you on the App Store / Seeker?" with a link
+// must never be auto-deleted — and we don't even spend an LLM call judging it.
+// Operator-mandated 2026-06-30: users should feel comfortable asking questions.
+export const SAFE_REFERENCE_DOMAINS = [
+  "apps.apple.com", "apple.com",        // Apple App Store
+  "play.google.com",                    // Google Play
+  "solanamobile.com",                   // Solana Mobile / Seeker (SKR)
+  "solana.com",                         // official Solana
+  "phantom.app", "solflare.com",        // official wallets users ask about
+  "backpack.app", "jup.ag",             // Backpack wallet · Jupiter (our router)
+  "solscan.io", "explorer.solana.com", "solana.fm", // block explorers
+];
+
 // Quarantine: new members can't post links/forwards and are rate-
 // limited for this many days. Captcha must still be passed before
 // the timer even starts.
@@ -389,6 +405,9 @@ export function isAllowedUrl(rawUrl) {
     // Magpie's own domains are always allowed (any path) — official links
     // (magpie.capital, docs.magpie.capital, …) must never be auto-deleted.
     if (OWN_DOMAINS.some((d) => host === d || host.endsWith("." + d))) return true;
+    // Well-known safe platforms (app stores, Solana, wallets, explorers) —
+    // referenced in honest product questions, not phishing vectors.
+    if (SAFE_REFERENCE_DOMAINS.some((d) => host === d || host.endsWith("." + d))) return true;
     // Twitter/X handles are case-insensitive (x.com/MagpieLoans ==
     // x.com/magpieloans on Twitter's side). Compare both sides
     // lowercased to avoid false rejects on case variants.
