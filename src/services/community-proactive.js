@@ -111,19 +111,29 @@ function displayName(tgUser) {
   return first ? escapeMdName(first) : "friend";
 }
 
-/** Post an in-group welcome after a member passes the captcha.
+/** Welcome a member privately after they pass the captcha.
+ *  Operator 2026-06-30: this used to broadcast to the WHOLE group on every
+ *  join — pure noise for everyone else. It now DMs the new member instead, so
+ *  only they see it. If they passed via the in-group captcha button they may
+ *  not have started the bot, so the DM can fail (403) — that's fine: on pass
+ *  they ALREADY got the per-user "Welcome to Magpie!" callback toast + their
+ *  captcha message edited to "✅ verified", so we simply skip rather than fall
+ *  back to a group post. `chatId` is kept in the signature for compatibility.
  *  Templated, zero LLM cost. Best-effort; failures are non-fatal. */
 export async function postCaptchaWelcome(botApi, chatId, tgUser) {
   if (PROACTIVE_DISABLED) return;
+  if (!tgUser?.id) return;
   const name = displayName(tgUser);
   const text = pickWelcome(name);
   try {
-    await botApi.sendMessage(Number(chatId), text, {
+    await botApi.sendMessage(Number(tgUser.id), text, {
       parse_mode: "Markdown",
       disable_web_page_preview: true,
     });
   } catch (err) {
-    console.warn(`[proactive] captcha-welcome to ${chatId} failed:`, err.message);
+    // Expected when the member hasn't started the bot — do NOT post to the
+    // group; the per-user pass toast already greeted them.
+    console.warn(`[proactive] captcha-welcome DM to ${tgUser.id} skipped:`, err.message?.slice(0, 80));
   }
 }
 
