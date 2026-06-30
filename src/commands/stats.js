@@ -4,6 +4,8 @@ import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { getBurnSummary } from "../services/magpie-burns.js";
+import { isAdmin } from "../services/admin.js";
+import { getDistributionFunderStatus } from "../services/distribution-auto-funder.js";
 
 // Helper: fetch a single pool's on-chain snapshot for the /stats roll-up.
 // Pool layouts are identical between V1 and V2 across the fields we read
@@ -57,6 +59,40 @@ const RULE = "─".repeat(COL_WIDTH + 2);
 function fmtSol(lamports) {
   const n = Number(lamports) / 1e9;
   return Number.isFinite(n) ? n.toFixed(2) : "—";
+}
+
+// OPERATOR-ONLY: the autonomous rewards-funder true picture. The point (per the
+// operator) is that a transient lag must never READ as a shortfall — so this
+// shows CHCAM-spendable vs owed vs gap PLUS a plain-English verdict, so the
+// operator stops pre-funding phantoms. Wallet balances are operator-private, so
+// this block is gated to admins and never rendered in public /stats.
+function renderFunderHealth(fs) {
+  if (!fs) return [];
+  const fmt2 = (n) => (n == null || !Number.isFinite(n) ? "—" : n.toFixed(2));
+  const verdictLine = {
+    healthy:        "✓ healthy — CHCAM covers all owed",
+    catching_up:    "⏳ catching up — auto-funds ≤5m (transient, do NOT hand-fund)",
+    lender_limited: "⚠ lender-limited — real revenue lag; investigate, do NOT hand-fund",
+    paused:         "⏸ PAUSED — DIST_FUNDER_DISABLED is set",
+    unknown:        "… status unavailable (RPC)",
+  }[fs.verdict] || fs.verdict;
+
+  const out = [
+    ``,
+    `REWARDS FUNDER (autonomous · ops-only)`,
+    row("CHCAM spendable", `${fmt2(fs.distribution_spendable_sol)} SOL`),
+    row("Owed (holder+LP)", `${fmt2(fs.payable_owed_sol)} SOL`),
+  ];
+  // Only show the gap line when there actually is one — keeps the healthy
+  // readout terse.
+  if ((fs.current_gap_sol ?? 0) >= 0.005) {
+    out.push(row("Gap", `${fmt2(fs.current_gap_sol)} SOL`));
+    out.push(row("Lender available", `${fmt2(fs.lender_available_sol)} SOL`));
+  }
+  // The verdict can exceed the column width — render it on its own indented
+  // line rather than squeezing it into the two-column row().
+  out.push(`  ${verdictLine}`);
+  return out;
 }
 
 export async function handleStats(ctx) {
@@ -373,6 +409,17 @@ export async function handleStats(ctx) {
         return row(`#${idx + 1} ${date}`, `${amount} SOL → ${s.eligible_count} LPs`);
       });
 
+    // OPERATOR-ONLY: autonomous rewards-funder health. Best-effort — a funder
+    // read failure must never break /stats. Public callers never see this.
+    let funderLines = [];
+    if (isAdmin(ctx.from?.id)) {
+      try {
+        funderLines = renderFunderHealth(await getDistributionFunderStatus());
+      } catch (e) {
+        console.warn("[stats] funder-health read failed:", e.message);
+      }
+    }
+
     const codeLines = [
       RULE,
       `LOAN BOOK`,
@@ -401,6 +448,8 @@ export async function handleStats(ctx) {
       row("Referrers (10%)",       `${fmtSol(refAccrued.toString())} SOL`),
       row("Protocol reserve (10%)",`${fmtSol(reserveAccrued.toString())} SOL`),
       row("Total accruing",        `${fmtSol(totalAccrued.toString())} SOL`),
+      // OPERATOR-ONLY funder-health (empty array for everyone else).
+      ...funderLines,
       ``,
       // Prior-snapshots section only renders once at least one snapshot
       // has happened. Until then, hide the section entirely — operator
