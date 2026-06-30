@@ -307,16 +307,15 @@ async function handleCaptchaCallback(ctx) {
     } catch { /* edit might fail if msg was deleted — silent */ }
     await recordModAction(chatId, userId, "captcha_pass", null, null);
 
-    // Post a warm in-group welcome. Static template, no LLM cost.
-    // The captcha message above lives in the user's DM with the bot —
-    // they need to see something IN the group too so the rest of the
-    // community knows someone new is here, and so the new member feels
-    // greeted rather than "you passed a test, now figure it out".
+    // Warm welcome — sent PRIVATELY to the new member (operator 2026-06-30:
+    // no longer broadcast to the whole group, which was noise for everyone
+    // else). The user already saw the per-user pass toast above; this DM is a
+    // bonus greeting and silently skips if they haven't started the bot.
     try {
       const { postCaptchaWelcome } = await import("../services/community-proactive.js");
       await postCaptchaWelcome(ctx.api, chatId, ctx.callbackQuery.from);
     } catch (err) {
-      console.warn("[community] welcome post failed (non-critical):", err.message);
+      console.warn("[community] welcome DM failed (non-critical):", err.message);
     }
   } catch (err) {
     console.warn("[community] captcha callback failed:", err.message);
