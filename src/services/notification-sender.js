@@ -469,6 +469,37 @@ function renderEnginePreflightFailed(p) {
   return lines.join("\n");
 }
 
+// Engine crash — uncaughtException/unhandledRejection caught the engine and
+// it exit(1)'d for a clean Railway restart. The fail-closed breadcrumb means
+// no order double-fires. Operator-facing (enqueued with userId=OPERATOR_USER_ID).
+function renderEngineCrash(p = {}) {
+  return [
+    "🔴 *Limit-close engine crashed & restarted*",
+    "",
+    `Type: \`${p.crash_kind || "unknown"}\``,
+    `Error: \`${String(p.error || "unknown").slice(0, 300)}\``,
+    p.detected_at ? `When: \`${p.detected_at}\`` : null,
+    "",
+    p.remedy ||
+      "The engine hit an unhandled error and auto-restarted. No order double-fires (fail-closed breadcrumb). Check the Railway logs for the stack trace.",
+  ].filter((l) => l !== null).join("\n");
+}
+
+// Engine stall — the in-process watchdog saw no tick progress past the
+// threshold and exit(1)'d to self-heal a wedged loop. Operator-facing.
+function renderEngineStallRestart(p = {}) {
+  return [
+    "🟠 *Limit-close engine stalled & auto-restarted*",
+    "",
+    `No tick progress for ~${p.stalled_for_seconds ?? "?"}s (threshold ${p.stall_threshold_seconds ?? "?"}s)`,
+    `Last status: \`${p.last_status || "unknown"}\``,
+    p.detected_at ? `When: \`${p.detected_at}\`` : null,
+    "",
+    p.remedy ||
+      "The fire loop wedged and was auto-restarted. Check RPC/DB health; no order double-fired.",
+  ].filter((l) => l !== null).join("\n");
+}
+
 const RENDERERS = {
   limit_close_armed:        renderLimitCloseArmed,
   limit_close_arm_failed:   renderLimitCloseArmFailed,
@@ -483,6 +514,8 @@ const RENDERERS = {
   limit_close_staleness_nudge: renderLimitCloseStalenessNudge,
   limit_close_near_trigger:    renderLimitCloseNearTrigger,
   engine_preflight_failed:  renderEnginePreflightFailed,
+  engine_crash:             renderEngineCrash,
+  engine_stall_restart:     renderEngineStallRestart,
   pip_upside_alert:         renderPipUpsideAlert,
   // Downside alert reuses the same renderer — the watcher pre-renders
   // the entire DM body into payload.text, identical contract.
