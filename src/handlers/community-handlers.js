@@ -41,6 +41,12 @@ import {
   CAPTCHA_TIMEOUT_MS,
 } from "../services/community-moderation.js";
 import { classifyImage, actionForImageVerdict } from "../services/community-image-ocr.js";
+import {
+  judgeCommunityPost,
+  hasSolicitationSignal,
+  isConfidentRemoval,
+  HARD_SCAM_RE,
+} from "../services/community-intent-classifier.js";
 import { findUserByTelegramId } from "../services/users.js";
 
 /**
@@ -438,24 +444,11 @@ async function handleGroupMessage(ctx) {
       return;
     }
 
-    // ── URL allowlist ───────────────────────────────────────
-    const urls = extractUrls(msg);
-    for (const u of urls) {
-      if (!isAllowedUrl(u)) {
-        await tryDelete(ctx, msg.message_id);
-        await recordModAction(ctx.chat.id, sender.id, "delete_link", "url not on allowlist", u);
-        const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-        await softWarn(
-          ctx,
-          sender.id,
-          `Your message was removed from the Magpie community group because it contained a link.\n\n` +
-          `*Only tweets from the official @MagpieLoans X account are allowed.* This is to keep scammers and phishing links out — almost every other "useful link" in a DeFi community turns out to be a scam.\n\n` +
-          `Allowed format: https://x.com/MagpieLoans/... or https://twitter.com/MagpieLoans/...` +
-          (count >= 3 ? `\n\nThis is warning #${count}. Repeated removals may result in a temporary mute.` : ``),
-        );
-        return; // already removed; don't run other checks
-      }
-    }
+    // ── Links are no longer auto-deleted ────────────────────
+    // A non-allowlisted link is now just ONE signal into Pip's judgement
+    // block below — a real user asking "are you on the App Store? <link>"
+    // must never be removed merely for including a link. (operator
+    // 2026-06-30: "we cant just delete their posts or boot them.")
 
     // ── Screenshot + "DM me" → PERMANENT BAN (operator-mandated 2026-06-30) ──
     // A photo whose caption solicits a DM ("DM me to claim", "message admin")
@@ -494,45 +487,83 @@ async function handleGroupMessage(ctx) {
       }
     }
 
-    // ── Scam pattern (non-impersonator users) ──────────────
-    // Impersonators are already banned above, so anyone reaching here
-    // is a regular user posting a phishing-shaped phrase. Delete +
-    // warn via the strike ladder.
-    const scam = matchesScamPattern(msg.text || msg.caption || "");
-    if (scam) {
-      await tryDelete(ctx, msg.message_id);
-      await recordModAction(ctx.chat.id, sender.id, "delete_scam_pattern", scam, msg.text || msg.caption);
-      const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-      await softWarn(
-        ctx,
-        sender.id,
-        `Your message was removed from the Magpie group — it matched a pattern we automatically flag (seed phrase requests, "send X SOL", "DM me", "claim airdrop", etc.). If this was a misunderstanding, just rephrase.` +
-        (count >= 3 ? `\n\n#${count} warning. Repeated matches may result in a mute.` : ``),
-      );
-      return;
+    // ── Pip's judgement on flagged content (operator 2026-06-30) ──
+    // Coarse signals — a non-allowlisted link, scam-shaped phrasing, an
+    // unofficial Magpie handle, or service-solicitation markers — DO NOT
+    // auto-delete. They only FLAG the post; Pip then judges whether it's a
+    // genuine user (question / idea / interest / criticism → KEEP) or a
+    // scam / solicitation (→ remove). Operator mandate, verbatim: "if they
+    // are asking clear questions or giving ideas or showing interest in
+    // the Magpie platform, we cant just delete their posts or boot them.
+    // Pip really needs to use their best judgement with every single post."
+    {
+      const bodyText = msg.text || msg.caption || "";
+      const badUrls = extractUrls(msg).filter((u) => !isAllowedUrl(u));
+      const scamHit = matchesScamPattern(bodyText);
+      const handleHits = findImpersonatingHandles(bodyText);
+      const solicits = hasSolicitationSignal(bodyText);
+      const flagged = badUrls.length || scamHit || handleHits.length || solicits;
+
+      if (flagged && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+        const signalParts = [];
+        if (badUrls.length) signalParts.push(`link not on allowlist: ${badUrls.join(", ").slice(0, 180)}`);
+        if (scamHit) signalParts.push(`scam-phrase: ${scamHit}`);
+        if (handleHits.length) signalParts.push(`unofficial handle: ${handleHits.join(", ")}`);
+        if (solicits) signalParts.push(`possible solicitation`);
+
+        const member = await getMember(ctx.chat.id, sender.id);
+        const memberAgeHours = member?.joined_at
+          ? (Date.now() - new Date(member.joined_at).getTime()) / 3_600_000
+          : null;
+
+        const verdict = await judgeCommunityPost(bodyText, {
+          signal: signalParts.join(" · "),
+          member_age_hours: memberAgeHours,
+          has_link: badUrls.length > 0,
+        });
+
+        // Heavy ALLOW bias. On LLM failure (verdict == null) fail OPEN
+        // (keep) for soft signals; fail CLOSED (remove) ONLY for an
+        // unambiguous hard-scam phrase, which a real user essentially never
+        // types — so a wallet-drainer can't slip through during an LLM
+        // outage, yet a genuine post is never deleted on uncertainty.
+        const remove = verdict
+          ? isConfidentRemoval(verdict)
+          : HARD_SCAM_RE.test(bodyText);
+
+        if (remove) {
+          await tryDelete(ctx, msg.message_id);
+          const cat = verdict?.category || (scamHit ? "scam" : solicits ? "solicitation" : "scam");
+          await recordModAction(
+            ctx.chat.id, sender.id, `judge_remove_${cat}`,
+            `${verdict ? `conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}` : "LLM down → hard-scam fallback"} · ${signalParts.join(" · ")}`,
+            bodyText.slice(0, 500),
+          );
+          const count = await bumpWarnedCount(ctx.chat.id, sender.id);
+          const isSolicit = cat === "solicitation" || cat === "spam";
+          const notice = isSolicit
+            ? `Hey — your message was removed because it read as solicitation/promotion (offering services, shilling another project, etc.), which we keep out of the group. Genuine questions and ideas about Magpie are always welcome — feel free to ask! 🙂`
+            : `Hey — your message was removed because it matched a scam/phishing pattern we filter (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links, etc.). If that was a genuine misunderstanding, just rephrase — real questions are always welcome. 🙂`;
+          await softWarn(
+            ctx, sender.id,
+            notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
+          );
+          return; // removed; skip remaining checks
+        }
+
+        // KEPT — log Pip's rescue so the operator can see judgement at work.
+        await recordModAction(
+          ctx.chat.id, sender.id, "judge_keep",
+          `${verdict ? `${verdict.category} · conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}` : "LLM unavailable → kept (favor the user)"} · ${signalParts.join(" · ")}`,
+          bodyText.slice(0, 300),
+        );
+      }
     }
 
-    // ── Verbal handle impersonation ──────────────────────────
-    // Catches "DM @MagpieSupport for help" — no link, just text, but
-    // routes the user to a scammer. URL filter doesn't see it because
-    // it's a bare handle. Strict on Magpie-flavored handles only —
-    // legit cross-mentions like "@MagpieLoans posted X" pass.
-    const impersonators = findImpersonatingHandles(msg.text || msg.caption || "");
-    if (impersonators.length > 0) {
-      await tryDelete(ctx, msg.message_id);
-      await recordModAction(
-        ctx.chat.id, sender.id, "delete_handle_impersonation",
-        impersonators.join(","), msg.text || msg.caption,
-      );
-      const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-      await softWarn(
-        ctx,
-        sender.id,
-        `Your message was removed because it referenced an unofficial Magpie-related handle (${impersonators.join(", ")}). The ONLY official Magpie accounts are *@MagpieLoans* on X and *@magpie_capital_bot* on Telegram. Anyone else claiming to be Magpie support is a scammer.` +
-        (count >= 3 ? `\n\n#${count} warning. Repeated removals may result in a mute.` : ``),
-      );
-      return;
-    }
+    // (Verbal handle impersonation — e.g. "DM @MagpieSupport for help" —
+    // is now folded into the Pip-judgement block above: findImpersonatingHandles
+    // is one of the signals it weighs, so a scam handle is removed while a
+    // legit cross-mention like "@MagpieLoans posted X" is kept.)
 
     // ── Impersonation (re-check per-message in case they rename) ─
     if (isImpersonationName(sender)) {
@@ -561,6 +592,26 @@ async function handleGroupMessage(ctx) {
         await recordModAction(ctx.chat.id, sender.id, "delete_quarantine_rate", `wait_ms=${wait}`, null);
         return;
       }
+    }
+
+    // ── Captcha auto-pass on genuine activity (operator 2026-06-30) ──
+    // The message survived every removal gate above, so it's a real,
+    // non-scam post. A human who actually chats has proven they're human
+    // far better than a button tap — so if a captcha kick is still pending
+    // for this user, cancel it. We NEVER boot someone for asking a question
+    // or sharing an idea. ("my chat keeps getting removed" was a brand-new
+    // member kicked by the 5-min captcha timer before they tapped verify.)
+    try {
+      const pendingKey = kickKey(ctx.chat.id, sender.id);
+      if (pendingKicks.has(pendingKey)) {
+        clearTimeout(pendingKicks.get(pendingKey));
+        pendingKicks.delete(pendingKey);
+        await markCaptchaPassed(ctx.chat.id, sender.id);
+        await clearGroupCaptcha(ctx.api, ctx.chat.id, sender.id);
+        await recordModAction(ctx.chat.id, sender.id, "captcha_pass_via_message", "genuine message = proof of human", null);
+      }
+    } catch (err) {
+      console.warn("[community] captcha auto-pass-on-message failed (non-critical):", err.message);
     }
 
     // ── Image vision classifier ─────────────────────────────────
