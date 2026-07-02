@@ -1193,6 +1193,28 @@ export async function applyStartupPatches() {
      VALUES ('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn')
      ON CONFLICT DO NOTHING`,
 
+    // ─────── DEPLOYER-SPEND CONTROL: warm idle memecoins ───────
+    // Root cause of the ~2.4 SOL/day deployer attestation spend: the
+    // attestation_tier column DEFAULTS to 'hot', so EVERY approved memecoin is
+    // continuously attested forever — even idle ones never borrowed. That's the
+    // bulk of the on-chain attestation-write firehose (verified live: 61 mints
+    // continuously attested). The tiered-attestation cost design intends
+    // memecoins to be 'warm' (attested only when there's borrower interest,
+    // JIT-warmed at borrow + pre-warmed by the hot-on-select beacon). This keeps
+    // NON-protected memecoins on 'warm'. SAFE: the attestor's fetchMintsToAttest
+    // query AUTO-includes any mint with an active loan, armed/firing exit,
+    // recent arm intent, hot-on-select warming, OR protected=TRUE — regardless
+    // of tier — so this ONLY drops truly-idle, non-borrowed, non-protected
+    // memecoins from the continuous loop. Stocks/RWAs stay 'hot' (the
+    // stocks-rwa-protection-sentinel forces it). Idempotent; runs every boot to
+    // hold the cost-conscious steady state. Operator-mandated 2026-07-02:
+    // deployer daily spend 1-1.5 SOL, not ~2.5. [[feedback_tiered_attestation_cost_conscious]]
+    `UPDATE supported_mints
+        SET attestation_tier = 'warm'
+      WHERE category = 'memecoin'
+        AND protected = FALSE
+        AND attestation_tier = 'hot'`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
