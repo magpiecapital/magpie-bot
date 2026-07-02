@@ -1154,6 +1154,45 @@ export async function applyStartupPatches() {
      VALUES ('DRAMjSWR7HRfJKjRkvQWYL2bcaejaVhuxEcjf4pAY4Cw')
      ON CONFLICT DO NOTHING`,
 
+    // $PUMP — Pump.fun platform token. OPERATOR-TRUSTED EXEMPT LARGE-CAP
+    // (manual approval 2026-07-02; operator trusts it despite it not fitting
+    // the auto-screener thresholds). It was auto-removed once; this seed
+    // re-adds it AND exempts it so no screener/health-watcher can EVER take it
+    // off again. Token-2022, decimals=6, mint+freeze authority BOTH renounced
+    // (verified on-chain, CA pumpCmXq…H9Dfn). category='memecoin' → routes V1
+    // (no-exit) + V4 (with-exit, Token-2022 in-vault). attestation_tier='warm'
+    // (NOT hot on purpose): it's a deep-liquidity large-cap, so warm/JIT
+    // attestation fills the TWAP window fine at borrow time — keeps it fully
+    // borrowable WITHOUT adding to the always-on attestation burn (operator is
+    // cost-conscious on deployer SOL spend). ON CONFLICT re-asserts
+    // enabled/protected on EVERY boot = never-removed. To exempt another
+    // trusted large-cap in future, add it right here in the same two-insert form.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn',
+             'PUMP', 'Pump', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'warm')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'PUMP',
+       name = 'Pump',
+       category = 'memecoin',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'warm',
+       source = 'operator_trusted'`,
+    // Keep the screener from ever re-processing $PUMP (operator-trusted, exempt).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn')
+     ON CONFLICT DO NOTHING`,
+
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).
     // Records every move of accrued fees from fee_wallet (lender pubkey's
