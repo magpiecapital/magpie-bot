@@ -594,7 +594,7 @@ async function fetchMintsToAttest() {
          FROM mint_warming_intents
         WHERE expires_at > NOW()
      )
-     SELECT sm.mint, sm.decimals,
+     SELECT sm.mint, sm.decimals, sm.category,
             TRUE AS needs_legacy_attest,
             TRUE AS needs_continuous
        FROM supported_mints sm
@@ -622,6 +622,7 @@ async function fetchMintsToAttest() {
   return r.rows.map((row) => ({
     mint: row.mint,
     decimals: row.decimals,
+    category: row.category,
     needsLegacyAttest: row.needs_legacy_attest,
   }));
 }
@@ -816,7 +817,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
     ].filter(Boolean);
 
     const queue = [];
-    for (const { mint, decimals, needsLegacyAttest } of tokens) {
+    for (const { mint, decimals, needsLegacyAttest, category } of tokens) {
       const priceSol = priceMap.get(mint);
       if (!priceSol) continue;
       const priceLamports = Math.floor(priceSol * 1e9);
@@ -829,6 +830,15 @@ export function startPriceAttestor(intervalMs = 30_000) {
         queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports });
       }
       for (const target of v3v4Targets) {
+        // V3 is the RWA-only program. Memecoins route V1+V4 and NEVER borrow
+        // on V3, so writing their V3 feed every tick is pure wasted SOL. Skip
+        // the explicit V3 write for EXPLICIT memecoins only — RWAs keep their
+        // V3 (via both this write and the category-default "legacy" write, so
+        // no timing change and zero risk), and anything with an unknown/null
+        // category also keeps V3 (fail-safe: never stale a feed a mint uses).
+        // Operator-mandated 2026-07-02: cut deployer attestation spend to
+        // ~1–1.5 SOL/day. [[feedback_tiered_attestation_cost_conscious]]
+        if (target.label === "V3" && category === "memecoin") continue;
         const sinceLast = Date.now() - (target.lastMap.get(mint) || 0);
         if (sinceLast < MAX_GAP_MS_V4) continue;
         queue.push({ kind: "twap", mint, decimals, priceSol, target });
