@@ -257,43 +257,67 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
       await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
-    if (status.inWindow >= REQUIRED_IN_WINDOW) {
+    // The on-chain V3/V4 TWAP gate requires BOTH >= MIN_SAMPLES in-window AND
+    // >= MIN_HISTORY_SECONDS (300s) of span since the oldest in-window sample
+    // (magpie-lending-v3 lib.rs). Checking the COUNT alone false-readies a
+    // stone-cold feed (10 samples fired in 15s → count ok, span 15s → the chain
+    // REJECTS at broadcast). So require the span too: "ready" here now means
+    // "will pass on-chain", which is what closes the sign-then-fail path.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const spanSec = status.oldestInWindowTs != null ? nowSec - status.oldestInWindowTs : 0;
+    if (status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= WINDOW_SEC) {
       return {
         ok: true,
         inWindow: status.inWindow,
+        spanSec,
         waitedMs: Date.now() - START,
         attests,
         programId: programId.toBase58().slice(0, 8),
       };
     }
-    // Need more samples — fire one attest and wait briefly so the
-    // tx finalizes (confirmed) before the next iteration measures.
-    try {
-      await attestPrice(mintStr, decimals, undefined, programId);
-      attests++;
-    } catch (e) {
-      lastErr = e.message?.slice(0, 100);
-      // If this fails because the feed PDA wasn't actually initialized,
-      // re-init and try again. AccountNotInitialized → 3012/0xbc4.
-      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(lastErr)) {
-        try {
-          await initializePriceFeed(mintStr, programId);
-        } catch (e2) {
-          lastErr = `init-then-attest failed: ${e2.message?.slice(0, 80)}`;
+    // Fire an attest ONLY when we're short on SAMPLES. Once the window is
+    // populated (count met) but the SPAN is still < 300s, firing more would
+    // wrap the 32-slot circular buffer and keep the oldest in-window sample
+    // recent — so the span could NEVER reach 300s and the feed would never
+    // become borrowable. When count is met, just WAIT for the span to age
+    // (the transient-interest continuous attestor the caller registers keeps
+    // the feed fresh at the ~30s cadence that lets span grow naturally).
+    if (status.inWindow < REQUIRED_IN_WINDOW) {
+      try {
+        await attestPrice(mintStr, decimals, undefined, programId);
+        attests++;
+      } catch (e) {
+        lastErr = e.message?.slice(0, 100);
+        // If this fails because the feed PDA wasn't actually initialized,
+        // re-init and try again. AccountNotInitialized → 3012/0xbc4.
+        if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(lastErr)) {
+          try {
+            await initializePriceFeed(mintStr, programId);
+          } catch (e2) {
+            lastErr = `init-then-attest failed: ${e2.message?.slice(0, 80)}`;
+          }
         }
       }
     }
     await new Promise((r) => setTimeout(r, SPACING_MS));
   }
 
-  // Timed out — return current state so caller can surface a good message.
+  // Timed out — return current state + an ACCURATE seconds-to-ready so the
+  // caller surfaces a truthful "warming, retry in ~N s" (not a flat 30s that
+  // bounces a genuinely-cold feed for minutes). secondsToReady is dominated by
+  // the 300s span requirement for a cold feed.
   const final = await getV4TwapSampleCount(mintStr, WINDOW_SEC, programId);
+  const finalNowSec = Math.floor(Date.now() / 1000);
+  const finalSpanSec = final?.oldestInWindowTs != null ? finalNowSec - final.oldestInWindowTs : 0;
+  const countShort = (final?.inWindow ?? 0) < REQUIRED_IN_WINDOW;
   return {
     ok: false,
     inWindow: final?.inWindow ?? 0,
+    spanSec: finalSpanSec,
+    secondsToReady: Math.max(5, WINDOW_SEC - finalSpanSec),
     waitedMs: Date.now() - START,
     attests,
-    reason: lastErr || "timeout",
+    reason: lastErr || (countShort ? "timeout" : "span_warming"),
   };
 }
 

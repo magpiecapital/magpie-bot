@@ -1450,6 +1450,26 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
             borrowProgramId.toBase58() === process.env.PROGRAM_ID_V3);
 
         if (usesTwapGate) {
+          // Register TRANSIENT INTEREST first: a warm-tier idle memecoin is
+          // excluded from continuous attestation, and the 300s TWAP span is a
+          // TIME requirement (no amount of rapid attesting shortcuts it — that
+          // just wraps the 32-slot buffer). So put this mint into the continuous
+          // (~30s-cadence) attest loop for ~10 min so its span keeps building
+          // through this warm AND the user's retry. Same two-track mechanism as
+          // the site's hot-on-select beacon. Fire-and-forget; never blocks.
+          try {
+            const { requestMintWarm } = await import("../services/v4-feed-readiness.js");
+            requestMintWarm(mintStr);
+          } catch {}
+          try {
+            await query(
+              `INSERT INTO mint_warming_intents (mint, requested_by, expires_at)
+                 VALUES ($1, 'cosign-jit-warm', NOW() + INTERVAL '10 minutes')
+               ON CONFLICT (mint) DO UPDATE
+                 SET expires_at = NOW() + INTERVAL '10 minutes'`,
+              [mintStr],
+            );
+          } catch {}
           // Program's TWAP gate needs >= 8 samples within 300s OR
           // `TwapInsufficientHistory` (Anchor 6016 / 0x1780) rejects
           // the borrow. The single-shot freshness attest below is
@@ -1482,15 +1502,23 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
                 `CRIT [cosign-borrow] JIT TWAP warmer TIMED OUT — user hit TwapInsufficientHistory on borrow. prog=${borrowProgramId.toBase58().slice(0, 8)} mint=${mintStr.slice(0, 12)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
               );
             } catch {}
+            // Accurate, honest retry hint. secondsToReady (from ensureV4TwapReady)
+            // is dominated by the 300s span requirement for a stone-cold feed —
+            // don't promise "30s" when it's really a few minutes. The mint is
+            // now in the continuous loop (transient interest above), so the span
+            // WILL build and the retry lands.
+            const secs = Math.min(300, Math.max(15, warm.secondsToReady ?? 30));
             return {
               status: 503,
               body: {
                 error:
-                  "Price oracle is warming up for this token (we need a few more samples in the rolling 5-min window). This usually clears in 30–45 seconds — please tap Borrow again.",
+                  secs > 60
+                    ? `Price oracle is warming up for this token — it needs about ${Math.ceil(secs / 60)} more minute(s) of price history in the rolling 5-min window. We've queued it to warm; please tap Borrow again shortly.`
+                    : "Price oracle is warming up for this token (a few more samples in the rolling 5-min window). This usually clears in 30–45 seconds — please tap Borrow again.",
                 oracle_warming: true,
                 in_window: warm.inWindow,
                 required_in_window: 8,
-                retry_after_seconds: 30,
+                retry_after_seconds: secs,
               },
             };
           }
@@ -1934,6 +1962,28 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     })();
     const detail = [message, code, logs, stringified].filter(Boolean).join(" :: ").slice(0, 600) || "unknown_submission_error";
     console.error("[cosign-borrow] SUBMISSION_FAILED:", stringified, "logs:", logs);
+    // CLASS-ELIMINATING (borrow-conversion mandate): a broadcast-TIME TWAP /
+    // price error — e.g. the oldest in-window sample ages past the on-chain
+    // 300s edge in the gap between the pre-broadcast sim passing and confirm —
+    // must NEVER surface raw. Pip/x402 surfaces don't run translateTxError, so
+    // a raw "custom program error: 0x1780" would leak to a real borrower.
+    // Classify send/confirm the SAME way the sim path (~1738-1768) does, BEFORE
+    // building the raw "Submission failed" body, so no surface can ever get it.
+    if (/StalePriceAttestation|"Custom":\s*6013\b|0x177d/i.test(detail)) {
+      recordBorrowFailure("stale_price_attestation");
+      _recordBorrowConversionFailure(_convCtx, "stale_price_attestation_broadcast", { detail: detail?.slice(0, 220) });
+      return { status: 503, body: { error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.", oracle_warming: true, retry_after_seconds: 25, detail } };
+    }
+    if (/TwapInsufficientHistory|"Custom":\s*6016\b|0x1780/i.test(detail)) {
+      recordBorrowFailure("twap_insufficient_history");
+      _recordBorrowConversionFailure(_convCtx, "twap_insufficient_history_broadcast", { detail: detail?.slice(0, 220) });
+      return { status: 503, body: { error: "Oracle is finalizing — please tap Borrow again in 20–30 seconds.", oracle_warming: true, retry_after_seconds: 25, detail } };
+    }
+    if (/CollateralValueExceedsAttestation|"Custom":\s*6014\b|0x177e/i.test(detail)) {
+      recordBorrowFailure("collateral_value_exceeds");
+      _recordBorrowConversionFailure(_convCtx, "collateral_value_exceeds_broadcast", { detail: detail?.slice(0, 220) });
+      return { status: 503, body: { error: "Price moved while you were signing. Please tap Borrow again to get a fresh quote.", price_moved: true, retry_after_seconds: 3, detail } };
+    }
     return {
       status: 500,
       body: { error: `Submission failed: ${detail}`, detail, message, code, logs },
