@@ -953,6 +953,14 @@ bot.start({
     import("./services/liquidation-distribution-watcher.js").then((m) =>
       m.startLiquidationDistributionWatcher(),
     );
+    // Liquidation safety watchdog — the "keeper canary." READ-ONLY: DMs the
+    // operator if any active loan goes overdue and is NOT liquidated (i.e. the
+    // separate keeper process is down/stalled/unfunded). The post-liquidation
+    // watchers above assume liquidations happen; this makes the EXECUTOR's
+    // health observable so a silent keeper death can't accrue bad debt unseen.
+    import("./services/liquidation-safety-watchdog.js").then((m) =>
+      m.startLiquidationSafetyWatchdog(bot),
+    );
     // Exploit-detector — auto-bans wallets/users matching the
     // pump-and-borrow attack pattern, alerts on weaker signals.
     // Multi-signal requirement (outcome + profile) keeps false-positive
