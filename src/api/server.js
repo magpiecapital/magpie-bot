@@ -1970,6 +1970,41 @@ async function router(req, res) {
       v4Feeds = getFeedReadinessSnapshot();
     } catch { /* module not loaded yet — safe to omit */ }
 
+    // External engine liveness — the limit-close fire engine runs as a
+    // SEPARATE service (magpiecapital/magpie-limitclose) and UPSERTs
+    // engine_heartbeats id=1 each tick. The bot's engine-heartbeat-watcher
+    // already DMs the operator on staleness; this surfaces the same signal
+    // on the health JSON so the fire engine's liveness is observable at a
+    // glance (dashboards, curl). Read-only and non-fatal: a missing/stale
+    // engine heartbeat NEVER flips the bot's own status to degraded (the
+    // engine is a different process — folding it into `reasons` could trip
+    // the site's BOT-DOWN watchdog for something that isn't the bot).
+    let limitCloseEngine = null;
+    try {
+      const r = await query(
+        `SELECT last_tick_at, last_tick_status, armed_count
+           FROM engine_heartbeats
+          WHERE id = 1 AND service = 'limit_close_watcher'`,
+      );
+      if (r.rows[0]) {
+        const ageMs = now - new Date(r.rows[0].last_tick_at).getTime();
+        const stale = ageMs > 5 * 60_000; // matches engine-heartbeat-watcher WARN tier
+        limitCloseEngine = {
+          state: stale ? "stale" : (r.rows[0].last_tick_status === "ok" ? "ok" : "degraded"),
+          last_tick_at: r.rows[0].last_tick_at,
+          last_tick_status: r.rows[0].last_tick_status,
+          armed_count: r.rows[0].armed_count,
+          age_ms: ageMs,
+        };
+      } else {
+        limitCloseEngine = { state: "no_heartbeat", detail: "engine service has not written a heartbeat row yet" };
+      }
+    } catch (err) {
+      // Table might not exist on an old DB, or a transient read error —
+      // never let this break the health response.
+      limitCloseEngine = { state: "unknown", detail: err.message?.slice(0, 100) };
+    }
+
     const failing = reasons.length > 0;
     res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -1981,6 +2016,7 @@ async function router(req, res) {
       startedAt: hb.startedAt,
       heartbeats: hb.services,
       v4_feeds: v4Feeds,
+      limit_close_engine: limitCloseEngine,
     }));
   }
 
