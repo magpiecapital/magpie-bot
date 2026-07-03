@@ -1593,6 +1593,37 @@ async function handleProtocolPulse() {
          AS liquidations_24h
      FROM loans`,
   );
+  // Per-version breakdown of ACTIVE loans — "how much value is on-loan in each
+  // deployed program." Useful for the site /stats and for audit-scope / risk-per-
+  // program decisions (each version is a separate program custodying its own funds).
+  const VERSION_LABELS = {
+    "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh": "V1 (memecoin)",
+    "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe": "V2 (deprecated)",
+    "B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP": "V3 (RWA)",
+    "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo": "V4 (in-vault)",
+  };
+  let byVersion = [];
+  try {
+    const { rows } = await query(
+      `SELECT program_id,
+              COUNT(*) FILTER (WHERE status = 'active')::int AS active_loans,
+              COALESCE(SUM(CASE WHEN status = 'active'
+                                 THEN loan_amount_lamports::numeric ELSE 0 END), 0)::text
+                AS active_borrowed_lamports
+         FROM loans
+        WHERE program_id IS NOT NULL
+        GROUP BY program_id`,
+    );
+    byVersion = rows
+      .map((r) => ({
+        program_id: r.program_id,
+        version: VERSION_LABELS[r.program_id] || "unknown",
+        active_loans: r.active_loans,
+        active_borrowed_sol: Number(r.active_borrowed_lamports) / 1e9,
+      }))
+      .filter((v) => v.active_loans > 0)
+      .sort((a, b) => b.active_borrowed_sol - a.active_borrowed_sol);
+  } catch { /* non-fatal — omit the breakdown if this query errors */ }
   return {
     status: 200,
     body: {
@@ -1603,6 +1634,7 @@ async function handleProtocolPulse() {
       borrowed_24h_sol: Number(agg.borrowed_24h_lamports) / 1e9,
       repays_24h: agg.repays_24h,
       liquidations_24h: agg.liquidations_24h,
+      by_version: byVersion,
       generated_at: new Date().toISOString(),
     },
   };
