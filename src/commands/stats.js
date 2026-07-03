@@ -482,7 +482,10 @@ export async function handleStats(ctx) {
             ...(defaultsAwaitingDistribution > 0n || defaultsAwaitingDistributionCount > 0
               ? [row("Pending distribute", `${defaultsAwaitingDistributionCount} (${fmtSol(defaultsAwaitingDistribution.toString())} SOL)`)] : []),
             ...(magpieBurnPendingCount > 0 || magpieBurnedCount > 0
-              ? [row("$MAGPIE burns", `${magpieBurnedCount} done / ${magpieBurnPendingCount} pending`)] : []),
+              ? [row("$MAGPIE defaults",
+                  magpieBurnPendingCount === 0
+                    ? `${magpieBurnedCount} — all burned 1:1 ✓`
+                    : `${magpieBurnedCount} burned / ${magpieBurnPendingCount} awaiting burn`)] : []),
           ]
         : []),
       // ── AUTO-SELL FEES (limit-close fires) ─────────────────────
