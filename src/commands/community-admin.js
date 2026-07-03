@@ -421,7 +421,7 @@ export async function handleCommunityCrosspost(ctx) {
   const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
   if (!arg) {
     return ctx.reply(
-      "Usage: `/crosspost <tweet-url>` — must be a https://x.com/MagpieLoans/status/... URL.\n\n" +
+      "Usage: `/crosspost <tweet-url>` — any https://x.com/<handle>/status/... URL (Magpie's or anyone's).\n\n" +
       "Posts the tweet to every enabled community chat with a Pip-flavored engagement prompt. " +
       "Telegram's OG-card preview renders the tweet content inline automatically.",
       { parse_mode: "Markdown" },
