@@ -390,7 +390,7 @@ bot.command("pools", handleHolderPool); // alias
 // the handlers ensures it does nothing in groups that haven't opted in.
 import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
-import { handleBurnConfirm, handleBurnRecord, handleBurnStats } from "./commands/burn-admin.js";
+import { handleBurnConfirm, handleBurnRecord, handleBurnStats, handleBurnPending } from "./commands/burn-admin.js";
 import { handleVote, handleVotingPower } from "./commands/vote.js";
 import {
   handleNominate,
@@ -537,6 +537,8 @@ bot.command("burn-record", handleBurnRecord);
 bot.command("burn_record", handleBurnRecord);
 bot.command("burn-stats", handleBurnStats);
 bot.command("burn_stats", handleBurnStats);
+bot.command("burn-pending", handleBurnPending);
+bot.command("burn_pending", handleBurnPending);
 
 // Public voter-engagement commands
 bot.command("vote", handleVote);
