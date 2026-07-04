@@ -169,10 +169,11 @@ export async function handleStats(ctx) {
       if (hp?.accr) holderAccrued = BigInt(hp.accr);
     } catch { /* table absent in old deploys */ }
     try {
-      // SOL LPs = THIRD-PARTY net (operator's exempt lender wallet taken out) —
-      // gross pool × (non-exempt LP weight / total weight), weight = shares ×
-      // seconds_held. Mirrors the distributor + magpie.capital/stats so every
-      // surface shows the same number. See feedback_lender_wallet_exempt_from_lp_loyalty.
+      // SOL LPs = THIRD-PARTY net (operator's exempt lender wallet taken out of
+      // BOTH numerator AND denominator, 2026-07-04) — the third-party LPs split
+      // the FULL pool: gross pool × (non-exempt weight / non-exempt weight).
+      // Mirrors the distributor + magpie.capital/stats so every surface shows
+      // the same number. See feedback_lender_wallet_exempt_from_lp_loyalty.
       const { rows: [lp] } = await query(
         `SELECT COALESCE(
            (SELECT accrued_lamports FROM lp_loyalty_pool WHERE id = 1)::numeric
@@ -184,7 +185,8 @@ export async function handleStats(ctx) {
                / NULLIF(
                (SELECT SUM(shares * EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)))
                   FROM lp_positions
-                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0), 0)
+                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0
+                   AND wallet_address NOT IN (SELECT wallet_address FROM lp_loyalty_exempt_wallets)), 0)
              , 1)
          , 0)::bigint::text AS accr`,
       );

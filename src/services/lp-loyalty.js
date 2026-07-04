@@ -391,11 +391,10 @@ export async function snapshotAndDistributeLpLoyalty() {
   await syncOnChainPositions();
 
   // Distributor (REWARDS_DISTRIBUTOR_PRIVATE_KEY, fallback LENDER_PRIVATE_KEY).
-  // NOTE: the balance pre-flight is DEFERRED until after allocatedSum is known
-  // (below). Exempt wallets (the operator's ~96% LP seed) stay in the
-  // denominator so only the third-party slice is actually paid; gating here on
-  // the FULL pool would wrongly skip a correctly-sized run whenever most LP
-  // weight is the operator's exempt seed. We check against the real payout.
+  // NOTE: the balance pre-flight is DEFERRED until after the payout is known
+  // (below). Exempt wallets are excluded from the denominator, so the third-
+  // party LPs split ~the FULL pool — the deferred check gates on that real
+  // payout (previewAlloc), which is what the distributor must actually cover.
   const distributor = getRewardsDistributorKeypair();
   const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
 
@@ -430,15 +429,15 @@ export async function snapshotAndDistributeLpLoyalty() {
 
   // Compute weights.
   //
-  // EXEMPT WALLETS STAY IN THE DENOMINATOR but are NOT paid (operator decision
-  // 2026-06-25, "calculate the figure with my share taken out"). The operator's
-  // lender wallet is ~96% of LP weight; if it were dropped from the denominator
-  // too, the remaining third-party LPs would be re-normalized onto the FULL pool
-  // (a ~26x windfall over what they earned). Instead, each third-party LP gets
-  // ONLY its own proportional share (weight / totalWeight × pool), and the exempt
-  // wallet's proportional slice is left UNDISTRIBUTED — the pool is decremented by
-  // allocatedSum (below), so that slice carries forward in lp_loyalty_pool.
-  // See [[feedback_lender_wallet_exempt_from_lp_loyalty]].
+  // EXEMPT WALLETS ARE REMOVED FROM THE DENOMINATOR ENTIRELY (operator decision
+  // 2026-07-04, SUPERSEDING the 2026-06-25 "stay in the denominator, forgo the
+  // slice" model). The operator funds LP from an exempt seed wallet (~79% of LP
+  // weight) and wants that seed CUT OUT so the third-party LPs split the FULL
+  // pool — i.e. the real LP providers receive the entire intended 10%-of-fees
+  // budget instead of being diluted by the operator's seed. Each third-party LP
+  // now gets weight / (third-party-only totalWeight) × pool, so their combined
+  // payout ≈ the whole pool and NOTHING is forgone. This ~4.7x's each real LP's
+  // cut vs the prior model. See [[feedback_lender_wallet_exempt_from_lp_loyalty]].
   let totalWeight = 0n;
   const items = [];
   for (const r of rows) {
@@ -447,17 +446,17 @@ export async function snapshotAndDistributeLpLoyalty() {
     if (seconds <= 0n) continue; // brand-new deposits get no loyalty this round
     const weight = shares * seconds;
     if (weight <= 0n) continue;
-    totalWeight += weight; // exempt counts toward the denominator…
-    if (exempt.has(r.wallet_address)) continue; // …but receives no payout row
+    if (exempt.has(r.wallet_address)) continue; // exempt: excluded from BOTH the denominator AND any payout
+    totalWeight += weight; // only third-party weight → the pool is split among real LPs only
     items.push({ wallet: r.wallet_address, shares, seconds, weight });
   }
   if (totalWeight === 0n || items.length === 0) return null;
 
-  // Deferred pre-flight: gate on the ACTUAL third-party payout (allocatedSum),
-  // not the full pool. Exempt seed stays in the denominator, so the real spend
-  // is (sum of third-party weight / totalWeight) × pool — typically a small
-  // slice. Requiring the full pool here was an over-block that stranded
-  // correctly-sized runs. [[feedback_lender_wallet_exempt_from_lp_loyalty]]
+  // Deferred pre-flight: gate on the ACTUAL payout (previewAlloc). With exempt
+  // wallets excluded from totalWeight, the third-party LPs split ~the whole
+  // pool, so the distributor must hold ~the full pool + reserve. We compute the
+  // real figure rather than assume, so rounding never over- or under-blocks.
+  // [[feedback_lender_wallet_exempt_from_lp_loyalty]]
   let previewAlloc = 0n;
   for (const it of items) previewAlloc += (pool * it.weight) / totalWeight;
   if (previewAlloc <= 0n) return null;
@@ -518,11 +517,11 @@ export async function snapshotAndDistributeLpLoyalty() {
               next_distribution_at = NOW() + ($2 || ' milliseconds')::interval,
               updated_at = NOW()
         WHERE id = 1`,
-      // Decrement by the FULL snapshotted pool, NOT just the third-party
-      // allocatedSum: the operator-exempt slice is FORGONE on distribution so
-      // the LP "rewards snapshot" resets to ~0 (like the holder pool) instead
-      // of carrying the exempt slice forward as a phantom figure. Only accruals
-      // that landed AFTER the snapshot (concurrent borrow fees) carry forward.
+      // Decrement by the FULL snapshotted pool. With exempt wallets excluded
+      // from the denominator, the third-party LPs are paid ~the whole pool, so
+      // the decrement matches the actual payout and the LP "rewards snapshot"
+      // resets to ~0. Only accruals that landed AFTER the snapshot (concurrent
+      // borrow fees) carry forward.
       [pool.toString(), Math.floor(nextDelay).toString()],
     );
 
