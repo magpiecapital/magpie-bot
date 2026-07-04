@@ -723,7 +723,7 @@ const VIBE_ROTATORS = [
   // 8. Safety reminder (rotates with the four-handle trust line)
   () => `🛡 Quick reminder: Magpie has *exactly four* official accounts. Anyone else claiming to be us is a scammer. Verify at magpie.capital/links.`,
   // 9. Two-surface reminder
-  () => `📲 Two Magpies: *@magpie\\_capital\\_bot* (your private wallet) and *@magpietalk* (this community). No DM support. No airdrops. No surprises.`,
+  () => `📲 Two Magpies: \`@magpie_capital_bot\` (your private wallet) and \`@magpietalk\` (this community). No DM support. No airdrops. No surprises.`,
   // 10. Lifetime repaid milestone
   (s) => `✅ *${s.repaid}* loans repaid lifetime. Zero LP losses. Every flow on-chain.`,
 ];
