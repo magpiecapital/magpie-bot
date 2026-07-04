@@ -339,10 +339,11 @@ export async function handleLinkStatus(req, url) {
       };
     }
 
-    // ?ref=CODE on the request URL credits the referrer when we
-    // create the user. Sanitize to uppercase alphanumerics only.
+    // ?ref=CODE on the request URL credits the referrer when we create the
+    // user. Sanitize to the vanity-code charset (3–20, letters/numbers/_/-),
+    // stored upper-cased to match the case-insensitive resolver.
     const refRaw = url.searchParams.get("ref");
-    const refCode = refRaw && /^[A-Z0-9]{4,16}$/i.test(refRaw)
+    const refCode = refRaw && /^[A-Za-z0-9_-]{3,20}$/.test(refRaw)
       ? refRaw.toUpperCase()
       : null;
     try {
