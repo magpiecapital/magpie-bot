@@ -76,6 +76,7 @@ export async function handleRefer(ctx) {
     kb.text(`💸 Claim ${fmtSol(summary.claimable_lamports)} SOL`, "refer:claim").row();
   }
 
+  kb.text("✏️ Set custom code", "refer:setcode").row();
   kb.text("🏠 Home", "start:home");
 
   await ctx.reply(lines.join("\n"), {
@@ -122,6 +123,27 @@ export async function handleReferSet(ctx) {
 }
 
 export function registerReferCallbacks(bot) {
+  // Guided "set a custom code" — walks the user through it on a tap.
+  bot.callbackQuery("refer:setcode", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply(
+      [
+        "✏️ *Set your custom referral code*",
+        "",
+        "Just send me this (fill in your nickname):",
+        "`/refer set yourname`",
+        "",
+        "Example: `/refer set moon` → your link becomes",
+        "`t.me/" + BOT_USERNAME + "?start=MOON`  (and `magpie.capital?ref=moon`)",
+        "",
+        "Rules: 3–20 characters · letters, numbers, `_` or `-` · must be unique · changeable once every 7 days.",
+        "",
+        "Prefer the website? You can also set it in the *Referrals* card on magpie.capital/dashboard — type it in and sign with your wallet.",
+      ].join("\n"),
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  });
+
   bot.callbackQuery("refer:claim", async (ctx) => {
     await ctx.answerCallbackQuery();
 
