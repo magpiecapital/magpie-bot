@@ -39,7 +39,7 @@ const RULES = [
     key: "impersonation_cluster",
     windowMin: 30,
     threshold: 3,
-    actions: ["warn_impersonation_join", "flag_impersonation_msg"],
+    actions: ["ban_impersonator_join", "ban_impersonator", "warn_impersonation_join", "flag_impersonation_msg"],
     label: (n) => `🕵️ *Impersonation cluster*: ${n} accounts with admin/support/team-style names in the last 30 min — coordinated push`,
   },
 ];
