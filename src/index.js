@@ -262,6 +262,26 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+// Pinned-message awareness: capture pin events so Pip treats operator
+// announcements (e.g. "we chose Sec3") as current authoritative state and
+// never gives a stale answer. Fire-and-forget; always continues the chain.
+bot.use(async (ctx, next) => {
+  const pm = ctx.msg?.pinned_message;
+  if (pm && ctx.chat?.id) {
+    import("./services/community-pins.js")
+      .then(({ recordPinnedMessage }) =>
+        recordPinnedMessage({
+          chatId: ctx.chat.id,
+          messageId: pm.message_id,
+          text: pm.text || pm.caption || "",
+          pinnedBy: ctx.from?.username || String(ctx.from?.id || ""),
+        }),
+      )
+      .catch(() => {});
+  }
+  return next();
+});
+
 // User commands
 bot.command("start", handleStart);
 bot.command("deposit", handleDeposit);
@@ -745,6 +765,9 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
+    // Seed current pinned messages so Pip is aware of announcements pinned
+    // while the bot was offline (Telegram doesn't re-send pin events on boot).
+    import("./services/community-pins.js").then((m) => m.seedPinsForEnabledChats(bot.api)).catch(() => {});
     // Token-catalog → @MagpieLoans auto-announce — reconciliation worker that
     // diffs supported_mints.enabled and tweets when a token is added/removed
     // from the approved-collateral catalog (the /tokens page). No-op posting

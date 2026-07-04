@@ -439,6 +439,17 @@ export async function answerGroupQuestion(question, opts = {}) {
   const snap = await getProtocolSnapshot();
   const extraSystem = formatSnapshotForPrompt(snap);
 
+  // Pinned-announcement awareness: the operator's pinned posts are CURRENT,
+  // authoritative state — inject them so Pip never contradicts what the
+  // community has already seen the operator announce (e.g. "we chose Sec3").
+  let pinnedSystem = "";
+  if (opts.chatId) {
+    try {
+      const { getPinnedContext } = await import("./community-pins.js");
+      pinnedSystem = await getPinnedContext(opts.chatId);
+    } catch { /* non-fatal */ }
+  }
+
   // Build the user-turn content. If we have a repliedTo, prepend it as
   // visible context so the model can react to a reaction without asking
   // "which one?". 1500-char hard cap on the context too — same shape as
@@ -468,6 +479,7 @@ export async function answerGroupQuestion(question, opts = {}) {
         system: [
           { type: "text", text: GROUP_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
           { type: "text", text: extraSystem },
+          ...(pinnedSystem ? [{ type: "text", text: pinnedSystem }] : []),
         ],
         messages: [{ role: "user", content: userContent }],
       }),
