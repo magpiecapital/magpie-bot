@@ -99,7 +99,8 @@ import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
-import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
+import { handleRefer, handleReferSet, registerReferCallbacks } from "./commands/refer.js";
+import { handleAudit } from "./commands/audit.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
 import { handleDistributions } from "./commands/distributions.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
@@ -228,6 +229,59 @@ const bot = new Bot(token);
 
 bot.use(rateLimit());
 
+// ── DM-only guard for account-scoped commands ──────────────────────────
+// Personal wallet / loan / security actions must run ONLY in the user's
+// private 1:1 chat with the bot — never in the Magpie Talk community group
+// (which is a public forum for chat + protocol questions with Pip).
+// Operator-mandated 2026-07-03 after a /lock ran in the group and posted a
+// personal security notice publicly. Read-only/community/info commands
+// (/stats, /price, /audit, /refer, etc.) are intentionally NOT gated.
+const DM_ONLY_COMMANDS = new Set([
+  "deposit", "borrow", "repay", "partialrepay", "reborrow", "withdraw",
+  "topup", "extend", "lock", "autoprotect", "protect", "tp", "sl",
+  "export", "exportdata", "import", "wallet", "wallets", "switchwallet",
+  "signedhistory", "me", "positions", "loans", "history",
+]);
+bot.use(async (ctx, next) => {
+  const text = ctx.message?.text || "";
+  const m = text.match(/^\/([a-z_]+)(?:@\w+)?/i);
+  if (
+    m &&
+    ctx.chat?.type &&
+    ctx.chat.type !== "private" &&
+    DM_ONLY_COMMANDS.has(m[1].toLowerCase())
+  ) {
+    await ctx
+      .reply(
+        "🔒 That's a personal wallet command — for your security it only works in our private 1:1 chat. Open your Magpie wallet: DM @magpie_capital_bot.\n\nMagpie Talk is for community chat + protocol questions with Pip. 🐦‍⬛",
+        { disable_web_page_preview: true },
+      )
+      .catch(() => {});
+    return; // stop — never run an account command in a group
+  }
+  return next();
+});
+
+// Pinned-message awareness: capture pin events so Pip treats operator
+// announcements (e.g. "we chose Sec3") as current authoritative state and
+// never gives a stale answer. Fire-and-forget; always continues the chain.
+bot.use(async (ctx, next) => {
+  const pm = ctx.msg?.pinned_message;
+  if (pm && ctx.chat?.id) {
+    import("./services/community-pins.js")
+      .then(({ recordPinnedMessage }) =>
+        recordPinnedMessage({
+          chatId: ctx.chat.id,
+          messageId: pm.message_id,
+          text: pm.text || pm.caption || "",
+          pinnedBy: ctx.from?.username || String(ctx.from?.id || ""),
+        }),
+      )
+      .catch(() => {});
+  }
+  return next();
+});
+
 // User commands
 bot.command("start", handleStart);
 bot.command("deposit", handleDeposit);
@@ -290,6 +344,9 @@ bot.command("potential", handleUnlock); // alias
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
+bot.command("setref", handleReferSet); // claim a custom vanity referral code
+bot.command("refcode", handleReferSet); // alias
+bot.command("audit", handleAudit); // public audit status (Sec3 engaged for V4)
 bot.command("holders", handleHolders);
 bot.command("holder", handleHolders); // alias
 bot.command("distributions", handleDistributions);
@@ -708,6 +765,9 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
+    // Seed current pinned messages so Pip is aware of announcements pinned
+    // while the bot was offline (Telegram doesn't re-send pin events on boot).
+    import("./services/community-pins.js").then((m) => m.seedPinsForEnabledChats(bot.api)).catch(() => {});
     // Token-catalog → @MagpieLoans auto-announce — reconciliation worker that
     // diffs supported_mints.enabled and tweets when a token is added/removed
     // from the approved-collateral catalog (the /tokens page). No-op posting
