@@ -6,10 +6,10 @@
  *
  * payableOwed = holderOwed + lpThirdPartyNet — the ONLY two pools that pay
  * OUT of CHCAM and decrement on payout. LP uses the THIRD-PARTY-NET figure
- * (operator-exempt seed removed from the numerator, kept in the denominator)
- * so the funded native exactly matches what actually leaves CHCAM and what
- * every surface shows. protocol_reserve + referrals are EXCLUDED — they never
- * pay out of CHCAM.
+ * (operator-exempt seed removed from BOTH the numerator AND the denominator, as
+ * of 2026-07-04) so the third-party LPs split the FULL pool and the funded
+ * native exactly matches what actually leaves CHCAM and what every surface
+ * shows. protocol_reserve + referrals are EXCLUDED — they never pay out of CHCAM.
  *
  * One single-snapshot SQL read so the three independently-timed callers can't
  * tear across a concurrent pool decrement.
@@ -36,9 +36,9 @@ export async function readPayableOwed() {
     holderOwed = 0n; // table absent in old deploys → treat as 0
   }
 
-  // LP gross + third-party-NET in ONE query. Mirrors src/commands/stats.js
-  // (the displayed "SOL LPs") exactly: gross pool × (non-exempt weight /
-  // total weight), weight = shares × seconds_held.
+  // LP gross + third-party-NET in ONE query. gross pool × (non-exempt weight /
+  // non-exempt weight) = the FULL pool to the third-party LPs (exempt seed
+  // excluded from both sides), weight = shares × seconds_held.
   let lpGross = 0n;
   let lpThirdPartyNet = 0n;
   try {
@@ -55,7 +55,8 @@ export async function readPayableOwed() {
                / NULLIF(
                (SELECT SUM(shares * EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)))
                   FROM lp_positions
-                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0), 0)
+                 WHERE shares > 0 AND EXTRACT(EPOCH FROM (NOW() - weighted_deposit_at)) > 0
+                   AND wallet_address NOT IN (SELECT wallet_address FROM lp_loyalty_exempt_wallets)), 0)
              , 1)
          , 0)::bigint::text AS net`,
     );
