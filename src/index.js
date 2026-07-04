@@ -241,6 +241,10 @@ const DM_ONLY_COMMANDS = new Set([
   "topup", "extend", "lock", "autoprotect", "protect", "tp", "sl",
   "export", "exportdata", "import", "wallet", "wallets", "switchwallet",
   "signedhistory", "me", "positions", "loans", "history",
+  // Agent-delegation commands are account-scoped (they authorize a delegate to
+  // act on the caller's wallet) — NEVER let them run in a public group, where a
+  // copy-pasted /agent_authorize could silently grant an attacker's key access.
+  "agent_authorize", "agent_revoke", "agent_list",
 ]);
 bot.use(async (ctx, next) => {
   const text = ctx.message?.text || "";

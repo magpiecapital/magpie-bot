@@ -34,6 +34,7 @@ export async function handleRepay(ctx) {
      FROM loans l
      LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
      WHERE l.status = 'active'
+       AND COALESCE(l.suspended, FALSE) = FALSE
        AND (l.user_id = $1
             OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $1))
      ORDER BY l.due_timestamp ASC`,
@@ -126,6 +127,7 @@ export function registerRepayCallbacks(bot) {
        FROM loans l
        LEFT JOIN supported_mints sm ON sm.mint = l.collateral_mint
        WHERE l.id = $1 AND l.status = 'active'
+         AND COALESCE(l.suspended, FALSE) = FALSE
          AND (l.user_id = $2
               OR l.borrower_wallet IN (SELECT public_key FROM wallets WHERE user_id = $2))`,
       [loanDbId, user.id],
