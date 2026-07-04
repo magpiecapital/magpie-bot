@@ -783,10 +783,59 @@ async function _auditTokenExtensionsUncached(mintStr) {
 
 // ─── Holder concentration ───────────────────────────────────────────────────
 
+// Operator-designated TRUSTED SUPPLY HOLDERS. Wallets in this set legitimately
+// hold a large share of many *good* tokens (protocol / market-maker / treasury
+// wallets), so their balance must NOT count against the supply-concentration
+// limits. We resolve the owner of each top token-account and subtract any owned
+// by a trusted wallet from the top-10/top-20 numerator — the concentration gate
+// then measures only the *public float*, so a big trusted position never
+// disqualifies an otherwise well-distributed token, while a scammer's
+// concentration still trips the gate normally.
+//
+// Operator-mandated 2026-07-04. Strict approval guidelines stay in force for
+// every other check; this is a narrow, deliberate carve-out.
+//
+// IMPORTANT — this repo is PUBLIC: the actual wallet addresses are NEVER
+// hardcoded here. They live in the private `screening_trusted_holders` prod
+// table (and/or the TRUSTED_SUPPLY_HOLDERS env var, comma-separated), so the
+// operator's trusted wallets aren't published or trivially trackable. Loaded
+// with a short in-process cache; fail-open (env-only, then empty) on error.
+const _TRUSTED_HOLDERS_TTL_MS = 5 * 60 * 1000;
+let _trustedHoldersCache = { at: 0, set: null };
+
+async function getTrustedSupplyHolders() {
+  const now = Date.now();
+  if (_trustedHoldersCache.set && now - _trustedHoldersCache.at < _TRUSTED_HOLDERS_TTL_MS) {
+    return _trustedHoldersCache.set;
+  }
+  const set = new Set(
+    (process.env.TRUSTED_SUPPLY_HOLDERS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  try {
+    const { rows } = await query(`SELECT wallet_address FROM screening_trusted_holders`);
+    for (const r of rows) {
+      const w = (r.wallet_address || "").trim();
+      if (w) set.add(w);
+    }
+  } catch (e) {
+    // Table missing / transient DB error → fall back to env-only (fail-open).
+    console.warn(`[screener] trusted-holders load failed: ${e.message}`);
+  }
+  _trustedHoldersCache = { at: now, set };
+  return set;
+}
+
 /**
  * Reject tokens where the top 10 holders control >40% of supply — this is
  * the classic dev-dump risk: a tiny group of wallets can crash the price
  * right after we accept the token as collateral.
+ *
+ * Holdings owned by TRUSTED_SUPPLY_HOLDERS are excluded from the numerator
+ * (see the constant above) so a large trusted stake never disqualifies an
+ * otherwise-distributed token.
  *
  * Skips tokens whose top holders are clearly pool addresses (DEX LPs are
  * expected to hold significant supply). For now we treat any holder with
@@ -819,23 +868,54 @@ async function _checkHolderConcentrationUncached(mintStr, opts = {}) {
     const total = BigInt(supplyInfo.value.amount);
     if (total === 0n) return { ok: false, reason: "zero supply" };
 
+    // Exclude any of the largest token-accounts OWNED by a trusted supply
+    // holder. getTokenLargestAccounts returns token-account addresses, not
+    // owner wallets, so we resolve owners for the (<=20) accounts and drop
+    // the trusted ones from the concentration set. Fail-open: if owner
+    // resolution errors, we simply don't exclude (original strict behavior).
+    let holders = largest.value;
+    let trustedExcluded = 0;
+    const trustedHolders = await getTrustedSupplyHolders();
+    if (trustedHolders.size > 0 && holders.length > 0) {
+      try {
+        const infos = await connection.getMultipleParsedAccounts(
+          holders.map((a) => new PublicKey(a.address)),
+          { commitment: "confirmed" },
+        );
+        const trustedAddrs = new Set();
+        (infos?.value || []).forEach((acc, i) => {
+          const owner = acc?.data?.parsed?.info?.owner;
+          if (owner && trustedHolders.has(owner)) {
+            trustedAddrs.add(holders[i].address);
+          }
+        });
+        if (trustedAddrs.size > 0) {
+          holders = holders.filter((a) => !trustedAddrs.has(a.address));
+          trustedExcluded = trustedAddrs.size;
+        }
+      } catch (e) {
+        console.warn(`[screener] trusted-holder owner resolve failed for ${mintStr}: ${e.message}`);
+      }
+    }
+
     // Solana returns up to 20 largest accounts; check both top-10 and
     // top-20 (=full set) so a scammer can't just split 90% across 11
-    // wallets to dodge the top-10 limit.
-    const top10 = largest.value.slice(0, 10);
-    const top20 = largest.value.slice(0, 20);
+    // wallets to dodge the top-10 limit. `holders` here already has any
+    // trusted-holder accounts removed, so % is measured over the public float.
+    const top10 = holders.slice(0, 10);
+    const top20 = holders.slice(0, 20);
     const sum10 = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const sum20 = top20.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const pct10 = Number((sum10 * 10000n) / total) / 100;
     const pct20 = Number((sum20 * 10000n) / total) / 100;
 
     if (pct10 > maxTop10Pct) {
-      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)` };
+      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)`, trustedExcluded };
     }
     if (pct20 > maxTop20Pct) {
-      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)` };
+      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)`, trustedExcluded };
     }
-    return { ok: true, topTenPct: pct10, topTwentyPct: pct20 };
+    return { ok: true, topTenPct: pct10, topTwentyPct: pct20, trustedExcluded };
   } catch (err) {
     // Don't block on transient RPC errors — log and let downstream checks
     // (sellability) be the safety net.
