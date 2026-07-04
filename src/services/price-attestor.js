@@ -854,15 +854,26 @@ export function startPriceAttestor(intervalMs = 30_000) {
         queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports });
       }
       for (const target of v3v4Targets) {
-        // V3 is the RWA-only program. Memecoins route V1+V4 and NEVER borrow
-        // on V3, so writing their V3 feed every tick is pure wasted SOL. Skip
-        // the explicit V3 write for EXPLICIT memecoins only — RWAs keep their
-        // V3 (via both this write and the category-default "legacy" write, so
-        // no timing change and zero risk), and anything with an unknown/null
-        // category also keeps V3 (fail-safe: never stale a feed a mint uses).
+        // V3 is the RWA-only program WHILE ROUTE_MEMECOINS_TO_V3 is off:
+        // memecoins route V1+V4 and never borrow on V3, so writing their V3
+        // feed every tick is pure wasted SOL. Skip the explicit V3 write for
+        // EXPLICIT memecoins ONLY in that mode — RWAs keep their V3 (via both
+        // this write and the category-default "legacy" write, so no timing
+        // change and zero risk), and anything with an unknown/null category
+        // also keeps V3 (fail-safe: never stale a feed a mint uses).
         // Operator-mandated 2026-07-02: cut deployer attestation spend to
         // ~1–1.5 SOL/day. [[feedback_tiered_attestation_cost_conscious]]
-        if (target.label === "V3" && category === "memecoin") continue;
+        //
+        // SECURITY (audit 2026-07-04 #4): when ROUTE_MEMECOINS_TO_V3=true,
+        // plain memecoins DO borrow on V3 (which has the on-chain TWAP V1
+        // lacks), so their V3 feed MUST be warmed or the first borrow hits
+        // TwapInsufficientHistory. Gating the skip on the flag keeps routing
+        // and attestation in lock-step — flip the env and both switch together.
+        if (
+          target.label === "V3" &&
+          category === "memecoin" &&
+          process.env.ROUTE_MEMECOINS_TO_V3 !== "true"
+        ) continue;
         const sinceLast = Date.now() - (target.lastMap.get(mint) || 0);
         if (sinceLast < MAX_GAP_MS_V4) continue;
         queue.push({ kind: "twap", mint, decimals, priceSol, target });
