@@ -1023,7 +1023,7 @@ async function maybeAnswerPipQuestion(ctx, msg, sender) {
 
   let answer;
   try {
-    answer = await answerGroupQuestion(question, { repliedTo });
+    answer = await answerGroupQuestion(question, { repliedTo, chatId: ctx.chat?.id });
   } catch (err) {
     console.warn("[community] Pip group answer failed:", err.message);
     answer = null;

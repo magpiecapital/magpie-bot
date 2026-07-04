@@ -7,7 +7,7 @@
  */
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { getOrCreateCode } from "../services/referrals.js";
+import { getOrCreateCode, setCustomCode } from "../services/referrals.js";
 import {
   getReferralSummary,
   getReferralRewardBps,
@@ -25,6 +25,13 @@ export async function handleRefer(ctx) {
   if (!tgUser) return;
 
   const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // /refer set <name> — claim a custom vanity code.
+  const args = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  if (args[0]?.toLowerCase() === "set") {
+    return applyCustomCode(ctx, user.id, args[1] || "");
+  }
+
   const code = await getOrCreateCode(user.id);
   const [summary, liveBps] = await Promise.all([
     getReferralSummary(user.id),
@@ -43,6 +50,7 @@ export async function handleRefer(ctx) {
     `\`${shareLink}\``,
     "",
     "*Your code:* `" + code + "`",
+    "_✏️ Prefer a custom code? `/refer set yourname`_",
     "",
     "*Stats:*",
     `• Invited: ${summary.referred_count} user${summary.referred_count === 1 ? "" : "s"}`,
@@ -75,6 +83,42 @@ export async function handleRefer(ctx) {
     reply_markup: kb,
     disable_web_page_preview: true,
   });
+}
+
+/** Shared logic for /refer set <name> and /setref <name>. */
+async function applyCustomCode(ctx, userId, desired) {
+  if (!desired) {
+    return ctx.reply(
+      "✏️ *Set a custom referral code*\n\n" +
+        "Usage: `/refer set yourname`\n\n" +
+        "3–20 characters — letters, numbers, `_` or `-` only. It becomes your link:\n" +
+        "`https://t.me/" + BOT_USERNAME + "?start=YOURNAME`\n" +
+        "(and `magpie.capital?ref=yourname`). You can change it once every 7 days.",
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  }
+  const res = await setCustomCode(userId, desired);
+  if (!res.ok) return ctx.reply(`❌ ${res.reason}`);
+  const link = `https://t.me/${BOT_USERNAME}?start=${res.code}`;
+  return ctx.reply(
+    [
+      "✅ *Custom referral code set!*",
+      "",
+      "*Your code:* `" + res.code + "`",
+      "*Your link:* `" + link + "`",
+      "Also works as `magpie.capital?ref=" + res.code + "` (case-insensitive).",
+    ].join("\n"),
+    { parse_mode: "Markdown", disable_web_page_preview: true },
+  );
+}
+
+/** /setref <name> — direct alias for claiming a vanity code. */
+export async function handleReferSet(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const user = await upsertUser(tgUser.id, tgUser.username);
+  const args = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  return applyCustomCode(ctx, user.id, args[0] || "");
 }
 
 export function registerReferCallbacks(bot) {

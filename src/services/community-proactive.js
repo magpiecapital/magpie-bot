@@ -356,7 +356,7 @@ async function sweepProactiveQuestions(botApi) {
       if (!q) continue;
 
       // Single Sonnet call via the existing /ask path. ~$0.005.
-      const answer = await answerGroupQuestion(q.text);
+      const answer = await answerGroupQuestion(q.text, { chatId });
       if (!answer) {
         // Fail-open: don't mark picked up so it can be retried next sweep
         // (and naturally ages out via QUESTION_MAX_AGE_MS).
