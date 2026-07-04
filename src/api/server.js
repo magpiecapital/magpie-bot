@@ -87,6 +87,7 @@ import {
 } from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
+import { handleReferralSetCode } from "./referral-set-code.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 import {
   handleGovernanceVoteSubmit,
@@ -1816,6 +1817,8 @@ const PUBLIC_ROUTES = new Set([
   // Wallets list (by-wallet read) and signed set-active.
   "/api/v1/wallets",
   "/api/v1/wallets/set-active",
+  // Signed vanity referral-code setter (site dashboard).
+  "/api/v1/referral/set-code",
   // User prefs (notifications, auto-protect). Read is wallet-keyed,
   // write is signed JSON.
   "/api/v1/prefs",
@@ -2387,6 +2390,9 @@ async function router(req, res) {
         break;
       case "/api/v1/wallets/set-active":
         result = await handleWalletsSetActive(req);
+        break;
+      case "/api/v1/referral/set-code":
+        result = await handleReferralSetCode(req);
         break;
       case "/api/v1/prefs":
         result = await handlePrefsList(req, url);
