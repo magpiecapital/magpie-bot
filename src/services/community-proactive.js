@@ -660,11 +660,15 @@ async function sweepCommandHints(botApi) {
 // 8 content rotators so 8 consecutive posts are all different. Each
 // pulls live data where applicable so the chat sees changing numbers
 // not static slogans.
+// Cadence: hourly. Community felt the old ~7min default too frequent
+// (operator-flagged 2026-07-04). Floor raised to 30min so it can never
+// regress to spammy sub-hourly without an intentional code change; env
+// var still lets the operator make it *slower* (e.g. 120 = every 2h).
 const VIBE_BASE_GAP_MS = Math.max(
-  3 * 60 * 1000,
-  Number(process.env.PIP_VIBE_GAP_MIN) * 60 * 1000 || 7 * 60 * 1000, // default ~7min
+  30 * 60 * 1000,
+  Number(process.env.PIP_VIBE_GAP_MIN) * 60 * 1000 || 60 * 60 * 1000, // default hourly
 );
-const VIBE_JITTER_MS = 3 * 60 * 1000;          // ±3min so posts don't feel robotic
+const VIBE_JITTER_MS = 8 * 60 * 1000;          // ±8min so hourly posts don't feel robotic
 const VIBE_HUMAN_QUIET_MS = 2 * 60 * 1000;     // skip if humans posted <2min ago
 const VIBE_PIP_GAP_MS = 3 * 60 * 1000;         // never within 3min of another Pip post
 const vibeChatState = new Map();               // chatId → { lastVibeAt, lastHumanAt, idx }
@@ -802,7 +806,8 @@ export function startCommunityProactive(bot) {
   console.log(
     `[proactive] starting — pickup ${Math.round(QUESTION_PICKUP_INTERVAL_MS/60000)}min (max ${DAILY_PROACTIVE_MAX}/chat/day), ` +
     `milestones ${Math.round(MILESTONE_INTERVAL_MS/60000)}min, ` +
-    `cmd hints ${Math.round(COMMAND_HINT_GAP_MS/60000)}min + ${COMMAND_HINT_MIN_MESSAGES} msgs`,
+    `cmd hints ${Math.round(COMMAND_HINT_GAP_MS/60000)}min + ${COMMAND_HINT_MIN_MESSAGES} msgs, ` +
+    `vibe ${Math.round(VIBE_BASE_GAP_MS/60000)}min ±${Math.round(VIBE_JITTER_MS/60000)}min`,
   );
   questionTimer = setInterval(() => {
     sweepProactiveQuestions(bot.api).catch((err) =>
@@ -820,8 +825,8 @@ export function startCommunityProactive(bot) {
     );
   }, COMMAND_HINT_INTERVAL_MS);
   // Vibe poster — checks every minute, posts only when gap + quiet-chat
-  // + no-recent-Pip-post conditions all met. Default cadence ~7min,
-  // configurable via PIP_VIBE_GAP_MIN env var (minimum 3).
+  // + no-recent-Pip-post conditions all met. Default cadence hourly,
+  // configurable via PIP_VIBE_GAP_MIN env var (minimum 30).
   vibeTimer = setInterval(() => {
     sweepVibePosts(bot.api).catch((err) =>
       console.error("[proactive] vibe sweep failed:", err.message),
