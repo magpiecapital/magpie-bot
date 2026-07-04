@@ -92,8 +92,16 @@ export const CAPTCHA_TIMEOUT_MS = 5 * 60 * 1000;
 // Named Magpie protocol personas that must never be impersonated (e.g.
 // "MagpieMatt"). Env-extensible (comma-separated PROTECTED_PERSONA_NAMES) so a
 // new persona can be protected without a code change; "matt" is the default.
-const PROTECTED_PERSONA_NAMES = (process.env.PROTECTED_PERSONA_NAMES || "matt")
-  .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean);
+// Baseline personas are ALWAYS protected. The env var can ADD to them but must
+// never be able to REPLACE/drop them — a stale or partial PROTECTED_PERSONA_NAMES
+// silently un-protecting "matt" is exactly how a "Magpie Matt" impersonator can
+// slip through (operator-flagged 2026-07-04). So we UNION baseline + env.
+const PERSONA_BASELINE = ["matt"];
+const PROTECTED_PERSONA_NAMES = [...new Set([
+  ...PERSONA_BASELINE,
+  ...(process.env.PROTECTED_PERSONA_NAMES || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+])];
 const PERSONA_ALT = (PROTECTED_PERSONA_NAMES.length ? PROTECTED_PERSONA_NAMES : ["matt"]).join("|");
 
 export const IMPERSONATION_PATTERNS = [
@@ -432,6 +440,90 @@ export function isAllowedUrl(rawUrl) {
 
 /* ──────────────────── IMPERSONATION + SCAM ───────────────────── */
 
+// ── Fuzzy brand-lookalike layer (operator-mandated 2026-07-04) ───────────────
+// The literal-"magpie" IMPERSONATION_PATTERNS above only match the EXACT string
+// "magpie" (after homoglyph folding). They MISS deliberate misspellings and
+// transpositions the operator called out — "Mapgie", "Magpei", "Mgpie" — plus
+// doubled letters ("Maggpie") and separators the despace pass doesn't strip
+// (zero-width, emoji). This layer collapses the name to bare a-z0-9 and
+// fuzzy-matches the brand root, catching lookalikes too.
+//
+// HIGH-PRECISION so real members are safe: a fuzzy brand hit is a ban ONLY when
+// (A) the whole name is an exact letter-scramble of the brand (an anagram — a
+// real word almost never is), or (B/C) the lookalike sits next to a staff/
+// persona role word. A lone near-miss like "Maggie" is NOT banned. Residual
+// false positives self-heal via the instant /appeal flow.
+const BRAND_ROOT = "magpie";
+const _BRAND_SORTED = BRAND_ROOT.split("").sort().join("");
+const IMPERSONATION_ROLE_WORDS = new Set([
+  ...PROTECTED_PERSONA_NAMES,
+  "support", "admin", "team", "mod", "moderator", "official", "help", "helpdesk",
+  "staff", "service", "founder", "owner", "ceo", "cto", "dev", "developer",
+  "customer", "talk", "news", "announce", "announcement", "announcements", "bot",
+  "capital", "loans", "loan", "lending", "finance", "labs", "lab",
+]);
+
+function collapseToAlnum(s) {
+  return foldConfusables(normalizeUnicode(s || "")).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function alnumTokens(s) {
+  return foldConfusables(normalizeUnicode(s || "")).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+// Bounded Damerau-Levenshtein (adjacent transposition counts as 1 edit).
+function damerau(a, b) {
+  const al = a.length, bl = b.length;
+  if (Math.abs(al - bl) > 2) return 3;
+  const d = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+  for (let i = 0; i <= al; i++) d[i][0] = i;
+  for (let j = 0; j <= bl; j++) d[0][j] = j;
+  for (let i = 1; i <= al; i++) {
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[al][bl];
+}
+// An exact letter-scramble of the brand — very high signal it's deliberate.
+function isBrandAnagram(tok) {
+  return tok.length === BRAND_ROOT.length && tok !== BRAND_ROOT &&
+    tok.split("").sort().join("") === _BRAND_SORTED;
+}
+// A near-miss of the brand (<=1 edit or an anagram). Used ONLY alongside a role
+// word (except the anagram case) so real names like "Maggie" are never banned.
+function isBrandLookalike(tok) {
+  if (tok.length < 5 || tok.length > 8) return false;
+  if (tok === BRAND_ROOT) return true;
+  if (isBrandAnagram(tok)) return true;
+  return damerau(tok, BRAND_ROOT) <= 1;
+}
+
+/** Fuzzy impersonation catch — deliberate brand misspellings / lookalikes that
+ *  the exact IMPERSONATION_PATTERNS miss (e.g. "Mapgie", "Magpei Admin"). */
+export function isBrandLookalikeImpersonation(user) {
+  if (!user) return false;
+  const combined = [user.username || "", user.first_name || "", user.last_name || ""]
+    .filter(Boolean).join(" ");
+  const full = collapseToAlnum(combined);
+  if (!full) return false;
+  // (A) whole collapsed name is a brand scramble → deliberate ("Mapgie","Magpei").
+  if (isBrandAnagram(full)) return true;
+  // (B) collapsed name is <lookalike-brand><role> or <role><lookalike-brand>
+  //     ("mapgiematt", "magpesupport", "adminmagpe") — defeats zero-width spacing.
+  for (const role of IMPERSONATION_ROLE_WORDS) {
+    if (role.length < 2 || full.length <= role.length) continue;
+    if (full.endsWith(role) && isBrandLookalike(full.slice(0, full.length - role.length))) return true;
+    if (full.startsWith(role) && isBrandLookalike(full.slice(role.length))) return true;
+  }
+  // (C) token level: a lookalike-brand token AND a separate role token.
+  const toks = alnumTokens(combined);
+  if (toks.some(isBrandLookalike) && toks.some((t) => IMPERSONATION_ROLE_WORDS.has(t))) return true;
+  return false;
+}
+
 export function isImpersonationName(user) {
   if (!user) return false;
   // Test raw + unicode-normalized + homoglyph-folded + despaced + combined-field
@@ -442,6 +534,8 @@ export function isImpersonationName(user) {
       if (re.test(c)) return true;
     }
   }
+  // Fuzzy layer — deliberate misspellings / lookalikes ("Mapgie", "Magpei Admin").
+  if (isBrandLookalikeImpersonation(user)) return true;
   return false;
 }
 

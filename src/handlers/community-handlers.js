@@ -165,21 +165,39 @@ async function handleNewMembers(ctx) {
       // their appeal invite is not re-shamed on join or captcha-kicked again.
       if (await isUserCleared(ctx.chat.id, m.id, nameKey(m))) continue;
 
-      // Impersonation check on join — fastest way to catch
-      // fake-support accounts.
+      // Impersonation check on join — BAN immediately, don't just warn.
+      // Impersonation IS the attack (there's no legitimate reason to join
+      // named "Magpie Matt" / "Mapgie Support"), so we remove them BEFORE
+      // they can post a single scam message — closing the join→first-post
+      // window (and the case where the bot misses the first message during a
+      // restart). Verified accounts + appeal-cleared users are already exempt
+      // (isVerifiedAccount here; isUserCleared checked at the top of the loop).
+      // False positives recover instantly via the /appeal path in softWarn.
       if (isImpersonationName(m) && !isVerifiedAccount(m)) {
+        try { await ctx.api.banChatMember(ctx.chat.id, m.id); }
+        catch (err) { console.warn("[community] impersonator join-ban failed:", err.message); }
         await recordModAction(
-          ctx.chat.id, m.id, "warn_impersonation_join",
-          "name contains impersonation pattern",
+          ctx.chat.id, m.id, "ban_impersonator_join",
+          "name matches impersonation pattern (banned on join)",
           JSON.stringify({ username: m.username, first: m.first_name, last: m.last_name }),
         );
+        await softWarn(
+          ctx, m.id,
+          `You were removed from the Magpie community because your name matched our Magpie-staff impersonation filter.\n\n` +
+          `If you're a real member and this was a mistake, reply /appeal and Pip will review it instantly and let you back in if it was wrong.`,
+        );
         try {
-          await ctx.api.sendMessage(
-            ctx.chat.id,
-            `⚠️ *Heads up:* a new account named "${m.first_name || m.username}" just joined and uses a name that resembles official Magpie support. Never DM strangers about your wallet. The only official account is @magpie_capital_bot.`,
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            { api: ctx.api },
+            `🛡 *Magpie impersonator banned on JOIN*\n\n` +
+            `*Name:* ${m.username ? `@${m.username}` : (m.first_name || m.id)}\n` +
+            `*ID:* \`${m.id}\`\n\n` +
+            `Removed before they could post. \`/unban ${m.id}\` if a false positive.`,
             { parse_mode: "Markdown" },
           );
-        } catch { /* permission issue — skip */ }
+        } catch { /* silent */ }
+        continue; // banned — don't captcha-challenge them
       }
 
       // Captcha. Post it IN THE GROUP so the new member can actually SEE
