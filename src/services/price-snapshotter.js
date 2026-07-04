@@ -26,9 +26,18 @@ const PRUNE_AFTER_HOURS = Math.max(
   1,
   Number(process.env.PRICE_SNAPSHOT_PRUNE_HOURS) || 24,
 );
+// Must cover EVERY eligible mint each tick. The old default of 50 (with
+// `ORDER BY mint LIMIT 50` and no rotation) silently dropped every mint past
+// the 50th alphabetically — ~124 of 174 eligible mints never got a snapshot,
+// which PERMANENTLY fail-opened the off-chain TWAP pump-guard for them
+// (getTrailingPriceStats needs >=5 samples in a 30-min window; anti-exploit.js
+// skips the check when it returns null). A mint also needs a snapshot roughly
+// every <=6 min to accumulate 5 samples in the window, so partial rotation is
+// not enough — we snapshot the WHOLE eligible set every tick. High ceiling is
+// a runaway backstop, not a working limit; run() logs if it's ever hit.
 const MAX_MINTS_PER_TICK = Math.max(
   1,
-  Number(process.env.PRICE_SNAPSHOT_MAX_MINTS_PER_TICK) || 50,
+  Number(process.env.PRICE_SNAPSHOT_MAX_MINTS_PER_TICK) || 1000,
 );
 
 const DISABLED = process.env.PRICE_SNAPSHOTTER_DISABLED === "true";
@@ -45,6 +54,15 @@ async function fetchMintsToSnapshot() {
       LIMIT $1`,
     [MAX_MINTS_PER_TICK],
   );
+  if (rows.length >= MAX_MINTS_PER_TICK) {
+    // Truncation would silently re-disable the off-chain TWAP guard for the
+    // dropped mints — surface it loudly instead of failing open in the dark.
+    console.warn(
+      `[price-snapshotter] eligible mints hit the ${MAX_MINTS_PER_TICK} cap — ` +
+      `mints past the cap get NO snapshots (off-chain TWAP fail-opens for them). ` +
+      `Raise PRICE_SNAPSHOT_MAX_MINTS_PER_TICK.`,
+    );
+  }
   return rows.map((r) => r.mint);
 }
 
