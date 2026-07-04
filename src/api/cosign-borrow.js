@@ -49,6 +49,7 @@ import { connection, withFailover } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
+import { getTrailingPriceStats } from "../services/price-snapshotter.js";
 import { query } from "../db/pool.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
@@ -1303,6 +1304,22 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
                 [collateralMintStr, String(STALE_SNAPSHOT_MAX_AGE_MS)],
               );
               if (snap?.price_usd) {
+                // Anti-pump hardening (security audit 2026-07-04, #3): with the
+                // live cross-source oracle down we lose its single-pool-pump
+                // resistance, so cap the fallback price at the 30-min trailing
+                // AVERAGE — min(last snapshot, trailing avg). This ONLY ever
+                // LOWERS the value, so it can never block or inflate a legit
+                // borrow, but it neutralises a single pumped snapshot slipping
+                // through the degraded path. If we have no trailing stats yet
+                // (freshly-enabled mint) we use the snapshot as-is — still
+                // bounded by the earlier preBorrowAntiExploitCheck TWAP gate.
+                let effectivePriceUsd = Number(snap.price_usd);
+                try {
+                  const trail = await getTrailingPriceStats(collateralMintStr, 30, 5);
+                  if (trail && trail.avgPrice > 0) {
+                    effectivePriceUsd = Math.min(effectivePriceUsd, trail.avgPrice);
+                  }
+                } catch { /* no trailing stats → snapshot as-is (bounded by the anti-exploit gate) */ }
                 // SOL/USD also from snapshotter — snapshotter records SOL
                 // every cycle, so a recent snapshot is the source of
                 // truth during oracle blip.
@@ -1319,10 +1336,11 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
                   // collateral_units = collateralAmountRaw / 10^decimals
                   const decimals = Number(mintRow.decimals);
                   const units = Number(collateralAmountRaw) / Math.pow(10, decimals);
-                  const valueSol = (units * Number(snap.price_usd)) / solUsd;
+                  const valueSol = (units * effectivePriceUsd) / solUsd;
                   valueLamports = Math.floor(valueSol * 1e9);
                   const ageSec = Math.round((Date.now() - new Date(snap.snapshot_at).getTime()) / 1000);
-                  console.warn(`[cosign-borrow] live oracle failed for ${collateralMintStr.slice(0, 8)}…, fell back to ${ageSec}s-old snapshot (price_usd=${snap.price_usd}, sol_usd=${solUsd.toFixed(2)}). valueLamports=${valueLamports}`);
+                  const cappedNote = effectivePriceUsd < Number(snap.price_usd) ? ` (capped from ${snap.price_usd} to trailing-avg ${effectivePriceUsd})` : "";
+                  console.warn(`[cosign-borrow] live oracle failed for ${collateralMintStr.slice(0, 8)}…, fell back to ${ageSec}s-old snapshot (price_usd=${effectivePriceUsd}${cappedNote}, sol_usd=${solUsd.toFixed(2)}). valueLamports=${valueLamports}`);
                 }
               }
             } catch (snapErr) {
