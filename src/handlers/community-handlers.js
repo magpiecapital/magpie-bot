@@ -65,6 +65,16 @@ function escMd(s) {
   return String(s).replace(/([_*`\[\]()])/g, "\\$1");
 }
 
+// New-member PROACTIVE scam review: a brand-new account is the scam cohort, so
+// its substantive messages get a FULL AI judge even when nothing pre-flagged
+// them by a known coarse signal. This is how the bot catches NOVEL scam methods
+// it has no pattern for yet (operator 2026-07-04, "keep monitoring for new scam
+// methods"). Established members' chatter is never proactively judged (no
+// over-moderation, and cost stays negligible since only fresh accounts qualify).
+// Env-tunable.
+const NEW_MEMBER_JUDGE_WINDOW_HOURS = Number(process.env.NEW_MEMBER_JUDGE_WINDOW_HOURS) || 72;
+const NEW_MEMBER_JUDGE_MIN_CHARS = Number(process.env.NEW_MEMBER_JUDGE_MIN_CHARS) || 25;
+
 /**
  * Trusted members are TG users who already have a Magpie wallet through
  * the bot. They're known good actors — auto-muting them on a misread is
@@ -522,17 +532,26 @@ async function handleGroupMessage(ctx) {
       const solicits = hasSolicitationSignal(bodyText);
       const flagged = badUrls.length || scamHit || handleHits.length || solicits;
 
-      if (flagged && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+      // New-member PROACTIVE check: even with NO known coarse signal, a
+      // substantive message from a brand-new account gets a full AI judge, so a
+      // never-seen scam phrasing (novel migration/airdrop/etc.) is still caught.
+      const member = await getMember(ctx.chat.id, sender.id);
+      const memberAgeHours = member?.joined_at
+        ? (Date.now() - new Date(member.joined_at).getTime()) / 3_600_000
+        : null;
+      const proactiveNewMember =
+        !flagged &&
+        memberAgeHours != null &&
+        memberAgeHours < NEW_MEMBER_JUDGE_WINDOW_HOURS &&
+        bodyText.trim().length >= NEW_MEMBER_JUDGE_MIN_CHARS;
+
+      if ((flagged || proactiveNewMember) && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
         const signalParts = [];
         if (badUrls.length) signalParts.push(`link not on allowlist: ${badUrls.join(", ").slice(0, 180)}`);
         if (scamHit) signalParts.push(`scam-phrase: ${scamHit}`);
         if (handleHits.length) signalParts.push(`unofficial handle: ${handleHits.join(", ")}`);
         if (solicits) signalParts.push(`possible solicitation`);
-
-        const member = await getMember(ctx.chat.id, sender.id);
-        const memberAgeHours = member?.joined_at
-          ? (Date.now() - new Date(member.joined_at).getTime()) / 3_600_000
-          : null;
+        if (proactiveNewMember) signalParts.push(`new-member proactive check (${Math.round(memberAgeHours)}h old)`);
 
         const verdict = await judgeCommunityPost(bodyText, {
           signal: signalParts.join(" · "),
@@ -544,10 +563,13 @@ async function handleGroupMessage(ctx) {
         // (keep) for soft signals; fail CLOSED (remove) ONLY for an
         // unambiguous hard-scam phrase, which a real user essentially never
         // types — so a wallet-drainer can't slip through during an LLM
-        // outage, yet a genuine post is never deleted on uncertainty.
+        // outage, yet a genuine post is never deleted on uncertainty. For a
+        // PROACTIVE (unflagged) new-member check we NEVER fall back to removal
+        // on LLM failure — fail fully open so a normal newcomer post is never
+        // deleted just because the model was briefly down.
         const remove = verdict
           ? isConfidentRemoval(verdict)
-          : HARD_SCAM_RE.test(bodyText);
+          : (flagged && HARD_SCAM_RE.test(bodyText));
 
         if (remove) {
           await tryDelete(ctx, msg.message_id);
