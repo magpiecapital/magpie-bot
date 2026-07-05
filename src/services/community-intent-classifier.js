@@ -22,8 +22,11 @@
  * letting one borderline post slide (other nets + human review catch the
  * rare miss). The judge only removes when clearly confident.
  *
- * Cost: Haiku, ~$0.0002 per call, and it ONLY runs on posts a coarse
- * filter already flagged — so the steady-state cost is a few cents a day.
+ * Cost: Haiku, ~$0.0002 per call. Runs on posts a coarse filter flagged, PLUS
+ * (2026-07-04) a proactive pass on substantive messages from brand-new accounts
+ * even when nothing flagged them — so a NOVEL scam method with no known pattern
+ * still gets judged. Only fresh accounts qualify (see NEW_MEMBER_JUDGE_* in
+ * community-handlers), so steady-state cost stays a few cents a day.
  */
 
 const JUDGE_MODEL = "claude-haiku-4-5-20251001";
