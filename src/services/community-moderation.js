@@ -599,6 +599,41 @@ export function isHomoglyphDisguisedImpersonation(user) {
   return false;
 }
 
+// Staff/role words that ARE impersonation when they make up the WHOLE name.
+// No legit member in a protocol's group is named exactly "Dev" / "Admin" /
+// "Support" / "Dev Team". This is the precise version of the operator's
+// 2026-06-30 "don't over-ban standalone role words": we ban ONLY when the
+// ENTIRE name is role words, so a role word as PART of a longer name
+// ("CryptoDev", "Dev Dan", "Team Solana") is still allowed. Excludes real first
+// names ("Matt") and the allowed nickname "Pip". Env-extensible.
+const BARE_ROLE_WORDS = new Set([
+  "magpie",
+  "dev", "devs", "developer", "developers", "admin", "admins", "administrator",
+  "administrators", "support", "moderator", "moderators", "mod", "mods",
+  "official", "staff", "team", "founder", "founders", "owner", "ceo", "cto",
+  "announcement", "announcements", "helpdesk", "moderation",
+  ...(process.env.BARE_ROLE_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+]);
+
+/** A name that is ENTIRELY staff/role words — "Dev", "Support", "Dev Team",
+ *  "Admin Support", "🛠 Dev" — is impersonation. A role word as PART of a
+ *  longer name ("CryptoDev", "Dev Dan", "Team Solana", "Devon") is NOT flagged,
+ *  preserving the 2026-06-30 anti-over-ban rule. Folds homoglyphs first, so
+ *  "Ðev"/"Аdmin" as the whole name are caught here too. */
+export function isBareRoleWordImpersonation(user) {
+  if (!user) return false;
+  const combined = [user.first_name, user.last_name].filter(Boolean).join(" ");
+  for (const raw of [user.username || "", user.first_name || "", user.last_name || "", combined]) {
+    if (!raw) continue;
+    const folded = foldConfusables(normalizeUnicode(raw)).toLowerCase();
+    const toks = folded.split(/[^a-z0-9]+/).filter(Boolean);
+    if (!toks.length || toks.length > 4) continue;      // 1–4 tokens; a sentence isn't a name
+    if (toks.every((t) => BARE_ROLE_WORDS.has(t))) return true;
+  }
+  return false;
+}
+
 export function isImpersonationName(user) {
   if (!user) return false;
   // Test raw + unicode-normalized + homoglyph-folded + despaced + combined-field
@@ -613,6 +648,8 @@ export function isImpersonationName(user) {
   if (isBrandLookalikeImpersonation(user)) return true;
   // Homoglyph-disguised role/brand word ("Ðeveloper", "Аdmin", "Ｍagpie").
   if (isHomoglyphDisguisedImpersonation(user)) return true;
+  // Bare staff/role word as the WHOLE name ("Dev", "Support", "Dev Team").
+  if (isBareRoleWordImpersonation(user)) return true;
   return false;
 }
 
