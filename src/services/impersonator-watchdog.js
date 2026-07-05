@@ -36,19 +36,29 @@ import { query } from "../db/pool.js";
 import { isImpersonationName, isVerifiedAccount, recordModAction, isUserCleared, nameKey } from "./community-moderation.js";
 
 const SCAN_INTERVAL_MS = Number(process.env.IMPERSONATOR_SCAN_INTERVAL_MS) || 30 * 60_000; // 30 min default
-const SCAN_WINDOW_HOURS = Number(process.env.IMPERSONATOR_SCAN_WINDOW_HOURS) || 24;
+// Scan the ENTIRE membership, not just recent joiners (operator 2026-07-04,
+// "keep impersonators out at all costs"). The old 24h window let anyone who
+// joined earlier and RENAMED into an impersonator/homoglyph handle slip past
+// the watchdog forever (only the message-ban would catch them, and only if
+// they posted). Default is effectively unbounded (10y); the per-member cooldown
+// below + the per-cycle cap keep the TG API load sane even for a large group.
+const SCAN_WINDOW_HOURS = Number(process.env.IMPERSONATOR_SCAN_WINDOW_HOURS) || 24 * 365 * 10;
 // Bounded TG API throughput — getChatMember is rate-limited around
 // 30 req/sec. 50ms gap keeps us well below.
 const GET_MEMBER_GAP_MS = 50;
-// Per-cycle cap so a backlog can't run forever or hit TG rate limits.
-const MAX_MEMBERS_PER_CYCLE = 1_000;
+// Per-cycle cap so a backlog can't run forever or hit TG rate limits. Raised so
+// a whole realistic membership is covered in a single cycle (cooldown-eligible
+// members per cycle is far lower once the cooldown map warms up).
+const MAX_MEMBERS_PER_CYCLE = Number(process.env.IMPERSONATOR_MAX_PER_CYCLE) || 5_000;
 
 // Suppress re-scanning the same member repeatedly. Once we've checked
 // a (chat_id, user_id) within COOLDOWN_HOURS we don't re-check unless
 // the patterns list itself has changed (operator deploy = new boot =
 // in-memory cooldown reset = re-scan everyone fresh, which is desired).
+// Tightened 12h → 2h (operator 2026-07-04) so a rename into an impersonator
+// handle is caught within ~2h even if the member never posts a message.
 const checkedRecently = new Map(); // key: `${chatId}:${userId}` → ms ts
-const COOLDOWN_MS = Number(process.env.IMPERSONATOR_RECHECK_COOLDOWN_HOURS || 12) * 3_600_000;
+const COOLDOWN_MS = Number(process.env.IMPERSONATOR_RECHECK_COOLDOWN_HOURS || 2) * 3_600_000;
 
 function cooldownKey(chatId, userId) { return `${chatId}:${userId}`; }
 
@@ -195,7 +205,8 @@ async function tick(bot) {
 
 export function startImpersonatorWatchdog(bot) {
   if (!bot) return;
-  console.log(`[impersonator-watch] armed — sweeping every ${SCAN_INTERVAL_MS / 60_000} min over a ${SCAN_WINDOW_HOURS}h window`);
+  const windowLabel = SCAN_WINDOW_HOURS >= 24 * 365 ? "the FULL membership" : `a ${SCAN_WINDOW_HOURS}h window`;
+  console.log(`[impersonator-watch] armed — sweeping every ${SCAN_INTERVAL_MS / 60_000} min over ${windowLabel} (recheck cooldown ${COOLDOWN_MS / 3_600_000}h)`);
   // First tick after a 5-min startup delay so the bot finishes its
   // own onboarding before we start hammering getChatMember.
   setTimeout(() => tick(bot).catch((e) => console.warn("[impersonator-watch] first tick:", e.message?.slice(0, 80))), 5 * 60_000);
