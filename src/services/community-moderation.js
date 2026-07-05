@@ -132,18 +132,43 @@ export const IMPERSONATION_PATTERNS = [
 ];
 
 // Homoglyphs / leetspeak an impersonator uses to dodge the brand filter
-// ("Mаgpie" with a Cyrillic а, "0fficial", "M4gpie"). Folded to ASCII before
-// matching. Ambiguous 1/l/i is deliberately left out to avoid mangling real
-// names; the unicode + despace + combined-field passes cover the common cases.
+// ("Mаgpie" with a Cyrillic а, "0fficial", "M4gpie", "Ðeveloper" with a Latin
+// Eth). Folded to ASCII before matching. This map holds ONLY the NON-decomposable
+// specials (Ð ð Đ đ Ø ł ß Þ) + cross-script VISUAL homoglyphs (Cyrillic / Greek);
+// the huge decomposable space (accented Latin é/à, fullwidth Ｄ, mathematical
+// 𝐃/𝑫/𝔡, superscripts) is folded GENERICALLY by NFKD in foldConfusables below.
+// Only VISUAL look-alikes are mapped (Cyrillic У→y not phonetic u, Н→h not n);
+// ambiguous 1/l/i is left out to avoid mangling real names.
 const CONFUSABLE_MAP = {
-  "а": "a", "ӓ": "a", "@": "a", "4": "a", "е": "e", "ё": "e", "3": "e",
-  "о": "o", "ο": "o", "0": "o", "р": "p", "с": "c", "ѕ": "s", "$": "s", "5": "s",
-  "х": "x", "у": "y", "і": "i", "ӏ": "i", "т": "t", "к": "k", "н": "h", "м": "m",
-  "ԁ": "d", "ɡ": "g", "ⅼ": "l", "ӏ": "l",
+  // leetspeak / symbols
+  "@": "a", "4": "a", "3": "e", "0": "o", "$": "s", "5": "s",
+  // Latin specials NFKD does NOT decompose — the "Ðeveloper" class
+  "Ð": "d", "ð": "d", "Đ": "d", "đ": "d", "Ø": "o", "ø": "o",
+  "Ł": "l", "ł": "l", "ß": "b", "Þ": "p", "þ": "p", "ẞ": "b",
+  // Cyrillic visual homoglyphs (look identical to the Latin letter)
+  "А": "a", "а": "a", "ӓ": "a", "В": "b", "в": "b", "Е": "e", "е": "e", "Ё": "e", "ё": "e",
+  "К": "k", "к": "k", "М": "m", "м": "m", "Н": "h", "н": "h", "О": "o", "о": "o",
+  "Р": "p", "р": "p", "С": "c", "с": "c", "Т": "t", "т": "t", "Х": "x", "х": "x",
+  "У": "y", "у": "y", "І": "i", "і": "i", "ӏ": "i", "Ј": "j", "ј": "j", "Ѕ": "s", "ѕ": "s",
+  "ԁ": "d", "Ԁ": "d", "ɡ": "g",
+  // Greek visual homoglyphs
+  "Α": "a", "Β": "b", "Ε": "e", "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n",
+  "Ο": "o", "ο": "o", "Ρ": "p", "ρ": "p", "Τ": "t", "τ": "t", "Χ": "x", "Υ": "y",
+  "ν": "v", "ⅼ": "l", "ӏ": "l",
 };
+// Invisible / format / bidi-override / variant-selector chars — pure obfuscation
+// with no legit use inside a display name (zero-width space/joiner, RLO/LRO,
+// VS15/16, BOM, soft hyphen). Stripped before folding so "De​veloper" and
+// RTL-scrambled names collapse to their real letters.
+const INVISIBLE_CHARS = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufe00-\ufe0f\ufeff]/g;
 function foldConfusables(s) {
+  if (!s) return "";
+  let t = s.replace(INVISIBLE_CHARS, "");
+  // NFKD + strip combining marks folds accented Latin, fullwidth, mathematical
+  // alphanumeric, and superscripts to plain ASCII generically.
+  try { t = t.normalize("NFKD").replace(/[\u0300-\u036f]/g, ""); } catch { /* keep t */ }
   let out = "";
-  for (const ch of s) out += CONFUSABLE_MAP[ch] ?? CONFUSABLE_MAP[ch.toLowerCase()] ?? ch;
+  for (const ch of t) out += CONFUSABLE_MAP[ch] ?? CONFUSABLE_MAP[ch.toLowerCase()] ?? ch;
   return out;
 }
 
@@ -239,6 +264,16 @@ export const SCAM_PHRASES = [
   // Recovery / refund scams
   /\b(?:lost|recover|refund)\s+(?:your|my)\s+(?:funds?|sol|tokens?|wallet)\b/i,
   /\b(?:rug(?:ged|pull)?|scammed|lost)\b.*\b(?:dm|message|pm|contact)\s+me\b/i,
+  // Fake token-MIGRATION / 1:1-allocation phishing (the "Ðeveloper" 2026-07-04
+  // post). These are SIGNALS into Pip's allow-biased judge (not auto-delete),
+  // and each requires scam STRUCTURE (authority + allocation + redirect), so
+  // real governance / distribution / holder-reward discussion isn't flagged.
+  /\b1\s*[:：]\s*1\s+(?:token\s+)?(?:allocation|swap|claim|distribution)\b/i,
+  /\btransition(?:ing)?\s+to\s+(?:an?\s+)?(?:new|upgraded|revised|different)\s+(?:token\s+)?(?:structure|contract|standard|system)\b/i,
+  /\b(?:eligible|qualif(?:y|ied))\s+for\s+(?:an?\s+)?(?:1\s*[:：]\s*1\s+)?(?:token\s+)?(?:allocation|airdrop|distribution)\b/i,
+  /\b(?:reach\s+out\s+to|contact|message|dm|pm)\s+(?:our\s+)?(?:dev(?:eloper)?s?|admin(?:istrator)?s?|support|team|moderators?|mods?)\b.*\b(?:for|to\s+(?:get|receive))\b.*\b(?:instructions?|next\s+steps?|details?|how\s+to\s+proceed|guidance|allocation)\b/i,
+  /\bclaim\s+(?:your\s+)?(?:new\s+|token\s+)?allocation\b/i,
+  /\bofficial\s+(?:update|announcement)\s+(?:regarding|about|on)\b.*\b(?:token|migration|upgrade|allocation|snapshot|phase)\b/i,
 ];
 
 /**
@@ -524,6 +559,46 @@ export function isBrandLookalikeImpersonation(user) {
   return false;
 }
 
+// Role / brand words that must never be spelled with HOMOGLYPHS. A PLAIN-ASCII
+// role word ("Developer", "CryptoDev", "Team Solana") is deliberately allowed
+// (operator 2026-06-30, "don't ban standalone role words") — the malice signal
+// is the DISGUISE: a name that uses non-ASCII look-alikes to spell one of these
+// is impersonation, full stop (a real member types "Developer", never
+// "Ðeveloper"). Env-extensible via HOMOGLYPH_PROTECTED_WORDS.
+const HOMOGLYPH_PROTECTED_WORDS = new Set([
+  "magpie", "pip", ...PROTECTED_PERSONA_NAMES,
+  "developer", "developers", "dev", "devs", "admin", "administrator", "support",
+  "supporter", "staff", "official", "moderator", "mod", "team", "help", "helpdesk",
+  "service", "customer", "founder", "owner", "ceo", "cto", "bot", "announcement",
+  "announcements", "announce", "partner", "verified", "trust",
+  ...(process.env.HOMOGLYPH_PROTECTED_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+]);
+
+/** Catch a name that uses HOMOGLYPHS / confusables to spell a protected role or
+ *  brand word — "Ðeveloper" (Latin Eth), "Аdmin" (Cyrillic А), "Ｍagpie"
+ *  (fullwidth). Precise by construction: fires ONLY when a token folds to a
+ *  protected word AND the fold actually CHANGED it (i.e. a look-alike was used),
+ *  so a plain-ASCII role word and normal names ("José Developer") are untouched. */
+export function isHomoglyphDisguisedImpersonation(user) {
+  if (!user) return false;
+  const fields = [user.username || "", user.first_name || "", user.last_name || ""].filter(Boolean);
+  for (const raw of [...fields, fields.join(" ")]) {
+    if (!raw) continue;
+    // Per-token so a homoglyph in ONE word (the disguised role word) is caught
+    // without a real accented word elsewhere ("José") tripping it. Also test the
+    // whole despaced string (defeats "Ð e v e l o p e r" letter-spacing).
+    const rawToks = raw.split(/[\s._@\-]+/).filter(Boolean);
+    for (const rawTok of [...rawToks, raw.replace(/[\s._@\-]+/g, "")]) {
+      const cleanRaw = rawTok.toLowerCase().replace(/[^a-z0-9]/g, "");        // ASCII-only part of the raw
+      const folded = foldConfusables(normalizeUnicode(rawTok)).toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!folded || folded === cleanRaw) continue;                           // no look-alike used → allowed
+      if (HOMOGLYPH_PROTECTED_WORDS.has(folded)) return true;                 // disguised protected word → ban
+    }
+  }
+  return false;
+}
+
 export function isImpersonationName(user) {
   if (!user) return false;
   // Test raw + unicode-normalized + homoglyph-folded + despaced + combined-field
@@ -536,6 +611,8 @@ export function isImpersonationName(user) {
   }
   // Fuzzy layer — deliberate misspellings / lookalikes ("Mapgie", "Magpei Admin").
   if (isBrandLookalikeImpersonation(user)) return true;
+  // Homoglyph-disguised role/brand word ("Ðeveloper", "Аdmin", "Ｍagpie").
+  if (isHomoglyphDisguisedImpersonation(user)) return true;
   return false;
 }
 
