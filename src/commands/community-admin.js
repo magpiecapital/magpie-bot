@@ -372,6 +372,101 @@ export async function handleCommunityUnban(ctx) {
   }
 }
 
+/**
+ * /ban — permanently ban a user from the community group.
+ *
+ * The friction this removes: the existing /ban_tg needs a numeric
+ * telegram_id, but operators think in @usernames and usually just want
+ * to nuke the scammer whose message they're looking at. So this command
+ * is reply-first: reply to the scammer's message with `/ban [reason]`,
+ * or `/ban <@user|user_id> [reason]`.
+ *
+ * Actions: (1) Telegram group ban with revoke_messages (kicks them AND
+ * wipes their spam), (2) deletes the replied-to message, (3) best-effort
+ * adds them to Magpie's protocol ban registry if they map to a known
+ * Magpie account (blocks borrow/cosign too).
+ */
+export async function handleCommunityBan(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  if (!isGroup(ctx)) {
+    return ctx.reply(
+      "Run `/ban` *inside* the community group. Reply to the scammer's message with `/ban [reason]`, or `/ban <@user|user_id> [reason]`.",
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  // When it's a reply, resolveUserRef uses the replied-to sender, so the
+  // whole arg string is the reason. Otherwise the first token is the user
+  // reference and the rest is the reason.
+  const argStr = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  const isReply = !!ctx.message?.reply_to_message?.from?.id;
+  let userArg = "";
+  let reason = argStr;
+  if (!isReply) {
+    const parts = argStr.split(/\s+/).filter(Boolean);
+    userArg = parts[0] || "";
+    reason = parts.slice(1).join(" ");
+  }
+  reason = reason || "scammer / spam (manual /ban)";
+
+  const ref = await resolveUserRef(ctx, userArg);
+  if (ref.error) return ctx.reply(`❌ ${ref.error}`);
+
+  // Guardrails: never self-ban, never ban a fellow admin.
+  if (Number(ref.userId) === Number(ctx.from?.id)) {
+    return ctx.reply("❌ That's you — refusing to self-ban.");
+  }
+  if (isAdmin(ref.userId)) {
+    return ctx.reply("❌ That user is a Magpie admin — refusing to ban.");
+  }
+
+  // 1. Telegram group ban + wipe their messages.
+  try {
+    await ctx.api.banChatMember(ctx.chat.id, ref.userId, { revoke_messages: true });
+  } catch (err) {
+    return ctx.reply(
+      `❌ Couldn't ban ${ref.label} from the group: ${err.message?.slice(0, 180)}\n` +
+      `Make sure Pip is a group admin with the "Ban users" permission.`,
+    );
+  }
+
+  // 2. Delete the replied-to scam message immediately (revoke_messages
+  //    usually covers this, but do it explicitly for instant feedback).
+  if (isReply) {
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.reply_to_message.message_id);
+    } catch { /* non-critical */ }
+  }
+
+  // 3. Best-effort: if this Telegram user maps to a Magpie account, add
+  //    them to the protocol ban registry too (blocks borrow/cosign).
+  let protocolNote = "";
+  try {
+    const { query } = await import("../db/pool.js");
+    const { rows } = await query(
+      `SELECT id FROM users WHERE telegram_id = $1 LIMIT 1`,
+      [Number(ref.userId)],
+    );
+    if (rows[0]?.id) {
+      const { banUser } = await import("../services/bans.js");
+      await banUser({
+        userId: rows[0].id,
+        telegramId: Number(ref.userId),
+        reason,
+        bannedBy: String(ctx.from?.id ?? "operator"),
+        notes: "manual /ban in community group",
+      });
+      protocolNote = ` Also added to the protocol ban registry (user #${rows[0].id}) — blocked from borrow/cosign.`;
+    }
+  } catch (err) {
+    console.warn(`[community-ban] protocol-registry ban skipped for ${ref.userId}: ${err.message}`);
+  }
+
+  await ctx.reply(
+    `🚫 Permanently banned ${ref.label} (tg ${ref.userId}) and removed their messages.${protocolNote}\nReason: ${reason}`,
+  );
+}
+
 export async function handleCommunityStrikes(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const arg = (ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
