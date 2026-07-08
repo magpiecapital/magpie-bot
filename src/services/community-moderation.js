@@ -407,6 +407,26 @@ export function findImpersonatingHandles(text) {
 
 /* ───────────────────────── URL HANDLING ──────────────────────── */
 
+/**
+ * Collapse common link-obfuscation tricks back into a real URL so the
+ * extractor + allowlist can see them. Handles unicode dot lookalikes,
+ * bracketed dots ("[dot]", "(.)"), and spelled-out "evil dot com".
+ * Deliberately conservative — only transforms high-signal obfuscation
+ * markers, never plain sentence punctuation, so "e.g." / "Node.js" are
+ * left untouched.
+ */
+export function deobfuscateLinks(text) {
+  if (!text) return "";
+  return text
+    // unicode dot lookalikes → "." (one-dot leader, ideographic / fullwidth /
+    // arabic full stops, small full stop, syriac dots)
+    .replace(/[․。．۔﹒܁܂]/g, ".")
+    // bracketed / parenthesized dot: "[dot]" "(dot)" "{dot}" "[.]" "( . )"
+    .replace(/\s*[[({]\s*(?:dot|d0t|\.)\s*[\])}]\s*/gi, ".")
+    // spelled-out "word dot word": "evil dot com" → "evil.com"
+    .replace(/([a-z0-9-])\s+(?:dot|d0t)\s+([a-z0-9-])/gi, "$1.$2");
+}
+
 /** Extract every URL the user sent — both via TG entities + plain text */
 export function extractUrls(msg) {
   const urls = new Set();
@@ -423,6 +443,22 @@ export function extractUrls(msg) {
   // 2. Bare-text fallback (catches anything TG didn't auto-detect)
   const bareRegex = /(?:https?:\/\/|www\.|t\.me\/|x\.com\/|twitter\.com\/)[^\s<>'"`]+/gi;
   for (const m of text.matchAll(bareRegex)) urls.add(m[0]);
+  // 3. De-obfuscated pass — scammers hide links as "evil [dot] com",
+  //    "evil dot com", or with fullwidth/unicode dots to dodge (1)+(2).
+  //    Only runs when an obfuscation marker was actually present
+  //    (deob !== text), so normal messages never hit the broad domain regex.
+  const deob = deobfuscateLinks(text);
+  if (deob !== text) {
+    for (const m of deob.matchAll(bareRegex)) urls.add(m[0]);
+    const domainRe = /\b(?:[a-z0-9-]+\.)+[a-z]{2,24}(?:\/[^\s<>'"`]*)?/gi;
+    for (const m of deob.matchAll(domainRe)) urls.add(m[0]);
+  }
+  // 4. Bare domain WITH a path but no scheme (e.g. "scam.io/claim-airdrop").
+  //    Telegram usually entity-detects these, but this catches stragglers.
+  //    Requiring a path keeps false-positives near zero; the allowlist
+  //    (isAllowedUrl) still lets official/safe domains through.
+  const barePathRe = /\b(?:[a-z0-9-]+\.)+[a-z]{2,24}\/[^\s<>'"`]+/gi;
+  for (const m of text.matchAll(barePathRe)) urls.add(m[0]);
   return [...urls];
 }
 
