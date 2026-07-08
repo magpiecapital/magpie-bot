@@ -997,13 +997,62 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     return { status: 400, body: { error: "Borrower has not signed yet — co-sign endpoint signs last" } };
   }
 
+  // Gate 3b (SECURITY 2026-07-05, finding #2 — decoy-signer bypass):
+  // Bind the borrower identity to the SAME account the on-chain program
+  // treats as the borrower — request_and_fund_loan accounts[8] — NOT the
+  // "first non-lender signer". This endpoint accepts an arbitrary
+  // attacker-crafted partial tx; keying the per-wallet gauntlet (ban,
+  // soft-lock, anti-exploit, resolveWalletOwner) off signatures[0] would
+  // let an attacker mark a throwaway "clean" wallet as the fee payer /
+  // first signer while the REAL borrower (accounts[8]) is a separate,
+  // also-signing account — validating the decoy while the loan is
+  // recorded/attributed to accounts[8] (see the recordLoan path below,
+  // which already keys off keys[8]). Every per-wallet control below MUST
+  // reference this identical pubkey. Gate 1 already guaranteed exactly one
+  // magpie instruction, so this find() resolves it unambiguously.
+  const magpieIxForBorrower = tx.instructions.find((ix) => isMagpieProgram(ix.programId));
+  const borrowerAccountKey = magpieIxForBorrower?.keys?.[8]?.pubkey;
+  if (!borrowerAccountKey) {
+    return {
+      status: 400,
+      body: { error: "Borrower account missing from borrow instruction (accounts[8])" },
+    };
+  }
+  // Reject the decoy-signer shape: there must be exactly ONE non-lender
+  // signer with a real signature, and (below) it must BE the on-chain
+  // borrower. More than one non-lender signer is the attack shape.
+  const nonLenderSigners = tx.signatures.filter(
+    (s) => !s.publicKey.equals(LENDER_PUBKEY) && s.signature !== null,
+  );
+  if (nonLenderSigners.length !== 1) {
+    return {
+      status: 400,
+      body: {
+        error: "Borrow tx must have exactly one non-lender signer (the borrower)",
+        detail: `found ${nonLenderSigners.length} non-lender signer(s); the on-chain borrower (accounts[8]) must be the sole additional signer`,
+      },
+    };
+  }
+  // The authoritative borrower signature = the accounts[8] entry. Require
+  // it be present in tx.signatures with a non-null signature (fail closed
+  // if keys[8] is not among the signers).
+  const borrowerSig = tx.signatures.find(
+    (s) => s.publicKey.equals(borrowerAccountKey) && s.signature !== null,
+  );
+  if (!borrowerSig) {
+    return {
+      status: 400,
+      body: {
+        error: "On-chain borrower (accounts[8]) has not signed this transaction",
+        detail: "the account the program treats as the borrower must be a signer with a valid signature",
+      },
+    };
+  }
+
   // Gate 4 (NEW, 2026-06-07): borrower wallet must not be on the ban list.
   // Catches the case where a banned wallet attempts to open a loan via
   // the web path. Wallet-level ban applies regardless of which TG account
-  // (if any) owns it.
-  const borrowerSig = tx.signatures.find(
-    (s) => !s.publicKey.equals(LENDER_PUBKEY) && s.signature !== null,
-  );
+  // (if any) owns it. Keyed on the authoritative borrower (accounts[8]).
   if (borrowerSig) {
     const borrowerPubkey = borrowerSig.publicKey.toBase58();
     try {

@@ -51,7 +51,6 @@
 import {
   PublicKey,
   Transaction,
-  sendAndConfirmTransaction,
   Keypair,
 } from "@solana/web3.js";
 import {
@@ -77,6 +76,13 @@ import {
 import { lendingPoolPda, loanTokenVaultPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 import { notifyAdmin } from "./admin-notify.js";
+import { assertAllowedDestination } from "./privileged-destinations.js";
+import {
+  runPrivilegedSign,
+  recordPrivilegedSignResult,
+} from "./privileged-sign-guard.js";
+import { withLenderSpendLock } from "./lender-spend-lock.js";
+import { availableLenderNative } from "./lender-reserve.js";
 
 const TICK_MS = Number(process.env.LP_EXCESS_SWEEPER_MS) || 24 * 60 * 60 * 1000;
 const MIN_SWEEP_LAMPORTS = BigInt(process.env.LP_EXCESS_MIN_SWEEP_LAMPORTS || "100000000"); // 0.1 SOL — don't waste tx fees on dust
@@ -85,6 +91,14 @@ const MAX_SWEEPS_PER_TICK = Number(process.env.LP_EXCESS_MAX_SWEEPS_PER_TICK || 
 const CHCAM_PUBKEY = new PublicKey(
   process.env.REWARDS_DISTRIBUTOR_PUBKEY || "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac",
 );
+// The ONLY native-SOL cost this sweep imposes on the lender (fee payer +
+// admin_withdraw authority): the tx fee plus, at most, wSOL ATA rent
+// (~0.00204 SOL) if the idempotent create actually opens the ATA. The swept
+// SOL itself comes from the pool vault and lands on CHCAM via closeAccount —
+// it never transits the lender's native balance. We declare this ceiling to
+// the privileged-sign guard AND require the lender to hold it ABOVE the shared
+// 5-SOL gas reserve before spending, so a sweep can never starve loan-gas.
+const LENDER_SOL_COST_CEILING_LAMPORTS = 3_000_000n;
 let _timer = null;
 
 function fmtSol(lamports) {
@@ -185,6 +199,13 @@ async function readPoolFresh(lenderPubkey, programId, programLabel) {
  */
 async function executeSweep(state, lenderKp, program, sweepLamports) {
   const { pool, vault } = state;
+
+  // DESTINATION GUARD — reject a flipped env pubkey. The close destination is a
+  // PRIVILEGED, source-allowlisted wallet; an attacker who flips
+  // REWARDS_DISTRIBUTOR_PUBKEY on Railway can NOT redirect the swept SOL. Fail
+  // fast before we build/sign anything.
+  assertAllowedDestination("lp-excess-sweeper", CHCAM_PUBKEY);
+
   const authorityAta = getAssociatedTokenAddressSync(
     NATIVE_MINT,
     lenderKp.publicKey,
@@ -222,17 +243,50 @@ async function executeSweep(state, lenderKp, program, sweepLamports) {
     TOKEN_PROGRAM_ID,
   ));
 
-  // Pre-flight simulate. Refuse to broadcast if RPC rejects.
-  const sim = await connection.simulateTransaction(tx, [lenderKp]);
-  if (sim.value.err) {
-    const logs = (sim.value.logs || []).slice(-5).join(" | ").slice(0, 400);
-    throw new Error(`pre-flight sim rejected: ${JSON.stringify(sim.value.err)} logs=${logs}`);
-  }
+  const { blockhash, lastValidBlockHeight } = await withFailover((c) =>
+    c.getLatestBlockhash("confirmed"),
+  );
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = lenderKp.publicKey;
 
-  const signature = await sendAndConfirmTransaction(connection, tx, [lenderKp], {
-    commitment: "confirmed",
-    maxRetries: 3,
+  // GUARDED SIGN — replaces the bare error-only simulateTransaction. The guard
+  // (a) balance-delta-simulates and rejects ANY undeclared decrease on a
+  // lender-owned account (still refusing to broadcast a tx the RPC rejects),
+  // (b) pins the closeAccount destination to CHCAM via allowedCloseDestinations
+  // so the swept SOL+rent can go NOWHERE else, and (c) writes an audit row so a
+  // key-leak monitor can reconcile on-chain movement vs signed intent. The
+  // lender pays only tx fee + (at most) wSOL ATA rent; declare that ceiling.
+  const guard = await runPrivilegedSign({
+    service: "lp-excess-sweeper",
+    tx,
+    signers: [lenderKp],
+    allowedDeltas: [
+      { pubkey: lenderKp.publicKey, kind: "sol", maxDecrease: LENDER_SOL_COST_CEILING_LAMPORTS },
+    ],
+    allowedCloseDestinations: [CHCAM_PUBKEY],
   });
+
+  let signature;
+  try {
+    signature = await withFailover((c) =>
+      c.sendRawTransaction(guard.signedTx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      }),
+    );
+  } catch (e) {
+    await recordPrivilegedSignResult({
+      auditId: guard.auditId,
+      status: "failed",
+      error: e.message?.slice(0, 200),
+    });
+    throw e;
+  }
+  await recordPrivilegedSignResult({ auditId: guard.auditId, status: "broadcast", txSig: signature });
+  await withFailover((c) =>
+    c.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed"),
+  );
+  await recordPrivilegedSignResult({ auditId: guard.auditId, status: "confirmed", txSig: signature });
   return signature;
 }
 
@@ -301,7 +355,31 @@ async function tick(bot) {
         continue;
       }
 
-      const sig = await executeSweep(state, state.lenderKp, state.program, sweep);
+      // Broadcast under the ONE shared lender-spend lock (the lender key signs
+      // as fee payer + admin_withdraw authority) so this can never race a
+      // sibling lender-spending service, and size the lender's small
+      // gas/rent cost against availableLenderNative() — which enforces the
+      // canonical 5-SOL reserve — so a sweep never dips the gas wallet below it.
+      const lockOutcome = await withLenderSpendLock(async () => {
+        const avail = await availableLenderNative(connection);
+        if (avail < LENDER_SOL_COST_CEILING_LAMPORTS) {
+          return { deferredReserve: true };
+        }
+        const s = await executeSweep(state, state.lenderKp, state.program, sweep);
+        return { sig: s };
+      });
+
+      if (lockOutcome.skipped) {
+        await markFailed(auditId, `lender-spend-lock: ${lockOutcome.reason}`);
+        summary.push(`  ${p.label}: SKIPPED — ${lockOutcome.reason}`);
+        continue;
+      }
+      if (lockOutcome.result?.deferredReserve) {
+        await markFailed(auditId, "lender below gas reserve — sweep deferred");
+        summary.push(`  ${p.label}: SKIPPED — lender at/below gas reserve; sweep deferred`);
+        continue;
+      }
+      const sig = lockOutcome.result.sig;
       await markConfirmed(auditId, sig);
       sweptCount++;
       totalSweptLamports += sweep;

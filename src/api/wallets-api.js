@@ -1,10 +1,18 @@
 /**
  * Site wallets endpoints.
  *
- *   GET  /api/v1/wallets?wallet=<linked-pubkey>
+ *   GET  /api/v1/wallets?wallet=<linked-pubkey>&signerPubkey=..&signatureBase58=..&signedMessageBase64=..
  *     Returns the wallets list for the user owning the queried wallet:
  *     id, public_key, source ('custodial' | 'imported' | 'site-link'),
  *     label, is_active, created_at. No secrets ever leak.
+ *     SIGNED flow: the caller must prove control of the queried wallet
+ *     with a fresh Ed25519 signature (same posture as /wallets/set-active).
+ *     Enumerating a user's sibling wallets leaks the operator's
+ *     wallet-routing graph + defeats on-chain pseudonymity, so this is
+ *     NOT servable unauthenticated even though wallet pubkeys are public.
+ *     Signature material may arrive via query params (GET) or JSON body
+ *     (POST). Signed payload header: "wallets/list/v1", { wallet, nonce,
+ *     issuedAt }; signerPubkey MUST equal the queried wallet.
  *
  *   POST /api/v1/wallets/set-active
  *     Signed action. Switches the user's active custodial wallet.
@@ -26,6 +34,7 @@ import { rejectIfSiteDisabled } from "../services/site-global.js";
 const bs58decode = bs58.decode || (bs58.default && bs58.default.decode);
 
 const FRESH_WINDOW_MS = 5 * 60 * 1000;
+const LIST_FRESH_WINDOW_MS = 5 * 60 * 1000;
 const MIN_INTERVAL_MS = 5_000;
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const lastBySigner = new Map();
@@ -70,6 +79,87 @@ export async function handleWalletsList(req, url) {
   if (!isValidPubkey(wallet)) {
     return { status: 400, body: { error: "Invalid wallet pubkey" } };
   }
+
+  // AUTH (IDOR fix): returning a user's sibling wallets deanonymizes the
+  // on-chain wallet cluster and leaks the operator's wallet-routing graph,
+  // so the caller must prove control of the queried wallet with a fresh
+  // Ed25519 signature. Signature material may arrive via query params (GET)
+  // or JSON body (POST) — same crypto posture as /wallets/set-active.
+  let signedMessageBase64 = url.searchParams.get("signedMessageBase64");
+  let signatureBase58 = url.searchParams.get("signatureBase58");
+  let signerPubkey = url.searchParams.get("signerPubkey");
+  if ((!signedMessageBase64 || !signatureBase58 || !signerPubkey) && req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      signedMessageBase64 = signedMessageBase64 || body?.signedMessageBase64;
+      signatureBase58 = signatureBase58 || body?.signatureBase58;
+      signerPubkey = signerPubkey || body?.signerPubkey;
+    } catch {
+      /* fall through to the missing-auth error below */
+    }
+  }
+  if (!signedMessageBase64 || !signatureBase58 || !signerPubkey) {
+    return {
+      status: 401,
+      body: { error: "Signed request required (signerPubkey, signatureBase58, signedMessageBase64)" },
+    };
+  }
+  // The signer must BE the queried wallet — proving control of a wallet is
+  // the only thing that entitles the caller to see that wallet's cluster.
+  if (signerPubkey !== wallet) {
+    return { status: 403, body: { error: "Signer must be the queried wallet" } };
+  }
+
+  let signerPk;
+  try {
+    signerPk = new PublicKey(signerPubkey);
+  } catch {
+    return { status: 400, body: { error: "Invalid signerPubkey" } };
+  }
+  let sigBytes;
+  try {
+    sigBytes = bs58decode(signatureBase58);
+    if (sigBytes.length !== 64) throw new Error("bad length");
+  } catch {
+    return { status: 400, body: { error: "Invalid signatureBase58" } };
+  }
+  let messageBytes;
+  try {
+    messageBytes = Buffer.from(signedMessageBase64, "base64");
+    if (messageBytes.length === 0 || messageBytes.length > 2048) {
+      throw new Error("size out of range");
+    }
+  } catch {
+    return { status: 400, body: { error: "Invalid signedMessageBase64" } };
+  }
+  let payload;
+  try {
+    payload = JSON.parse(messageBytes.toString("utf-8"));
+  } catch {
+    return { status: 400, body: { error: "Signed message is not valid JSON" } };
+  }
+  if (payload?.magpie !== "wallets/list/v1") {
+    return { status: 400, body: { error: "Bad payload header" } };
+  }
+  if (payload.wallet !== wallet) {
+    return { status: 400, body: { error: "Payload wallet does not match queried wallet" } };
+  }
+  if (!payload.nonce || !payload.issuedAt) {
+    return { status: 400, body: { error: "Payload missing nonce or issuedAt" } };
+  }
+  const ts = Date.parse(payload.issuedAt);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > LIST_FRESH_WINDOW_MS) {
+    return { status: 400, body: { error: "Signed message is stale — re-sign" } };
+  }
+  let sigOk;
+  try {
+    sigOk = verifyEd25519(messageBytes, sigBytes, signerPk.toBytes());
+  } catch (e) {
+    console.warn("[wallets-list] verify threw:", e.message);
+    return { status: 400, body: { error: "Signature verification failed" } };
+  }
+  if (!sigOk) return { status: 401, body: { error: "Signature does not match signer" } };
+
   // Prefer TG-linked user (canonical), site_native otherwise. See
   // src/services/wallet-owner-resolver.js.
   const { resolveWalletOwner } = await import("../services/wallet-owner-resolver.js");

@@ -254,8 +254,20 @@ const PER_IP_CREATE_WINDOW_MS = 24 * 60 * 60 * 1000;
 const PER_IP_CREATE_MAX = 8;
 const ipCreateBuckets = new Map();
 function ipKey(req) {
+  // SECURITY (audit finding #14): the LEFTMOST x-forwarded-for value is
+  // client-SUPPLIED and spoofable — trusting xff[0] let an attacker rotate it
+  // to defeat the per-IP read/create caps. Trust only the hop our OWN infra
+  // appended: Railway's edge appends the real connecting IP as the rightmost
+  // entry, so take the PUBLIC_TRUSTED_PROXY_HOPS-th hop from the right
+  // (default 1 = rightmost), matching server.js extractClientIp.
   const xf = req.headers["x-forwarded-for"];
-  if (typeof xf === "string" && xf) return xf.split(",")[0].trim();
+  if (typeof xf === "string" && xf.length > 0) {
+    const hops = xf.split(",").map((s) => s.trim()).filter(Boolean);
+    if (hops.length) {
+      const trusted = Math.max(1, parseInt(process.env.PUBLIC_TRUSTED_PROXY_HOPS || "1", 10));
+      return hops[Math.max(0, hops.length - trusted)];
+    }
+  }
   return req.socket?.remoteAddress || "unknown";
 }
 function checkIpRate(ip) {
@@ -339,15 +351,16 @@ export async function handleLinkStatus(req, url) {
       };
     }
 
-    // ?ref=CODE on the request URL credits the referrer when we create the
-    // user. Sanitize to the vanity-code charset (3–20, letters/numbers/_/-),
-    // stored upper-cased to match the case-insensitive resolver.
-    const refRaw = url.searchParams.get("ref");
-    const refCode = refRaw && /^[A-Za-z0-9_-]{3,20}$/.test(refRaw)
-      ? refRaw.toUpperCase()
-      : null;
+    // SECURITY (audit finding #14): do NOT attribute a referral here.
+    // This endpoint is UNAUTHENTICATED and this GET poll is prefetch-/
+    // CSRF-triggerable, while the ?ref=CODE param is fully attacker-
+    // controlled — crediting a referrer at this point would let anyone
+    // attribute a freshly-bootstrapped account to a code of their choosing.
+    // Referral attribution must happen on an authenticated/first-borrow
+    // event instead. We still auto-create the account (no ref) so the
+    // wallet can chat with Pip immediately, no Telegram required.
     try {
-      await findOrCreateSiteUser(wallet, refCode);
+      await findOrCreateSiteUser(wallet);
       recordIpCreate(ip);
       // Re-read the user row we just created so the response shape
       // matches what the chat panel expects.
