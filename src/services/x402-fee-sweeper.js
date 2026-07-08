@@ -44,6 +44,11 @@ import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
 import { getAdminId } from "./admin-notify.js";
 import { accrueToHolderPool } from "./magpie-holder-rewards.js";
+import {
+  runPrivilegedSign,
+  recordPrivilegedSignResult,
+} from "./privileged-sign-guard.js";
+import { withLenderSpendLock } from "./lender-spend-lock.js";
 
 // ─── Constants ────────────────────────────────────────────────────
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -56,8 +61,11 @@ const ADVISORY_LOCK_KEY = 73_004_022_990_402n;
 
 const JUPITER_QUOTE_API =
   process.env.JUPITER_QUOTE_API || "https://lite-api.jup.ag/swap/v1/quote";
-const JUPITER_SWAP_API =
-  process.env.JUPITER_SWAP_API || "https://lite-api.jup.ag/swap/v1/swap";
+// Hardened to a source-level constant (finding #7): this endpoint returns the
+// exact transaction the lender key signs, so an env flip must NOT be able to
+// redirect it to an attacker-controlled swap builder that injects extra lender
+// debits into the tx.
+const JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap";
 
 // ─── Config ───────────────────────────────────────────────────────
 function envNumber(name, fallback) {
@@ -91,6 +99,12 @@ const SLIPPAGE_BPS = envNumber("X402_FEE_SWEEP_SLIPPAGE_BPS", 100); // 1%
 // so a manipulated/compromised Jupiter quote can't inject an implausible value
 // that over-credits the holder pool. Default 5 SOL.
 const MAX_SWEEP_SOL_LAMPORTS = envNumber("X402_FEE_SWEEP_MAX_SOL_LAMPORTS", 5_000_000_000);
+// Max lender SOL the swap tx may net-debit — the priority-fee ceiling
+// (maxLamports 2_000_000 in getJupiterSwapTx) + base fee + buffer. The swap
+// outputs native SOL to the lender so it nets POSITIVE, but we still declare a
+// tight SOL headroom so runPrivilegedSign rejects any unexpected lender-SOL
+// drain hidden in the externally-supplied Jupiter transaction.
+const SWAP_FEE_HEADROOM_LAMPORTS = 2_100_000n;
 
 // ─── Lender keypair (env-first, no CWD fallback) ──────────────────
 let _lenderKp = null;
@@ -292,22 +306,63 @@ async function tickInner(bot) {
     }
     const swapTxB64 = await getJupiterSwapTx({ quoteResponse: quote, userPublicKey: lender.publicKey.toBase58() });
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTxB64, "base64"));
-    tx.sign([lender]);
-    const sim = await connection.simulateTransaction(tx, { sigVerify: false, commitment: "confirmed" });
-    if (sim.value.err) {
-      throw new Error(`swap sim rejected: ${JSON.stringify(sim.value.err).slice(0, 120)} ${(sim.value.logs || []).slice(-2).join(" | ").slice(0, 160)}`);
+
+    // 4. Sign + guarded-simulate + send under the ONE shared lender-spend lock.
+    //    runPrivilegedSign (finding #7) snapshots pre-state, signs with the
+    //    lender key, and rejects the broadcast unless the ONLY declared lender
+    //    debit is the USDC ATA (maxDecrease = the swapped balance) plus a small
+    //    SOL fee headroom — so an externally-supplied / manipulated Jupiter tx
+    //    can't drain any other lender account (the old error-only sim checked
+    //    sim.value.err but no per-account balance deltas). The shared lock keeps
+    //    the 5-SOL gas reserve intact across sibling lender-spending services
+    //    for the signing window.
+    const usdcAta = getAssociatedTokenAddressSync(USDC_MINT, lender.publicKey, false);
+    const lock = await withLenderSpendLock(async () => {
+      const guard = await runPrivilegedSign({
+        service: "x402-fee-sweeper",
+        tx,
+        signers: [lender],
+        allowedDeltas: [
+          { pubkey: usdcAta, kind: "token", mint: USDC_MINT, maxDecrease: usdc },
+          { pubkey: lender.publicKey, kind: "sol", maxDecrease: SWAP_FEE_HEADROOM_LAMPORTS },
+        ],
+      });
+      const sig = await connection.sendRawTransaction(guard.signedTx.serialize(), { skipPreflight: false });
+      try {
+        await connection.confirmTransaction(sig, "confirmed");
+        await recordPrivilegedSignResult({ auditId: guard.auditId, status: "confirmed", txSig: sig });
+      } catch (e) {
+        await recordPrivilegedSignResult({
+          auditId: guard.auditId,
+          status: "broadcast",
+          txSig: sig,
+          error: e.message?.slice(0, 160),
+        });
+        throw e;
+      }
+      return sig;
+    });
+    if (lock.skipped) {
+      // Another lender-spending service holds the shared lock — nothing was
+      // signed or broadcast; leave the USDC in place and retry next tick
+      // (never queue/block). The next tick re-reads the balance and re-plans.
+      await query(
+        `UPDATE x402_fee_sweeps SET status = 'failed', error_message = $2, updated_at = NOW() WHERE id = $1`,
+        [rowId, `lender-spend lock held: ${lock.reason}`.slice(0, 300)],
+      );
+      console.log(`[x402-fee-sweeper] sweep #${rowId} deferred — ${lock.reason}`);
+      return;
     }
-    const swapSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    await connection.confirmTransaction(swapSig, "confirmed");
+    const swapSig = lock.result;
     const solLamports = Number(quote.outAmount);
 
-    // 4. Record swap success BEFORE accrual/transfer (reconcile anchor)
+    // 5. Record swap success BEFORE accrual (reconcile anchor)
     await query(
       `UPDATE x402_fee_sweeps SET status = 'swapped', swap_sig = $2, sol_lamports = $3, updated_at = NOW() WHERE id = $1`,
       [rowId, swapSig, String(solLamports)],
     );
 
-    // 5. Accrue holder share (idempotent) + transfer to distributor
+    // 6. Accrue holder share (idempotent)
     await finalizeSweep(rowId, swapSig, solLamports, lender, bot, usdc);
     console.log(`[x402-fee-sweeper] swept ${(Number(usdc) / 1e6).toFixed(4)} USDC → ${(solLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL (${swapSig.slice(0, 10)}…)`);
   } catch (err) {

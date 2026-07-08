@@ -197,14 +197,47 @@ export async function handleAgentRevoke(ctx) {
         AND agent_pubkey = $2
         AND status = 'active'
         AND ($3::text IS NULL OR action = $3)
-      RETURNING id, action`,
+      RETURNING id, action, user_wallet`,
     [user.id, agentPubkey, action],
   );
   if (result.rows.length === 0) {
     return ctx.reply(`No active grant found for that agent.`);
   }
+
+  // Revoking the grant MUST also stand down the orders the agent already
+  // armed — the delegation is snapshotted at arm time and the firing
+  // engine does not re-read it, so orders armed before revoke would keep
+  // firing autonomous forced-sales after revoke. Cancel every armed
+  // agent_x402 order this agent placed on the revoked wallet(s).
+  // Cancelling only removes the auto-sell trigger; the loan stays active
+  // and no collateral is touched.
+  const revokedWallets = [...new Set(
+    result.rows.filter((r) => r.action === "limit_close").map((r) => r.user_wallet),
+  )];
+  let cancelledCount = 0;
+  if (revokedWallets.length > 0) {
+    const cancelRes = await query(
+      `UPDATE limit_close_orders lc
+          SET status = 'cancelled',
+              cancellation_reason = 'agent_delegation_revoked',
+              updated_at = NOW()
+         FROM loans l
+        WHERE lc.loan_id = l.id
+          AND lc.source = 'agent_x402'
+          AND lc.source_agent_pubkey = $1
+          AND lc.status = 'armed'
+          AND l.borrower_wallet = ANY($2::text[])
+        RETURNING lc.id`,
+      [agentPubkey, revokedWallets],
+    );
+    cancelledCount = cancelRes.rows.length;
+  }
+
   const list = result.rows.map((r) => `\`${r.action}\``).join(", ");
-  await ctx.reply(`Revoked ${result.rows.length} grant(s) for agent \`${agentPubkey.slice(0, 8)}…\`: ${list}`, { parse_mode: "Markdown" });
+  const cancelNote = cancelledCount > 0
+    ? `\nStood down ${cancelledCount} armed order(s) the agent had working.`
+    : "";
+  await ctx.reply(`Revoked ${result.rows.length} grant(s) for agent \`${agentPubkey.slice(0, 8)}…\`: ${list}${cancelNote}`, { parse_mode: "Markdown" });
 }
 
 /* ─── /agent_list ─────────────────────────────────────────────── */

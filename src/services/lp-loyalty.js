@@ -23,7 +23,6 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import fs from "node:fs";
@@ -35,6 +34,15 @@ import { lendingPoolPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
 import { getRuntimeConfigBps } from "./runtime-config.js";
+// SECURITY (findings 3 + 4): in production the distributor resolves to the
+// LENDER gas wallet (lender-fallback mode — REWARDS_DISTRIBUTOR_PRIVATE_KEY is
+// forbidden on the bot). Every reward payout is therefore a lender-key spend and
+// MUST (a) hold the ONE shared lender-spend lock, (b) be sized against the
+// canonical 5-SOL gas reserve, and (c) reconcile its broadcast on a confirm-
+// timeout so a landed-but-unconfirmed tx is never re-sent (double-pay of SOL).
+import { withLenderSpendLock } from "./lender-spend-lock.js";
+import { availableLenderNative, TX_FEE_HEADROOM } from "./lender-reserve.js";
+import { runPrivilegedSign, recordPrivilegedSignResult } from "./privileged-sign-guard.js";
 
 // Fallback used when governance_config.lp_loyalty_reward_bps can't be
 // read (DB outage or unset key). MGP-001 ratified the live value to
@@ -370,6 +378,198 @@ export async function syncPositionsForWallet(walletPubkey) {
   return updates;
 }
 
+const LP_LOYALTY_SERVICE = "lp-loyalty";
+
+/**
+ * Broadcast an already-built+signed reward-payout tx and resolve its TRUE
+ * on-chain fate (finding 4). web3.js sendAndConfirmTransaction throws on a
+ * confirm timeout EVEN WHEN THE TX LANDED — leaving the rows retryable then
+ * DOUBLE-PAYS real SOL on the next cycle. So we send once and, on any confirm
+ * timeout, reconcile with getSignatureStatuses(searchTransactionHistory) —
+ * definitive once the blockhash has expired — before deciding. Mirrors
+ * distribution-auto-funder.js's confirm-timeout guard.
+ *
+ * @returns {{ outcome: 'paid'|'retry'|'unresolved', sig: string|null, error?: string }}
+ *   paid       → proven on-chain (mark rows paid)
+ *   retry      → proven NOT on-chain (safe to leave 'accrued' for retry)
+ *   unresolved → RPC could not confirm inclusion (rare — total RPC outage);
+ *                treat as landed to protect the lender from a double-pay + flag.
+ */
+async function broadcastAndReconcile(signedTx, blockhash, lastValidBlockHeight) {
+  let sig = null;
+  try {
+    sig = await connection.sendRawTransaction(signedTx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+  } catch (err) {
+    // Never broadcast (e.g. preflight reject) → definitively safe to retry.
+    return { outcome: "retry", sig: null, error: err.message?.slice(0, 160) };
+  }
+  try {
+    await connection.confirmTransaction(
+      { signature: sig, blockhash, lastValidBlockHeight },
+      "confirmed",
+    );
+    return { outcome: "paid", sig };
+  } catch (confirmErr) {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const r = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
+        const st = r?.value?.[0];
+        if (st) {
+          if (st.err) {
+            // Processed but failed on-chain → funds did NOT move → safe to retry.
+            return { outcome: "retry", sig, error: `on-chain failure: ${JSON.stringify(st.err).slice(0, 80)}` };
+          }
+          if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") {
+            return { outcome: "paid", sig };
+          }
+          // processed but not yet confirmed — keep polling
+        } else if (i >= 2) {
+          // RPC answered null after the blockhash expired + a couple polls: the
+          // tx is not in the ledger, so it never landed → safe to retry.
+          return { outcome: "retry", sig };
+        }
+      } catch {
+        /* RPC blip — keep polling */
+      }
+      await new Promise((res) => setTimeout(res, 3000));
+    }
+    // Could not resolve (RPC unavailable throughout). Fail CLOSED to protect the
+    // lender gas wallet from a double-pay: treat as landed + flag for manual
+    // verification rather than auto-retrying.
+    return { outcome: "unresolved", sig, error: confirmErr.message?.slice(0, 160) };
+  }
+}
+
+/**
+ * Build, guard-sign, broadcast + reconcile ONE payout batch. When the signer is
+ * the lender gas wallet, routes through runPrivilegedSign so the spend is
+ * audited and the lender SOL decrease is bounded to the batch total. (No
+ * per-destination allowlist applies — payouts go to arbitrary LP wallets.)
+ */
+async function payRewardBatch({ service, batch, distributor, isLenderSigner }) {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  const tx = new Transaction();
+  tx.feePayer = distributor.publicKey;
+  tx.recentBlockhash = blockhash;
+  for (const r of batch) {
+    tx.add(
+      SystemProgram.transfer({
+        fromPubkey: distributor.publicKey,
+        toPubkey: new PublicKey(r.wallet_address),
+        lamports: BigInt(r.reward_lamports),
+      }),
+    );
+  }
+  const batchTotal = batch.reduce((a, r) => a + BigInt(r.reward_lamports), 0n);
+
+  let auditId = null;
+  if (isLenderSigner) {
+    let guard;
+    try {
+      guard = await runPrivilegedSign({
+        service,
+        tx,
+        signers: [distributor],
+        allowedDeltas: [
+          { pubkey: distributor.publicKey, kind: "sol", maxDecrease: batchTotal + TX_FEE_HEADROOM },
+        ],
+      });
+    } catch (err) {
+      // Sim/guard rejected → nothing broadcast → safe to retry.
+      return { outcome: "retry", sig: null, error: err.message?.slice(0, 160) };
+    }
+    auditId = guard.auditId;
+  } else {
+    tx.sign(distributor);
+  }
+
+  const res = await broadcastAndReconcile(tx, blockhash, lastValidBlockHeight);
+  if (auditId) {
+    const status = res.outcome === "paid" ? "confirmed" : res.outcome === "unresolved" ? "broadcast" : "failed";
+    await recordPrivilegedSignResult({ auditId, status, txSig: res.sig ?? undefined, error: res.error }).catch(() => {});
+  }
+  return res;
+}
+
+/**
+ * Pay a set of lp_loyalty_rewards rows in batches (findings 3 + 4). When the
+ * distributor is the lender gas wallet the whole run holds the ONE shared
+ * lender-spend lock and is sized against availableLenderNative() (canonical
+ * 5-SOL reserve) so reward payouts can NEVER starve loan-origination gas. Rows
+ * that don't fit under the reserve — or a proven-failed broadcast — stay
+ * 'accrued' for the next cycle. Returns { paidCount, paidLamports, deferred }.
+ */
+async function payLpRewardBatches(rows, distributor) {
+  if (rows.length === 0) return { paidCount: 0, paidLamports: 0n, deferred: 0 };
+  const isLenderSigner = distributor.publicKey.equals(LENDER_PUBKEY);
+  let paidCount = 0;
+  let paidLamports = 0n;
+  let deferred = 0;
+
+  const runBatches = async () => {
+    let avail;
+    if (isLenderSigner) {
+      avail = await availableLenderNative(connection);
+    } else {
+      const bal = BigInt(await connection.getBalance(distributor.publicKey));
+      avail = bal > MIN_LENDER_RESERVE_LAMPORTS ? bal - MIN_LENDER_RESERVE_LAMPORTS : 0n;
+    }
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const batch = rows.slice(i, i + BATCH_SIZE);
+      const batchTotal = batch.reduce((a, r) => a + BigInt(r.reward_lamports), 0n);
+      if (avail < batchTotal + TX_FEE_HEADROOM) {
+        deferred += rows.length - i;
+        console.warn(
+          `[lp-loyalty] reserve floor reached — ${rows.length - i} reward row(s) remain 'accrued' for the next cycle`,
+        );
+        break;
+      }
+      const { outcome, sig, error } = await payRewardBatch({
+        service: LP_LOYALTY_SERVICE,
+        batch,
+        distributor,
+        isLenderSigner,
+      });
+      if (outcome === "paid" || outcome === "unresolved") {
+        await query(
+          `UPDATE lp_loyalty_rewards
+              SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
+            WHERE id = ANY($1::bigint[])`,
+          [batch.map((r) => r.id), sig],
+        );
+        paidCount += batch.length;
+        paidLamports += batchTotal;
+        avail -= batchTotal + TX_FEE_HEADROOM;
+        if (outcome === "unresolved") {
+          console.error(
+            `[lp-loyalty] CRIT payout ${sig} confirm UNRESOLVED — marked paid to prevent a double-pay; VERIFY on-chain. ${error || ""}`,
+          );
+        }
+      } else {
+        deferred += batch.length;
+        console.error(`[lp-loyalty] batch payout failed (rows remain 'accrued' for retry): ${error || ""}`);
+      }
+    }
+  };
+
+  if (isLenderSigner) {
+    const lockRes = await withLenderSpendLock(runBatches);
+    if (lockRes.skipped) {
+      deferred = rows.length;
+      console.warn(
+        `[lp-loyalty] lender-spend lock held by another service — payouts deferred; ${rows.length} row(s) remain 'accrued' for retry`,
+      );
+    }
+  } else {
+    await runBatches();
+  }
+
+  return { paidCount, paidLamports, deferred };
+}
+
 /**
  * Snapshot + auto-pay. Computes each LP's weight = shares × seconds
  * since their weighted_deposit_at. Distributes pool pro-rata.
@@ -396,6 +596,7 @@ export async function snapshotAndDistributeLpLoyalty() {
   // party LPs split ~the FULL pool — the deferred check gates on that real
   // payout (previewAlloc), which is what the distributor must actually cover.
   const distributor = getRewardsDistributorKeypair();
+  const isLenderSigner = distributor.publicKey.equals(LENDER_PUBKEY);
   const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
 
   // Pull eligible LPs
@@ -460,7 +661,20 @@ export async function snapshotAndDistributeLpLoyalty() {
   let previewAlloc = 0n;
   for (const it of items) previewAlloc += (pool * it.weight) / totalWeight;
   if (previewAlloc <= 0n) return null;
-  if (distributorBalance < previewAlloc + MIN_LENDER_RESERVE_LAMPORTS) {
+  if (isLenderSigner) {
+    // Lender-fallback mode (production): gate on the canonical 5-SOL gas reserve
+    // via availableLenderNative — NOT the 0.1-SOL local floor — so a reward
+    // payout can never draw the loan-origination gas wallet toward empty. The
+    // per-batch in-lock check below is the authoritative gate; this is an early
+    // out that avoids the Phase-1 DB writes when clearly underfunded.
+    const avail = await availableLenderNative(connection);
+    if (avail < previewAlloc) {
+      console.warn(
+        `[lp-loyalty] Skipped: lender available ${avail} < payout ${previewAlloc} (canonical gas reserve protected)`,
+      );
+      return null;
+    }
+  } else if (distributorBalance < previewAlloc + MIN_LENDER_RESERVE_LAMPORTS) {
     console.warn(
       `[lp-loyalty] Skipped: distributor balance ${distributorBalance} < payout ${previewAlloc} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
     );
@@ -533,35 +747,9 @@ export async function snapshotAndDistributeLpLoyalty() {
   }
   client.release();
 
-  // Phase 2: batched SOL transfers
-  let paidCount = 0;
-  let paidLamports = 0n;
-  for (let i = 0; i < rewardRows.length; i += BATCH_SIZE) {
-    const batch = rewardRows.slice(i, i + BATCH_SIZE);
-    const tx = new Transaction();
-    for (const r of batch) {
-      tx.add(
-        SystemProgram.transfer({
-          fromPubkey: distributor.publicKey,
-          toPubkey: new PublicKey(r.wallet_address),
-          lamports: BigInt(r.reward_lamports),
-        }),
-      );
-    }
-    try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
-      await query(
-        `UPDATE lp_loyalty_rewards
-            SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
-          WHERE id = ANY($1::bigint[])`,
-        [batch.map((r) => r.id), sig],
-      );
-      paidCount += batch.length;
-      paidLamports += batch.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
-    } catch (err) {
-      console.error("[lp-loyalty] batch payout failed:", err.message);
-    }
-  }
+  // Phase 2: batched SOL transfers — reserve-gated, lock-serialized, and
+  // confirm-reconciled (findings 3 + 4).
+  const { paidCount, paidLamports } = await payLpRewardBatches(rewardRows, distributor);
 
   return {
     distribution_id: distId,
@@ -588,33 +776,11 @@ export async function retryAccruedLpLoyaltyPayouts() {
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
   const distributor = getRewardsDistributorKeypair();
-  const total = rows.reduce((s, r) => s + BigInt(r.reward_lamports), 0n);
-  const bal = BigInt(await connection.getBalance(distributor.publicKey));
-  if (bal < total + MIN_LENDER_RESERVE_LAMPORTS) return { retried: 0, paid: 0, skipped: rows.length };
-
-  let paid = 0;
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
-    const tx = new Transaction();
-    for (const r of batch) {
-      tx.add(SystemProgram.transfer({
-        fromPubkey: distributor.publicKey,
-        toPubkey: new PublicKey(r.wallet_address),
-        lamports: BigInt(r.reward_lamports),
-      }));
-    }
-    try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], { commitment: "confirmed" });
-      await query(
-        `UPDATE lp_loyalty_rewards SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2 WHERE id = ANY($1::bigint[])`,
-        [batch.map((r) => r.id), sig],
-      );
-      paid += batch.length;
-    } catch (err) {
-      console.error("[lp-loyalty] retry batch failed:", err.message);
-    }
-  }
-  return { retried: rows.length, paid };
+  // Reserve-gated, lock-serialized, confirm-reconciled (findings 3 + 4). The
+  // per-batch reserve gate means partial payment is possible — rows that don't
+  // fit under the gas reserve stay 'accrued' for the next cycle.
+  const { paidCount, deferred } = await payLpRewardBatches(rows, distributor);
+  return { retried: rows.length, paid: paidCount, skipped: deferred };
 }
 
 /**

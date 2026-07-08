@@ -1118,15 +1118,21 @@ async function handleAdminPoolStats(req, url) {
     if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
-  } else {
-    console.warn(
-      "[admin] ADMIN_API_TOKEN unset — falling back to LENDER_PUBKEY-equality gate (audit HIGH#4 mitigation). Set ADMIN_API_TOKEN to a 32-byte random hex/base64 string and rotate the deploy.",
+  } else if (process.env.ALLOW_INSECURE_ADMIN_FALLBACK === "1") {
+    // Explicit, off-by-default bootstrap escape hatch. LENDER_PUBKEY is a PUBLIC
+    // on-chain identifier (stamped into every loan PDA, readable from any tx) —
+    // it is NOT a secret, so this path is insecure by construction.
+    console.error(
+      "[admin][INSECURE] ADMIN_API_TOKEN unset + ALLOW_INSECURE_ADMIN_FALLBACK=1 — admin data gated ONLY by a public pubkey. Set ADMIN_API_TOKEN and remove this flag now.",
     );
-    if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
     const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    if (!wallet || !LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden" } };
     }
+  } else {
+    // Fail CLOSED — never treat a public identifier as a credential.
+    console.error("[admin] ADMIN_API_TOKEN not configured — refusing admin request (fail-closed). Set ADMIN_API_TOKEN.");
+    return { status: 503, body: { error: "Admin auth not configured" } };
   }
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
 
@@ -1446,13 +1452,16 @@ async function handleAdminLifetimeStats(req, url) {
     if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
-  } else {
-    console.warn(
-      "[admin] ADMIN_API_TOKEN unset on lifetime-stats — falling back to LENDER_PUBKEY-equality gate. Set ADMIN_API_TOKEN and rotate the deploy.",
+  } else if (process.env.ALLOW_INSECURE_ADMIN_FALLBACK === "1") {
+    console.error(
+      "[admin][INSECURE] ADMIN_API_TOKEN unset on lifetime-stats + ALLOW_INSECURE_ADMIN_FALLBACK=1 — gated ONLY by a public pubkey. Set ADMIN_API_TOKEN and remove this flag now.",
     );
-    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    if (!wallet || !LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden" } };
     }
+  } else {
+    console.error("[admin] ADMIN_API_TOKEN not configured — refusing lifetime-stats (fail-closed). Set ADMIN_API_TOKEN.");
+    return { status: 503, body: { error: "Admin auth not configured" } };
   }
 
   const now = Date.now();
