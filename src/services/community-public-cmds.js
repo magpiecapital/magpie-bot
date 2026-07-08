@@ -771,14 +771,13 @@ export async function handleCommunityWhitepaper(ctx) {
 /* ─────────────────────────── /audit ─────────────────────────── */
 
 export async function handleCommunityAudit(ctx) {
-  // Honest answer — there is no formal third-party audit yet.
-  // Saying "audited" when we're not would be misrepresentation,
-  // and the community will eventually find out. Instead: explain
-  // what compensates for the missing audit + what's planned.
+  // Honest answer — no audit REPORT has shipped yet, but the Sec3
+  // audit is now actively underway (activities commenced 2026-07-08).
+  // Never say "audited" (the report isn't out) — say it's in progress.
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie has *not* yet shipped a formal third-party audit. The team is *actively researching and vetting auditors* right now — that's the current posture. No public timeline yet; the operator will announce when scope + firm are locked.`,
+    `Magpie has *engaged Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. Audit activities *commenced Wednesday, July 8, 2026*. *V3 + the credit-oracle program are next in line.* The report is published when it's complete — so the protocol is *not yet audited*, and remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -819,7 +818,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `A formal third-party audit hasn't shipped yet — team is *researching and vetting auditors* (see /audit for the current posture). Source is open. Until an audit lands, a bug anywhere in the program could result in loss of funds.`,
+    `The audit *report* hasn't shipped yet, but *Sec3's audit of V4 is now underway* (commenced July 8, 2026 — see /audit). Source is open. Until the report lands, a bug anywhere in the program could result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
