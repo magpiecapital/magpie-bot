@@ -104,6 +104,24 @@ const PROTECTED_PERSONA_NAMES = [...new Set([
 ])];
 const PERSONA_ALT = (PROTECTED_PERSONA_NAMES.length ? PROTECTED_PERSONA_NAMES : ["matt"]).join("|");
 
+// Standalone role-words that are impersonation ON THEIR OWN (no "magpie"
+// needed) — nobody legitimately names themselves just "Founder" / "Creator" in
+// the project's OWN chat. This is a DELIBERATE, operator-mandated exception to
+// the 2026-06-30 "don't ban bare role words" rule (operator 2026-07-08, after a
+// "Founder" scammer joined Magpie Talk). Baseline is UNIONed with env so a stale
+// or partial env can never silently un-ban a baseline word; add more standalone
+// words later via STANDALONE_IMPERSONATOR_WORDS (comma-separated) with no code
+// change. Homoglyph / spaced-out / styled-unicode variants ("different latin
+// letters") are covered automatically because impersonationVariants() tests each
+// pattern against the homoglyph-folded + despaced forms of the name.
+const STANDALONE_IMPERSONATOR_BASELINE = ["founder", "creator"];
+const STANDALONE_IMPERSONATOR_WORDS = [...new Set([
+  ...STANDALONE_IMPERSONATOR_BASELINE,
+  ...(process.env.STANDALONE_IMPERSONATOR_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+])];
+const STANDALONE_IMPERSONATOR_ALT = STANDALONE_IMPERSONATOR_WORDS.join("|");
+
 export const IMPERSONATION_PATTERNS = [
   // (Near-)exact brand name as the whole display name — no legitimate use.
   // Includes the GROUP name "Magpie Talk" + news/announcement/dev/exec poses.
@@ -114,6 +132,13 @@ export const IMPERSONATION_PATTERNS = [
   /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|cto|dev(?:eloper)?|customer|talk|news|announce(?:ment)?s?|bot)\b/i,
   /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
   /\bofficial\s+magpie\b/i,
+  // Standalone "Founder" / "Creator" (+ any STANDALONE_IMPERSONATOR_WORDS env
+  // additions) as the WHOLE display name — matches Founder, Founders, Cofounder,
+  // Co-Founder, The Creator, Creators, etc., plus homoglyph/spaced variants via
+  // the folded+despaced forms. Operator-mandated 2026-07-08 (a "Founder" scammer
+  // joined). Anchored to the whole name so real members ("Merlin Founder's Fan")
+  // are unaffected — only names that ARE the role word trip it.
+  new RegExp(`^\\s*(co[\\s._-]*|the[\\s._-]+)?(${STANDALONE_IMPERSONATOR_ALT})s?\\s*[.!·•]*$`, "i"),
   // NOTE (operator 2026-06-30, "calm down on kicks"): we deliberately do NOT
   // name-ban a STANDALONE role word ("CTO", "Dev", "Support") with no "magpie"
   // — that over-banned real members (a "$Merlin CTO" / "Dev Dan" who never
