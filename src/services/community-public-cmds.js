@@ -777,7 +777,7 @@ export async function handleCommunityAudit(ctx) {
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie has *engaged Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. Audit activities *commenced Wednesday, July 8, 2026*. *V3 + the credit-oracle program are next in line.* The report is published when it's complete — so the protocol is *not yet audited*, and remember an audit reduces risk, it doesn't eliminate it.`,
+    `Magpie has *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. The engagement is *paid for* and the *audit is actively underway* (commenced Wednesday, July 8, 2026). *V3 + the credit-oracle program are next in line.* The report is published when it's complete — so the protocol is *not yet audited*, and remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
