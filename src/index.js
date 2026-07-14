@@ -726,7 +726,7 @@ async function registerBotCommands() {
       { command: "supported", description: "Approved collateral tokens" },
       { command: "credit", description: "Your credit score + points" },
       { command: "history", description: "Loan history" },
-      { command: "refer", description: "Earn 5% of friends' loan fees" },
+      { command: "refer", description: "Earn 10% of friends' loan fees" },
       { command: "share", description: "Flex your loan / streak on Twitter" },
       { command: "holders", description: "$MAGPIE holder rewards" },
       { command: "distributions", description: "Your full distribution history" },
@@ -1000,7 +1000,7 @@ bot.start({
     // permanently off; if a future MGP proposal restores automated distributions,
     // re-enable this line as part of that proposal's ratified implementation.
     // setTimeout(() => startHolderDistributor(bot), 90_000);
-    // LP Loyalty distributor — rewards long-term LPs from 2% of fees
+    // LP Loyalty distributor — rewards long-term LPs from 10% of fees
     setTimeout(() => startLpLoyaltyDistributor(), 120_000);
     // Loan reconciler — proactively syncs DB state with on-chain truth
     // every 5 min. Catches partial-repay/extend/liquidation drift.
