@@ -3,7 +3,7 @@
  *
  * The lender wallet funds three things:
  *   1. Protocol operations (price attestations, ATA rents)
- *   2. Referral payouts (5% of fees → referrers on claim)
+ *   2. Referral payouts (10% of fees → referrers on claim)
  *   3. Holder reward distributions ($MAGPIE holders, LP loyalty)
  *
  * If it drains overnight without warning, holder/referral payouts

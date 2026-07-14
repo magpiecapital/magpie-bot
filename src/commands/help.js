@@ -54,7 +54,7 @@ export async function handleHelp(ctx) {
     "/risk <symbol> — AI risk assessment for a token",
     "",
     "*Earn*",
-    "/refer — earn 5% of friends' loan fees (lifetime, paid in SOL)",
+    "/refer — earn 10% of friends' loan fees (lifetime, paid in SOL)",
     "/holders — $MAGPIE holders earn 70% of all fees pro-rata (weekly distribution)",
     "",
     "*Marketplace*",

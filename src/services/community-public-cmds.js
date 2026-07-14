@@ -616,13 +616,13 @@ export async function handleCommunityRefer(ctx) {
   const text = [
     `🤝 *Magpie referral program*`,
     ``,
-    `Refer a friend → earn *5% of every loan fee they ever pay*. Lifetime. Paid in SOL.`,
+    `Refer a friend → earn *10% of every loan fee they ever pay*. Lifetime. Paid in SOL.`,
     ``,
     `*How it works*`,
     `• DM @magpie\\_capital\\_bot and run /refer`,
     `• You get a unique link — share it`,
     `• Anyone who starts the bot through your link is linked to you forever`,
-    `• 5% of every fee they pay is airdropped to your wallet automatically`,
+    `• 10% of every fee they pay is airdropped to your wallet automatically`,
     ``,
     `*No cap, no claim, no signup* — just hold the wallet that originated the link.`,
   ].join("\n");
@@ -950,7 +950,7 @@ export async function handleCommunityApy(ctx) {
       RULE,
       "```",
       ``,
-      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee (≈ 2% avg) flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
+      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
       ``,
       `Deposit at [magpie.capital/earn](${SITE_URL}/earn). See /lend for how it works.`,
     ].join("\n");
