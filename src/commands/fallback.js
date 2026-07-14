@@ -3,6 +3,7 @@
  * Maps common phrases to the right command, or shows a helpful nudge.
  */
 import { InlineKeyboard } from "grammy";
+import { query } from "../db/pool.js";
 
 // Keyword → { handler, label } mapping
 // Order matters — first match wins
@@ -334,6 +335,12 @@ export async function handleFallback(ctx) {
         try { await ctx.api.sendMessage(op, note); } catch { /* best-effort per operator */ }
       }
     }
+    // Durable store so replies are searchable/aggregatable (powers /feedback),
+    // not just a forwarded DM. Best-effort — never blocks the user's reply.
+    await query(
+      `INSERT INTO user_feedback (telegram_id, telegram_username, message) VALUES ($1, $2, $3)`,
+      [ctx.from?.id ?? null, ctx.from?.username ?? null, text],
+    ).catch(() => {});
     console.log(`[reply-capture] from ${ctx.from?.id} (@${ctx.from?.username || "?"}): ${text.slice(0, 200)}`);
   } catch { /* capture must never break the user's reply */ }
 
