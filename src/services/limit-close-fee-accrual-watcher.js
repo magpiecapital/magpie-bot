@@ -67,11 +67,13 @@ async function tick() {
     { accrueToHolderPool },
     { accrueToLpLoyaltyPool },
     { accrueToProtocolReserve },
+    { rollUnreferredShareToHolders },
   ] = await Promise.all([
     import("./referral-rewards.js"),
     import("./magpie-holder-rewards.js"),
     import("./lp-loyalty.js"),
     import("./protocol-reserve.js"),
+    import("./loans.js"),
   ]);
 
   let accruedCount = 0;
@@ -112,6 +114,10 @@ async function tick() {
       } catch (err) {
         console.warn(`[limit-close-accrual] holder accrual failed for order ${row.id}:`, err.message);
       }
+      // No-referrer rollover — same 0%-retained guarantee as the borrow/extend
+      // fee paths: if the borrower has no referrer, the unpaid 10% rolls into
+      // holders (→80/10/10) instead of being retained. No-op if referred.
+      await rollUnreferredShareToHolders({ refereeUserId: row.user_id, feeLamports, sourceId: `lc_order_${row.id}` });
       try {
         await accrueToLpLoyaltyPool(feeLamports, { sourceType: "limit_close_fee", sourceId: `lc_order_${row.id}` });
       } catch (err) {
