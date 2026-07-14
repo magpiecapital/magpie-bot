@@ -581,7 +581,7 @@ async function _executeRepayImpl({ userId, loanDbRow }) {
  * exists (their 10% was already accrued). Idempotent via creditHolderPoolDirect's
  * ON CONFLICT (source_type, source_id, pool_kind).
  */
-async function rollUnreferredShareToHolders({ refereeUserId, feeLamports, sourceId }) {
+export async function rollUnreferredShareToHolders({ refereeUserId, feeLamports, sourceId }) {
   const fee = BigInt(feeLamports);
   if (fee <= 0n || !refereeUserId || !sourceId) return;
   try {
