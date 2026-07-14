@@ -922,8 +922,9 @@ export async function handleHolderPool(ctx) {
   // Read the LIVE bps from governance_config — flips automatically when
   // MGP-001 ratifies.
   const { getHolderRewardBps } = await import("../services/magpie-holder-rewards.js");
+  const { getLpLoyaltyRewardBps } = await import("../services/lp-loyalty.js");
   const HOLDER_REWARD_BPS = await getHolderRewardBps();
-  const LP_LOYALTY_BPS = 200;        // 2% (no governance flip planned)
+  const LP_LOYALTY_BPS = await getLpLoyaltyRewardBps();   // live bps (10% post-MGP-001), not a hardcoded 2% guess
 
   const { rows: [hp] } = await query(
     `SELECT accrued_lamports::text, last_distribution_at, updated_at,
@@ -971,7 +972,7 @@ export async function handleHolderPool(ctx) {
     "",
     "*$MAGPIE Holder Pool*",
     `  Actual accrued:  \`${fmt(actualHolder)} SOL\``,
-    `  Expected (10% of all loan fees${hp?.last_distribution_at ? " since last dist" : ""}):`,
+    `  Expected (${(HOLDER_REWARD_BPS / 100).toFixed(0)}% of all loan fees${hp?.last_distribution_at ? " since last dist" : ""}):`,
     `                   \`${fmt(expectedHolderAccrual)} SOL\``,
     `  Δ (expected − actual): *\`${sign(holderDelta)}${fmt(holderDelta)} SOL\`*`,
     `  Last distribution:  ${hp?.last_distribution_at ? new Date(hp.last_distribution_at).toISOString() : "_never_"}`,
@@ -980,7 +981,7 @@ export async function handleHolderPool(ctx) {
     "",
     "*LP Loyalty Pool*",
     `  Actual accrued:  \`${fmt(actualLp)} SOL\``,
-    `  Expected (2%):   \`${fmt(expectedLpAccrual)} SOL\``,
+    `  Expected (${(LP_LOYALTY_BPS / 100).toFixed(0)}%):   \`${fmt(expectedLpAccrual)} SOL\``,
     `  Δ: *\`${sign(lpDelta)}${fmt(lpDelta)} SOL\`*`,
     `  Pool last touched: ${lp?.updated_at ? new Date(lp.updated_at).toISOString() : "_never_"}`,
     "",
