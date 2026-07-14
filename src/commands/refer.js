@@ -2,7 +2,7 @@
  * /refer — show the user's referral code, share link, lifetime earnings,
  * and a button to claim their accrued SOL payout.
  *
- * Economics: 5% of every loan fee from users they bring in. Sourced from
+ * Economics: 10% of every loan fee from users they bring in. Sourced from
  * the protocol's share — LPs are unaffected. Paid out in SOL on demand.
  */
 import { InlineKeyboard } from "grammy";
