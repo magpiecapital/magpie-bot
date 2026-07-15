@@ -30,6 +30,7 @@ import {
 } from "@solana/spl-token";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   getReadOnlyProgram,
   getProgramForSigner,
@@ -152,7 +153,7 @@ async function liquidateLoan(program, keeper, loan, pool) {
   const isV4 = PROGRAM_ID_V4 && program.programId.equals(PROGRAM_ID_V4);
   let v4ExtraAccounts = {};
   let preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "liquidation" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
   ];
   if (isV4) {

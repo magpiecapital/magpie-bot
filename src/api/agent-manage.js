@@ -37,6 +37,7 @@ import {
 import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection, withFailover } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import { chooseProgramIdForLoan, getProgramForSigner } from "../solana/program.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
@@ -195,7 +196,7 @@ export async function handleAgentBuildExtend(req) {
     const feeLamports = (owedLive * feeBps) / 10_000n;
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "agent-manage" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
       createAssociatedTokenAccountIdempotentInstruction(borrowerPk, borrowerWsolAta, borrowerPk, NATIVE_MINT, loanTokenProgram),
       createAssociatedTokenAccountIdempotentInstruction(borrowerPk, feeWalletWsolAta, LENDER_PUBKEY, NATIVE_MINT, loanTokenProgram),
@@ -250,7 +251,7 @@ export async function handleAgentBuildTopup(req) {
     const borrowerCollateralAta = getAssociatedTokenAddressSync(collateralMintPk, borrowerPk, false, collateralTokenProgram);
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "agent-manage" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     ];
 
@@ -310,7 +311,7 @@ export async function handleAgentBuildPartialRepay(req) {
     const borrowerWsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, borrowerPk, false, loanTokenProgram);
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "agent-manage" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
       createAssociatedTokenAccountIdempotentInstruction(borrowerPk, borrowerWsolAta, borrowerPk, NATIVE_MINT, loanTokenProgram),
       SystemProgram.transfer({ fromPubkey: borrowerPk, toPubkey: borrowerWsolAta, lamports: repayLamports }),

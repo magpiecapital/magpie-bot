@@ -21,6 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   getProgramForSigner,
   PROGRAM_ID,
@@ -257,7 +258,7 @@ export async function executeBorrow({
   // fee_wallet_token_account constraint. Borrower pays the rent (~0.002 SOL,
   // one-time) — fee ATA persists thereafter as long as it holds wSOL.
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -470,7 +471,7 @@ async function _executeRepayImpl({ userId, loanDbRow }) {
   //   2. Wrap SOL → wSOL in borrower's loan-token ATA so they can pay back
   //      the principal: create ATA, fund it, sync_native.
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -1064,7 +1065,7 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
       tokenProgram: collateralTokenProgram,
     })
     .preInstructions([
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     ])
     .rpc({ commitment: "confirmed" });
@@ -1096,7 +1097,7 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
   );
 
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -1180,7 +1181,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   const feeLamports = (owedLive * feeBps) / 10_000n;
 
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,

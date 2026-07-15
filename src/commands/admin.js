@@ -7,6 +7,7 @@ import {
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import { ensureMintFeedsInitialized } from "../services/price-attestor.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
@@ -1404,7 +1405,7 @@ export async function handleFundPool(ctx) {
     const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, lender.publicKey);
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "fundpool" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
       createAssociatedTokenAccountIdempotentInstruction(
         lender.publicKey,
