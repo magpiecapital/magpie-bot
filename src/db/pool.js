@@ -244,6 +244,38 @@ export async function applyStartupPatches() {
      VALUES ('9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump')
      ON CONFLICT DO NOTHING`,
 
+    // $SOLdiers — operator manual approval 2026-07-15 (full authorization →
+    // screening bypassed per feedback_operator_manual_token_approval_bypasses_screening).
+    // Verified on-chain: pump.fun memecoin, Token-2022, decimals=6, mint+freeze
+    // authority BOTH renounced, metadata-only extensions (no transfer-hook/fee/
+    // permanent-delegate = not a honeypot), ~$295k Jupiter liquidity, routable
+    // BOTH directions (buy + sell, <0.1% impact on ~$2k) so it stays liquidatable.
+    // category='memecoin' → V1 (no-exits) / V4 (with-exits). protected=TRUE =
+    // exempt from auto-disable; attestation_tier='hot' + warm-all (#599) keep the
+    // TWAP feed continuously warm so first-attempt borrows never hit a cold feed.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('B4ptaVsUe6YbtBwAS38WFeweSrVNfQLCcj9JRrtjU8vn',
+             'SOLdiers', 'SOLdiers', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from re-processing $SOLdiers through the audit pipeline.
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('B4ptaVsUe6YbtBwAS38WFeweSrVNfQLCcj9JRrtjU8vn')
+     ON CONFLICT DO NOTHING`,
+
     // Referral rewards ledger. One row per fee-bearing event (borrow, extend)
     // produced by a referred user. Sum of unpaid rows = claimable balance.
     `CREATE TABLE IF NOT EXISTS referral_earnings (
