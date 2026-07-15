@@ -679,50 +679,6 @@ async function refreshContinuousList() {
   console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints`);
 }
 
-async function processContinuousMint(target, lenderPk, programIdV4) {
-  if (state.inFlight.has(target.mint)) {
-    return { mint: target.mint, action: "in_flight_skip" };
-  }
-  state.inFlight.add(target.mint);
-  try {
-    const readiness = await checkMintReadiness(target.mint);
-    const buffered =
-      readiness.ready &&
-      typeof readiness.samples_in_window === "number" &&
-      readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
-    if (buffered) {
-      state.continuousSkipped++;
-      return { mint: target.mint, action: "buffered_skip" };
-    }
-    // Fire one attestation. If feed PDA missing, init then attest.
-    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
-    try {
-      await attestPrice(target.mint, target.decimals, undefined, programIdV4);
-    } catch (err) {
-      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
-        try {
-          await initializePriceFeed(target.mint, programIdV4);
-          await attestPrice(target.mint, target.decimals, undefined, programIdV4);
-        } catch (initErr) {
-          state.continuousErrors++;
-          state.lastError = `init+attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${initErr.message?.slice(0, 120)}`;
-          state.lastErrorAt = new Date().toISOString();
-          return { mint: target.mint, action: "init_failed" };
-        }
-      } else {
-        state.continuousErrors++;
-        state.lastError = `attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`;
-        state.lastErrorAt = new Date().toISOString();
-        return { mint: target.mint, action: "attest_failed" };
-      }
-    }
-    state.continuousAttestations++;
-    return { mint: target.mint, action: "attested" };
-  } finally {
-    state.inFlight.delete(target.mint);
-  }
-}
-
 async function continuousAllMintsLoop(lenderPk, programIdV4) {
   // Refresh mint list periodically — handles new mints added at runtime.
   const sinceRefresh = Date.now() - state.continuousListRefreshedAt;
@@ -776,14 +732,75 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
   }
   state.continuousCursor = (state.continuousCursor + memeSlots) % Math.max(memecoins.length, 1);
 
-  // Fire in parallel — each mint independently goes through readiness
-  // check + attestation.
-  await Promise.all(batch.map((m) =>
-    processContinuousMint(m, lenderPk, programIdV4).catch((e) => {
-      state.continuousErrors++;
-      return { mint: m.mint, action: "error", error: e.message?.slice(0, 120) };
+  // Readiness-filter the batch (a cheap on-chain read; buffered mints cost
+  // nothing), then BATCH the needed attestations into multi-instruction
+  // transactions — the same cost win as the main attestor tick. This is
+  // what keeps every V4 mint warm 24/7 affordably.
+  // See [[feedback_first_attempt_loan_success_cost_effective]].
+  const needy = [];
+  await Promise.all(
+    batch.map(async (m) => {
+      if (state.inFlight.has(m.mint)) return;
+      try {
+        const readiness = await checkMintReadiness(m.mint);
+        const buffered =
+          readiness.ready &&
+          typeof readiness.samples_in_window === "number" &&
+          readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
+        if (buffered) {
+          state.continuousSkipped++;
+          return;
+        }
+        needy.push(m);
+      } catch {
+        // readiness read blip — treat as needy so a feed never starves.
+        needy.push(m);
+      }
     }),
-  ));
+  );
+
+  if (needy.length > 0) {
+    try {
+      const { attestPriceBatch } = await import("./price-attestor.js");
+      const { getPricesInSolBatch, getPriceInSol } = await import("./price.js");
+      let priceMap = new Map();
+      try {
+        priceMap = await getPricesInSolBatch(needy.map((m) => m.mint));
+      } catch {
+        priceMap = new Map();
+      }
+      // Per-mint backfill for anything the batch endpoint omits (Token-2022
+      // stocks need Dex-first routing) — mirrors the main attestor tick.
+      const missing = needy.filter((m) => !priceMap.has(m.mint));
+      for (const m of missing) {
+        try {
+          const p = await getPriceInSol(m.mint);
+          if (p) priceMap.set(m.mint, p);
+        } catch {
+          /* this mint retries next tick */
+        }
+      }
+      const items = needy
+        .map((m) => ({ mint: m.mint, decimals: m.decimals, priceSol: priceMap.get(m.mint) }))
+        .filter((it) => it.priceSol && it.priceSol > 0);
+      // Guard against double-attest races with the on-demand/burst loops.
+      for (const it of items) state.inFlight.add(it.mint);
+      try {
+        const res = await attestPriceBatch(items, programIdV4, { label: "v4-continuous" });
+        state.continuousAttestations += res.attested.length;
+        state.continuousErrors += res.failed.length;
+        if (res.failed.length) {
+          state.lastError = `v4-continuous batch: ${res.failed[0].err}`;
+          state.lastErrorAt = new Date().toISOString();
+        }
+      } finally {
+        for (const it of items) state.inFlight.delete(it.mint);
+      }
+    } catch (e) {
+      state.continuousErrors++;
+      console.warn("[v4-readiness] continuous batch threw:", e.message?.slice(0, 120));
+    }
+  }
 
   setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
     console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),
