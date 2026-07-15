@@ -5105,21 +5105,24 @@ async function loadConversation(userId) {
   return { messages: row.messages || [], turns: row.turns || 0, isNew: false };
 }
 
-async function saveConversation(userId, messages, turns, tokensIn, tokensOut) {
+async function saveConversation(userId, messages, turns, tokensIn, tokensOut, cacheReadIn = 0, cacheWriteIn = 0) {
   const trimmed = messages.length > MAX_HISTORY_TURNS * 2
     ? messages.slice(-MAX_HISTORY_TURNS * 2)
     : messages;
   await query(
     `INSERT INTO support_conversations
-       (user_id, messages, turns, total_input_tokens, total_output_tokens, started_at, last_active_at)
-     VALUES ($1, $2::jsonb, $3, $4, $5, NOW(), NOW())
+       (user_id, messages, turns, total_input_tokens, total_output_tokens,
+        total_cache_read_tokens, total_cache_write_tokens, started_at, last_active_at)
+     VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, NOW(), NOW())
      ON CONFLICT (user_id) DO UPDATE SET
        messages = EXCLUDED.messages,
        turns = support_conversations.turns + 1,
        total_input_tokens = support_conversations.total_input_tokens + EXCLUDED.total_input_tokens,
        total_output_tokens = support_conversations.total_output_tokens + EXCLUDED.total_output_tokens,
+       total_cache_read_tokens = support_conversations.total_cache_read_tokens + EXCLUDED.total_cache_read_tokens,
+       total_cache_write_tokens = support_conversations.total_cache_write_tokens + EXCLUDED.total_cache_write_tokens,
        last_active_at = NOW()`,
-    [userId, JSON.stringify(trimmed), turns + 1, tokensIn, tokensOut],
+    [userId, JSON.stringify(trimmed), turns + 1, tokensIn, tokensOut, cacheReadIn, cacheWriteIn],
   );
 }
 
@@ -5165,16 +5168,22 @@ async function getTodaySpendUsd() {
   try {
     const { rows: [r] } = await query(
       `SELECT
-         COALESCE(SUM(total_input_tokens), 0)::bigint  AS input_tok,
-         COALESCE(SUM(total_output_tokens), 0)::bigint AS output_tok
+         COALESCE(SUM(total_input_tokens), 0)::bigint       AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint      AS output_tok,
+         COALESCE(SUM(total_cache_read_tokens), 0)::bigint  AS cache_read_tok,
+         COALESCE(SUM(total_cache_write_tokens), 0)::bigint AS cache_write_tok
        FROM support_conversations
        WHERE last_active_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
     );
-    // We don't track cache hits separately yet — assume worst-case base rates.
-    // This over-estimates by ~70%, which is fine for a safety cap.
+    // Full cost incl. prompt-cache reads/writes — mirrors estimateCostUsd so the
+    // daily cap reflects the REAL Anthropic bill. Cache write/read dominate spend,
+    // so counting only base input/output (as before) made the cap blind to ~80%
+    // of the bill and it never fired.
     return (
       (Number(r.input_tok) * PRICE_PER_M_INPUT
-        + Number(r.output_tok) * PRICE_PER_M_OUTPUT) / 1_000_000
+        + Number(r.output_tok) * PRICE_PER_M_OUTPUT
+        + Number(r.cache_read_tok) * PRICE_PER_M_CACHE_READ
+        + Number(r.cache_write_tok) * PRICE_PER_M_CACHE_WRITE) / 1_000_000
     );
   } catch {
     return 0; // If DB blip, don't block the agent on metering
@@ -5713,6 +5722,8 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
 
   let totalIn = 0;
   let totalOut = 0;
+  let totalCacheRead = 0;
+  let totalCacheWrite = 0;
   const usedTools = [];
   let escalatedTicketId = null;
   let escalatedReason = null;
@@ -5807,6 +5818,8 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
 
     totalIn += response.usage?.input_tokens ?? 0;
     totalOut += response.usage?.output_tokens ?? 0;
+    totalCacheRead += response.usage?.cache_read_input_tokens ?? 0;
+    totalCacheWrite += response.usage?.cache_creation_input_tokens ?? 0;
 
     // Collect any tool calls; if none, we're done
     const toolUses = (response.content || []).filter((b) => b.type === "tool_use");
@@ -5815,7 +5828,7 @@ export async function chatWithAgent(userId, userMessage, opts = {}) {
     if (toolUses.length === 0) {
       // Final answer — save + return
       messages.push({ role: "assistant", content: response.content });
-      await saveConversation(userId, messages, 1, totalIn, totalOut);
+      await saveConversation(userId, messages, 1, totalIn, totalOut, totalCacheRead, totalCacheWrite);
       return {
         text: textBlocks.map((b) => b.text).join("\n").trim() || "I don't have a good answer — try /support and open a ticket.",
         escalated_ticket_id: escalatedTicketId,
@@ -5934,6 +5947,8 @@ export async function chatWithAgentStream(userId, userMessage, opts = {}, onEven
 
   let totalIn = 0;
   let totalOut = 0;
+  let totalCacheRead = 0;
+  let totalCacheWrite = 0;
   const usedTools = [];
   let escalatedTicketId = null;
   let escalatedReason = null;
@@ -6008,13 +6023,15 @@ export async function chatWithAgentStream(userId, userMessage, opts = {}, onEven
 
     totalIn += response.usage?.input_tokens ?? 0;
     totalOut += response.usage?.output_tokens ?? 0;
+    totalCacheRead += response.usage?.cache_read_input_tokens ?? 0;
+    totalCacheWrite += response.usage?.cache_creation_input_tokens ?? 0;
 
     const toolUses = (response.content || []).filter((b) => b.type === "tool_use");
     const textBlocks = (response.content || []).filter((b) => b.type === "text");
 
     if (toolUses.length === 0) {
       messages.push({ role: "assistant", content: response.content });
-      await saveConversation(userId, messages, 1, totalIn, totalOut);
+      await saveConversation(userId, messages, 1, totalIn, totalOut, totalCacheRead, totalCacheWrite);
       const result = {
         text: textBlocks.map((b) => b.text).join("\n").trim() || "I don't have a good answer — try /support and open a ticket.",
         escalated_ticket_id: escalatedTicketId,
