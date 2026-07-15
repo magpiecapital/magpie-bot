@@ -680,19 +680,38 @@ export async function attestPriceBatch(items, programId, opts = {}) {
       multiplier: lowBal ? 1.0 : Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
     });
 
-    const tx = new Transaction().add(...feeIxs, ...built.map((b) => b.ix));
-    try {
-      // "processed" + skipPreflight: same fast path as single attest. The
-      // provider wallet (lender) is the sole signer.
-      await program.provider.sendAndConfirm(tx, [], { commitment: "processed", skipPreflight: true });
-      out.txs++;
-      out.instructions += built.length;
-      for (const b of built) out.attested.push(b.it.mint);
-    } catch (err) {
-      // Batch failed as a unit — fall back to per-mint so one bad feed
-      // (uninitialized, transient) doesn't sink the whole chunk.
-      console.warn(`[attest-batch] ${label}: batch of ${built.length} failed (${(err.message || "").slice(0, 100)}) — per-mint fallback`);
-      for (const b of built) await attestOneWithFallback(b.it);
+    // Retry the batch on TRANSIENT errors (429 / blockhash-expired) before
+    // collapsing to per-mint — otherwise a Helius 429 storm would fan every
+    // batch out into N individual txs, defeating the cost win AND hammering
+    // RPC exactly when it's already struggling. A fresh Transaction is built
+    // per attempt so it picks up a fresh blockhash.
+    const BATCH_RETRY_DELAYS_MS = [400, 1200];
+    let sent = false;
+    for (let attempt = 0; attempt <= BATCH_RETRY_DELAYS_MS.length && !sent; attempt++) {
+      const tx = new Transaction().add(...feeIxs, ...built.map((b) => b.ix));
+      try {
+        // "processed" + skipPreflight: same fast path as single attest. The
+        // provider wallet (lender) is the sole signer.
+        await program.provider.sendAndConfirm(tx, [], { commitment: "processed", skipPreflight: true });
+        out.txs++;
+        out.instructions += built.length;
+        for (const b of built) out.attested.push(b.it.mint);
+        sent = true;
+      } catch (err) {
+        const msg = err.message || "";
+        const retriable =
+          /429|Too Many Requests|rate.?limit/i.test(msg) ||
+          /blockhash.*not.*found|block.*expired|TransactionExpiredBlockheightExceeded/i.test(msg);
+        if (retriable && attempt < BATCH_RETRY_DELAYS_MS.length) {
+          await new Promise((r) => setTimeout(r, BATCH_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+        // Non-retriable, or retries exhausted — fall back to per-mint so one
+        // bad feed (uninitialized, etc.) doesn't sink the whole chunk.
+        console.warn(`[attest-batch] ${label}: batch of ${built.length} failed (${msg.slice(0, 100)}) — per-mint fallback`);
+        for (const b of built) await attestOneWithFallback(b.it);
+        break;
+      }
     }
   };
 
