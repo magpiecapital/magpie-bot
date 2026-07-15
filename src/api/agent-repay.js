@@ -52,6 +52,7 @@ import {
 import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection, withFailover } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   chooseProgramIdForLoan,
   getProgramForSigner,
@@ -223,7 +224,7 @@ export async function handleAgentBuildRepay(req) {
     // Same pre/post ix pattern as executeRepay: create ATAs idempotently,
     // wrap SOL→wSOL with exact repay amount, sync, then close ATA after.
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "agent-repay" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
       createAssociatedTokenAccountIdempotentInstruction(
         borrowerPk, borrowerCollateralAta, borrowerPk, collateralMintPk, collateralTokenProgram,

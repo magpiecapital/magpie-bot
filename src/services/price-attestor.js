@@ -7,6 +7,7 @@ import "dotenv/config";
 import { getPriceInSol, getPricesInSolBatch } from "./price.js";
 import { getProgramForSigner, chooseProgramIdForCategory, PROGRAM_ID_V4 } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
+import { priorityFeeInstructions } from "../solana/priority-fee.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 
@@ -346,6 +347,10 @@ export async function initializePriceFeed(mintStr, programIdOverride = null) {
     return { alreadyExists: true, priceFeed: priceFeed.toBase58() };
   }
 
+  const feeIxs = await priorityFeeInstructions(120_000, {
+    accountKeys: [pool.toBase58(), priceFeed.toBase58()],
+    label: `init-feed ${mintStr.slice(0, 6)}`,
+  });
   const sig = await program.methods
     .initializePriceFeed()
     .accounts({
@@ -355,6 +360,7 @@ export async function initializePriceFeed(mintStr, programIdOverride = null) {
       authority: lender.publicKey,
       systemProgram: new PublicKey("11111111111111111111111111111111"),
     })
+    .preInstructions(feeIxs)
     .rpc({ commitment: "confirmed" });
 
   console.log(`Price feed initialized for ${mintStr}: ${sig}`);
@@ -474,6 +480,20 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
       // "processed" is acceptable; on-chain readers see the new sample
       // immediately. Operator hit ~60s cadence at confirmed level
       // 2026-06-18 PM, vs the 37.5s required for 8 samples in 300s.
+      // Dynamic priority fee so attestations land during congestion (the
+      // root cause of the 2026-07-15 "not confirmed in 30s" flood + stale
+      // feeds that hung live borrows). The attestor was previously 0-fee, so
+      // to keep the steady-state gas increase minimal we use a LOW floor +
+      // tight compute-unit limit (updatePrice is a tiny write) and only ~1.25x
+      // headroom — this tick retries every 30s, so it doesn't need one-shot
+      // grade fees; the dynamic estimate still ramps it up during real
+      // congestion, hard-capped inside priorityFeeInstructions.
+      const feeIxs = await priorityFeeInstructions(40_000, {
+        accountKeys: [pool.toBase58(), priceFeed.toBase58()],
+        label: `attest ${mintStr.slice(0, 6)}`,
+        floor: Number(process.env.ATTEST_MIN_PRIORITY_FEE_MICROLAMPORTS) || 3_000,
+        multiplier: Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
+      });
       const sig = await program.methods
         .updatePrice(new BN(priceLamports), confidenceBps)
         .accounts({
@@ -481,6 +501,7 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
           priceFeed,
           authority: lender.publicKey,
         })
+        .preInstructions(feeIxs)
         .rpc({ commitment: "processed", skipPreflight: true });
       return { signature: sig, priceLamports, priceSol };
     } catch (err) {
