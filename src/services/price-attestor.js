@@ -28,7 +28,10 @@ const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
 const ATTEST_MIN_DEPLOYER_SOL = Number(process.env.ATTEST_MIN_DEPLOYER_SOL) || 1.5;
 let _lenderBalCache = { sol: Infinity, at: 0 };
 let _lastLowBalAlarmAt = 0;
-async function deployerBalanceIsLow() {
+// Exported so the on-demand/burst warming loops (public-endpoint triggerable)
+// can pause aggressive attestation when the deployer is low — a drain-guard
+// on the cost-amplification path, not just the priority fee.
+export async function deployerBalanceIsLow() {
   const now = Date.now();
   if (now - _lenderBalCache.at >= 60_000) {
     try {
@@ -822,6 +825,13 @@ async function fetchMintsToAttest() {
   //
   // See [[feedback_tiered_attestation_cost_conscious]] for rollout +
   // cost projections.
+  //
+  // WARM-ALL (2026-07-15, default): batched attestation made keeping EVERY
+  // enabled token continuously warm cheap, so cold-tier mints are no longer
+  // left to a slow, failure-prone JIT warm at borrow time (the $TripleT
+  // "oracle warming up — 4 more minutes" failure). ATTEST_WARM_ALL=false
+  // reverts to the tiered filter. See [[feedback_first_attempt_loan_success_cost_effective]].
+  const warmAll = process.env.ATTEST_WARM_ALL !== "false"; // default ON
   const r = await query(
     `WITH active_loan_mints AS (
        SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
@@ -857,8 +867,11 @@ async function fetchMintsToAttest() {
        LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
       WHERE sm.enabled = TRUE
         AND (
+          -- WARM-ALL: every enabled token stays warm (default). Reverts to
+          -- the tiered filter below when ATTEST_WARM_ALL=false.
+          $1::boolean = TRUE
           -- hot tier: always continuous
-          sm.attestation_tier = 'hot'
+          OR sm.attestation_tier = 'hot'
           -- ANY tier (warm/cold) with borrower activity gets auto-attested.
           -- Safety net: a 'cold' mint with an active loan or armed exit
           -- MUST keep its feed warm or the engine can't fire exits and
@@ -871,6 +884,7 @@ async function fetchMintsToAttest() {
           -- Hot-on-Select: user staring at V4 picker for this mint now.
           OR wm.collateral_mint IS NOT NULL
         )`,
+    [warmAll],
   );
   return r.rows.map((row) => ({
     mint: row.mint,
