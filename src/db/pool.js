@@ -480,6 +480,8 @@ export async function applyStartupPatches() {
        turns INTEGER NOT NULL DEFAULT 0,
        total_input_tokens INTEGER NOT NULL DEFAULT 0,
        total_output_tokens INTEGER NOT NULL DEFAULT 0,
+       total_cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+       total_cache_write_tokens BIGINT NOT NULL DEFAULT 0,
        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        escalated_to_ticket_id BIGINT
