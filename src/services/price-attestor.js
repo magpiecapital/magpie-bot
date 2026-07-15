@@ -7,6 +7,7 @@ import "dotenv/config";
 import { getPriceInSol, getPricesInSolBatch } from "./price.js";
 import { getProgramForSigner, chooseProgramIdForCategory, PROGRAM_ID_V4 } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
+import { priorityFeeInstructions } from "../solana/priority-fee.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 
@@ -346,6 +347,10 @@ export async function initializePriceFeed(mintStr, programIdOverride = null) {
     return { alreadyExists: true, priceFeed: priceFeed.toBase58() };
   }
 
+  const feeIxs = await priorityFeeInstructions(120_000, {
+    accountKeys: [pool.toBase58(), priceFeed.toBase58()],
+    label: `init-feed ${mintStr.slice(0, 6)}`,
+  });
   const sig = await program.methods
     .initializePriceFeed()
     .accounts({
@@ -355,6 +360,7 @@ export async function initializePriceFeed(mintStr, programIdOverride = null) {
       authority: lender.publicKey,
       systemProgram: new PublicKey("11111111111111111111111111111111"),
     })
+    .preInstructions(feeIxs)
     .rpc({ commitment: "confirmed" });
 
   console.log(`Price feed initialized for ${mintStr}: ${sig}`);
@@ -474,6 +480,14 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
       // "processed" is acceptable; on-chain readers see the new sample
       // immediately. Operator hit ~60s cadence at confirmed level
       // 2026-06-18 PM, vs the 37.5s required for 8 samples in 300s.
+      // Dynamic priority fee so attestations land during congestion (the
+      // root cause of the 2026-07-15 "not confirmed in 30s" flood + stale
+      // feeds that hung live borrows). Account-specific estimate on the
+      // contended feed/pool; capped + logged inside priorityFeeInstructions.
+      const feeIxs = await priorityFeeInstructions(80_000, {
+        accountKeys: [pool.toBase58(), priceFeed.toBase58()],
+        label: `attest ${mintStr.slice(0, 6)}`,
+      });
       const sig = await program.methods
         .updatePrice(new BN(priceLamports), confidenceBps)
         .accounts({
@@ -481,6 +495,7 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
           priceFeed,
           authority: lender.publicKey,
         })
+        .preInstructions(feeIxs)
         .rpc({ commitment: "processed", skipPreflight: true });
       return { signature: sig, priceLamports, priceSol };
     } catch (err) {
