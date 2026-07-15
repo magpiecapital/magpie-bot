@@ -478,13 +478,14 @@ export async function answerGroupQuestion(question, opts = {}) {
       headers: {
         "x-api-key": API_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "extended-cache-ttl-2025-04-11",
         "content-type": "application/json",
       },
       body: JSON.stringify({
         model: MODEL,
         max_tokens: MAX_TOKENS,
         system: [
-          { type: "text", text: GROUP_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+          { type: "text", text: GROUP_SYSTEM_PROMPT, cache_control: { type: "ephemeral", ttl: "1h" } },
           { type: "text", text: extraSystem },
           ...(pinnedSystem ? [{ type: "text", text: pinnedSystem }] : []),
         ],
