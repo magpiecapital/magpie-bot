@@ -74,6 +74,7 @@ import {
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
 import { handleWarmMint } from "./warm-mint.js";
+import { handleWarmMintsBatch } from "./warm-mints-batch.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
@@ -1885,6 +1886,12 @@ const PUBLIC_ROUTES = new Set([
   // supported_mints check. Operator-mandated 2026-06-19 PM after
   // $TROLL V4 borrow hit "Markets warming up."
   "/api/v1/v4/warm-mint",
+  // Batch pre-warm (Just-Ahead Warming) — dashboard POSTs the user's
+  // whole borrowable-holdings set on load so their feeds warm during
+  // token-pick/amount-entry time → first-attempt borrow success with
+  // no perceived wait, warming only the tokens this user holds (auto-
+  // expiring). See feedback_first_attempt_loan_success_cost_effective.
+  "/api/v1/v4/warm-mints",
   // Live-debug ring buffer of recent console.error/warn output. No
   // PII; bounded in-memory; cleared on restart.
   "/api/v1/debug/recent-errors",
@@ -2354,6 +2361,13 @@ async function router(req, res) {
         // TTL) so the continuous attestation loop picks it up. By the
         // time the user signs the borrow tx, samples are in window.
         result = await handleWarmMint(req);
+        break;
+      case "/api/v1/v4/warm-mints":
+        // Batch pre-warm — Just-Ahead Warming. Dashboard sends the
+        // user's borrowable holdings on load so feeds are warm by the
+        // time they click Borrow. Bounded fan-out (MAX_BATCH), auto-
+        // expiring intents, only this user's held tokens.
+        result = await handleWarmMintsBatch(req);
         break;
       case "/api/v1/debug/recent-errors":
         // Live tail of console.error/warn. Safe to expose — no PII,
