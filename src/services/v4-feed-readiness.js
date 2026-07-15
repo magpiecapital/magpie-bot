@@ -572,6 +572,26 @@ async function processBurstMint(mint, entry, lenderPk, programIdV4) {
  * no SOL. See [[feedback_first_attempt_loan_success_cost_effective]].
  */
 async function burstLoop(lenderPk, programIdV4) {
+  // DRAIN GUARD (security): the burst is the most aggressive attestation path
+  // (~1.5s cadence, up to BURST_MAX_ATTEMPTS/mint, unbatched) and it's reachable
+  // from the PUBLIC /warm-mint(s) beacons via requestMintWarm. If the deployer
+  // wallet is low, pause bursting entirely so a spam/IP-rotation attacker can't
+  // amplify a low balance toward drain — the batched continuous loop still keeps
+  // active-loan feeds warm. Queue is retained; it resumes when the wallet refills.
+  try {
+    const { deployerBalanceIsLow } = await import("./price-attestor.js");
+    if (await deployerBalanceIsLow()) {
+      setTimeout(() => {
+        burstLoop(lenderPk, programIdV4).catch((e) =>
+          console.warn("[v4-readiness] burst loop threw:", e.message?.slice(0, 120)),
+        );
+      }, Math.max(BURST_SPACING_MS, 10_000));
+      return;
+    }
+  } catch {
+    /* if the guard read fails, fall through — better to warm than to stall */
+  }
+
   const mints = Array.from(state.burst.entries()).slice(0, BURST_MAX_CONCURRENT);
   if (mints.length > 0) {
     await Promise.all(
@@ -615,60 +635,69 @@ async function burstLoop(lenderPk, programIdV4) {
  * worst-case 5.3 attestations/sec. Mints sitting at 10 samples don't
  * get attested until they drift to 9, then 8.
  */
+// WARM-ALL is the default (2026-07-15). Batched attestation made keeping
+// EVERY enabled token continuously warm cheap (~0.2 SOL/day for ~175 mints
+// vs ~2.3 unbatched), so we no longer leave cold-tier tokens to a slow,
+// failure-prone just-in-time warm at borrow time. Every enabled memecoin/
+// stock is kept warm 24/7 → a borrow on ANY token never hits
+// TwapInsufficientHistory / "oracle warming up". The tiered filter is kept
+// as an env-gated fallback (ATTEST_WARM_ALL=false) for when the catalog
+// grows large enough that warming everything is no longer the cheapest path
+// (then: warm the active core + burst the long tail on demand).
+// Supersedes [[feedback_tiered_attestation_cost_conscious]] for the current
+// scale. See [[feedback_first_attempt_loan_success_cost_effective]].
 async function refreshContinuousList() {
-  // Tiered attestation Phase 2 (2026-06-19 PM): filter by attestation_tier.
-  // Hot mints always in list. Warm mints included when there's borrower
-  // interest. Cold mints excluded — cosign-borrow JIT warmer handles
-  // first-borrow on cold tier.
-  // See [[feedback_tiered_attestation_cost_conscious]].
-  const { rows } = await query(
-    `WITH active_loan_mints AS (
-       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
-     ),
-     armed_exit_mints AS (
-       SELECT DISTINCT l.collateral_mint
-         FROM limit_close_orders lc
-         JOIN loans l ON l.id = lc.loan_id
-        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
-     ),
-     recent_intent_mints AS (
-       SELECT DISTINCT l.collateral_mint
-         FROM arm_intents ai
-         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
-        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
-     ),
-     -- Hot-on-Select beacon: site POSTs /api/v1/v4/warm-mint when user
-     -- opens the V4 exit picker, even for cold mints. Bot UNIONs that
-     -- mint into continuous attestation for the 10-min TTL so samples
-     -- accumulate during user review time. Operator-mandated 2026-06-19
-     -- PM after $TROLL hit "Markets warming up." See migration 086.
-     warming_mints AS (
-       SELECT DISTINCT mint AS collateral_mint
-         FROM mint_warming_intents
-        WHERE expires_at > NOW()
-     )
-     SELECT sm.mint, sm.decimals, sm.symbol, sm.category
-       FROM supported_mints sm
-       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
-       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
-       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
-       LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
-      WHERE sm.enabled = TRUE
-        AND sm.category IN ('memecoin', 'stock')
-        AND (
-          sm.attestation_tier = 'hot'
-          -- Safety net: ANY tier (incl. cold) with borrower activity
-          -- gets auto-attested. A cold mint with active loan/arm MUST
-          -- keep its V4 feed warm or the engine can't fire exits.
-          OR sm.protected = TRUE
-          OR alm.collateral_mint IS NOT NULL
-          OR aem.collateral_mint IS NOT NULL
-          OR rim.collateral_mint IS NOT NULL
-          -- Hot-on-Select: user is staring at the V4 picker right now
-          -- for this mint; we have ~10 min to fill the TWAP window.
-          OR wm.collateral_mint IS NOT NULL
-        )`,
-  );
+  const warmAll = process.env.ATTEST_WARM_ALL !== "false"; // default ON
+  let rows;
+  if (warmAll) {
+    // Warm EVERY enabled memecoin/stock — no tier gate.
+    ({ rows } = await query(
+      `SELECT mint, decimals, symbol, category
+         FROM supported_mints
+        WHERE enabled = TRUE
+          AND category IN ('memecoin', 'stock')`,
+    ));
+  } else {
+    // Tiered fallback: hot + protected + any borrower activity/intent only.
+    ({ rows } = await query(
+      `WITH active_loan_mints AS (
+         SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+       ),
+       armed_exit_mints AS (
+         SELECT DISTINCT l.collateral_mint
+           FROM limit_close_orders lc
+           JOIN loans l ON l.id = lc.loan_id
+          WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+       ),
+       recent_intent_mints AS (
+         SELECT DISTINCT l.collateral_mint
+           FROM arm_intents ai
+           JOIN loans l ON l.loan_id::text = ai.loan_id_chain
+          WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+       ),
+       warming_mints AS (
+         SELECT DISTINCT mint AS collateral_mint
+           FROM mint_warming_intents
+          WHERE expires_at > NOW()
+       )
+       SELECT sm.mint, sm.decimals, sm.symbol, sm.category
+         FROM supported_mints sm
+         LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
+         LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+         LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+         LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
+        WHERE sm.enabled = TRUE
+          AND sm.category IN ('memecoin', 'stock')
+          AND (
+            sm.attestation_tier = 'hot'
+            OR sm.protected = TRUE
+            OR alm.collateral_mint IS NOT NULL
+            OR aem.collateral_mint IS NOT NULL
+            OR rim.collateral_mint IS NOT NULL
+            OR wm.collateral_mint IS NOT NULL
+          )`,
+    ));
+  }
   state.continuousList = rows.map((r) => ({
     mint: r.mint,
     decimals: Number(r.decimals),
@@ -676,7 +705,7 @@ async function refreshContinuousList() {
     category: r.category,
   }));
   state.continuousListRefreshedAt = Date.now();
-  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints`);
+  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints (warm_all=${warmAll})`);
 }
 
 async function continuousAllMintsLoop(lenderPk, programIdV4) {
@@ -721,12 +750,29 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
   // 2. Round-robin memecoins fill the remaining slots — same logic as before.
   const stocks = list.filter((m) => m.category === 'stock');
   const memecoins = list.filter((m) => m.category !== 'stock');
+
+  // Size the per-tick batch so the WHOLE list is cycled within a target
+  // window (default 25s, safely under the 37.5s cadence needed for 8
+  // samples in 300s) — otherwise warming ~175 mints (warm-all) with the
+  // old fixed batch of 16 would starve the memecoin round-robin and let
+  // feeds drift below threshold. Batched attestation makes the extra
+  // per-tick throughput cheap; readiness reads are lightweight. Bounded by
+  // V4_CONTINUOUS_MAX_BATCH to cap RPC per tick.
+  // See [[feedback_first_attempt_loan_success_cost_effective]].
+  const TARGET_CYCLE_MS = Number(process.env.V4_CONTINUOUS_TARGET_CYCLE_MS) || 25_000;
+  const MAX_BATCH = Number(process.env.V4_CONTINUOUS_MAX_BATCH) || 64;
+  const memeSlotsNeeded = Math.max(1, Math.ceil((memecoins.length * CONTINUOUS_BATCH_SPACING_MS) / TARGET_CYCLE_MS));
+  const effectiveConcurrency = Math.min(
+    MAX_BATCH,
+    Math.max(CONTINUOUS_CONCURRENCY, stocks.length + memeSlotsNeeded),
+  );
+
   const batch = [];
   for (const s of stocks) {
-    if (batch.length >= CONTINUOUS_CONCURRENCY) break;
+    if (batch.length >= effectiveConcurrency) break;
     batch.push(s);
   }
-  const memeSlots = CONTINUOUS_CONCURRENCY - batch.length;
+  const memeSlots = effectiveConcurrency - batch.length;
   for (let i = 0; i < memeSlots && i < memecoins.length; i++) {
     batch.push(memecoins[(state.continuousCursor + i) % memecoins.length]);
   }
