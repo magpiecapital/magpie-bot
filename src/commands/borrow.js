@@ -12,7 +12,7 @@ import { translateTxError, errorActionKeyboard } from "../services/tx-error-tran
 import { renderRiskBlock } from "../services/token-risk-preview.js";
 import { preBorrowBanCheck } from "../services/bans.js";
 import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
-import { armOrder, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
+import { armOrder, armOrderBatch, resolveMultiplierToPrice } from "../services/limit-close-arm-core.js";
 import { parseStrike } from "../lib/strike-price-parser.js";
 
 // Tier schedule is category-aware as of 2026-06-12 migration 040.
@@ -208,136 +208,142 @@ function fmtSol(lamports) {
 async function armConfiguredExits({ userId, loanIdChain, collateralMint, exits }) {
   if (!exits || exits.type === "skip") return [];
 
-  const armSingle = async ({ label, direction, multiplier, parsedStrike, sliceBps }) => {
-    let triggerKind, triggerValueMicro;
-    if (parsedStrike) {
-      triggerKind = parsedStrike.kind;
-      triggerValueMicro = parsedStrike.valueMicro.toString();
-    } else {
-      const resolved = await resolveMultiplierToPrice(
-        collateralMint,
-        multiplier,
-        { allowBelowOne: direction === "below" },
-      );
-      if (!resolved.ok) return { ok: false, label, error: resolved.error || "resolve_failed" };
-      triggerKind = "price_usd";
-      triggerValueMicro = resolved.triggerValueMicro.toString();
-    }
-    const slippageBps = direction === "below" ? 300 : 200;
-    // Internal retry on transient failures so the user doesn't see a
-    // raw "insert_failed" or "resolve_failed" when a quick second try
-    // would have succeeded. We retry up to 2 extra times with a small
-    // backoff, only for codes that are known-transient. Codes like
-    // loan_already_has_active_order_in_direction, ladder_sum_exceeds_100,
-    // trigger_would_fire_immediately, user_concurrency_cap_reached are
-    // permanent — retrying would just produce the same error and slow
-    // things down. We bail on the FIRST attempt for those.
-    const TRANSIENT_CODES = new Set([
-      "insert_failed",
-      "resolve_failed",
-      "loan_not_found",
-      "internal_error",
-    ]);
-    let armed;
-    let attempt = 0;
-    const MAX_ATTEMPTS = 3;
-    while (attempt < MAX_ATTEMPTS) {
-      attempt++;
-      armed = await armOrder({
-        userId,
-        source: "tg",
-        loanIdChain,
-        triggerKind,
-        triggerValueMicro,
-        triggerDirection: direction,
-        slippageBps,
-        sellDestination: "sol",
-        slicePct: sliceBps && sliceBps < 10000 ? sliceBps : undefined,
-      });
-      if (armed.ok) break;
-      if (!TRANSIENT_CODES.has(armed.error)) break;
-      if (attempt < MAX_ATTEMPTS) {
-        // Brief backoff before retry — gives the DB / network a beat to
-        // settle and avoids hammering the same failed path back-to-back.
-        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
-        console.warn(`[borrow] armOrder transient failure on "${label}" (attempt ${attempt}/${MAX_ATTEMPTS}): ${armed.error}, retrying`);
-      }
-    }
-    return armed.ok
-      ? { ok: true, label, orderId: armed.orderId }
-      : { ok: false, label, error: armed.error };
+  // Build the full leg set + display labels up front, then arm ALL legs in
+  // ONE atomic armOrderBatch call (inserts N rows in a single DB
+  // transaction — all-or-none). This brings the TG custodial flow to
+  // parity with the site's batch path + the operator mandate
+  // (feedback_one_signature_for_n_legs_always): a mid-leg failure can no
+  // longer leave a partial ladder / half-bracket. Multiplier legs forward
+  // kind:"multiplier" + multiplier so arm-core resolves them against the
+  // cross-source oracle at batch time (the same single source of truth the
+  // site uses); parsedStrike legs forward the literal kind + valueMicro.
+  // collateralMint is unused here now — arm-core loads the loan's mint for
+  // multiplier resolution — but kept in the signature for the caller.
+  void collateralMint;
+  const legs = [];
+  const labels = [];
+  const addMultiplier = (label, direction, multiplier, sliceBps) => {
+    legs.push({
+      direction,
+      kind: "multiplier",
+      multiplier,
+      valueMicro: String(multiplier),
+      sliceBps: sliceBps && sliceBps < 10000 ? sliceBps : 10000,
+      slippageBps: direction === "below" ? 300 : 200,
+    });
+    labels.push(label);
+  };
+  const addStrike = (label, direction, parsedStrike, sliceBps) => {
+    legs.push({
+      direction,
+      kind: parsedStrike.kind,
+      valueMicro: parsedStrike.valueMicro.toString(),
+      sliceBps: sliceBps && sliceBps < 10000 ? sliceBps : 10000,
+      slippageBps: direction === "below" ? 300 : 200,
+    });
+    labels.push(label);
   };
 
   switch (exits.type) {
     case "tp_default":
-      return [await armSingle({ label: "TP @ 2x", direction: "above", multiplier: 2 })];
+      addMultiplier("TP @ 2x", "above", 2);
+      break;
     case "sl_default":
-      return [await armSingle({ label: "SL @ 0.7x", direction: "below", multiplier: 0.7 })];
-    case "bracket": {
-      const tp = await armSingle({ label: "TP @ 2x", direction: "above", multiplier: 2 });
-      // Only attempt SL if TP succeeded — otherwise user gets confusing
-      // half-bracket. The TP-only case still leaves the post-borrow SL
-      // button tappable.
-      if (!tp.ok) return [tp];
-      const sl = await armSingle({ label: "SL @ 0.7x", direction: "below", multiplier: 0.7 });
-      return [tp, sl];
-    }
+      addMultiplier("SL @ 0.7x", "below", 0.7);
+      break;
+    case "bracket":
+      // Atomic: TP + SL arm together or not at all — no half-bracket.
+      addMultiplier("TP @ 2x", "above", 2);
+      addMultiplier("SL @ 0.7x", "below", 0.7);
+      break;
     case "custom_tp":
-      return [await armSingle({
-        label: `TP @ ${exits.parsedStrike.normalizedDisplay}`,
-        direction: "above",
-        parsedStrike: exits.parsedStrike,
-      })];
+      addStrike(`TP @ ${exits.parsedStrike.normalizedDisplay}`, "above", exits.parsedStrike);
+      break;
     case "custom_sl":
-      return [await armSingle({
-        label: `SL @ ${exits.parsedStrike.normalizedDisplay}`,
-        direction: "below",
-        parsedStrike: exits.parsedStrike,
-      })];
+      addStrike(`SL @ ${exits.parsedStrike.normalizedDisplay}`, "below", exits.parsedStrike);
+      break;
     case "tp_ladder":
     case "sl_ladder": {
       const direction = exits.type === "tp_ladder" ? "above" : "below";
       const sidePrefix = direction === "above" ? "TP" : "SL";
-      const results = [];
       for (const leg of exits.preset.legs) {
-        const r = await armSingle({
-          label: `${sidePrefix} ${leg.multiplier}x (${(leg.sliceBps / 100).toFixed(0)}%)`,
+        addMultiplier(
+          `${sidePrefix} ${leg.multiplier}x (${(leg.sliceBps / 100).toFixed(0)}%)`,
           direction,
-          multiplier: leg.multiplier,
-          sliceBps: leg.sliceBps,
-        });
-        results.push(r);
-        // Stop the cascade on a hard failure to avoid partial-ladder
-        // confusion; user can retry the remaining legs manually.
-        if (!r.ok) break;
+          leg.multiplier,
+          leg.sliceBps,
+        );
       }
-      return results;
+      break;
     }
     case "custom_ladder": {
-      // User-built ladder. exits.legs is an array of
-      //   { parsedStrike, sliceBps, direction }
+      // User-built ladder. exits.legs = [{ parsedStrike, sliceBps, direction }].
       // Direction is uniform across legs (validated at submit time —
       // mixed-direction ladders are rejected before this point). sidePrefix
       // tracks the first leg's direction for label rendering.
-      const direction = exits.legs[0]?.direction || "above";
-      const sidePrefix = direction === "above" ? "Profit" : "Stop";
-      const results = [];
+      const sidePrefix = (exits.legs[0]?.direction || "above") === "above" ? "Profit" : "Stop";
       for (let i = 0; i < exits.legs.length; i++) {
         const leg = exits.legs[i];
-        const r = await armSingle({
-          label: `${sidePrefix} step ${i + 1} @ ${leg.parsedStrike.normalizedDisplay} (${(leg.sliceBps / 100).toFixed(0)}%)`,
-          direction: leg.direction,
-          parsedStrike: leg.parsedStrike,
-          sliceBps: leg.sliceBps,
-        });
-        results.push(r);
-        if (!r.ok) break;
+        addStrike(
+          `${sidePrefix} step ${i + 1} @ ${leg.parsedStrike.normalizedDisplay} (${(leg.sliceBps / 100).toFixed(0)}%)`,
+          leg.direction,
+          leg.parsedStrike,
+          leg.sliceBps,
+        );
       }
-      return results;
+      break;
     }
     default:
       return [];
   }
+
+  if (legs.length === 0) return [];
+
+  // Atomic arm with a small transient-retry, mirroring the old per-leg
+  // TRANSIENT_CODES loop but now at the batch level. arm-core already
+  // polls up to 30s for the loan row (loan_not_found_for_user race), but
+  // oracle / DB blips (resolve_failed / insert_failed / internal_error /
+  // exception) can still transiently fail — retry a couple of times before
+  // giving up. Permanent codes (ladder_sum_exceeds_100,
+  // trigger_would_fire_immediately, user_concurrency_cap_reached, etc.)
+  // break out on the first try.
+  const TRANSIENT_CODES = new Set([
+    "insert_failed",
+    "resolve_failed",
+    "loan_not_found",
+    "loan_not_found_for_user",
+    "internal_error",
+    "exception",
+  ]);
+  let result;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    result = await armOrderBatch({
+      userId,
+      source: "tg",
+      loanIdChain,
+      legs,
+    });
+    if (result.ok) break;
+    if (!TRANSIENT_CODES.has(result.error)) break;
+    if (attempt < MAX_ATTEMPTS) {
+      // Brief backoff before retry — gives the DB / oracle a beat to settle.
+      await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+      console.warn(`[borrow] armOrderBatch transient failure (attempt ${attempt}/${MAX_ATTEMPTS}): ${result.error}, retrying`);
+    }
+  }
+
+  // Map the atomic outcome back to the per-leg array the funded-loan card
+  // consumes (drives allLegsArmed / the manual-retry buttons). All-or-none:
+  // ok => every leg armed; fail => every leg failed. orderIds align to the
+  // legs order we supplied (arm-core inserts in that order).
+  if (result.ok) {
+    const orderIds = Array.isArray(result.orderIds) ? result.orderIds : [];
+    return labels.map((label, i) => ({ ok: true, label, orderId: orderIds[i] }));
+  }
+  const legNote = result.failedLegIndex != null ? ` (leg ${result.failedLegIndex + 1})` : "";
+  console.warn(`[borrow] armConfiguredExits batch failed: ${result.error}${legNote}`);
+  return labels.map((label) => ({ ok: false, label, error: result.error }));
 }
 
 // Escape Markdown V1 special chars that would otherwise be treated as
