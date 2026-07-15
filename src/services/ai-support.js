@@ -5432,7 +5432,7 @@ async function callAnthropic(messages, extraSystemText) {
     {
       type: "text",
       text: SYSTEM_PROMPT,
-      cache_control: { type: "ephemeral" },
+      cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ];
   if (extraSystemText) {
@@ -5447,6 +5447,7 @@ async function callAnthropic(messages, extraSystemText) {
         headers: {
           "x-api-key": API_KEY,
           "anthropic-version": "2023-06-01",
+          "anthropic-beta": "extended-cache-ttl-2025-04-11",
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -5458,7 +5459,18 @@ async function callAnthropic(messages, extraSystemText) {
         }),
         signal: AbortSignal.timeout(45_000),
       });
-      if (res.ok) return res.json();
+      if (res.ok) {
+        const json = await res.json();
+        const u = json.usage;
+        if (u) {
+          console.log(
+            `[ai-support] api call ~$${estimateCostUsd(u).toFixed(4)} ` +
+            `(in=${u.input_tokens || 0} out=${u.output_tokens || 0} ` +
+            `cacheR=${u.cache_read_input_tokens || 0} cacheW=${u.cache_creation_input_tokens || 0})`,
+          );
+        }
+        return json;
+      }
       const errBody = await res.text();
       const err = new Error(`Anthropic API ${res.status}: ${errBody.slice(0, 200)}`);
       err.status = res.status;
@@ -5496,7 +5508,7 @@ async function callAnthropicStream(messages, extraSystemText, onTextDelta) {
     {
       type: "text",
       text: SYSTEM_PROMPT,
-      cache_control: { type: "ephemeral" },
+      cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ];
   if (extraSystemText) {
@@ -5508,6 +5520,7 @@ async function callAnthropicStream(messages, extraSystemText, onTextDelta) {
     headers: {
       "x-api-key": API_KEY,
       "anthropic-version": "2023-06-01",
+      "anthropic-beta": "extended-cache-ttl-2025-04-11",
       "content-type": "application/json",
     },
     body: JSON.stringify({
@@ -5616,6 +5629,14 @@ async function callAnthropicStream(messages, extraSystemText, onTextDelta) {
 
   // Filter out any stray empty slots (defensive — shouldn't happen)
   response.content = response.content.filter(Boolean);
+  const u = response.usage;
+  if (u) {
+    console.log(
+      `[ai-support] api call (stream) ~$${estimateCostUsd(u).toFixed(4)} ` +
+      `(in=${u.input_tokens || 0} out=${u.output_tokens || 0} ` +
+      `cacheR=${u.cache_read_input_tokens || 0} cacheW=${u.cache_creation_input_tokens || 0})`,
+    );
+  }
   return response;
 }
 
