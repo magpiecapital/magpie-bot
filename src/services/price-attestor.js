@@ -8,10 +8,49 @@ import { getPriceInSol, getPricesInSolBatch } from "./price.js";
 import { getProgramForSigner, chooseProgramIdForCategory, PROGRAM_ID_V4 } from "../solana/program.js";
 import { connection } from "../solana/connection.js";
 import { priorityFeeInstructions } from "../solana/priority-fee.js";
+import { notifyAdmin } from "./admin-notify.js";
 import { lendingPoolPda, priceFeedPda } from "../solana/pdas.js";
 import { query } from "../db/pool.js";
 
 const LENDER_PUBKEY = new PublicKey(process.env.LENDER_PUBKEY);
+
+// ── Deployer drain guard (2026-07-15) ──
+// Attestations are deployer-paid and high-frequency, so a congestion spike
+// with an aggressive priority fee is the one way this service could bleed the
+// lender wallet. Two backstops:
+//   1. a TIGHT attestor-only fee cap (ATTEST_MAX_PRIORITY_FEE_MICROLAMPORTS),
+//      applied at the call site, and
+//   2. this balance floor: if the lender wallet drops below
+//      ATTEST_MIN_DEPLOYER_SOL, attestations fall back to a MINIMAL fee (no
+//      congestion ramp) and the operator is alerted to refill. Feeds may lag a
+//      few seconds under congestion while low, but funds cannot be drained.
+// The balance is cached ~60s so we don't add a getBalance to every attestation.
+const ATTEST_MIN_DEPLOYER_SOL = Number(process.env.ATTEST_MIN_DEPLOYER_SOL) || 1.5;
+let _lenderBalCache = { sol: Infinity, at: 0 };
+let _lastLowBalAlarmAt = 0;
+async function deployerBalanceIsLow() {
+  const now = Date.now();
+  if (now - _lenderBalCache.at >= 60_000) {
+    try {
+      const lam = await connection.getBalance(LENDER_PUBKEY);
+      _lenderBalCache = { sol: lam / 1e9, at: now };
+    } catch {
+      // keep last-known balance on a transient RPC error
+    }
+  }
+  const low = _lenderBalCache.sol < ATTEST_MIN_DEPLOYER_SOL;
+  if (low && now - _lastLowBalAlarmAt > 5 * 60_000) {
+    _lastLowBalAlarmAt = now;
+    const msg =
+      `⚠️ *Deployer balance low* — ${_lenderBalCache.sol.toFixed(3)} SOL ` +
+      `(floor ${ATTEST_MIN_DEPLOYER_SOL}). Attestation priority fees pinned to ` +
+      `MINIMUM to protect funds; price feeds may lag under congestion until you ` +
+      `refill \`${LENDER_PUBKEY.toBase58()}\`.`;
+    console.warn(`CRIT [price-attestor] ${msg.replace(/[*`]/g, "")}`);
+    try { await notifyAdmin(msg, { parse_mode: "Markdown" }); } catch { /* alerting is best-effort */ }
+  }
+  return low;
+}
 
 // Cached mint→category lookup so we don't query the DB on every attest tick.
 // Category never changes after a mint is enabled (we never re-categorize live
@@ -488,11 +527,18 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
       // headroom — this tick retries every 30s, so it doesn't need one-shot
       // grade fees; the dynamic estimate still ramps it up during real
       // congestion, hard-capped inside priorityFeeInstructions.
+      // Drain guard: pin to a minimal fee when the deployer wallet is low, so a
+      // congestion spike can never bleed it (feeds may lag until refilled).
+      const lowBal = await deployerBalanceIsLow();
       const feeIxs = await priorityFeeInstructions(40_000, {
         accountKeys: [pool.toBase58(), priceFeed.toBase58()],
-        label: `attest ${mintStr.slice(0, 6)}`,
-        floor: Number(process.env.ATTEST_MIN_PRIORITY_FEE_MICROLAMPORTS) || 3_000,
-        multiplier: Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
+        label: `attest ${mintStr.slice(0, 6)}${lowBal ? " LOWBAL" : ""}`,
+        floor: lowBal ? 1_000 : Number(process.env.ATTEST_MIN_PRIORITY_FEE_MICROLAMPORTS) || 3_000,
+        // Tight attestor-only cap (default 250k, vs the 2M global cap for
+        // one-shot user borrows). Bounds worst-case spike spend; when low,
+        // pin to the floor so no congestion premium is paid at all.
+        cap: lowBal ? 1_000 : Number(process.env.ATTEST_MAX_PRIORITY_FEE_MICROLAMPORTS) || 250_000,
+        multiplier: lowBal ? 1.0 : Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
       });
       const sig = await program.methods
         .updatePrice(new BN(priceLamports), confidenceBps)
