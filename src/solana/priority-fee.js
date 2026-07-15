@@ -39,11 +39,9 @@ const MULTIPLIER = Number(process.env.PRIORITY_FEE_MULTIPLIER) || 1.5;
 // How long a single estimate is reused across many sends.
 const CACHE_TTL_MS = Number(process.env.PRIORITY_FEE_CACHE_MS) || 8_000;
 
-let _cache = { fee: FLOOR, at: 0 };
-
-function clamp(fee) {
-  return Math.max(FLOOR, Math.min(CAP, Math.ceil(fee)));
-}
+// Cache the RAW network estimate (pre-clamp), so one RPC serves many callers
+// even when they apply different floor/cap/multiplier overrides.
+let _cache = { raw: FLOOR, source: "floor", at: 0 };
 
 async function fetchHeliusEstimate(accountKeys) {
   if (!/helius/i.test(PRIMARY_RPC)) throw new Error("primary RPC is not Helius");
@@ -87,33 +85,46 @@ async function fetchNativeEstimate(accountKeys) {
  *        accurate, account-specific estimate (optional).
  * @param {string} [opts.label] short tag for the log line.
  * @param {boolean} [opts.force] bypass the cache (rarely needed).
+ * @param {number} [opts.floor] per-call floor override (µL/CU). Lets a cheap,
+ *        frequent, retry-tolerant sender (the price attestor) pay near-zero in
+ *        calm conditions while one-shot user actions keep the higher default.
+ * @param {number} [opts.cap] per-call cap override (µL/CU).
+ * @param {number} [opts.multiplier] per-call headroom multiplier override.
  */
 export async function getDynamicPriorityFee(opts = {}) {
-  const { accountKeys = [], label = "tx", force = false } = opts;
+  const {
+    accountKeys = [],
+    label = "tx",
+    force = false,
+    floor = FLOOR,
+    cap = CAP,
+    multiplier = MULTIPLIER,
+  } = opts;
   const now = Date.now();
-  if (!force && now - _cache.at < CACHE_TTL_MS) return _cache.fee;
 
-  let raw = FLOOR;
-  let source = "floor";
-  try {
-    raw = await fetchHeliusEstimate(accountKeys);
-    source = "helius";
-  } catch {
+  let raw = _cache.raw;
+  let source = _cache.source;
+  if (force || now - _cache.at >= CACHE_TTL_MS) {
     try {
-      raw = await fetchNativeEstimate(accountKeys);
-      source = "native";
+      raw = await fetchHeliusEstimate(accountKeys);
+      source = "helius";
     } catch {
-      raw = FLOOR;
-      source = "floor";
+      try {
+        raw = await fetchNativeEstimate(accountKeys);
+        source = "native";
+      } catch {
+        raw = floor;
+        source = "floor";
+      }
     }
+    _cache = { raw, source, at: now };
   }
 
-  const fee = clamp(raw * MULTIPLIER);
-  _cache = { fee, at: now };
-  const capped = fee === CAP && raw * MULTIPLIER > CAP;
+  const fee = Math.max(floor, Math.min(cap, Math.ceil(raw * multiplier)));
+  const capped = raw * multiplier > cap;
   console.log(
-    `[priority-fee] ${label}: ${fee} µL/CU (src=${source} raw=${Math.round(raw)} x${MULTIPLIER}` +
-      `${capped ? " CAPPED" : ""}, floor=${FLOOR} cap=${CAP})`,
+    `[priority-fee] ${label}: ${fee} µL/CU (src=${source} raw=${Math.round(raw)} x${multiplier}` +
+      `${capped ? " CAPPED" : ""}, floor=${floor} cap=${cap})`,
   );
   return fee;
 }

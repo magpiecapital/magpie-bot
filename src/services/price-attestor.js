@@ -482,11 +482,17 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
       // 2026-06-18 PM, vs the 37.5s required for 8 samples in 300s.
       // Dynamic priority fee so attestations land during congestion (the
       // root cause of the 2026-07-15 "not confirmed in 30s" flood + stale
-      // feeds that hung live borrows). Account-specific estimate on the
-      // contended feed/pool; capped + logged inside priorityFeeInstructions.
-      const feeIxs = await priorityFeeInstructions(80_000, {
+      // feeds that hung live borrows). The attestor was previously 0-fee, so
+      // to keep the steady-state gas increase minimal we use a LOW floor +
+      // tight compute-unit limit (updatePrice is a tiny write) and only ~1.25x
+      // headroom — this tick retries every 30s, so it doesn't need one-shot
+      // grade fees; the dynamic estimate still ramps it up during real
+      // congestion, hard-capped inside priorityFeeInstructions.
+      const feeIxs = await priorityFeeInstructions(40_000, {
         accountKeys: [pool.toBase58(), priceFeed.toBase58()],
         label: `attest ${mintStr.slice(0, 6)}`,
+        floor: Number(process.env.ATTEST_MIN_PRIORITY_FEE_MICROLAMPORTS) || 3_000,
+        multiplier: Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
       });
       const sig = await program.methods
         .updatePrice(new BN(priceLamports), confidenceBps)
