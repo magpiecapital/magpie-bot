@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import bs58 from "bs58";
-import { Keypair, PublicKey } from "@solana/web3.js";
+import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import "dotenv/config";
 import { getPriceInSol, getPricesInSolBatch } from "./price.js";
@@ -565,6 +565,168 @@ export async function attestPrice(mintStr, decimals, priceSolOverride, programId
   throw lastErr;
 }
 
+/**
+ * BATCHED attestation — the cost-eliminating core of "warm everything, always."
+ *
+ * Packs up to ATTEST_BATCH_SIZE `updatePrice` instructions into ONE
+ * transaction for a single program. Each instruction writes its own
+ * priceFeed PDA (distinct writable accounts → no lock contention), so N
+ * price samples ride on ONE signature and ONE ~5,000-lamport base fee
+ * instead of N. Base fee is ~98% of attestation cost, so this cuts spend
+ * ~10–15× — cheap enough to keep EVERY enabled mint continuously warm and
+ * retire the hot/warm/cold tiers entirely.
+ *
+ * Works for any program that exposes `updatePrice` (V1 legacy single-price
+ * feeds, V3 + V4 TWAP feeds) — the caller passes the resolved programId, so
+ * one primitive covers all pool versions.
+ *
+ * Robustness (never regress single-attest reliability):
+ *   - If a batch tx fails (e.g. one uninitialized feed fails the whole tx),
+ *     it FALLS BACK to per-mint `attestPrice` for that chunk — isolating the
+ *     bad mint and preserving the existing init-on-AccountNotInitialized path.
+ *   - Bounded init-per-call cap so a fallback storm can't spam initializations.
+ *   - Chunks processed with bounded concurrency so a full sweep still fits
+ *     inside a tick.
+ *   - ATTEST_BATCH_SIZE=1 disables batching (pure per-mint path) — an instant
+ *     env kill-switch with no redeploy.
+ *
+ * @param {Array<{mint:string, decimals:number, priceSol:number}>} items
+ * @param {PublicKey} programId  resolved target program (V1/V3/V4)
+ * @param {object} [opts] { maxInits, concurrency, label }
+ * @returns {Promise<{attested:string[], failed:Array<{mint:string,err:string}>, txs:number, instructions:number}>}
+ */
+export async function attestPriceBatch(items, programId, opts = {}) {
+  const out = { attested: [], failed: [], txs: 0, instructions: 0, initsUsed: 0 };
+  if (!items || items.length === 0) return out;
+  if (!programId) {
+    for (const it of items) out.failed.push({ mint: it.mint, err: "no_program_id" });
+    return out;
+  }
+
+  const BATCH_SIZE = Math.max(1, Number(process.env.ATTEST_BATCH_SIZE) || 10);
+  const CU_PER_IX = Number(process.env.ATTEST_BATCH_CU_PER_IX) || 30_000;
+  const MAX_TX_CU = 1_300_000; // leave headroom under the 1.4M cap
+  const CHUNK_CONCURRENCY = Math.max(1, Number(opts.concurrency) || Number(process.env.ATTEST_BATCH_CONCURRENCY) || 6);
+  const label = opts.label || "attest-batch";
+  let initBudget = Number.isFinite(opts.maxInits) ? opts.maxInits : (Number(process.env.ATTEST_BATCH_MAX_INITS) || 4);
+
+  const lender = loadLenderKeypair();
+  const program = getProgramForSigner(lender, programId);
+  const [pool] = lendingPoolPda(LENDER_PUBKEY, programId);
+
+  // Per-mint fallback that preserves the single-attest init path. Shares the
+  // init budget so a batch of uninitialized feeds can't trigger unbounded inits.
+  const attestOneWithFallback = async (it) => {
+    try {
+      await attestPrice(it.mint, it.decimals, it.priceSol, programId);
+      out.attested.push(it.mint);
+    } catch (err) {
+      if (isUninitFeedError(err) && initBudget > 0) {
+        initBudget--;
+        out.initsUsed++;
+        try {
+          await initializePriceFeed(it.mint, programId);
+          await attestPrice(it.mint, it.decimals, it.priceSol, programId);
+          out.attested.push(it.mint);
+          return;
+        } catch (err2) {
+          out.failed.push({ mint: it.mint, err: attestErrDetail(err2).slice(0, 160) });
+          return;
+        }
+      }
+      out.failed.push({ mint: it.mint, err: attestErrDetail(err).slice(0, 160) });
+    }
+  };
+
+  // Build the list of chunks to send.
+  const chunks = [];
+  for (let i = 0; i < items.length; i += BATCH_SIZE) chunks.push(items.slice(i, i + BATCH_SIZE));
+
+  const sendChunk = async (chunk) => {
+    // Assemble instructions, dropping items with an invalid price.
+    const built = [];
+    for (const it of chunk) {
+      const priceLamports = Math.floor((it.priceSol ?? 0) * 1e9);
+      if (priceLamports <= 0) {
+        out.failed.push({ mint: it.mint, err: `invalid_price ${it.priceSol}` });
+        continue;
+      }
+      const mintPk = new PublicKey(it.mint);
+      const [priceFeed] = priceFeedPda(mintPk, pool, programId);
+      const ix = await program.methods
+        .updatePrice(new BN(priceLamports), 200)
+        .accounts({ pool, priceFeed, authority: lender.publicKey })
+        .instruction();
+      built.push({ it, ix });
+    }
+    if (built.length === 0) return;
+
+    // A single valid instruction isn't worth a hand-built tx — route it
+    // through attestPrice so it keeps the full init/retry path for free.
+    if (built.length === 1) {
+      await attestOneWithFallback(built[0].it);
+      return;
+    }
+
+    // Compute-budget + dynamic priority fee, scaled to the instruction count.
+    // Drain guard identical to the single-attest path.
+    const lowBal = await deployerBalanceIsLow();
+    const cuLimit = Math.min(MAX_TX_CU, CU_PER_IX * built.length);
+    const feeIxs = await priorityFeeInstructions(cuLimit, {
+      accountKeys: [pool.toBase58()],
+      label: `${label} x${built.length}${lowBal ? " LOWBAL" : ""}`,
+      floor: lowBal ? 1_000 : Number(process.env.ATTEST_MIN_PRIORITY_FEE_MICROLAMPORTS) || 3_000,
+      cap: lowBal ? 1_000 : Number(process.env.ATTEST_MAX_PRIORITY_FEE_MICROLAMPORTS) || 250_000,
+      multiplier: lowBal ? 1.0 : Number(process.env.ATTEST_PRIORITY_FEE_MULTIPLIER) || 1.25,
+    });
+
+    // Retry the batch on TRANSIENT errors (429 / blockhash-expired) before
+    // collapsing to per-mint — otherwise a Helius 429 storm would fan every
+    // batch out into N individual txs, defeating the cost win AND hammering
+    // RPC exactly when it's already struggling. A fresh Transaction is built
+    // per attempt so it picks up a fresh blockhash.
+    const BATCH_RETRY_DELAYS_MS = [400, 1200];
+    let sent = false;
+    for (let attempt = 0; attempt <= BATCH_RETRY_DELAYS_MS.length && !sent; attempt++) {
+      const tx = new Transaction().add(...feeIxs, ...built.map((b) => b.ix));
+      try {
+        // "processed" + skipPreflight: same fast path as single attest. The
+        // provider wallet (lender) is the sole signer.
+        await program.provider.sendAndConfirm(tx, [], { commitment: "processed", skipPreflight: true });
+        out.txs++;
+        out.instructions += built.length;
+        for (const b of built) out.attested.push(b.it.mint);
+        sent = true;
+      } catch (err) {
+        const msg = err.message || "";
+        const retriable =
+          /429|Too Many Requests|rate.?limit/i.test(msg) ||
+          /blockhash.*not.*found|block.*expired|TransactionExpiredBlockheightExceeded/i.test(msg);
+        if (retriable && attempt < BATCH_RETRY_DELAYS_MS.length) {
+          await new Promise((r) => setTimeout(r, BATCH_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+        // Non-retriable, or retries exhausted — fall back to per-mint so one
+        // bad feed (uninitialized, etc.) doesn't sink the whole chunk.
+        console.warn(`[attest-batch] ${label}: batch of ${built.length} failed (${msg.slice(0, 100)}) — per-mint fallback`);
+        for (const b of built) await attestOneWithFallback(b.it);
+        break;
+      }
+    }
+  };
+
+  // Bounded-concurrency chunk pool.
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < chunks.length) {
+      const chunk = chunks[cursor++];
+      await sendChunk(chunk);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CHUNK_CONCURRENCY, chunks.length) }, () => worker()));
+  return out;
+}
+
 // Detect the "price-feed PDA not initialized" failure across BOTH err.message
 // AND err.logs. updatePrice runs with skipPreflight:true, so the program's
 // AccountNotInitialized signature (3012 / 0xbc4) surfaces in the on-chain
@@ -918,7 +1080,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
       const driftSkip = drift < 0.005 && lastPrice > 0 && since < MAX_GAP_MS;
 
       if (needsLegacyAttest && !driftSkip) {
-        queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports });
+        queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports, category });
       }
       for (const target of v3v4Targets) {
         // V3 is the RWA-only program WHILE ROUTE_MEMECOINS_TO_V3 is off:
@@ -964,66 +1126,73 @@ export function startPriceAttestor(intervalMs = 30_000) {
       _lastTickError = "paused_by_env";
       return;
     }
-    let initsThisTick = 0;
     let attempted = 0, succeeded = 0, initialized = 0, failed = 0;
-    let cursor = 0;
-    async function attestWorker() {
-      while (cursor < queue.length) {
-        const task = queue[cursor++];
-        attempted++;
-        try {
-          if (task.kind === "legacy") {
-            try {
-              const result = await attestPrice(task.mint, task.decimals, task.priceSol);
-              lastPrices.set(task.mint, task.priceLamports);
-              lastAttestAt.set(task.mint, Date.now());
-              succeeded++;
-            } catch (attestErr) {
-              if (isUninitFeedError(attestErr)) {
-                if (initsThisTick < MAX_INITS_PER_TICK) {
-                  initsThisTick++; // claim slot before async to avoid race
-                  const init = await initializePriceFeed(task.mint);
-                  if (!init.alreadyExists) {
-                    initialized++;
-                    console.log(`[PriceAttestor] Auto-initialized feed for ${task.mint.slice(0, 8)} (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
-                  }
-                }
-              } else {
-                failed++;
-                console.warn(`[PriceAttestor] legacy attest failed for ${task.mint.slice(0, 8)}: ${attestErrDetail(attestErr)}`);
-              }
-            }
-          } else {
-            // twap (V3 or V4)
-            try {
-              await attestPrice(task.mint, task.decimals, task.priceSol, task.target.id);
-              task.target.lastMap.set(task.mint, Date.now());
-              succeeded++;
-            } catch (twapErr) {
-              if (isUninitFeedError(twapErr)) {
-                if (initsThisTick < MAX_INITS_PER_TICK) {
-                  initsThisTick++;
-                  await initializePriceFeed(task.mint, task.target.id);
-                  initialized++;
-                  console.log(`[PriceAttestor] Auto-initialized ${task.target.label} feed for ${task.mint.slice(0, 8)} (${initsThisTick}/${MAX_INITS_PER_TICK} this tick)`);
-                }
-              } else {
-                failed++;
-                console.warn(`[PriceAttestor] ${task.target.label} attest failed for ${task.mint.slice(0, 8)}: ${attestErrDetail(twapErr)}`);
-              }
-            }
-          }
-        } catch (err) {
-          failed++;
-          console.error(`[PriceAttestor] worker exception for ${task.mint?.slice(0, 8)}: ${err.message?.slice(0, 120)}`);
+    const startedAt = Date.now();
+
+    // BATCHED attestation — group every queued task by its target program,
+    // then send each group as batched multi-instruction transactions (one
+    // base fee per ~ATTEST_BATCH_SIZE feeds instead of one per feed). This
+    // is what makes "keep every enabled mint warm 24/7" affordable and lets
+    // us retire hot/warm/cold tiers. Legacy tasks resolve to their category
+    // default program (V1 memecoin / V3 RWA); twap tasks carry an explicit
+    // V3/V4 target — so this single path covers all pool versions.
+    //
+    // attestPriceBatch falls back to per-mint attestPrice on ANY batch
+    // failure (isolating a bad/uninitialized feed) and shares a tick-wide
+    // init budget, so reliability never regresses vs the per-mint loop.
+    // ATTEST_BATCH_SIZE=1 disables batching (pure per-mint) with no redeploy.
+    // See [[feedback_first_attempt_loan_success_cost_effective]].
+    const groups = new Map(); // programIdStr -> { programId, tasks: [] }
+    for (const task of queue) {
+      let pid;
+      if (task.kind === "twap") pid = task.target.id;
+      else pid = chooseProgramIdForCategory(task.category); // legacy = category default
+      if (!pid) { failed++; continue; }
+      const key = pid.toBase58();
+      let g = groups.get(key);
+      if (!g) { g = { programId: pid, tasks: [] }; groups.set(key, g); }
+      g.tasks.push(task);
+    }
+
+    let initBudgetLeft = MAX_INITS_PER_TICK;
+    let totalTxs = 0, totalIx = 0;
+    for (const { programId, tasks } of groups.values()) {
+      attempted += tasks.length;
+      const items = tasks.map((t) => ({ mint: t.mint, decimals: t.decimals, priceSol: t.priceSol }));
+      let res;
+      try {
+        res = await attestPriceBatch(items, programId, { maxInits: initBudgetLeft, label: "attest" });
+      } catch (err) {
+        failed += tasks.length;
+        console.error(`[PriceAttestor] batch group ${programId.toBase58().slice(0, 8)} threw: ${err.message?.slice(0, 120)}`);
+        continue;
+      }
+      initBudgetLeft = Math.max(0, initBudgetLeft - (res.initsUsed || 0));
+      initialized += res.initsUsed || 0;
+      totalTxs += res.txs || 0;
+      totalIx += res.instructions || 0;
+      succeeded += res.attested.length;
+      failed += res.failed.length;
+      // Bookkeeping: mirror the per-mint loop's freshness maps for every
+      // mint that actually attested, so cadence gating stays correct.
+      const okSet = new Set(res.attested);
+      for (const t of tasks) {
+        if (!okSet.has(t.mint)) continue;
+        if (t.kind === "legacy") {
+          lastPrices.set(t.mint, t.priceLamports);
+          lastAttestAt.set(t.mint, Date.now());
+        } else {
+          t.target.lastMap.set(t.mint, Date.now());
         }
       }
+      for (const f of res.failed.slice(0, 5)) {
+        console.warn(`[PriceAttestor] attest failed for ${f.mint.slice(0, 8)}: ${f.err}`);
+      }
     }
-    const startedAt = Date.now();
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, () => attestWorker()));
     const elapsedMs = Date.now() - startedAt;
     if (succeeded > 0 || failed > 0 || initialized > 0) {
-      console.log(`[PriceAttestor] tick: queue=${queue.length} attempted=${attempted} ok=${succeeded} init=${initialized} fail=${failed} elapsed=${elapsedMs}ms concurrency=${CONCURRENCY}`);
+      const savedTxs = attempted - totalTxs - failed; // fewer signatures than one-tx-each
+      console.log(`[PriceAttestor] tick: queue=${queue.length} groups=${groups.size} ok=${succeeded} fail=${failed} init=${initialized} txs=${totalTxs} ix=${totalIx} (~${savedTxs} base-fees saved) elapsed=${elapsedMs}ms batchSize=${process.env.ATTEST_BATCH_SIZE || 10}`);
     }
     // Heartbeat — self-monitor probe reads this to detect a stuck
     // attestor (e.g. SQL type-cast bug killing every tick). Updated
