@@ -1774,6 +1774,8 @@ export async function handleAiStats(ctx) {
          COALESCE(SUM(turns), 0)::int                           AS turns,
          COALESCE(SUM(total_input_tokens), 0)::bigint           AS input_tok,
          COALESCE(SUM(total_output_tokens), 0)::bigint          AS output_tok,
+         COALESCE(SUM(total_cache_read_tokens), 0)::bigint      AS cache_read_tok,
+         COALESCE(SUM(total_cache_write_tokens), 0)::bigint     AS cache_write_tok,
          COUNT(DISTINCT user_id)::int                           AS unique_users
        FROM support_conversations
        WHERE last_active_at >= NOW() - INTERVAL '24 hours'`,
@@ -1790,8 +1792,10 @@ export async function handleAiStats(ctx) {
     // Today (UTC) for spend cap comparison
     const { rows: [today] } = await query(
       `SELECT
-         COALESCE(SUM(total_input_tokens), 0)::bigint  AS input_tok,
-         COALESCE(SUM(total_output_tokens), 0)::bigint AS output_tok
+         COALESCE(SUM(total_input_tokens), 0)::bigint       AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint      AS output_tok,
+         COALESCE(SUM(total_cache_read_tokens), 0)::bigint  AS cache_read_tok,
+         COALESCE(SUM(total_cache_write_tokens), 0)::bigint AS cache_write_tok
        FROM support_conversations
        WHERE last_active_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
     );
@@ -1799,10 +1803,14 @@ export async function handleAiStats(ctx) {
     const cost24h = estimateCostUsd({
       input_tokens: Number(agg.input_tok),
       output_tokens: Number(agg.output_tok),
+      cache_read_input_tokens: Number(agg.cache_read_tok),
+      cache_creation_input_tokens: Number(agg.cache_write_tok),
     });
     const costToday = estimateCostUsd({
       input_tokens: Number(today.input_tok),
       output_tokens: Number(today.output_tok),
+      cache_read_input_tokens: Number(today.cache_read_tok),
+      cache_creation_input_tokens: Number(today.cache_write_tok),
     });
     const cap = Number(process.env.AI_DAILY_SPEND_USD) || 20;
     const capPct = ((costToday / cap) * 100).toFixed(0);
