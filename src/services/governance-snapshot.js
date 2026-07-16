@@ -91,8 +91,21 @@ async function enumeratePureHolders(exempt) {
   }
 
   // Filter PDAs / contract accounts via System-Program owner check.
-  // Same defense-in-depth as the holder-rewards snapshot path.
+  // Same defense-in-depth as the holder-rewards snapshot path — and the
+  // SAME 0-SOL caveat: a real holder with 0 native SOL has no on-chain
+  // account (getAccountInfo → null) and would be wrongly dropped here,
+  // silently zeroing their governance weight. Discriminate by curve: real
+  // ed25519 wallets are on-curve, PDAs are off-curve by construction, so
+  // for a null account we keep it iff on-curve. Funded accounts keep the
+  // strict System-owner check. Mirrors magpie-holder-rewards.js.
   const SystemProgramId = SystemProgram.programId.toBase58();
+  const isOnCurveAddress = (addr) => {
+    try {
+      return PublicKey.isOnCurve(new PublicKey(addr).toBytes());
+    } catch {
+      return false;
+    }
+  };
   const allOwners = Array.from(byOwner.keys());
   const BATCH = 100;
   for (let i = 0; i < allOwners.length; i += BATCH) {
@@ -104,16 +117,24 @@ async function enumeratePureHolders(exempt) {
         commitment: "confirmed",
       });
     } catch (err) {
+      // Transient lookup failure — fall back to the on-curve filter rather
+      // than dropping the whole batch (which would silently disenfranchise
+      // real holders over a blip). Off-curve PDAs stay excluded.
       console.warn(
-        "[gov-snapshot] owner-lookup batch failed (excluding all in batch):",
+        "[gov-snapshot] owner-lookup batch failed — falling back to on-curve filter:",
         err.message,
       );
-      for (const o of batch) byOwner.delete(o);
+      for (const o of batch) {
+        if (!isOnCurveAddress(o)) byOwner.delete(o);
+      }
       continue;
     }
     for (let j = 0; j < batch.length; j++) {
       const info = infos[j];
-      if (!info || info.owner?.toBase58() !== SystemProgramId) {
+      if (!info) {
+        // Unfunded/null account: keep on-curve real wallets, drop off-curve PDAs.
+        if (!isOnCurveAddress(batch[j])) byOwner.delete(batch[j]);
+      } else if (info.owner?.toBase58() !== SystemProgramId) {
         byOwner.delete(batch[j]);
       }
     }
