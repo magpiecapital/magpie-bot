@@ -575,9 +575,31 @@ export async function snapshotMagpieHolders() {
   // would otherwise siphon ~14% of every distribution to non-holders
   // (e.g. PumpSwap AMM, Token-2022 protocol accounts, etc).
   //
+  // BUT: a holder whose native SOL balance is 0 has NO on-chain account
+  // (getAccountInfo → null), and a null account looks identical whether
+  // it's a drained real wallet or an unfunded PDA. Excluding all nulls
+  // (the pre-2026-07-16 behaviour) silently dropped legitimate 0-SOL
+  // holders from every round — e.g. a wallet holding millions of $MAGPIE
+  // but zero SOL would receive nothing, then get re-included the moment
+  // it happened to hold a little SOL at snapshot time. The reliable
+  // discriminator: real user wallets are ON-curve ed25519 addresses;
+  // program-derived addresses (the AMM/vault/bonding-curve accounts we
+  // must never pay) are OFF-curve by construction. So for a null account
+  // we keep it iff it's on-curve — a 0-SOL wallet can still receive SOL,
+  // and the payout itself creates its account. Funded accounts still get
+  // the strict System-Program owner check (an on-curve keypair account
+  // reassigned to a program is caught here by its non-System owner).
+  //
   // Batch fetch (100 per call) keeps RPC cost minimal even with thousands
   // of holders.
   const SystemProgramId = SystemProgram.programId.toBase58();
+  const isOnCurveAddress = (addr) => {
+    try {
+      return PublicKey.isOnCurve(new PublicKey(addr).toBytes());
+    } catch {
+      return false; // unparseable → treat as non-wallet, exclude
+    }
+  };
   const allOwners = Array.from(byOwner.keys());
   const BATCH = 100;
   for (let i = 0; i < allOwners.length; i += BATCH) {
@@ -587,16 +609,24 @@ export async function snapshotMagpieHolders() {
     try {
       infos = await connection.getMultipleAccountsInfo(pubkeys, { commitment: "confirmed" });
     } catch (err) {
-      console.error("[holder-rewards] account-owner lookup failed (keeping conservatively, excluding all in batch):", err.message);
-      // Conservative: if we can't verify, exclude rather than risk paying to PDAs.
-      for (const o of batch) byOwner.delete(o);
+      // RPC lookup failed — we can't read owners. Don't silently drop
+      // legitimate holders over a transient blip: fall back to the
+      // on-curve test, which still excludes every off-curve PDA (the
+      // actual siphon threat) while keeping real wallets in the round.
+      console.error("[holder-rewards] account-owner lookup failed — falling back to on-curve filter for this batch:", err.message);
+      for (const o of batch) {
+        if (!isOnCurveAddress(o)) byOwner.delete(o);
+      }
       continue;
     }
     for (let j = 0; j < batch.length; j++) {
       const info = infos[j];
-      // No account info → owner doesn't exist (could be a PDA never funded);
-      // OR owner is a contract — exclude to be safe.
-      if (!info || info.owner?.toBase58() !== SystemProgramId) {
+      if (!info) {
+        // Unfunded/null account: keep on-curve real wallets (0-SOL
+        // holders can still be paid), drop off-curve unfunded PDAs.
+        if (!isOnCurveAddress(batch[j])) byOwner.delete(batch[j]);
+      } else if (info.owner?.toBase58() !== SystemProgramId) {
+        // Funded account owned by a program → contract/PDA, never pay.
         byOwner.delete(batch[j]);
       }
     }
