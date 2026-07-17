@@ -368,12 +368,21 @@ async function retryFreshRows(bot) {
 
     // If the error is anything OTHER than the race itself, it's not
     // going to fix itself — mark failed and DM. Examples:
-    // loan_not_active, collateral_not_enabled, exits_require_v4_loan.
+    // collateral_not_enabled, exits_require_v4_loan.
     const TRANSIENT_ERRORS = new Set([
       "loan_not_found_for_user",
       "watcher_exception",
     ]);
-    if (!TRANSIENT_ERRORS.has(result.error)) {
+    // loan_not_active is transient ONLY while the loan is still FINALIZING
+    // (borrow committed the row but hasn't flipped to 'active' yet). Once it's
+    // active a replay succeeds; a TERMINAL status (repaid/liquidated/…) never
+    // will → hard-fail. result.detail carries the loan status string.
+    const TERMINAL_LOAN_STATUSES = new Set(["repaid", "liquidated", "cancelled", "closed", "defaulted", "refunded"]);
+    const isFinalizingRace =
+      result.error === "loan_not_active" &&
+      typeof result.detail === "string" &&
+      !TERMINAL_LOAN_STATUSES.has(result.detail.trim().toLowerCase());
+    if (!TRANSIENT_ERRORS.has(result.error) && !isFinalizingRace) {
       try {
         await query(
           `UPDATE pending_arms
