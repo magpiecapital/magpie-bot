@@ -209,6 +209,7 @@ import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
 import { startLimitCloseFirstV4FireWatcher } from "./services/limit-close-first-v4-fire-watcher.js";
 import { startV4FireFailureRateWatcher } from "./services/limit-close-v4-fire-failure-rate-watcher.js";
+import { startV4ConvertDrainWatcher } from "./services/v4-convert-drain-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -1183,6 +1184,9 @@ bot.start({
     // First-fire watcher catches "V4 wired up?" — this one catches "V4
     // is wired but something is silently failing repeatedly."
     setTimeout(() => startV4FireFailureRateWatcher(bot), 180_000);
+    // INTERIM detection for the unpatched V4 convert_collateral_slice drain
+    // (audit #1 critical; on-chain fix ships as V4.x pending Sec3). Read-only.
+    setTimeout(() => startV4ConvertDrainWatcher(bot), 190_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Fee-wallet auto-sweeper — every 1h moves accrued fee SOL from
