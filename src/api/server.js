@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 import { constantTimeEqual } from "./auth-utils.js";
+import { getV4ConvertDrainWatcherHealth } from "../services/v4-convert-drain-watcher.js";
 
 const gzipAsync = promisify(gzip);
 const brotliAsync = promisify(brotliCompress);
@@ -2056,6 +2057,13 @@ async function router(req, res) {
       limitCloseEngine = { state: "unknown", detail: err.message?.slice(0, 100) };
     }
 
+    // Interim V4 convert-slice drain watcher liveness — a silently-dead security
+    // monitor is a liability, so surface it here. In-process (runs in the bot),
+    // read-only, and NEVER folded into `reasons` (must not flip bot status).
+    let v4DrainWatcher = null;
+    try { v4DrainWatcher = getV4ConvertDrainWatcherHealth(); }
+    catch (err) { v4DrainWatcher = { state: "unknown", detail: err.message?.slice(0, 100) }; }
+
     const failing = reasons.length > 0;
     res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -2068,6 +2076,7 @@ async function router(req, res) {
       heartbeats: hb.services,
       v4_feeds: v4Feeds,
       limit_close_engine: limitCloseEngine,
+      v4_convert_drain_watcher: v4DrainWatcher,
     }));
   }
 
