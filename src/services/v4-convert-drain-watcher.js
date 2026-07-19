@@ -21,11 +21,37 @@
  *
  * No emojis per Magpie copy rules.
  */
-import { connection, withFailover } from "../solana/connection.js";
+import { connection, backupConnections, withFailover } from "../solana/connection.js";
 import { notifyAdmin } from "./admin-notify.js";
 import { PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 const b58decode = bs58.decode || (bs58.default && bs58.default.decode);
+
+// Fetch a jsonParsed transaction via RAW JSON-RPC (with endpoint failover).
+// web3.js Connection.getTransaction({encoding:"jsonParsed"}) THROWS on real
+// txs ("accountKeys.0 expected a string, received object") — its response
+// validator rejects the parsed shape — which would silently blind this
+// watcher. Raw RPC returns string account keys / base58 ix data, exactly what
+// analyzeConvertTx expects. Validated 2026-07-18 against real V4 conversions.
+const _rpcUrls = [connection.rpcEndpoint, ...backupConnections.map((c) => c.rpcEndpoint)]
+  .filter((u, i, a) => u && a.indexOf(u) === i);
+async function getParsedTxRaw(sig) {
+  for (const url of _rpcUrls) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1, method: "getTransaction",
+          params: [sig, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed", commitment: "confirmed" }],
+        }),
+      });
+      const j = await res.json();
+      if (j && j.result) return j.result;
+    } catch { /* try next endpoint */ }
+  }
+  return null;
+}
 
 const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4 || "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo";
 const WATCH_INTERVAL_MS = Number(process.env.V4_CONVERT_DRAIN_INTERVAL_MS) || 3 * 60_000;
@@ -115,9 +141,7 @@ async function scanOnce(bot) {
   for (const s of [...sigs].reverse()) {
     if (s.err) continue;
     if (_alerted.has(s.signature)) continue;
-    const tx = await withFailover((c) =>
-      c.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, encoding: "jsonParsed", commitment: "confirmed" }),
-    ).catch(() => null);
+    const tx = await getParsedTxRaw(s.signature).catch(() => null);
     if (!tx) continue;
     let reason = null;
     try { reason = analyzeConvertTx(tx); } catch (e) { console.warn(`[v4-drain] analyze failed ${s.signature.slice(0, 12)}: ${e.message?.slice(0, 120)}`); continue; }
