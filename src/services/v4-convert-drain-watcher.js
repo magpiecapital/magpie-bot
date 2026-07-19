@@ -55,7 +55,6 @@ async function getParsedTxRaw(sig) {
 
 const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4 || "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo";
 const WATCH_INTERVAL_MS = Number(process.env.V4_CONVERT_DRAIN_INTERVAL_MS) || 3 * 60_000;
-const FIRST_RUN_DELAY_MS = Number(process.env.V4_CONVERT_DRAIN_FIRST_DELAY_MS) || 90_000;
 const SCAN_LIMIT = Number(process.env.V4_CONVERT_DRAIN_SCAN_LIMIT) || 25;
 // SOL the proceeds vault must have gained for a real conversion; below this
 // (while collateral left the vault) = drain. 0.001 SOL — any real swap clears it.
@@ -173,8 +172,11 @@ async function scanOnce(bot) {
 export function startV4ConvertDrainWatcher(bot) {
   if (_timer) return;
   const tick = () => scanOnce(bot).catch((e) => console.warn(`[v4-drain] tick error: ${e.message?.slice(0, 160)}`));
-  setTimeout(() => { tick(); _timer = setInterval(tick, WATCH_INTERVAL_MS); }, FIRST_RUN_DELAY_MS);
-  console.log(`[v4-drain] convert-slice drain watcher armed — first scan in ${FIRST_RUN_DELAY_MS / 1000}s, then every ${WATCH_INTERVAL_MS / 1000}s`);
+  // index.js already staggers this call ~190s after boot — scan right away
+  // (no second delay) so the security monitor isn't blind for ~5 min per deploy.
+  tick();
+  _timer = setInterval(tick, WATCH_INTERVAL_MS);
+  console.log(`[v4-drain] convert-slice drain watcher armed — scanning now, then every ${WATCH_INTERVAL_MS / 1000}s`);
 }
 
 /** Liveness for /api/v1/health — so a silently-dead security monitor is visible. */
