@@ -67,6 +67,10 @@ const CONVERT_DISC = [253, 2, 10, 59, 245, 38, 24, 72];
 
 let _timer = null;
 let _lastSig = null;            // cursor: newest signature already scanned
+let _lastTickAt = null;         // liveness: epoch ms of the last completed scan
+let _lastScanSigs = 0;          // sigs seen in the last scan
+let _alertsTotal = 0;           // drain alerts paged this process
+let _lastError = null;          // last scan error message (for /health)
 const _alerted = new Set();     // signatures already paged on (bounded)
 
 function rememberAlerted(sig) {
@@ -130,11 +134,14 @@ function analyzeConvertTx(tx) {
 }
 
 async function scanOnce(bot) {
+  _lastTickAt = Date.now(); // liveness: the interval fired and a scan is running
   const program = new PublicKey(V4_PROGRAM_ID);
   const sigs = await withFailover((c) =>
     c.getSignaturesForAddress(program, { limit: SCAN_LIMIT, ...(_lastSig ? { until: _lastSig } : {}) }),
-  ).catch(() => null);
-  if (!Array.isArray(sigs) || sigs.length === 0) return;
+  ).catch((e) => { _lastError = `getSignatures: ${e.message?.slice(0, 80)}`; return null; });
+  if (!Array.isArray(sigs)) return;
+  _lastScanSigs = sigs.length; _lastError = null;
+  if (sigs.length === 0) return;
   // newest first → advance cursor to the newest we saw this pass
   const newest = sigs[0]?.signature;
   // process oldest→newest so alerts read chronologically
@@ -147,6 +154,7 @@ async function scanOnce(bot) {
     try { reason = analyzeConvertTx(tx); } catch (e) { console.warn(`[v4-drain] analyze failed ${s.signature.slice(0, 12)}: ${e.message?.slice(0, 120)}`); continue; }
     if (reason) {
       rememberAlerted(s.signature);
+      _alertsTotal++;
       console.error(`[v4-drain] ANOMALY ${s.signature}: ${reason}`);
       try {
         await notifyAdmin(
@@ -167,4 +175,20 @@ export function startV4ConvertDrainWatcher(bot) {
   const tick = () => scanOnce(bot).catch((e) => console.warn(`[v4-drain] tick error: ${e.message?.slice(0, 160)}`));
   setTimeout(() => { tick(); _timer = setInterval(tick, WATCH_INTERVAL_MS); }, FIRST_RUN_DELAY_MS);
   console.log(`[v4-drain] convert-slice drain watcher armed — first scan in ${FIRST_RUN_DELAY_MS / 1000}s, then every ${WATCH_INTERVAL_MS / 1000}s`);
+}
+
+/** Liveness for /api/v1/health — so a silently-dead security monitor is visible. */
+export function getV4ConvertDrainWatcherHealth() {
+  if (_timer == null && _lastTickAt == null) return { state: "not_started" };
+  const ageMs = _lastTickAt != null ? Date.now() - _lastTickAt : null;
+  // stale if we've missed ~3 intervals (never let this flip the bot's own status)
+  const stale = ageMs == null || ageMs > 3 * WATCH_INTERVAL_MS;
+  return {
+    state: _lastTickAt == null ? "starting" : (stale ? "stale" : "ok"),
+    last_tick_at: _lastTickAt != null ? new Date(_lastTickAt).toISOString() : null,
+    age_ms: ageMs,
+    last_scan_sigs: _lastScanSigs,
+    alerts_total: _alertsTotal,
+    ...(_lastError ? { last_error: _lastError } : {}),
+  };
 }
