@@ -1229,6 +1229,99 @@ export async function applyStartupPatches() {
      VALUES ('DRAMjSWR7HRfJKjRkvQWYL2bcaejaVhuxEcjf4pAY4Cw')
      ON CONFLICT DO NOTHING`,
 
+    // ── Backpack Securities tokenized-stock expansion (operator-trusted MANUAL
+    //    approval + full authorization 2026-07-21). Same profile as $MU/$SNDK:
+    //    category='stock' → shows in the site's Tokenized Stocks column, routes
+    //    V3 (no-exit) + V4 (with-exit) per chooseProgramId RWA routing, and is
+    //    force-kept hot+protected by the stocks-rwa-protection-sentinel so it
+    //    can NEVER be auto-disabled and its V3/V4 price_feed PDAs stay pre-warmed.
+    //    ALL THREE VERIFIED ON-CHAIN before onboarding: Token-2022 program
+    //    (TokenzQd…), decimals=6, mint+freeze authority held by Backpack (the
+    //    SAME freeze authority 2cVYpag… as the already-approved $MU — no new risk
+    //    class), and CRUCIALLY **no dangerous Token-2022 extensions** (no
+    //    permanent-delegate, transfer-hook, transfer-fee, or non-transferable —
+    //    plain base mints), and priced by DexScreener/Jupiter so the attestor can
+    //    fill the 8-sample TWAP window. ON CONFLICT re-asserts every boot.
+
+    // $INTC — Intel Corporation (Backpack Securities, Token-2022). DEX ~$200k.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('iNTCy1qTsUEZQe3DSocLz1ZXXai34Gdw8THQh5rxFaF',
+             'INTC', 'Intel Corporation', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'INTC',
+       name = 'Intel Corporation',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('iNTCy1qTsUEZQe3DSocLz1ZXXai34Gdw8THQh5rxFaF')
+     ON CONFLICT DO NOTHING`,
+
+    // $HOOD — Robinhood Markets, Inc. (Backpack Securities, Token-2022). DEX ~$473k.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('HooDYv5RewLRiMLnEVq3VJqdqxhuE6c5eYvqejMC3e9A',
+             'HOOD', 'Robinhood Markets, Inc.', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'HOOD',
+       name = 'Robinhood Markets, Inc.',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('HooDYv5RewLRiMLnEVq3VJqdqxhuE6c5eYvqejMC3e9A')
+     ON CONFLICT DO NOTHING`,
+
+    // $SKHY — SK Hynix (Backpack Securities, Token-2022). DEX ~$1.0M. Fulfills
+    // the long-standing "add $SKHY once trading" TODO (mint verified identical).
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('SKHYhSjuRWHgikq8eRKbtBbpABgJSkd7ytQV14i9EQ3',
+             'SKHY', 'SK Hynix', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'SKHY',
+       name = 'SK Hynix',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('SKHYhSjuRWHgikq8eRKbtBbpABgJSkd7ytQV14i9EQ3')
+     ON CONFLICT DO NOTHING`,
+
     // $PUMP — Pump.fun platform token. OPERATOR-TRUSTED EXEMPT LARGE-CAP
     // (manual approval 2026-07-02; operator trusts it despite it not fitting
     // the auto-screener thresholds). It was auto-removed once; this seed
