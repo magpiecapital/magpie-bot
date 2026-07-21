@@ -771,13 +771,14 @@ export async function handleCommunityWhitepaper(ctx) {
 /* ─────────────────────────── /audit ─────────────────────────── */
 
 export async function handleCommunityAudit(ctx) {
-  // Honest answer — no audit REPORT has shipped yet, but the Sec3
-  // audit is now actively underway (activities commenced 2026-07-08).
-  // Never say "audited" (the report isn't out) — say it's in progress.
+  // Honest answer — Sec3's INITIAL assessment is complete (findings delivered);
+  // we've remediated all of them and are in RE-REVIEW. Never say "audited"
+  // (the final report isn't out). Share the finding COUNTS for transparency,
+  // but NEVER describe any specific finding's mechanics.
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie has *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. The engagement is *paid for* and the *audit is actively underway* (commenced Wednesday, July 8, 2026). *V3 + the credit-oracle program are next in line.* The report is published when it's complete — so the protocol is *not yet audited*, and remember an audit reduces risk, it doesn't eliminate it.`,
+    `*Sec3* — a Solana-native security firm (formerly Soteria) — has completed its *initial assessment* of *V4*, our in-vault auto-sell flagship, and delivered a findings report: *22 findings — 2 high, 3 medium, 8 low, 6 informational, 3 questions.* We've *implemented fixes for every one* and submitted the updated program to Sec3 for *re-review*; the final report publishes after that re-check. *V3 + the credit-oracle program are next in line.* So Magpie is *still not "audited"* — the reviewed-and-fixed version ships together with the re-audit — and remember an audit reduces risk, it doesn't eliminate it. (A thorough audit surfacing a healthy set of issues, all of which we then fix, is exactly the process working as intended.)`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
