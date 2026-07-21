@@ -1322,6 +1322,327 @@ export async function applyStartupPatches() {
      VALUES ('SKHYhSjuRWHgikq8eRKbtBbpABgJSkd7ytQV14i9EQ3')
      ON CONFLICT DO NOTHING`,
 
+    // ─────── BACKED FINANCE xStocks (2026-07-21 diligent onboarding) ───────
+    // A second, larger source of tokenized-stock collateral beyond Backpack:
+    // Backed Finance xStocks — freely on-chain, DEX-liquid, Token-2022. Each
+    // mint below was verified on-chain this session: Token-2022 owner,
+    // decimals=8 (NOTE: xStocks are 8-dec, unlike the 6-dec Backpack stocks
+    // above — storing the wrong decimals = 100x mispricing, so it is asserted
+    // per-mint), consistent Backed issuer (mint authority 7pt9tkct… + freeze
+    // authority JDq14BWv… across the whole family), and CRITICALLY **no
+    // dangerous Token-2022 extensions** — no transfer-hook (would brick vault
+    // transfers), no permanent-delegate (seizure), no transfer-fee (over-lend),
+    // no non-transferable. Only the standard issuer freeze authority (same risk
+    // class as $MU, already accepted). Liquidity checked via DexScreener; only
+    // names ≥ ~$100k liquidity are seeded so the attestor can fill the 8-sample
+    // TWAP window. category='stock'|'etf'|'metal' → V3 (no-exit) + V4 (with-exit)
+    // RWA routing; enabled+protected+hot + screen-seen mirrors the $MU pattern,
+    // so no screener/health-watcher can ever auto-disable or re-screen them.
+    // Excluded on purpose: SPCXx (SpaceX — private co, no public price anchor,
+    // consistent with the SPCX Backpack exclusion), STRCx (niche preferred
+    // instrument), AAPLx (~$63k liquidity — below the reliable-pricing bar; the
+    // RWA screener will auto-add it once liquidity grows).
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh',
+             'NVDAx', 'NVIDIA xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'NVDAx',
+       name = 'NVIDIA xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB',
+             'TSLAx', 'Tesla xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'TSLAx',
+       name = 'Tesla xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs7ZdzSHLU9ftNJsii5fCeJhoRWSC32SQGzGQtePxNu',
+             'COINx', 'Coinbase xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'COINx',
+       name = 'Coinbase xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs7ZdzSHLU9ftNJsii5fCeJhoRWSC32SQGzGQtePxNu')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ',
+             'MSTRx', 'MicroStrategy xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'MSTRx',
+       name = 'MicroStrategy xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsvNBAYkrDRNhA7wPHQfX3ZUXZyZLdnCQDfHZ56bzpg',
+             'HOODx', 'Robinhood xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'HOODx',
+       name = 'Robinhood xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsvNBAYkrDRNhA7wPHQfX3ZUXZyZLdnCQDfHZ56bzpg')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs3eBt7uRfJX8QUs4suhyU8p2M6DoUDrJyWBa8LLZsg',
+             'AMZNx', 'Amazon.com xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'AMZNx',
+       name = 'Amazon.com xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs3eBt7uRfJX8QUs4suhyU8p2M6DoUDrJyWBa8LLZsg')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN',
+             'GOOGLx', 'Alphabet xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'GOOGLx',
+       name = 'Alphabet xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX',
+             'MSFTx', 'Microsoft xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'MSFTx',
+       name = 'Microsoft xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu',
+             'METAx', 'Meta xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'METAx',
+       name = 'Meta xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W',
+             'SPYx', 'SP500 xStock', 8, 'etf', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'SPYx',
+       name = 'SP500 xStock',
+       category = 'etf',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ',
+             'QQQx', 'Nasdaq xStock', 8, 'etf', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'QQQx',
+       name = 'Nasdaq xStock',
+       category = 'etf',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re',
+             'GLDx', 'Gold xStock', 8, 'metal', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'GLDx',
+       name = 'Gold xStock',
+       category = 'metal',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re')
+     ON CONFLICT DO NOTHING`,
+
     // $PUMP — Pump.fun platform token. OPERATOR-TRUSTED EXEMPT LARGE-CAP
     // (manual approval 2026-07-02; operator trusts it despite it not fitting
     // the auto-screener thresholds). It was auto-removed once; this seed
