@@ -276,6 +276,38 @@ export async function applyStartupPatches() {
      VALUES ('B4ptaVsUe6YbtBwAS38WFeweSrVNfQLCcj9JRrtjU8vn')
      ON CONFLICT DO NOTHING`,
 
+    // $CARDS (Collector Crypt) — operator manual approval 2026-07-31 (full green
+    // light → screening bypassed per feedback_operator_manual_token_approval_bypasses_screening).
+    // Verified on-chain: classic SPL mint, decimals=6, mint+freeze authority BOTH
+    // renounced (fixed supply, no freeze); ~$2.5M Raydium (CLMM) + Meteora liquidity,
+    // ~$1M 24h volume, price ~$0.15; Jupiter-routable to USDC (~0.002% impact) so it
+    // stays liquidatable ("collateral that can still sell itself"). It's a volatile,
+    // DEX-priced platform token — NOT a stable tokenized-stock — so category='memecoin'
+    // (standard LTV, V1 no-exit / V4 with-exit), NOT an RWA category. protected=TRUE =
+    // exempt from auto-disable; attestation_tier='hot' keeps the TWAP feed warm.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp',
+             'CARDS', 'Collector Crypt', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_approved',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_approved'`,
+
+    // Keep the screener from re-processing $CARDS through the audit pipeline.
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp')
+     ON CONFLICT DO NOTHING`,
+
     // Referral rewards ledger. One row per fee-bearing event (borrow, extend)
     // produced by a referred user. Sum of unpaid rows = claimable balance.
     `CREATE TABLE IF NOT EXISTS referral_earnings (
