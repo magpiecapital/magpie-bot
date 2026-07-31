@@ -2011,10 +2011,15 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
   let signature;
   try {
     const raw = tx.serialize();
-    signature = await sendAndConfirmRawTransaction(connection, raw, {
+    // Robust submit: rebroadcast the fully-signed tx every ~2s and poll to
+    // confirmation, instead of sending once and blocking on blockhash expiry.
+    // Fixes borrows stuck on "Landing your transaction…" during congestion.
+    // (Externally-signed → we can't re-sign, so this helper never re-signs; it
+    // gives up only once the blockhash can no longer land the tx = no dup loan.)
+    const { sendSignedRawWithRebroadcast } = await import("../solana/tx-send.js");
+    signature = await sendSignedRawWithRebroadcast(connection, raw, {
       commitment: "confirmed",
-      skipPreflight: false,
-      maxRetries: 3,
+      blockhash: tx.recentBlockhash,
     });
   } catch (e) {
     // Surface every possible field on the error object — message can be
@@ -2050,6 +2055,14 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
       recordBorrowFailure("collateral_value_exceeds");
       _recordBorrowConversionFailure(_convCtx, "collateral_value_exceeds_broadcast", { detail: detail?.slice(0, 220) });
       return { status: 503, body: { error: "Price moved while you were signing. Please tap Borrow again to get a fresh quote.", price_moved: true, retry_after_seconds: 3, detail } };
+    }
+    // Congestion give-up: the tx didn't land before its blockhash expired. This
+    // is SAFE to retry — the blockhash is dead, so no duplicate loan can form —
+    // and it must surface as a clean, retryable message, never a raw error.
+    if (e && e.expiredTimeout === true) {
+      recordBorrowFailure("congestion_timeout");
+      _recordBorrowConversionFailure(_convCtx, "congestion_timeout", { detail: detail?.slice(0, 220) });
+      return { status: 503, body: { error: "Solana is congested — your transaction didn't land in time and expired safely (no funds moved). Please tap Borrow again.", congested: true, retry_after_seconds: 3, detail } };
     }
     return {
       status: 500,
