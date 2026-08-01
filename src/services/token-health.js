@@ -192,7 +192,7 @@ async function tick(bot) {
     `SELECT mint, symbol, has_mint_authority, health_strikes, category
      FROM supported_mints
      WHERE enabled = TRUE AND (protected IS NOT TRUE)
-       AND (category NOT IN ('stock','etf','metal') OR category IS NULL)`,
+       AND (category NOT IN ('stock','rwa','etf','metal') OR category IS NULL)`,
   );
 
   if (tokens.length === 0) return;
