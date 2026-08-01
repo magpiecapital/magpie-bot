@@ -61,8 +61,22 @@ const MAX_PRICE_STALENESS_SECONDS = 110; // under the program's 120s wall
 // (strictly safer for the protocol — it can never over-value collateral); the
 // cost is a few % of borrowing power, which is the right trade for ZERO
 // rejections. Tune via env without a redeploy.
-const HEADROOM_MEMECOIN_BPS = Number(process.env.SAFE_HEADROOM_MEMECOIN_BPS) || 500; // 5% — memecoins are volatile
-const HEADROOM_RWA_BPS = Number(process.env.SAFE_HEADROOM_RWA_BPS) || 200; // 2% — RWAs/stocks (TWAP-smoothed, can still gap)
+// Clamp the drift-headroom env overrides to a safe band. The buffer only
+// ever REDUCES borrowing power (SCALE − headroom), so a misconfigured value
+// must not be able to (a) collapse the buffer to ~0 (a tiny positive like
+// `=1` → 0.01%, re-opening quote→execution drift rejections/over-valuation)
+// or (b) INVERT it (a negative value would make the multiplier > 1 and
+// inflate collateral value — a security-relevant misconfig). NaN/0/negative
+// fall back to the default; valid values are bounded to [0.5%, 50%].
+const MIN_HEADROOM_BPS = 50; // never let the buffer collapse below 0.5%
+const MAX_HEADROOM_BPS = 5000; // never exceed 50%
+function parseHeadroomBps(envVal, def) {
+  const n = Number(envVal);
+  if (!Number.isFinite(n) || n <= 0) return def;
+  return Math.min(Math.max(n, MIN_HEADROOM_BPS), MAX_HEADROOM_BPS);
+}
+const HEADROOM_MEMECOIN_BPS = parseHeadroomBps(process.env.SAFE_HEADROOM_MEMECOIN_BPS, 500); // 5% — memecoins are volatile
+const HEADROOM_RWA_BPS = parseHeadroomBps(process.env.SAFE_HEADROOM_RWA_BPS, 200); // 2% — RWAs/stocks (TWAP-smoothed, can still gap)
 const HEADROOM_DEFAULT_BPS = HEADROOM_MEMECOIN_BPS; // unknown category → widest (safest) buffer
 // Everything that isn't an RWA/stock/commodity class is treated as memecoin-volatile.
 const RWA_CATEGORIES = new Set([
