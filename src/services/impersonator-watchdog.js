@@ -33,7 +33,7 @@
  * detection path specifically.
  */
 import { query } from "../db/pool.js";
-import { isImpersonationName, isVerifiedAccount, recordModAction, isUserCleared, nameKey } from "./community-moderation.js";
+import { isImpersonationName, isHardImpersonation, isVerifiedAccount, recordModAction, isUserCleared, nameKey } from "./community-moderation.js";
 
 const SCAN_INTERVAL_MS = Number(process.env.IMPERSONATOR_SCAN_INTERVAL_MS) || 30 * 60_000; // 30 min default
 // Scan the ENTIRE membership, not just recent joiners (operator 2026-07-04,
@@ -110,7 +110,9 @@ async function scanChat(bot, chatId) {
     if (!isImpersonationName(u)) continue;
     // Pip's memory: never re-ban a member already cleared via appeal/operator
     // (name-scoped — a rename into a fresh impersonation handle is NOT cleared).
-    if (await isUserCleared(chatId, row.user_id, nameKey(u))) continue;
+    // A HARD impersonation name is banned even if cleared — no clearance
+    // (incl. name-agnostic operator /unban) shields "D E V" / "Magpie Support".
+    if (!isHardImpersonation(u) && (await isUserCleared(chatId, row.user_id, nameKey(u)))) continue;
 
     // HIT — auto-kick (matches on-join handler's action on a flagged
     // joiner that also failed captcha). The exact "warn vs. ban"
@@ -122,8 +124,11 @@ async function scanChat(bot, chatId) {
     // signal for removal.
     flagged++;
     try {
-      const until = Math.floor(Date.now() / 1000) + 60; // brief ban, then unban so they can re-join with a clean name
-      await bot.api.banChatMember(chatId, Number(row.user_id), { until_date: until });
+      // PERMANENT ban (no until_date) — a deliberate impersonation name is
+      // never allowed back in (operator directive 2026-08-01). The previous
+      // 60s "soft kick, rejoin with a clean name" was too lenient and let
+      // impersonators cycle back. False positives recover via /appeal.
+      await bot.api.banChatMember(chatId, Number(row.user_id));
       await recordModAction(
         chatId, row.user_id, "watchdog_auto_ban_impersonation",
         "watchdog retroactive scan matched IMPERSONATION_PATTERNS",
