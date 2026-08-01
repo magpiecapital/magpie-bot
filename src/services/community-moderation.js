@@ -726,6 +726,33 @@ export function isImpersonationName(user) {
   return false;
 }
 
+/**
+ * HARD impersonation = an UNAMBIGUOUS match: an exact brand pattern
+ * ("Magpie Support"), a homoglyph-disguised brand/role word ("Ðeveloper",
+ * "Аdmin"), or a bare/spaced staff-role word ("Dev", "D E V", "A D M I N").
+ * These are NEVER false positives — no legitimate member is named any of
+ * these — so a CLEARANCE (even a name-agnostic operator /unban) must NOT
+ * shield them. This closes the hole that let a previously-cleared account
+ * (from the 2026-06-30 captcha-bug bulk-unban) rename to "D E V" and stay
+ * immune to every name-ban path.
+ *
+ * DELIBERATELY EXCLUDES the fuzzy `isBrandLookalikeImpersonation` layer
+ * (Damerau-Levenshtein / anagram), which CAN misfire on a real name
+ * (e.g. "Maggie") — that layer stays clearance-protectable so an appeal
+ * winner isn't re-banned for a borderline resemblance.
+ */
+export function isHardImpersonation(user) {
+  if (!user) return false;
+  for (const c of impersonationVariants(user)) {
+    for (const re of IMPERSONATION_PATTERNS) {
+      if (re.test(c)) return true;
+    }
+  }
+  if (isHomoglyphDisguisedImpersonation(user)) return true;
+  if (isBareRoleWordImpersonation(user)) return true;
+  return false;
+}
+
 export function isVerifiedAccount(user) {
   if (!user?.id) return false;
   return getVerifiedTgIds().has(String(user.id));

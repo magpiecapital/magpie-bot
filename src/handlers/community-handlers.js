@@ -22,6 +22,7 @@ import {
   isChatEnabled,
   isVerifiedAccount,
   isImpersonationName,
+  isHardImpersonation,
   matchesScamPattern,
   matchesDmSolicitation,
   findImpersonatingHandles,
@@ -173,7 +174,10 @@ async function handleNewMembers(ctx) {
 
       // Pip's memory: a previously-cleared member (same name) rejoining via
       // their appeal invite is not re-shamed on join or captcha-kicked again.
-      if (await isUserCleared(ctx.chat.id, m.id, nameKey(m))) continue;
+      // BUT a clearance never shields a HARD impersonation name — a cleared
+      // account that (re)joins as "D E V" / "Magpie Support" / "Ðev" is still
+      // banned (closes the name-agnostic-clearance weaponization).
+      if (!isHardImpersonation(m) && (await isUserCleared(ctx.chat.id, m.id, nameKey(m)))) continue;
 
       // Impersonation check on join — BAN immediately, don't just warn.
       // Impersonation IS the attack (there's no legitimate reason to join
@@ -422,7 +426,12 @@ async function handleGroupMessage(ctx) {
     // pointless (they'd be banned again on their next message). Name-scoped:
     // if a cleared user RENAMES into a fresh impersonation pattern, the
     // clearance no longer applies and the ban fires.
-    if (isImpersonationName(sender) && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+    // A HARD impersonation name (exact brand / homoglyph / bare-or-spaced
+    // role word) is banned even if the account is cleared — no clearance,
+    // not even a name-agnostic operator /unban, shields a blatant
+    // impersonation handle. Only the fuzzy-lookalike layer stays
+    // clearance-protectable (see isHardImpersonation).
+    if (isImpersonationName(sender) && (isHardImpersonation(sender) || !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender))))) {
       await tryDelete(ctx, msg.message_id);
       try {
         await ctx.api.banChatMember(ctx.chat.id, sender.id);
