@@ -688,6 +688,18 @@ export function isBareRoleWordImpersonation(user) {
   for (const raw of [user.username || "", user.first_name || "", user.last_name || "", combined]) {
     if (!raw) continue;
     const folded = foldConfusables(normalizeUnicode(raw)).toLowerCase();
+    // (b) LETTER-/PUNCTUATION-SPACED evasion: the whole name with ALL
+    // separators removed IS a single role word — "D E V" → "dev",
+    // "A.D.M.I.N" → "admin", "s u p p o r t" → "support", "d_e_v" → "dev".
+    // Checked FIRST and regardless of token count: the token-based check (a)
+    // below misses this because each spaced letter becomes its own non-role
+    // token, and a spaced-out word can exceed the 4-token "not a sentence"
+    // guard ("A D M I N" = 5 tokens). A legit name only trips this if it
+    // collapses to an EXACT staff-role word (e.g. "Devon" → "devon" does
+    // NOT), and the appeal path (/appeal) covers the rare edge.
+    const despaced = folded.replace(/[^a-z0-9]/g, "");
+    if (despaced && BARE_ROLE_WORDS.has(despaced)) return true;
+    // (a) every token is itself a role word ("Dev", "Dev Team", "Admin Support").
     const toks = folded.split(/[^a-z0-9]+/).filter(Boolean);
     if (!toks.length || toks.length > 4) continue;      // 1–4 tokens; a sentence isn't a name
     if (toks.every((t) => BARE_ROLE_WORDS.has(t))) return true;
