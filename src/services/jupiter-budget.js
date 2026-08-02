@@ -128,6 +128,17 @@ async function getMintCategory(mint) {
 }
 
 /**
+ * [Oracle F1] Is this mint an RWA (stock / etf / metal)? Cached via
+ * getMintCategory. Used by the cross-source pricer to decide whether the
+ * primary slot must be a STRICT Jupiter fetch (memecoins) or may keep the
+ * DexScreener-first path (RWA legitimately routes Dex-first). Fails safe to
+ * `false` (treated as memecoin → strict Jupiter primary).
+ */
+export async function isRwaMint(mint) {
+  return RWA_CATEGORIES.has(await getMintCategory(mint));
+}
+
+/**
  * Decide the routing for a given mint.
  *
  * Returns one of:
