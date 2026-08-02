@@ -3,8 +3,8 @@
  *
  * Read-only + informational, so it's fine in the community group. Reflects
  * the operator's decision (2026-07-03): Sec3 selected + engaged for the V4
- * audit. HARD RULE: never say the protocol is "audited" — the audit is
- * UNDERWAY, not complete.
+ * audit. HARD RULE: never say the protocol is "audited" — Sec3's assessment
+ * is complete and the remediated fixes are in RE-REVIEW, not yet published.
  */
 export async function handleAudit(ctx) {
   const msg = [

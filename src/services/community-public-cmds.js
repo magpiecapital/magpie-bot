@@ -772,8 +772,8 @@ export async function handleCommunityWhitepaper(ctx) {
 
 export async function handleCommunityAudit(ctx) {
   // Honest answer — no audit REPORT has shipped yet, but the Sec3
-  // audit is now actively underway (activities commenced 2026-07-08).
-  // Never say "audited" (the report isn't out) — say it's in progress.
+  // assessment is complete + remediated fixes are back with Sec3 for
+  // re-review. Never say "audited" (final report isn't out) — say re-review.
   const text = [
     `*Audit status — honest answer*`,
     ``,
