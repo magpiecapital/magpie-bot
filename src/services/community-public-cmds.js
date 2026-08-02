@@ -777,7 +777,7 @@ export async function handleCommunityAudit(ctx) {
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie has *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. The engagement is *paid for* and the *audit is actively underway* (commenced Wednesday, July 8, 2026). *V3 + the credit-oracle program are next in line.* The report is published when it's complete — so the protocol is *not yet audited*, and remember an audit reduces risk, it doesn't eliminate it.`,
+    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. Sec3's assessment is *complete*: they delivered their findings, we *remediated every one* on a dedicated open-source fix branch, and the fixes are *back with Sec3 for re-review*. The final report publishes after their re-check. *V3 + the credit-oracle program are next in line.* So the protocol is *not yet "audited"* — we don't claim that until the re-checked report ships — and remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -818,7 +818,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `The audit *report* hasn't shipped yet, but *Sec3's audit of V4 is now underway* (commenced July 8, 2026 — see /audit). Source is open. Until the report lands, a bug anywhere in the program could result in loss of funds.`,
+    `The final audit *report* hasn't shipped yet, but *Sec3's assessment of V4 is complete and the fixes are back with them for re-review* (see /audit). Source is open. Until the re-checked report lands, a bug anywhere in the program could result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
