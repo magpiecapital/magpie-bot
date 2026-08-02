@@ -3,6 +3,7 @@ import "dotenv/config";
 import { hasPythCoverage, pythPriceInSol, pythPriceInUsd } from "./pyth-price.js";
 import {
   routeFor,
+  isRwaMint,
   tryAcquireJupiterToken,
   recordJupiterOk,
   recordJupiter429,
@@ -91,10 +92,32 @@ function isTransientPriceError(err) {
   return false;
 }
 
-export async function getPriceInSol(mint) {
+export async function getPriceInSol(mint, opts = {}) {
   // Route decision: budget + backoff + RWA-class aware. See
   // jupiter-budget.js for the policy.
   const { route, reason } = await routeFor(mint);
+
+  // [Oracle F1] STRICT JUPITER mode — used ONLY for the cross-source PRIMARY
+  // slot on memecoins. Return a genuine Jupiter price or THROW; NEVER silently
+  // fall back to DexScreener. Without this, when Jupiter was throttled the
+  // "Jupiter" slot in getPriceInSolCrossSourced degraded to a DexScreener
+  // price, so the two-source agreement check compared DexScreener against
+  // itself and passed at ~0% divergence — collapsing manipulation resistance
+  // to a single source. Throwing here instead routes the caller to its
+  // single-source (cache-corroborate-or-refuse) path, which is the honest
+  // secure behavior. Respects budget/backoff so we don't hammer Jupiter.
+  if (opts.strictJupiter === true) {
+    if (
+      route === "dexscreener_only" ||
+      isMintInJupiterBackoff(mint) ||
+      !tryAcquireJupiterToken()
+    ) {
+      throw new Error(
+        `strict-jupiter unavailable for ${mint} (route=${route}, reason=${reason})`,
+      );
+    }
+    return await jupiterPriceInSol(mint); // pure Jupiter; throws on failure, no Dex fallback
+  }
 
   if (route === "dexscreener_only") {
     // Jupiter is off the table this round. Dex or bust.
@@ -407,7 +430,19 @@ export async function getPriceInSolCrossSourced(mint) {
   // fine. The function gracefully degrades to 2-source mode (Jup+Dex)
   // for any mint without Pyth coverage.
   const usePyth = hasPythCoverage(mint);
-  const promises = [getPriceInSol(mint), dexscreenerPriceInSol(mint)];
+  // [Oracle F1] The PRIMARY ("Jupiter") slot must be a genuinely independent
+  // source, not a silent DexScreener fallback — otherwise a Jupiter-throttle
+  // makes both slots DexScreener and the agreement check compares Dex to
+  // itself. For MEMECOINS we force a strict Jupiter fetch (Jupiter-or-throw);
+  // if Jupiter is unavailable the slot resolves null and we drop to the
+  // single-source (cache-corroborate-or-refuse) path below — never a false
+  // 2-source pass. RWA (stock/etf/metal) legitimately routes DexScreener-first
+  // and is attestation-capped + lower-LTV, so it keeps the existing path.
+  const isRwa = await isRwaMint(mint).catch(() => false);
+  const primaryPromise = isRwa
+    ? getPriceInSol(mint)
+    : getPriceInSol(mint, { strictJupiter: true });
+  const promises = [primaryPromise, dexscreenerPriceInSol(mint)];
   if (usePyth) promises.push(pythPriceInSol(mint));
 
   const settled = await Promise.allSettled(promises);
