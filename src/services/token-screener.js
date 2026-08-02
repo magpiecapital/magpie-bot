@@ -1047,19 +1047,24 @@ export async function checkSellable(mint, decimals) {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
     if (!res.ok) {
-      // Jupiter explicitly fails when the token cannot be routed.
-      return { sellable: false, reason: `Jupiter quote ${res.status}` };
+      // Non-200 conflates a genuinely-unroutable token (400) with infra
+      // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
+      // treats !sellable as a fail (err on caution at approval time); the
+      // borrow-time re-check fails OPEN on non-definitive results.
+      return { sellable: false, definitive: false, reason: `Jupiter quote ${res.status}` };
     }
     const data = await res.json();
     if (!data?.outAmount || data.outAmount === "0") {
-      return { sellable: false, reason: "Jupiter returned no sell route" };
+      // Jupiter returned a SUCCESSFUL response with NO sell route — the
+      // clearest honeypot signal, safe for a borrow-time hard block.
+      return { sellable: false, definitive: true, reason: "Jupiter returned no sell route" };
     }
     return { sellable: true };
   } catch (err) {
     // Network errors don't necessarily mean honeypot, but we err on the
-    // side of caution and require a successful sellability check before
-    // approving anything.
-    return { sellable: false, reason: `quote check failed: ${err.message}` };
+    // side of caution at APPROVAL time and require a successful sellability
+    // check. Not definitive → the borrow-time re-check fails open on this.
+    return { sellable: false, definitive: false, reason: `quote check failed: ${err.message}` };
   }
 }
 
