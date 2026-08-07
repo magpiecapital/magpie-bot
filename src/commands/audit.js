@@ -12,7 +12,7 @@ export async function handleAudit(ctx) {
     "",
     "We've engaged *Sec3* — a Solana-native security firm (formerly Soteria) — to audit *Magpie V4*, our in-vault auto-sell program and the flagship of where the protocol is headed.",
     "",
-    "*Status: Sec3's assessment of V4 is complete* — they delivered their findings, we've remediated every one on a dedicated open-source fix branch, and the fixes are back with Sec3 for *re-review*. The final report publishes after their re-check. V3 + our credit-oracle program are next in line.",
+    "*Status: Sec3's V4 assessment is complete, and their second review of our fixes is back.* Across the engagement: *24 findings* — *18 resolved*, *4 acknowledged*, and *2* returned for more work (one of them an issue our own earlier fix introduced, which their re-review caught). Both are now fixed and resubmitted for the final round. Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off. V3 + our credit-oracle program are next in line.",
     "",
     "Straight talk: an audit is an independent, rigorous review — *not a guarantee*. It reduces risk; it doesn't eliminate it. And to be clear, *Magpie is not \"audited\" yet* — we won't claim that until Sec3 publishes the final, re-checked report.",
     "",
