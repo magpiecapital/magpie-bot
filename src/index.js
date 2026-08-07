@@ -89,6 +89,7 @@ import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleFeedback } from "./commands/feedback.js";
 import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
+import { startCollectibleRetention } from "./services/collectible-retention.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe, registerMeCallbacks } from "./commands/me.js";
@@ -995,6 +996,13 @@ bot.start({
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
     // Delayed start to avoid bunching with other startup workers.
     setTimeout(() => startRwaScreener(bot), 180_000);
+    // COLLECTIBLE SUBMISSION RETENTION — applies the data-retention clock from
+    // the design repo (doc 05): rolls demand into the persisted aggregate, then
+    // redacts stale contacts, clears old provenance hashes, and reduces aged
+    // declines to the aggregate row that already represents them. Rollup runs
+    // BEFORE any reduction, so retention can never destroy the demand history.
+    // Daily; slow clock by design.
+    setTimeout(() => startCollectibleRetention(), 240_000);
     // $MAGPIE holder reward distributions — DISABLED as of MGP-001 (2026-06-10).
     // Distributions now flow through the governance autopilot (MGP-XXX) instead
     // of an automated bot-driven cadence. The auto-snapshotter previously created
