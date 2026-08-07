@@ -14,7 +14,8 @@
     "check-site": "node scripts/check-site.js",
     "test-signed": "node scripts/test-signed-endpoints.js",
     "preflight": "npm run check-site && npm run test-signed",
-    "verify:tier2": "node scripts/verify-tier2/run.js"
+    "verify:tier2": "node scripts/verify-tier2/run.js",
+    "check:arming": "node scripts/check-arming-caps.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
