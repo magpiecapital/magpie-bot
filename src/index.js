@@ -88,6 +88,7 @@ import { handleCommunity } from "./commands/community.js";
 import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleFeedback } from "./commands/feedback.js";
+import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe, registerMeCallbacks } from "./commands/me.js";
@@ -588,6 +589,7 @@ bot.command("crosspost", handleCommunityCrosspost);
 bot.command("gov-pause", handleGovPause);
 bot.command("gov_pause", handleGovPause);   // underscore alias (TG strips dashes inconsistently on some clients)
 bot.command("feedback", handleFeedback);    // operator-only: review captured user replies (see fallback reply-capture)
+bot.command("submissions", handleCollectibleSubmissions); // operator-only: collectible submission review queue
 bot.command("gov-resume", handleGovResume);
 bot.command("gov_resume", handleGovResume);
 bot.command("gov-status", handleGovStatus);
