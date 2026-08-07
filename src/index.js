@@ -90,6 +90,7 @@ import { handleStats } from "./commands/stats.js";
 import { handleFeedback } from "./commands/feedback.js";
 import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
 import { startCollectibleRetention } from "./services/collectible-retention.js";
+import { startSchemaContractMonitor } from "./services/schema-contract.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe, registerMeCallbacks } from "./commands/me.js";
@@ -1003,6 +1004,12 @@ bot.start({
     // BEFORE any reduction, so retention can never destroy the demand history.
     // Daily; slow clock by design.
     setTimeout(() => startCollectibleRetention(), 240_000);
+    // SCHEMA CONTRACT — the site writes tables whose schema the bot owns, and
+    // nothing verified the two agreed. That gap let the collectible submission
+    // feature fail SILENTLY from the day it shipped (every INSERT rejected,
+    // caught by a best-effort try/catch, found only by chance). Declares the
+    // columns each writer depends on and alerts when one goes missing.
+    setTimeout(() => startSchemaContractMonitor(bot), 300_000);
     // $MAGPIE holder reward distributions — DISABLED as of MGP-001 (2026-06-10).
     // Distributions now flow through the governance autopilot (MGP-XXX) instead
     // of an automated bot-driven cadence. The auto-snapshotter previously created
