@@ -23,6 +23,9 @@ import { query } from "../db/pool.js";
 
 const STATUSES = { review: "in_review", approve: "approved", reject: "rejected" };
 
+/** How many days of demand the /submissions demand view covers. */
+const DEMAND_DAYS = 30;
+
 /** Telegram truncates long messages; keep the queue readable. */
 const QUEUE_LIMIT = 15;
 
@@ -156,6 +159,63 @@ async function setStatus(ctx, action, id, note) {
   );
 }
 
+/**
+ * The demand signal — what collectors are asking for, and what we turn away.
+ *
+ * Reads the DURABLE rollup (migration 098), not the live rows, so the picture
+ * stays intact after retention reduces old declines. The declines are the more
+ * valuable half here: they map the edge of the book and show which categories
+ * are worth underwriting next.
+ */
+async function showDemand(ctx) {
+  const { rows } = await query(
+    `SELECT verdict,
+            SUM(submissions)::int AS n,
+            SUM(wallets)::int     AS w
+       FROM collectible_submission_daily
+      WHERE day > CURRENT_DATE - $1::int
+      GROUP BY verdict
+      ORDER BY n DESC`,
+    [DEMAND_DAYS],
+  );
+
+  if (!rows.length) {
+    await ctx.reply(`No submissions in the last ${DEMAND_DAYS} days.`);
+    return;
+  }
+
+  const total = rows.reduce((a, r) => a + r.n, 0);
+  const pct = (n) => `${Math.round((n / total) * 100)}%`;
+  const lines = rows.map((r) => `  ${r.verdict.padEnd(20)} ${String(r.n).padStart(4)}  (${pct(r.n)})`);
+
+  const { rows: plat } = await query(
+    `SELECT platform, SUM(submissions)::int AS n
+       FROM collectible_submission_daily
+      WHERE day > CURRENT_DATE - $1::int
+      GROUP BY platform
+      ORDER BY n DESC
+      LIMIT 6`,
+    [DEMAND_DAYS],
+  );
+
+  await ctx.reply(
+    [
+      `📊 Collectible demand · last ${DEMAND_DAYS} days`,
+      "",
+      `Total submissions: ${total}`,
+      "",
+      "By outcome:",
+      ...lines,
+      "",
+      "Where the cards are held:",
+      ...plat.map((p) => `  ${String(p.platform).padEnd(20)} ${String(p.n).padStart(4)}`),
+      "",
+      "Declines are the useful half — they map the edge of the book.",
+    ].join("\n"),
+    { disable_web_page_preview: true },
+  );
+}
+
 export async function handleCollectibleSubmissions(ctx) {
   if (!isAdmin(ctx.from?.id)) {
     await ctx.reply("This command is operator-only.");
@@ -167,6 +227,8 @@ export async function handleCollectibleSubmissions(ctx) {
 
   try {
     if (!first) return await showQueue(ctx);
+
+    if (first === "demand") return await showDemand(ctx);
 
     if (/^\d+$/.test(first)) return await showOne(ctx, Number(first));
 
@@ -183,7 +245,8 @@ export async function handleCollectibleSubmissions(ctx) {
       "Usage:\n" +
         "/submissions — the queue\n" +
         "/submissions <id> — detail\n" +
-        "/submissions review|approve|reject <id> [note]",
+        "/submissions review|approve|reject <id> [note]\n" +
+        "/submissions demand — what collectors ask for, and what we decline",
     );
   } catch (e) {
     await ctx.reply(`Couldn't load submissions: ${e.message}`);
