@@ -24,51 +24,16 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
+import { deriveArmingCaps } from "./arming-caps.js";
+
+// The cap arithmetic lives in ./arming-caps.js — no web3 imports there, so
+// the CI guard can verify it without an install step.
+export { deriveArmingCaps };
 
 /** take-profit: fire when spot RISES to >= trigger. */
 export const DIRECTION_TAKE_PROFIT = 0;
 /** stop-loss: fire when spot FALLS to <= trigger. */
 export const DIRECTION_STOP_LOSS = 1;
-
-const BPS_MAX = 10_000;
-
-/**
- * Turn an exit spec into the two on-chain caps.
- *
- * @param {Array<{slicePct:number}>} legs one entry per ladder leg; a single
- *        take-profit or stop-loss is just a one-leg ladder.
- * @returns {{maxSliceBps:number, totalBps:number}}
- */
-export function deriveArmingCaps(legs) {
-  if (!Array.isArray(legs) || legs.length === 0) {
-    throw new Error("arming: at least one leg is required");
-  }
-
-  const bps = legs.map((l, i) => {
-    const pct = Number(l?.slicePct);
-    if (!Number.isFinite(pct) || pct <= 0) {
-      throw new Error(`arming: leg ${i + 1} has a non-positive slice`);
-    }
-    // Percent → bps. Round rather than truncate so a leg can't quietly shrink.
-    return Math.round(pct * 100);
-  });
-
-  const totalBps = bps.reduce((a, b) => a + b, 0);
-  const maxSliceBps = Math.max(...bps);
-
-  if (totalBps > BPS_MAX) {
-    throw new Error(
-      `arming: legs sum to ${totalBps / 100}% — cannot exceed 100% of the original collateral`,
-    );
-  }
-  // Invariant the program also enforces; assert here so a bad spec fails in the
-  // bot with a readable message instead of as an opaque on-chain error.
-  if (maxSliceBps > totalBps) {
-    throw new Error("arming: per-fire cap cannot exceed the total authorization");
-  }
-
-  return { maxSliceBps, totalBps };
-}
 
 function v41ProgramId() {
   const raw = process.env.PROGRAM_ID_V4_1;

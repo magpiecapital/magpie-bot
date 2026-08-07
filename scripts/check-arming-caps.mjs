@@ -15,7 +15,7 @@
  *
  * Usage: node scripts/check-arming-caps.mjs   ·   exit 0 clean, 1 regressed
  */
-import { deriveArmingCaps } from "../src/solana/v4-arm-conversion.js";
+import { deriveArmingCaps } from "../src/solana/arming-caps.js";
 
 let failed = 0;
 const ok = (name, cond, detail = "") => {
