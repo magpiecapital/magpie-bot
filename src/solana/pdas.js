@@ -1,6 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
-import { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4 } from "./program.js";
+import { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4, PROGRAM_ID_V4_1 } from "./program.js";
 
 // All PDA derivations accept an optional `programId` so v1 and v2 callers
 // can share these functions. Defaulting to v1's PROGRAM_ID keeps every
@@ -49,9 +49,15 @@ export function priceFeedPda(mintPubkey, poolPubkey, programId = PROGRAM_ID) {
   // PriceHistory layout, just a different program ID. Falling through
   // to the "price" default surfaces as "Account state mismatch" on
   // every V4 borrow (same audit bug class as the V3 launch day).
+  //
+  // V4.1 (post-Sec3) keeps the SAME "price_v3" seed — verified against the
+  // program's own `seeds = [b"price_v3", ...]` constraints. Omitting it here
+  // would fall through to the v1/v2 "price" prefix and reproduce the exact
+  // launch-day failure described above, on every V4.1 borrow and extend.
   const isV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
   const isV4 = PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
-  const seedPrefix = (isV3 || isV4) ? "price_v3" : "price";
+  const isV41 = PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1);
+  const seedPrefix = (isV3 || isV4 || isV41) ? "price_v3" : "price";
   return PublicKey.findProgramAddressSync(
     [Buffer.from(seedPrefix), mintPubkey.toBuffer(), poolPubkey.toBuffer()],
     programId,
