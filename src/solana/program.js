@@ -127,6 +127,11 @@ export const PROGRAM_ID_V4_1 = process.env.PROGRAM_ID_V4_1
   : null;
 const ROUTE_MEMECOINS_TO_V4 = process.env.ROUTE_MEMECOINS_TO_V4 === "true";
 const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
+// Sends NEW exit-armed borrows to V4.1 instead of V4 once it's deployed and
+// signed off. Default OFF: with this unset, routing is byte-identical to today.
+// Existing loans are unaffected either way — they repay/extend/liquidate against
+// their own stored program_id via chooseProgramIdForLoan.
+const ROUTE_EXITS_TO_V4_1 = process.env.ROUTE_EXITS_TO_V4_1 === "true";
 
 // Categories that should route to v2 once it's deployed. Source of truth
 // for the category vocabulary lives in supported_mints.category — keep in
@@ -201,7 +206,13 @@ export function chooseProgramId(category, opts = {}) {
     );
   }
   if (hasExitArming) {
-    if (!PROGRAM_ID_V4) {
+    // V4.1 is the post-Sec3 build and supersedes V4 for NEW exit-armed borrows
+    // once the operator flips ROUTE_EXITS_TO_V4_1. Resolved BEFORE the
+    // not-configured check so retiring V4 later doesn't block exits, and placed
+    // AFTER the pause check above so V4_BORROWS_PAUSED still freezes both.
+    const exitProgram =
+      PROGRAM_ID_V4_1 && ROUTE_EXITS_TO_V4_1 ? PROGRAM_ID_V4_1 : PROGRAM_ID_V4;
+    if (!exitProgram) {
       throw new Error(
         "EXIT_ARMING_REQUIRES_V4: exit-armed borrow requested but PROGRAM_ID_V4 is not configured. " +
         "Either complete the V4 deploy / env setup, or build a plain borrow without an exit.",
@@ -221,7 +232,7 @@ export function chooseProgramId(category, opts = {}) {
         "use a classic-SPL collateral. We'll re-enable Token-2022 exits shortly.",
       );
     }
-    return PROGRAM_ID_V4;
+    return exitProgram;
   }
   if (RWA_CATEGORIES.has(category)) {
     if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
