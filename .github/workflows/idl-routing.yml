@@ -1,0 +1,29 @@
+# V4.1 accounts must never be decoded with the V4 IDL. The layouts diverge and
+# Anchor does NOT throw on the mismatch — it reads later fields at the wrong
+# offset, which means wrong collateral and debt in repay math, silently.
+name: idl-routing
+on:
+  pull_request:
+    paths:
+      - "src/solana/program.js"
+      - "src/solana/idl/magpie-v4.json"
+      - "src/solana/idl/magpie-v4-1.json"
+      - "scripts/check-idl-routing.mjs"
+      - ".github/workflows/idl-routing.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/solana/program.js"
+      - "src/solana/idl/magpie-v4-1.json"
+      - "scripts/check-idl-routing.mjs"
+jobs:
+  routing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Dependency-free by design, like the repo's other guards — no install
+      # step to break.
+      - run: node scripts/check-idl-routing.mjs
