@@ -38,7 +38,7 @@ import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection, withFailover } from "../solana/connection.js";
 import { getDynamicPriorityFee } from "../solana/priority-fee.js";
-import { chooseProgramIdForLoan, getProgramForSigner } from "../solana/program.js";
+import { chooseProgramIdForLoan, getProgramForSigner, PROGRAM_ID_V4_1 } from "../solana/program.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import {
@@ -207,6 +207,20 @@ export async function handleAgentBuildExtend(req) {
       createCloseAccountInstruction(borrowerWsolAta, borrowerPk, borrowerPk, [], loanTokenProgram),
     ];
 
+    // V4.1 (Sec3 M-01): extend_loan re-checks collateral health on-chain and so
+    // additionally takes collateral_mint + price_history. `authority` is an
+    // OPTIONAL signer; we deliberately don't pass it, so an unhealthy loan
+    // fails loudly instead of being silently co-signed into an extension.
+    // Inert until PROGRAM_ID_V4_1 is set after a signed-off deploy.
+    const v41ExtendAccounts = {};
+    if (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)) {
+      const { priceFeedPda } = await import("../solana/pdas.js");
+      const extendCollateralMint = new PublicKey(loan.collateral_mint);
+      const [priceHistoryPda] = priceFeedPda(extendCollateralMint, lendingPool, programId);
+      v41ExtendAccounts.collateralMint = extendCollateralMint;
+      v41ExtendAccounts.priceHistory = priceHistoryPda;
+    }
+
     const ix = await program.methods
       .extendLoan()
       .accounts({
@@ -217,6 +231,7 @@ export async function handleAgentBuildExtend(req) {
         feeWalletTokenAccount: feeWalletWsolAta,
         borrower: borrowerPk,
         loanTokenProgram,
+        ...v41ExtendAccounts,
       })
       .preInstructions(preIxs).postInstructions(postIxs).instruction();
 

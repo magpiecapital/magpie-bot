@@ -1,0 +1,27 @@
+# V4.1 changes several account lists. A missing account fails on-chain with
+# AccountNotEnoughKeys and takes the instruction with it — exactly how V4
+# launch day went. This pins the IDL delta against what the call sites build.
+name: v41-accounts
+on:
+  pull_request:
+    paths:
+      - "src/solana/idl/magpie-v4*.json"
+      - "src/services/keeper.js"
+      - "src/services/loans.js"
+      - "src/api/agent-manage.js"
+      - "scripts/check-v41-accounts.mjs"
+      - ".github/workflows/v41-accounts.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/solana/idl/magpie-v4*.json"
+      - "scripts/check-v41-accounts.mjs"
+jobs:
+  accounts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node scripts/check-v41-accounts.mjs

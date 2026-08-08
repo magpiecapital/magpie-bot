@@ -16,7 +16,8 @@
     "preflight": "npm run check-site && npm run test-signed",
     "verify:tier2": "node scripts/verify-tier2/run.js",
     "check:arming": "node scripts/check-arming-caps.mjs",
-    "check:idl": "node scripts/check-idl-routing.mjs"
+    "check:idl": "node scripts/check-idl-routing.mjs",
+    "check:v41": "node scripts/check-v41-accounts.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
