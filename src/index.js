@@ -89,6 +89,7 @@ import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleFeedback } from "./commands/feedback.js";
 import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
+import { handleRecoverCollateral } from "./commands/recover-collateral.js";
 import { startCollectibleRetention } from "./services/collectible-retention.js";
 import { startSchemaContractMonitor } from "./services/schema-contract.js";
 import { handleHistory } from "./commands/history.js";
@@ -592,6 +593,7 @@ bot.command("gov-pause", handleGovPause);
 bot.command("gov_pause", handleGovPause);   // underscore alias (TG strips dashes inconsistently on some clients)
 bot.command("feedback", handleFeedback);    // operator-only: review captured user replies (see fallback reply-capture)
 bot.command("submissions", handleCollectibleSubmissions); // operator-only: collectible submission review queue
+bot.command("recover", handleRecoverCollateral);         // operator-only: return off-chain SPL sale proceeds to LPs (V4.1 L-02)
 bot.command("gov-resume", handleGovResume);
 bot.command("gov_resume", handleGovResume);
 bot.command("gov-status", handleGovStatus);
