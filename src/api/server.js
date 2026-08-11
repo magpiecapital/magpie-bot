@@ -60,6 +60,7 @@ async function writeJson(req, res, status, headers, body) {
 }
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
+import { admitCosign } from "../middleware/cosign-admission.js";
 import { handleAgentBuildBorrow } from "./agent.js";
 import { handleAgentBuildRepay } from "./agent-repay.js";
 import {
@@ -2327,9 +2328,24 @@ async function router(req, res) {
       case "/api/v1/lp-loyalty":
         result = await handleLpLoyalty(req, url);
         break;
-      case "/api/v1/cosign-borrow":
-        result = await handleCosignBorrow(req);
+      case "/api/v1/cosign-borrow": {
+        // Admission control (availability, not security — the handler's
+        // discriminator allowlist is what keeps this safe to expose). The path
+        // is unauthenticated and a single request can hold ~95s while a cold
+        // V4 feed TWAP-warms, so an unbounded flood starves REAL borrows.
+        // Fails OPEN; every rejection is explicitly retryable.
+        const adm = admitCosign(req);
+        if (!adm.ok) {
+          result = adm.response;
+          break;
+        }
+        try {
+          result = await handleCosignBorrow(req);
+        } finally {
+          adm.release();
+        }
         break;
+      }
       case "/api/v1/agent/build-borrow":
         result = await handleAgentBuildBorrow(req);
         break;
