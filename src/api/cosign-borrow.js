@@ -54,6 +54,7 @@ import { query } from "../db/pool.js";
 import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { getTierByOption } from "../services/loan-tier-resolver.js";
+import { isNonBorrowAttempt } from "./conversion-attempt.js";
 
 // Rolling counter of borrow failure classifications. self-monitor reads
 // this via getRecentBorrowFailures() and CRIT-alerts the operator when
@@ -603,6 +604,9 @@ export async function handleCosignBorrow(req) {
   try {
     const result = await _handleCosignBorrowImpl(req, _convCtx);
     if (_convCtx.recorded) return result; // per-class site already recorded — skip dup
+    // Requests that never supplied a transaction are not borrow attempts and
+    // must not pollute the conversion metric — see isNonBorrowAttempt().
+    if (isNonBorrowAttempt(result)) return result;
     const { outcome, klass } = classifyBorrowOutcome(result);
     // Fire-and-forget — never let telemetry block the response.
     import("../services/conversion-tracker.js")
