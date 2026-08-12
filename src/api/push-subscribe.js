@@ -128,56 +128,86 @@ export async function handleVapidPublicKey() {
   };
 }
 
+/**
+ * Verify the signed subscribe envelope. PURE — no database, no clock beyond
+ * `now`, no side effects — so the security-critical path can be exercised
+ * directly by the guard script instead of only through a live request.
+ *
+ * Returns `{ ok: true, sub, fields }` or `{ ok: false, status, error }`.
+ *
+ * @param {object} body     the untrusted request body
+ * @param {number} [now]    injectable clock, for freshness tests
+ */
+export function verifySubscribeEnvelope(body, now = Date.now()) {
+  // Field names match every other signed endpoint (site-limit-close, withdraw,
+  // me/export). A one-off naming here would be a trap for the next caller.
+  const { signerPubkey, signatureBase58, signedMessageBase64, subscription } = body || {};
+
+  if (!isValidPubkey(signerPubkey)) {
+    return { ok: false, status: 400, error: "invalid_signerPubkey" };
+  }
+  const v = validateSubscription(subscription);
+  if (!v.ok) return { ok: false, status: 400, error: v.error };
+
+  let messageBytes, signatureBytes, signerPk;
+  try {
+    messageBytes = Buffer.from(String(signedMessageBase64 || ""), "base64");
+    if (!messageBytes.length || messageBytes.length > 2048) throw new Error("size");
+    signatureBytes = bs58decode(String(signatureBase58 || ""));
+    if (signatureBytes.length !== 64) throw new Error("siglen");
+    signerPk = new PublicKey(signerPubkey);
+  } catch {
+    return { ok: false, status: 400, error: "malformed_envelope" };
+  }
+
+  const fields = parseSignedMessage(messageBytes.toString("utf-8"));
+
+  if (fields.magpie !== MAGPIE_HEADER) {
+    return { ok: false, status: 400, error: "wrong_magpie_header" };
+  }
+  if (fields.From !== signerPubkey) {
+    return { ok: false, status: 400, error: "from_signer_mismatch" };
+  }
+  if (!fields.Nonce || !fields.IssuedAt) {
+    return { ok: false, status: 400, error: "missing_nonce_or_issuedat" };
+  }
+
+  // THE BINDING. Without this the signature authorises "a subscription" rather
+  // than "this subscription", and could be replayed with an attacker's endpoint.
+  if (!fields.EndpointHash || fields.EndpointHash !== endpointHash(v.sub.endpoint)) {
+    return { ok: false, status: 400, error: "endpoint_hash_mismatch" };
+  }
+
+  const issuedAt = Date.parse(fields.IssuedAt);
+  if (!Number.isFinite(issuedAt)) {
+    return { ok: false, status: 400, error: "invalid_IssuedAt" };
+  }
+  if (Math.abs(now - issuedAt) > FRESH_WINDOW_MS) {
+    return { ok: false, status: 400, error: "stale_signed_message" };
+  }
+
+  // Signature is checked LAST of the cheap checks so malformed input is
+  // rejected before spending a verify, but still before ANY state is written.
+  let sigOk = false;
+  try { sigOk = naclSign.detached.verify(messageBytes, signatureBytes, signerPk.toBytes()); }
+  catch { return { ok: false, status: 400, error: "signature_verification_failed" }; }
+  if (!sigOk) return { ok: false, status: 401, error: "signature_does_not_match" };
+
+  return { ok: true, sub: v.sub, fields, signerPubkey };
+}
+
 /** POST /api/v1/push/subscribe */
 export async function handlePushSubscribe(req) {
   let body;
   try { body = await readJsonBody(req); }
   catch { return { status: 400, body: { ok: false, error: "invalid_body" } }; }
 
-  const { signerPubkey, signature, signedMessageBase64, subscription } = body || {};
-
-  if (!isValidPubkey(signerPubkey)) {
-    return { status: 400, body: { ok: false, error: "invalid_signerPubkey" } };
+  const verified = verifySubscribeEnvelope(body);
+  if (!verified.ok) {
+    return { status: verified.status, body: { ok: false, error: verified.error } };
   }
-  const v = validateSubscription(subscription);
-  if (!v.ok) return { status: 400, body: { ok: false, error: v.error } };
-
-  let messageBytes, signatureBytes, signerPk;
-  try {
-    messageBytes = Buffer.from(String(signedMessageBase64 || ""), "base64");
-    if (!messageBytes.length || messageBytes.length > 2048) throw new Error("size");
-    signatureBytes = bs58decode(String(signature || ""));
-    if (signatureBytes.length !== 64) throw new Error("siglen");
-    signerPk = new PublicKey(signerPubkey);
-  } catch {
-    return { status: 400, body: { ok: false, error: "malformed_envelope" } };
-  }
-
-  const fields = parseSignedMessage(messageBytes.toString("utf-8"));
-
-  if (fields.magpie !== MAGPIE_HEADER) {
-    return { status: 400, body: { ok: false, error: "wrong_magpie_header" } };
-  }
-  if (fields.From !== signerPubkey) {
-    return { status: 400, body: { ok: false, error: "from_signer_mismatch" } };
-  }
-  if (!fields.Nonce || !fields.IssuedAt) {
-    return { status: 400, body: { ok: false, error: "missing_nonce_or_issuedat" } };
-  }
-
-  // THE BINDING. Without this the signature authorises "a subscription" rather
-  // than "this subscription", and could be replayed with an attacker's endpoint.
-  if (!fields.EndpointHash || fields.EndpointHash !== endpointHash(v.sub.endpoint)) {
-    return { status: 400, body: { ok: false, error: "endpoint_hash_mismatch" } };
-  }
-
-  const issuedAt = Date.parse(fields.IssuedAt);
-  if (!Number.isFinite(issuedAt)) {
-    return { status: 400, body: { ok: false, error: "invalid_IssuedAt" } };
-  }
-  if (Math.abs(Date.now() - issuedAt) > FRESH_WINDOW_MS) {
-    return { status: 400, body: { ok: false, error: "stale_signed_message" } };
-  }
+  const { sub: verifiedSub, fields, signerPubkey } = verified;
+  const v = { sub: verifiedSub };
 
   const now = Date.now();
   const last = lastAttemptBySigner.get(signerPubkey) || 0;
@@ -185,11 +215,6 @@ export async function handlePushSubscribe(req) {
     return { status: 429, body: { ok: false, error: "too_fast" } };
   }
   lastAttemptBySigner.set(signerPubkey, now);
-
-  let sigOk = false;
-  try { sigOk = naclSign.detached.verify(messageBytes, signatureBytes, signerPk.toBytes()); }
-  catch { return { status: 400, body: { ok: false, error: "signature_verification_failed" } }; }
-  if (!sigOk) return { status: 401, body: { ok: false, error: "signature_does_not_match" } };
 
   // One-shot nonce, same table and purpose-tagging as every other signed
   // endpoint, so a captured envelope cannot be replayed inside the window.
