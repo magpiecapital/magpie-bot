@@ -139,6 +139,19 @@ try {
     const r = await reserveBorrowExposure(m, 1n, 0n, "w");
     expect("zero cap admits nothing", r.ok, false);
   }
+  console.log("\n== a DB failure must NEVER block a legitimate borrow ==");
+  {
+    // Blocking real borrowers would be a worse outcome than the vulnerability
+    // this fixes. reserveBorrowExposure throws on DB error and the caller's
+    // outer catch must fail OPEN (return null = not blocked), matching the
+    // posture of the racy cap query it replaced.
+    const fs = await import("node:fs");
+    const src = fs.readFileSync(new URL("../src/services/anti-exploit.js", import.meta.url), "utf8");
+    expect("outer catch fails open on any error",
+      /catch \(err\)[\s\S]{0,200}fail-open[\s\S]{0,120}return null/.test(src), true);
+    expect("reservation failure returns a friendly cap message, not a raw error",
+      /reason: "per_token_cap"[\s\S]{0,400}exposure cap/.test(src), true);
+  }
 } catch (err) {
   bad("race guard threw", err.message);
 } finally {
