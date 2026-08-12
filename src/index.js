@@ -174,6 +174,7 @@ import { startPriceSnapshotter } from "./services/price-snapshotter.js";
 import { startExtendLoanWatcher } from "./services/extend-loan-watcher.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
+import { startRpcHealthWatcher } from "./services/rpc-health-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
@@ -961,6 +962,11 @@ bot.start({
     // auto-closes after 7d total of silence.
     import("./services/support-vigil.js").then((m) => m.startSupportVigil(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
+    // RPC health: catches what the credit watcher structurally cannot — a
+    // provider serving HTTP 200 with STALE data. On 2026-08-12 Helius sat ~35
+    // min behind mainnet for an hour with credits perfectly fine. Starts early
+    // (10s) because every other service depends on chain reads being truthful.
+    setTimeout(() => startRpcHealthWatcher(bot), 10_000);
     // Neon quota watcher — hourly probe of Neon's HTTP API; pages
     // the operator when usage crosses NEON_ALERT_THRESHOLD_PCT (default
     // 70%) on compute or storage. Closes the 2026-06-14 outage class
