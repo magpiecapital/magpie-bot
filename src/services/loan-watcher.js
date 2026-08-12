@@ -218,10 +218,14 @@ async function checkUnwarnedNearDue(bot) {
               l.warn_undeliverable_reason,
               l.original_loan_amount_lamports,
               (u.telegram_id::bigint < 0) AS structurally_unreachable
-         -- LEFT so a loan with a missing/broken user row still gets a backstop.
-         -- An inner join would silently drop exactly the rows most likely to be
-         -- wrong, and losing coverage is the one thing this layer must not do.
-         -- NULL telegram_id falls through the CASE to the ordinary 3h window.
+         -- LEFT JOIN is defence-in-depth, not a fix for a live gap. Verified
+         -- 2026-08-12: loans.user_id is NOT NULL with loans_user_id_fkey
+         -- (ON DELETE CASCADE) and there are zero orphaned loans, so an inner
+         -- join would behave identically TODAY. It is written this way so that
+         -- if the constraint is ever relaxed, the backstop keeps covering the
+         -- rows most likely to be malformed instead of silently dropping them —
+         -- losing coverage is the one thing this layer must never do. A NULL
+         -- telegram_id falls through the CASE to the ordinary 3h window.
          FROM loans l LEFT JOIN users u ON u.id = l.user_id
         WHERE l.status = 'active'
           AND l.warned_6h_at IS NULL
