@@ -60,6 +60,7 @@ async function writeJson(req, res, status, headers, body) {
 }
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
+import { admitCosign } from "../middleware/cosign-admission.js";
 import { handleAgentBuildBorrow } from "./agent.js";
 import { handleAgentBuildRepay } from "./agent-repay.js";
 import {
@@ -81,6 +82,11 @@ import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
+import {
+  handlePushSubscribe,
+  handlePushUnsubscribe,
+  handleVapidPublicKey,
+} from "./push-subscribe.js";
 import { handleSiteWithdraw } from "./withdraw.js";
 import {
   handleSupportTickets,
@@ -1808,6 +1814,16 @@ const PUBLIC_ROUTES = new Set([
   // keyspace + 5-codes-per-wallet throttle.
   "/api/v1/link/request",
   "/api/v1/link/status",
+  // Web-push subscription. No API-key gate — the site calls these from any
+  // borrower's browser. Security is INTERNAL to the handler: Ed25519 signature
+  // from a linked wallet, a SHA-256 of the endpoint bound INTO the signed
+  // message (so a captured signature cannot be replayed with someone else's
+  // endpoint), one-shot nonce, freshness window and per-signer rate limit.
+  // The vapid key route returns a PUBLIC key and unsubscribe requires
+  // possession of the endpoint string. See src/api/push-subscribe.js.
+  "/api/v1/push/subscribe",
+  "/api/v1/push/unsubscribe",
+  "/api/v1/push/vapid-public-key",
   // Site-initiated withdraw. Security is enforced INTERNALLY: Ed25519
   // signature from a linked wallet, one-shot nonce, freshness window,
   // destination = signer (unless MAGPIE_SITE_WITHDRAW_ANY_DEST=1).
@@ -2327,9 +2343,24 @@ async function router(req, res) {
       case "/api/v1/lp-loyalty":
         result = await handleLpLoyalty(req, url);
         break;
-      case "/api/v1/cosign-borrow":
-        result = await handleCosignBorrow(req);
+      case "/api/v1/cosign-borrow": {
+        // Admission control (availability, not security — the handler's
+        // discriminator allowlist is what keeps this safe to expose). The path
+        // is unauthenticated and a single request can hold ~95s while a cold
+        // V4 feed TWAP-warms, so an unbounded flood starves REAL borrows.
+        // Fails OPEN; every rejection is explicitly retryable.
+        const adm = admitCosign(req);
+        if (!adm.ok) {
+          result = adm.response;
+          break;
+        }
+        try {
+          result = await handleCosignBorrow(req);
+        } finally {
+          adm.release();
+        }
         break;
+      }
       case "/api/v1/agent/build-borrow":
         result = await handleAgentBuildBorrow(req);
         break;
@@ -2401,6 +2432,15 @@ async function router(req, res) {
         break;
       case "/api/v1/link/status":
         result = await handleLinkStatus(req, url);
+        break;
+      case "/api/v1/push/subscribe":
+        result = await handlePushSubscribe(req);
+        break;
+      case "/api/v1/push/unsubscribe":
+        result = await handlePushUnsubscribe(req);
+        break;
+      case "/api/v1/push/vapid-public-key":
+        result = await handleVapidPublicKey();
         break;
       case "/api/v1/withdraw":
         result = await handleSiteWithdraw(req);

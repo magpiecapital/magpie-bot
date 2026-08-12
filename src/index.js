@@ -88,6 +88,10 @@ import { handleCommunity } from "./commands/community.js";
 import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
 import { handleFeedback } from "./commands/feedback.js";
+import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
+import { handleRecoverCollateral } from "./commands/recover-collateral.js";
+import { startCollectibleRetention } from "./services/collectible-retention.js";
+import { startSchemaContractMonitor } from "./services/schema-contract.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe, registerMeCallbacks } from "./commands/me.js";
@@ -170,6 +174,7 @@ import { startPriceSnapshotter } from "./services/price-snapshotter.js";
 import { startExtendLoanWatcher } from "./services/extend-loan-watcher.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
+import { startRpcHealthWatcher } from "./services/rpc-health-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
@@ -588,6 +593,8 @@ bot.command("crosspost", handleCommunityCrosspost);
 bot.command("gov-pause", handleGovPause);
 bot.command("gov_pause", handleGovPause);   // underscore alias (TG strips dashes inconsistently on some clients)
 bot.command("feedback", handleFeedback);    // operator-only: review captured user replies (see fallback reply-capture)
+bot.command("submissions", handleCollectibleSubmissions); // operator-only: collectible submission review queue
+bot.command("recover", handleRecoverCollateral);         // operator-only: return off-chain SPL sale proceeds to LPs (V4.1 L-02)
 bot.command("gov-resume", handleGovResume);
 bot.command("gov_resume", handleGovResume);
 bot.command("gov-status", handleGovStatus);
@@ -955,6 +962,11 @@ bot.start({
     // auto-closes after 7d total of silence.
     import("./services/support-vigil.js").then((m) => m.startSupportVigil(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
+    // RPC health: catches what the credit watcher structurally cannot — a
+    // provider serving HTTP 200 with STALE data. On 2026-08-12 Helius sat ~35
+    // min behind mainnet for an hour with credits perfectly fine. Starts early
+    // (10s) because every other service depends on chain reads being truthful.
+    setTimeout(() => startRpcHealthWatcher(bot), 10_000);
     // Neon quota watcher — hourly probe of Neon's HTTP API; pages
     // the operator when usage crosses NEON_ALERT_THRESHOLD_PCT (default
     // 70%) on compute or storage. Closes the 2026-06-14 outage class
@@ -993,6 +1005,19 @@ bot.start({
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
     // Delayed start to avoid bunching with other startup workers.
     setTimeout(() => startRwaScreener(bot), 180_000);
+    // COLLECTIBLE SUBMISSION RETENTION — applies the data-retention clock from
+    // the design repo (doc 05): rolls demand into the persisted aggregate, then
+    // redacts stale contacts, clears old provenance hashes, and reduces aged
+    // declines to the aggregate row that already represents them. Rollup runs
+    // BEFORE any reduction, so retention can never destroy the demand history.
+    // Daily; slow clock by design.
+    setTimeout(() => startCollectibleRetention(), 240_000);
+    // SCHEMA CONTRACT — the site writes tables whose schema the bot owns, and
+    // nothing verified the two agreed. That gap let the collectible submission
+    // feature fail SILENTLY from the day it shipped (every INSERT rejected,
+    // caught by a best-effort try/catch, found only by chance). Declares the
+    // columns each writer depends on and alerts when one goes missing.
+    setTimeout(() => startSchemaContractMonitor(bot), 300_000);
     // $MAGPIE holder reward distributions — DISABLED as of MGP-001 (2026-06-10).
     // Distributions now flow through the governance autopilot (MGP-XXX) instead
     // of an automated bot-driven cadence. The auto-snapshotter previously created

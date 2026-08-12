@@ -26,6 +26,7 @@ import {
   getProgramForSigner,
   PROGRAM_ID,
   PROGRAM_ID_V4,
+  PROGRAM_ID_V4_1,
   chooseProgramIdForCategory,
   chooseProgramId,
   assertProgramMatchesCategory,
@@ -1216,6 +1217,20 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     ),
   ];
 
+  // V4.1 (Sec3 M-01): extend_loan re-checks collateral health on-chain, so it
+  // additionally takes collateral_mint + price_history. `authority` is an
+  // OPTIONAL signer — a provably-healthy loan self-extends without it. We do
+  // NOT pass it: an unhealthy loan should fail loudly rather than be silently
+  // co-signed into an extension. Inert until PROGRAM_ID_V4_1 is set.
+  const v41ExtendAccounts = {};
+  if (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)) {
+    const { priceFeedPda } = await import("../solana/pdas.js");
+    const extendCollateralMint = new PublicKey(loanDbRow.collateral_mint);
+    const [priceHistoryPda] = priceFeedPda(extendCollateralMint, lendingPool, programId);
+    v41ExtendAccounts.collateralMint = extendCollateralMint;
+    v41ExtendAccounts.priceHistory = priceHistoryPda;
+  }
+
   const sig = await program.methods
     .extendLoan()
     .accounts({
@@ -1226,6 +1241,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
       feeWalletTokenAccount: feeWalletWsolAta,
       borrower: borrower.publicKey,
       loanTokenProgram,
+      ...v41ExtendAccounts,
     })
     .preInstructions(preIxs)
     .postInstructions(postIxs)

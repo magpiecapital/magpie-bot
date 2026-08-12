@@ -56,6 +56,22 @@ function getV4Idl() {
   return _idlV4;
 }
 
+// V4.1 IDL — the post-Sec3 remediation build. It deploys at a NEW program id,
+// and its account layouts DIVERGE from V4: Loan appends accrued_pool_fees plus
+// the five borrower-armed trigger fields, and LendingPool appends pending_fees.
+//
+// This is the same hazard the V3 comment above describes, and it is the reason
+// this loader exists rather than reusing getV4Idl(): decoding a V4.1 Loan with
+// the V4 IDL does NOT throw, it reads every field past the divergence at the
+// wrong offset. That means wrong collateral and wrong debt in repay math —
+// funds-adjacent, not cosmetic.
+const idlPathV41 = path.join(__dirname, "idl", "magpie-v4-1.json");
+let _idlV41 = null;
+function getV41Idl() {
+  if (!_idlV41) _idlV41 = JSON.parse(readFileSync(idlPathV41, "utf8"));
+  return _idlV41;
+}
+
 export const PROGRAM_ID = new PublicKey(
   process.env.PROGRAM_ID || idl.address,
 );
@@ -103,8 +119,19 @@ const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
 export const PROGRAM_ID_V4 = process.env.PROGRAM_ID_V4
   ? new PublicKey(process.env.PROGRAM_ID_V4)
   : null;
+
+// V4.1 — undeployed as of 2026-08-07. Stays null until the operator sets the
+// env after a signed-off deploy, so nothing can route to it accidentally.
+export const PROGRAM_ID_V4_1 = process.env.PROGRAM_ID_V4_1
+  ? new PublicKey(process.env.PROGRAM_ID_V4_1)
+  : null;
 const ROUTE_MEMECOINS_TO_V4 = process.env.ROUTE_MEMECOINS_TO_V4 === "true";
 const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
+// Sends NEW exit-armed borrows to V4.1 instead of V4 once it's deployed and
+// signed off. Default OFF: with this unset, routing is byte-identical to today.
+// Existing loans are unaffected either way — they repay/extend/liquidate against
+// their own stored program_id via chooseProgramIdForLoan.
+const ROUTE_EXITS_TO_V4_1 = process.env.ROUTE_EXITS_TO_V4_1 === "true";
 
 // Categories that should route to v2 once it's deployed. Source of truth
 // for the category vocabulary lives in supported_mints.category — keep in
@@ -179,7 +206,13 @@ export function chooseProgramId(category, opts = {}) {
     );
   }
   if (hasExitArming) {
-    if (!PROGRAM_ID_V4) {
+    // V4.1 is the post-Sec3 build and supersedes V4 for NEW exit-armed borrows
+    // once the operator flips ROUTE_EXITS_TO_V4_1. Resolved BEFORE the
+    // not-configured check so retiring V4 later doesn't block exits, and placed
+    // AFTER the pause check above so V4_BORROWS_PAUSED still freezes both.
+    const exitProgram =
+      PROGRAM_ID_V4_1 && ROUTE_EXITS_TO_V4_1 ? PROGRAM_ID_V4_1 : PROGRAM_ID_V4;
+    if (!exitProgram) {
       throw new Error(
         "EXIT_ARMING_REQUIRES_V4: exit-armed borrow requested but PROGRAM_ID_V4 is not configured. " +
         "Either complete the V4 deploy / env setup, or build a plain borrow without an exit.",
@@ -199,7 +232,7 @@ export function chooseProgramId(category, opts = {}) {
         "use a classic-SPL collateral. We'll re-enable Token-2022 exits shortly.",
       );
     }
-    return PROGRAM_ID_V4;
+    return exitProgram;
   }
   if (RWA_CATEGORIES.has(category)) {
     if (PROGRAM_ID_V3 && ROUTE_RWA_TO_V3) return PROGRAM_ID_V3;
@@ -302,7 +335,11 @@ export function getReadOnlyProgram(programId = PROGRAM_ID) {
   // divergence — caught the missing V2 fee_wallet during 2026-06-12
   // and the V3 Loan size mismatch during 2026-06-14.
   let useIdl = idl;
-  if (PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) {
+  if (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)) {
+    // Checked BEFORE V4: the two are different programs with different Loan
+    // layouts, and V4 must never be the fallback for a V4.1 account.
+    useIdl = getV41Idl();
+  } else if (PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) {
     useIdl = getV4Idl();
   } else if (PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3)) {
     useIdl = getV3Idl();
@@ -328,7 +365,11 @@ export function getProgramForSigner(signerKeypair, programId = PROGRAM_ID) {
   // 2026-06-14 on the SPCX TG borrow path. Mirrors the same IDL
   // selection getReadOnlyProgram does above.
   let useIdl = idl;
-  if (PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) {
+  if (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)) {
+    // Checked BEFORE V4: the two are different programs with different Loan
+    // layouts, and V4 must never be the fallback for a V4.1 account.
+    useIdl = getV41Idl();
+  } else if (PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) {
     useIdl = getV4Idl();
   } else if (PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3)) {
     useIdl = getV3Idl();
