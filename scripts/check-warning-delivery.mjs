@@ -111,6 +111,16 @@ console.log("\n== watcher wiring ==");
   expect("backstop runs each tick", /await checkUnwarnedNearDue\(bot\)/.test(src), true);
   expect("backstop ignores the classifier", /warn_escalated_at IS NULL/.test(src), true);
   expect("undeliverable rows still retried hourly", /warn_undeliverable_at < NOW\(\)/.test(src), true);
+  expect("backstop LEFT joins users (never drops broken rows)", /LEFT JOIN users u/.test(src), true);
+  expect("two-tier backstop window", /BACKSTOP_UNREACHABLE_HOURS/.test(src), true);
+  expect("unreachable tier keyed on negative telegram_id", /telegram_id::bigint < 0/.test(src), true);
+  // Scope to the backstop function: warn24h/warn6h legitimately inner-join,
+  // because they cannot DM a borrower with no user row. Only the backstop must
+  // survive a broken/missing user, so only its FROM clause is asserted here.
+  const backstop = src.slice(src.indexOf("async function checkUnwarnedNearDue"));
+  const backstopBody = backstop.slice(0, backstop.indexOf("\n}"));
+  expect("backstop query uses LEFT JOIN", /FROM loans l LEFT JOIN users/.test(backstopBody), true);
+  expect("backstop query is not an inner join", /FROM loans l JOIN users/.test(backstopBody), false);
 }
 
 console.log(

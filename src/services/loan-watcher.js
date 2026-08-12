@@ -55,6 +55,25 @@ const UNDELIVERABLE_RETRY = "1 hour";
 const BACKSTOP_HOURS = Number(process.env.LOAN_WARN_BACKSTOP_HOURS) || 3;
 
 /**
+ * Earlier backstop for borrowers we know are STRUCTURALLY unreachable.
+ *
+ * A site-native account is auto-bootstrapped with a synthetic NEGATIVE
+ * telegram_id derived from the wallet (see api/account-link.js), and no real
+ * Telegram account exists behind it. Every DM to one fails `chat not found`.
+ *
+ * That is knowable the moment the loan is created — it is not a delivery
+ * failure we discover late. Waiting until 3h before the deadline to mention it
+ * wastes the entire window in which a human could actually do something. These
+ * get flagged a full day out instead.
+ *
+ * Real TG users (positive id) keep the 3h window: for them a missing warning
+ * means something went wrong recently, and alerting a day early on what is
+ * usually a transient blip would just train the operator to ignore it.
+ */
+const BACKSTOP_UNREACHABLE_HOURS =
+  Number(process.env.LOAN_WARN_BACKSTOP_UNREACHABLE_HOURS) || 24;
+
+/**
  * Deliver one warning DM and record the outcome honestly.
  *
  * Returns nothing and never throws — the watcher must survive any single
@@ -118,13 +137,22 @@ async function checkUnwarnedNearDue(bot) {
     const { rows } = await query(
       `SELECT l.id, l.loan_id, l.borrower_wallet, l.due_timestamp,
               l.warn_undeliverable_reason,
-              l.original_loan_amount_lamports
-         FROM loans l
+              l.original_loan_amount_lamports,
+              (u.telegram_id::bigint < 0) AS structurally_unreachable
+         -- LEFT so a loan with a missing/broken user row still gets a backstop.
+         -- An inner join would silently drop exactly the rows most likely to be
+         -- wrong, and losing coverage is the one thing this layer must not do.
+         -- NULL telegram_id falls through the CASE to the ordinary 3h window.
+         FROM loans l LEFT JOIN users u ON u.id = l.user_id
         WHERE l.status = 'active'
           AND l.warned_6h_at IS NULL
           AND l.warn_escalated_at IS NULL
           AND l.due_timestamp > NOW()
-          AND l.due_timestamp <= NOW() + INTERVAL '${BACKSTOP_HOURS} hours'`,
+          AND l.due_timestamp <= NOW() + (
+                CASE WHEN u.telegram_id::bigint < 0
+                     THEN INTERVAL '${BACKSTOP_UNREACHABLE_HOURS} hours'
+                     ELSE INTERVAL '${BACKSTOP_HOURS} hours'
+                END)`,
     );
 
     for (const row of rows) {
@@ -143,9 +171,13 @@ async function checkUnwarnedNearDue(bot) {
           `Loan \`#${row.loan_id}\` is due in *${hrs}h* and no expiry warning has been delivered.\n` +
           `Wallet: \`${fmtWallet(row.borrower_wallet)}\`\n` +
           `Owed: *${sol} SOL*\n\n` +
-          (row.warn_undeliverable_reason
-            ? `Telegram rejected the DM: \`${row.warn_undeliverable_reason}\`\n\n`
-            : "No delivery failure was recorded — the warning simply never went out.\n\n") +
+          (row.structurally_unreachable
+            ? "This borrower opened the loan on the website and has **no Telegram account** — " +
+              "there is no channel to warn them on, and there never was. The dashboard notice " +
+              "is the only thing that will reach them, and only if they visit.\n\n"
+            : row.warn_undeliverable_reason
+              ? `Telegram rejected the DM: \`${row.warn_undeliverable_reason}\`\n\n`
+              : "No delivery failure was recorded — the warning simply never went out.\n\n") +
           "They can still be reached another way before the deadline.",
         { parse_mode: "Markdown" },
       ).catch(() => {});
