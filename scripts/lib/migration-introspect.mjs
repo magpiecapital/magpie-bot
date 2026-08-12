@@ -1,13 +1,54 @@
 /**
  * Shared introspection for the migration-ledger tools.
  *
- * Both `audit-migration-ledger.mjs` (read-only report) and
- * `reconcile-migration-ledger.mjs` (records verified migrations) parse the same
- * DDL and read the same live schema. Keeping that in one place means the thing
- * that REPORTS a migration as applied and the thing that RECORDS it can never
- * drift apart — which matters, because recording is effectively irreversible:
- * the runner will skip that file forever after.
+ * ⚠️ READ THIS BEFORE USING THESE TOOLS — THERE ARE TWO LEDGERS.
+ *
+ *   schema_migrations   written by src/db/migrations-runner.js. This is the
+ *                       REAL one. It runs on EVERY BOOT, stores a sha256 per
+ *                       file, and REFUSES TO START CLEAN if an applied
+ *                       migration's bytes change. Treat it as authoritative.
+ *
+ *   _migrations         written by scripts/migrate.js. Legacy, manual-only,
+ *                       no checksums. Nothing runs it automatically.
+ *
+ * These tools operate on `_migrations`. That is deliberate but easy to
+ * misread, and misreading it caused a real incident on 2026-08-12: I concluded
+ * from `_migrations` that migration 047 had never been applied, edited it, and
+ * thereby broke the checksum the BOOT runner verifies. The next restart would
+ * have thrown, degraded the bot, and blocked every later migration.
+ *
+ * Two rules follow:
+ *   1. NEVER edit a migration file that appears in `schema_migrations`. Add a
+ *      new file instead. `_migrations` saying "not applied" proves nothing.
+ *   2. Before concluding anything about whether a migration ran, check
+ *      `schema_migrations` — not this ledger, and not object presence alone.
+ *
+ * Both `audit-migration-ledger.mjs` and `reconcile-migration-ledger.mjs` share
+ * this parser so the thing that REPORTS a migration as applied and the thing
+ * that RECORDS it can never drift apart.
  */
+
+/** The ledger the boot runner uses — authoritative. */
+export const AUTHORITATIVE_LEDGER = "schema_migrations";
+/** The ledger these tools reconcile — legacy, manual-only. */
+export const LEGACY_LEDGER = "_migrations";
+
+/**
+ * Cross-check a file against the AUTHORITATIVE ledger before anyone edits it.
+ * Returns {applied, checksumMatches} — `applied` true means the file is frozen:
+ * editing it will break boot.
+ */
+export async function checkAuthoritativeLedger(c, filename, currentSql) {
+  const { createHash } = await import("node:crypto");
+  const { rows } = await c.query(
+    `SELECT checksum_sha256 FROM schema_migrations WHERE filename = $1`,
+    [filename],
+  );
+  if (!rows.length) return { applied: false, checksumMatches: null };
+  const recorded = rows[0].checksum_sha256;
+  const current = createHash("sha256").update(currentSql).digest("hex");
+  return { applied: true, checksumMatches: recorded === current, recorded, current };
+}
 
 /** Strip comments and string literals so keywords inside them don't match. */
 export function scrub(sql) {
