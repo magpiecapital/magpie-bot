@@ -37,6 +37,7 @@ import { query } from "../db/pool.js";
 import { getPrefs } from "./prefs.js";
 import { isPermanentDeliveryFailure, deliveryFailureReason } from "./telegram-delivery.js";
 import { notifyAdmin } from "./admin-notify.js";
+import { sendPushToUser, isPushConfigured } from "./push-send.js";
 
 const POLL_INTERVAL_MS = Number(process.env.LOAN_WATCH_MS) || 60_000;
 
@@ -74,6 +75,49 @@ const BACKSTOP_UNREACHABLE_HOURS =
   Number(process.env.LOAN_WARN_BACKSTOP_UNREACHABLE_HOURS) || 24;
 
 /**
+ * Try the web-push channel for this loan. Returns true only if a browser
+ * actually accepted the notification, in which case the borrower really was
+ * warned and the caller marks the loan.
+ *
+ * Fails soft in every direction: an unconfigured VAPID, a dead push service or
+ * a bug in here must never stop the Telegram path or crash the watcher.
+ *
+ * The push body deliberately carries NO wallet and NO loan id. A notification
+ * renders on a lock screen, which is a far more public surface than a DM, and
+ * the borrower does not need identifiers to know which loan is theirs — the
+ * link opens straight to the dashboard.
+ */
+async function tryPush(row, column, msg) {
+  try {
+    if (!isPushConfigured()) return false;
+    const urgent = column === "warned_6h_at";
+    const r = await sendPushToUser(row.user_id, {
+      title: urgent ? "Loan expiring soon" : "Loan due tomorrow",
+      body: urgent
+        ? "Repay or extend now to keep your collateral."
+        : "Repay or extend before the deadline to keep your collateral.",
+      url: "https://www.magpie.capital/dashboard",
+    });
+    if (r.sent > 0) {
+      await query(
+        `UPDATE loans
+            SET ${column} = NOW(),
+                warn_undeliverable_at = NULL,
+                warn_undeliverable_reason = NULL
+          WHERE id = $1`,
+        [row.id],
+      );
+      console.log(`[loan-watcher] ${column} delivered via web push for loan ${row.loan_id}`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error(`[loan-watcher] push attempt failed for loan ${row.loan_id}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * Deliver one warning DM and record the outcome honestly.
  *
  * Returns nothing and never throws — the watcher must survive any single
@@ -86,6 +130,37 @@ const BACKSTOP_UNREACHABLE_HOURS =
  * @param {InlineKeyboard} kb
  */
 async function deliverWarning(bot, row, column, msg, kb) {
+  // ── Never send to a non-positive telegram_id ────────────────────────────
+  // Telegram chat ids are POSITIVE for users and NEGATIVE for groups and
+  // supergroups. Site-native accounts get a synthetic id of -(low48 + 1)
+  // (api/account-link.js), which spans to about -2.8e14 and therefore OVERLAPS
+  // the real supergroup range (-100…, around -1e12).
+  //
+  // Sending to one of those has always failed `chat not found` — but only
+  // because the bot happens not to be a member of the group that id belongs
+  // to. The bot IS a member of the community group. A collision would post a
+  // borrower's loan id, wallet and amount owed into a public chat.
+  //
+  // The odds are about 1 in 2.8e14. The cost is a public leak of a user's
+  // position, so it is not worth carrying. There is no user behind a negative
+  // id anyway, so nothing is lost by skipping straight to push.
+  const tgId = Number(row.telegram_id);
+  const tgDeliverable = Number.isFinite(tgId) && tgId > 0;
+
+  if (!tgDeliverable) {
+    const pushed = await tryPush(row, column, msg);
+    if (!pushed) {
+      await query(
+        `UPDATE loans
+            SET warn_undeliverable_at = NOW(),
+                warn_undeliverable_reason = $2
+          WHERE id = $1`,
+        [row.id, "no telegram account (site-native) and no web-push subscription"],
+      ).catch(() => {});
+    }
+    return;
+  }
+
   try {
     await bot.api.sendMessage(row.telegram_id, msg, {
       parse_mode: "Markdown",
@@ -109,6 +184,10 @@ async function deliverWarning(bot, row, column, msg, kb) {
       `[loan-watcher] ${column} DM failed for loan ${row.loan_id} ` +
         `(${permanent ? "PERMANENT" : "transient"}): ${reason}`,
     );
+
+    // Telegram is out. Web push is the fallback, not a replacement — if it
+    // lands, the borrower WAS warned and the loan is marked accordingly.
+    if (await tryPush(row, column, msg)) return;
 
     if (!permanent) return; // plain retry next tick — nothing to record
 
