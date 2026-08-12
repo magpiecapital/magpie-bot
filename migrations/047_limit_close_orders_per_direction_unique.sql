@@ -1,35 +1,62 @@
--- migration 047: allow ONE armed TP + ONE armed SL on the same loan.
+-- migration 047: SUPERSEDED — intentionally a no-op. DO NOT RESTORE.
 --
--- Background
--- Previously a UNIQUE partial index on (loan_id WHERE status='armed')
--- physically capped a loan to ONE armed limit-close order at a time.
--- That meant a borrower had to choose between take-profit OR
--- stop-loss; they couldn't protect both sides simultaneously.
+-- ============================================================================
+-- WHY THIS FILE IS EMPTY
+-- ============================================================================
 --
--- This migration replaces that index with a per-direction one. Now:
---   ONE armed TP (trigger_direction='above')   +   ONE armed SL
---   (trigger_direction='below')   on the same loan is allowed.
---   TWO armed TPs OR TWO armed SLs on the same loan still throws —
---   that's the intended dedupe: you can't have two TPs racing.
+-- This migration was written to replace 025's index
+--   limit_close_orders_one_armed_per_loan_idx        (one armed order per loan)
+-- with
+--   limit_close_orders_one_armed_per_direction_idx   (one armed order per
+--                                                     loan + trigger_direction)
+-- so a borrower could hold a take-profit and a stop-loss simultaneously.
 --
--- COALESCE handles legacy rows that pre-date the trigger_direction
--- column (migration 039); they're treated as TP ('above'), matching
--- the column DEFAULT.
+-- It was never applied, and it must never be applied, because migration 064
+-- (slice_pct ladders) went further and made BOTH indexes wrong.
 --
--- Engine-side effect (paired magpie-limitclose change): when one
--- order fires successfully, the loan is closed (collateral sold,
--- repay done), so any sibling armed order on that loan must be
--- auto-cancelled with reason='sibling_order_fired'. Without that,
--- an SL on a TP'd-out loan would sit armed against a non-existent
--- position. Engine handles this in markFired().
+-- A ladder arms SEVERAL orders in the SAME direction on the same loan, each
+-- selling a slice of the collateral — e.g. 60% at one price and 40% at another.
+-- A UNIQUE index on (loan_id, trigger_direction) WHERE status='armed' rejects
+-- the second rung of every ladder. Verified against production on 2026-08-12:
+-- four loans were holding live 2-rung ladders (60/40, 60/40, 70/30, 80/20),
+-- so `CREATE UNIQUE INDEX` here would have failed outright — and since
+-- migrate.js exits on the first failure, every migration after 047 would have
+-- been skipped too.
+--
+-- The invariant did not disappear; it moved and got stricter in the useful
+-- direction. "At most one armed order per direction" was only ever a proxy for
+-- the thing that actually matters: YOU CANNOT SELL MORE THAN 100% OF THE
+-- COLLATERAL. That is now enforced by migration 064's trigger
+--
+--   limit_close_orders_slice_sum_check
+--     BEFORE INSERT OR UPDATE OF status, slice_pct, trigger_direction, loan_id
+--     EXECUTE FUNCTION limit_close_orders_validate_slice_sum()
+--
+-- which caps SUM(slice_pct) <= 10000 bps per (loan_id, trigger_direction).
+-- Confirmed live: the trigger exists and zero armed groups exceed 100%.
+-- The arm path (limit-close-arm-core.js) and the site preflight
+-- (site-limit-close-preflight.js) both check the same rule before insert, so
+-- the user gets a clean 409 instead of a raw constraint error.
+--
+-- 025's original index is likewise absent on purpose. Do not recreate it.
+--
+-- The file is kept rather than deleted so the numbering stays contiguous and
+-- so this reasoning survives. Restoring the DDL below would break ladders.
+--
+-- ============================================================================
+-- ORIGINAL CONTENT, PRESERVED FOR THE RECORD — DO NOT UNCOMMENT
+-- ============================================================================
+--
+--   DROP INDEX IF EXISTS limit_close_orders_one_armed_per_loan_idx;
+--
+--   CREATE UNIQUE INDEX IF NOT EXISTS limit_close_orders_one_armed_per_direction_idx
+--     ON limit_close_orders(loan_id, COALESCE(trigger_direction, 'above'))
+--     WHERE status = 'armed';
+--
+--   COMMENT ON INDEX limit_close_orders_one_armed_per_direction_idx IS
+--     'One armed limit-close order per (loan_id, trigger_direction). ...';
+--
+-- ============================================================================
 
-DROP INDEX IF EXISTS limit_close_orders_one_armed_per_loan_idx;
-
-CREATE UNIQUE INDEX IF NOT EXISTS limit_close_orders_one_armed_per_direction_idx
-  ON limit_close_orders(loan_id, COALESCE(trigger_direction, 'above'))
-  WHERE status = 'armed';
-
-COMMENT ON INDEX limit_close_orders_one_armed_per_direction_idx IS
-  'One armed limit-close order per (loan_id, trigger_direction).
-   Allows simultaneous TP + SL on the same loan. Replaces the prior
-   single-direction index from migration 025.';
+-- No-op. Present so the runner records this file and never revisits it.
+SELECT 1 WHERE FALSE;
