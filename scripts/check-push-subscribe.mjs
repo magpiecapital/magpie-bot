@@ -17,7 +17,14 @@
  *
  * Run: npm run check:push-subscribe
  */
-import { validateSubscription, endpointHash } from "../src/api/push-subscribe.js";
+import {
+  validateSubscription,
+  endpointHash,
+  verifySubscribeEnvelope,
+} from "../src/api/push-subscribe.js";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import { Keypair } from "@solana/web3.js";
 import { isSubscriptionGone } from "../src/services/push-send.js";
 
 let failures = 0;
@@ -102,6 +109,83 @@ expect("401 → NOT gone (config problem, not a dead sub)", isSubscriptionGone({
 expect("network error → NOT gone", isSubscriptionGone(new Error("ETIMEDOUT")), false);
 expect("undefined → NOT gone", isSubscriptionGone(undefined), false);
 expect("null → NOT gone", isSubscriptionGone(null), false);
+
+console.log("\n== END-TO-END: a real signed envelope, exactly as the site builds it ==");
+{
+  const kp = Keypair.generate();
+  const pubkey = kp.publicKey.toBase58();
+  const NOW = Date.parse("2026-08-12T12:00:00.000Z");
+
+  // Mirrors src/lib/solana/site-push.ts line for line. If the two ever drift,
+  // this fails — which is the point: a client/server envelope mismatch would
+  // otherwise only show up as a live user unable to subscribe.
+  const buildEnvelope = (endpointForHash, opts = {}) => {
+    const lines = [
+      `magpie: ${opts.header ?? "push-subscribe-v1"}`,
+      `From: ${opts.from ?? pubkey}`,
+      `EndpointHash: ${endpointHash(endpointForHash)}`,
+      `Nonce: ${opts.nonce ?? "a".repeat(32)}`,
+      `IssuedAt: ${opts.issuedAt ?? new Date(NOW).toISOString()}`,
+    ];
+    const messageBytes = Buffer.from(lines.join("\n"), "utf8");
+    const sig = nacl.sign.detached(messageBytes, kp.secretKey);
+    return {
+      signerPubkey: opts.from ?? pubkey,
+      signatureBase58: bs58.encode(sig),
+      signedMessageBase64: messageBytes.toString("base64"),
+    };
+  };
+  const subFor = (endpoint) => ({ endpoint, keys: KEYS });
+
+  const happy = { ...buildEnvelope(good), subscription: subFor(good) };
+  const r = verifySubscribeEnvelope(happy, NOW);
+  expect("valid envelope from the site format is ACCEPTED", r.ok, true);
+
+  // THE ATTACK: capture a valid envelope, attach your own endpoint.
+  const attacker = "https://fcm.googleapis.com/fcm/send/ATTACKER_ENDPOINT_9999";
+  const swapped = { ...buildEnvelope(good), subscription: subFor(attacker) };
+  const rs = verifySubscribeEnvelope(swapped, NOW);
+  expect("endpoint SWAP is rejected", rs.ok, false);
+  expect("  ...with endpoint_hash_mismatch", rs.error, "endpoint_hash_mismatch");
+
+  // Tamper with the signed bytes.
+  const tampered = { ...happy };
+  const msg = Buffer.from(tampered.signedMessageBase64, "base64").toString("utf8")
+    .replace(/From: \S+/, `From: ${pubkey}`) + " ";
+  tampered.signedMessageBase64 = Buffer.from(msg, "utf8").toString("base64");
+  expect("tampered message body is rejected", verifySubscribeEnvelope(tampered, NOW).ok, false);
+
+  // Signature from a DIFFERENT key.
+  const other = Keypair.generate();
+  const forged = { ...happy, signatureBase58: bs58.encode(
+    nacl.sign.detached(Buffer.from(happy.signedMessageBase64, "base64"), other.secretKey)) };
+  const rf = verifySubscribeEnvelope(forged, NOW);
+  expect("signature from another key is rejected", rf.ok, false);
+  expect("  ...with signature_does_not_match", rf.error, "signature_does_not_match");
+
+  // Someone else's wallet in From.
+  const impersonate = { ...buildEnvelope(good, { from: other.publicKey.toBase58() }),
+                        subscription: subFor(good) };
+  expect("signing for another wallet is rejected", verifySubscribeEnvelope(impersonate, NOW).ok, false);
+
+  // Freshness.
+  const stale = { ...buildEnvelope(good, { issuedAt: new Date(NOW - 10 * 60_000).toISOString() }),
+                  subscription: subFor(good) };
+  expect("10-minute-old envelope is rejected", verifySubscribeEnvelope(stale, NOW).error, "stale_signed_message");
+  const future = { ...buildEnvelope(good, { issuedAt: new Date(NOW + 10 * 60_000).toISOString() }),
+                   subscription: subFor(good) };
+  expect("10-minute-future envelope is rejected", verifySubscribeEnvelope(future, NOW).error, "stale_signed_message");
+
+  // Cross-action replay: a withdraw signature must not subscribe anything.
+  const wrongAction = { ...buildEnvelope(good, { header: "limit-close-arm/v1" }),
+                        subscription: subFor(good) };
+  expect("envelope for a different action is rejected", verifySubscribeEnvelope(wrongAction, NOW).error, "wrong_magpie_header");
+
+  // And the SSRF guard still applies to a perfectly-signed envelope.
+  const meta = "https://169.254.169.254/latest/meta-data/iam/security-credentials/";
+  const signedSsrf = { ...buildEnvelope(meta), subscription: subFor(meta) };
+  expect("signed SSRF endpoint is still rejected", verifySubscribeEnvelope(signedSsrf, NOW).ok, false);
+}
 
 console.log("\n== watcher wiring ==");
 {
