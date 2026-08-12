@@ -21,7 +21,8 @@
     "check:cosign-admission": "node scripts/check-cosign-admission.mjs",
     "check:conversion-metric": "node scripts/check-conversion-metric.mjs",
     "check:rpc-failover": "node scripts/check-rpc-failover.mjs",
-    "check:warning-delivery": "node scripts/check-warning-delivery.mjs"
+    "check:warning-delivery": "node scripts/check-warning-delivery.mjs",
+    "check:push-subscribe": "node scripts/check-push-subscribe.mjs"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
@@ -34,7 +35,8 @@
     "dotenv": "^16.4.7",
     "grammy": "^1.33.0",
     "pg": "^8.13.1",
-    "tweetnacl": "^1.0.3"
+    "tweetnacl": "^1.0.3",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/bn.js": "^5.2.0",
