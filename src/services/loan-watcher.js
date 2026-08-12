@@ -7,12 +7,153 @@
  *
  * Each warning is sent at most once per loan. Includes inline "Repay now"
  * button that piggybacks on the existing `/repay` callback-query handler.
+ *
+ * UNDELIVERABLE BORROWERS (2026-08-12). A warning is only marked sent once the
+ * DM actually goes through — which is right, but it used to mean a borrower who
+ * had blocked the bot was retried every 60s until expiry, was never warned, and
+ * nobody found out. Production logs show `400: Bad Request: chat not found`
+ * against live loans, and EVERY loan has a non-null user_id, so a linked
+ * account does not imply a reachable one.
+ *
+ * Two independent layers now cover that, because one is not enough:
+ *
+ *   1. CLASSIFY — `isPermanentDeliveryFailure()` recognises rejections that can
+ *      never succeed, records them on the loan, and backs the retry off from
+ *      every minute to hourly (still retrying, so a borrower who unblocks the
+ *      bot is picked up within the hour).
+ *
+ *   2. BACKSTOP — `checkUnwarnedNearDue()` alerts the operator about ANY active
+ *      loan approaching its deadline with no delivered warning, whatever the
+ *      cause. It does not consult the classifier, so it still fires if the
+ *      classifier is wrong, if the bot was down through the window, or if the
+ *      failure is something nobody anticipated.
+ *
+ * The thing being defended is specific: nobody should lose collateral without
+ * having been told it was about to happen, and if we cannot tell them, a human
+ * needs to know that.
  */
 import { InlineKeyboard } from "grammy";
 import { query } from "../db/pool.js";
 import { getPrefs } from "./prefs.js";
+import { isPermanentDeliveryFailure, deliveryFailureReason } from "./telegram-delivery.js";
+import { notifyAdmin } from "./admin-notify.js";
 
 const POLL_INTERVAL_MS = Number(process.env.LOAN_WATCH_MS) || 60_000;
+
+/**
+ * How long to wait before re-attempting a DM that Telegram called permanently
+ * undeliverable. Not "never again" — borrowers unblock bots — but not every
+ * 60s either, which is what produced the log flood.
+ */
+const UNDELIVERABLE_RETRY = "1 hour";
+
+/**
+ * Backstop window: alert the operator when an active loan is this close to due
+ * with no warning delivered. Sits inside the 6h checkpoint so there is still
+ * time for a human to do something.
+ */
+const BACKSTOP_HOURS = Number(process.env.LOAN_WARN_BACKSTOP_HOURS) || 3;
+
+/**
+ * Deliver one warning DM and record the outcome honestly.
+ *
+ * Returns nothing and never throws — the watcher must survive any single
+ * borrower being unreachable.
+ *
+ * @param {import("grammy").Bot} bot
+ * @param {{id:number, loan_id:string, telegram_id:string|number, borrower_wallet:string}} row
+ * @param {"warned_24h_at"|"warned_6h_at"} column
+ * @param {string} msg
+ * @param {InlineKeyboard} kb
+ */
+async function deliverWarning(bot, row, column, msg, kb) {
+  try {
+    await bot.api.sendMessage(row.telegram_id, msg, {
+      parse_mode: "Markdown",
+      disable_web_page_preview: true,
+      reply_markup: kb,
+    });
+    // Clear any prior undeliverable mark — they are reachable again.
+    await query(
+      `UPDATE loans
+          SET ${column} = NOW(),
+              warn_undeliverable_at = NULL,
+              warn_undeliverable_reason = NULL
+        WHERE id = $1`,
+      [row.id],
+    );
+    return;
+  } catch (err) {
+    const reason = deliveryFailureReason(err);
+    const permanent = isPermanentDeliveryFailure(err);
+    console.error(
+      `[loan-watcher] ${column} DM failed for loan ${row.loan_id} ` +
+        `(${permanent ? "PERMANENT" : "transient"}): ${reason}`,
+    );
+
+    if (!permanent) return; // plain retry next tick — nothing to record
+
+    // Record it. Deliberately does NOT set `column`: we did not warn them, and
+    // writing "warned" here would launder a failure into the audit trail. The
+    // queries below skip recently-undeliverable rows instead.
+    await query(
+      `UPDATE loans
+          SET warn_undeliverable_at = NOW(),
+              warn_undeliverable_reason = $2
+        WHERE id = $1`,
+      [row.id, reason],
+    ).catch((e) => console.error("[loan-watcher] undeliverable write failed:", e.message));
+  }
+}
+
+/**
+ * Backstop — the layer that does not trust anything above it.
+ *
+ * Any active loan inside the backstop window with no 6h warning delivered gets
+ * the operator told, once, regardless of why. Fails open: a broken backstop
+ * must never stop warnings from going out.
+ */
+async function checkUnwarnedNearDue(bot) {
+  try {
+    const { rows } = await query(
+      `SELECT l.id, l.loan_id, l.borrower_wallet, l.due_timestamp,
+              l.warn_undeliverable_reason,
+              l.original_loan_amount_lamports
+         FROM loans l
+        WHERE l.status = 'active'
+          AND l.warned_6h_at IS NULL
+          AND l.warn_escalated_at IS NULL
+          AND l.due_timestamp > NOW()
+          AND l.due_timestamp <= NOW() + INTERVAL '${BACKSTOP_HOURS} hours'`,
+    );
+
+    for (const row of rows) {
+      const hrs = (
+        (new Date(row.due_timestamp).getTime() - Date.now()) / 3_600_000
+      ).toFixed(1);
+      const sol = (Number(row.original_loan_amount_lamports) / 1e9).toFixed(4);
+
+      // Mark first. If the alert fails we would rather under-notify than loop
+      // and alert on every tick for the rest of the window.
+      await query(`UPDATE loans SET warn_escalated_at = NOW() WHERE id = $1`, [row.id]);
+
+      await notifyAdmin(
+        bot,
+        "⚠️ *Borrower may forfeit without warning*\n\n" +
+          `Loan \`#${row.loan_id}\` is due in *${hrs}h* and no expiry warning has been delivered.\n` +
+          `Wallet: \`${fmtWallet(row.borrower_wallet)}\`\n` +
+          `Owed: *${sol} SOL*\n\n` +
+          (row.warn_undeliverable_reason
+            ? `Telegram rejected the DM: \`${row.warn_undeliverable_reason}\`\n\n`
+            : "No delivery failure was recorded — the warning simply never went out.\n\n") +
+          "They can still be reached another way before the deadline.",
+        { parse_mode: "Markdown" },
+      ).catch(() => {});
+    }
+  } catch (err) {
+    console.error("[loan-watcher] backstop failed (warnings unaffected):", err.message);
+  }
+}
 
 // Format a deep-link to the user's dashboard view of a specific loan.
 // The dashboard route accepts ?loan=<chain_loan_id> and scrolls/focuses
@@ -34,6 +175,8 @@ async function warn24h(bot) {
      FROM loans l JOIN users u ON u.id = l.user_id
      WHERE l.status = 'active'
        AND l.warned_24h_at IS NULL
+       AND (l.warn_undeliverable_at IS NULL
+            OR l.warn_undeliverable_at < NOW() - INTERVAL '${UNDELIVERABLE_RETRY}')
        AND l.due_timestamp <= NOW() + INTERVAL '24 hours'
        AND l.due_timestamp > NOW()`,
   );
@@ -67,16 +210,7 @@ async function warn24h(bot) {
       .row()
       .url("📋 Open loan in dashboard", loanLink);
 
-    try {
-      await bot.api.sendMessage(row.telegram_id, msg, {
-        parse_mode: "Markdown",
-        reply_markup: kb,
-        disable_web_page_preview: true,
-      });
-      await query(`UPDATE loans SET warned_24h_at = NOW() WHERE id = $1`, [row.id]);
-    } catch (err) {
-      console.error(`[loan-watcher] 24h DM failed for loan ${row.loan_id}: ${err.message}`);
-    }
+    await deliverWarning(bot, row, "warned_24h_at", msg, kb);
   }
 }
 
@@ -89,6 +223,8 @@ async function warn6h(bot) {
      FROM loans l JOIN users u ON u.id = l.user_id
      WHERE l.status = 'active'
        AND l.warned_6h_at IS NULL
+       AND (l.warn_undeliverable_at IS NULL
+            OR l.warn_undeliverable_at < NOW() - INTERVAL '${UNDELIVERABLE_RETRY}')
        AND l.due_timestamp <= NOW() + INTERVAL '6 hours'
        AND l.due_timestamp > NOW()`,
   );
@@ -123,22 +259,15 @@ async function warn6h(bot) {
       .row()
       .url("📋 Open loan in dashboard", loanLink);
 
-    try {
-      await bot.api.sendMessage(row.telegram_id, msg, {
-        parse_mode: "Markdown",
-        disable_web_page_preview: true,
-        reply_markup: kb,
-      });
-      await query(`UPDATE loans SET warned_6h_at = NOW() WHERE id = $1`, [row.id]);
-    } catch (err) {
-      console.error(`[loan-watcher] 6h DM failed for loan ${row.loan_id}: ${err.message}`);
-    }
+    await deliverWarning(bot, row, "warned_6h_at", msg, kb);
   }
 }
 
 async function tick(bot) {
   await warn24h(bot);
   await warn6h(bot);
+  // Runs last, so it judges the state the two passes above just produced.
+  await checkUnwarnedNearDue(bot);
 }
 
 export function startLoanWatcher(bot) {
