@@ -590,12 +590,44 @@ async function handleGroupMessage(ctx) {
           );
           const count = await bumpWarnedCount(ctx.chat.id, sender.id);
           const isSolicit = cat === "solicitation" || cat === "spam";
+
+          // ── Operator directive 2026-08-13: a SCAMMER who posts is removed
+          // immediately, not warned. Previously every removal was warn-only
+          // with a possible mute at strike 3, which let a wallet-drainer keep
+          // posting into the group between strikes.
+          //
+          // Scoped to SCAM/PHISHING only. Solicitation and spam stay warn-only
+          // on purpose: shilling another project is obnoxious, not theft, and
+          // banning for it would remove real members over a judgement call —
+          // the opposite of the allow-biased standard. Impersonation already
+          // bans on sight further up, so this closes the last gap.
+          //
+          // Confidence gate: only an explicit judge verdict bans. The LLM-down
+          // hard-scam fallback still DELETES but does NOT ban, because nobody
+          // should be removed on a regex alone.
+          const isScamCategory = !isSolicit;
+          const banScammer = isScamCategory && verdict && isConfidentRemoval(verdict);
+          if (banScammer) {
+            try {
+              await ctx.api.banChatMember(ctx.chat.id, sender.id);
+              await recordModAction(
+                ctx.chat.id, sender.id, "ban_scammer_post",
+                `conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}`,
+                bodyText.slice(0, 500),
+              );
+            } catch (err) {
+              // A failed ban must never swallow the delete + warning above.
+              console.warn("[community] scammer ban failed:", err.message);
+            }
+          }
           const notice = isSolicit
             ? `Hey — your message was removed because it read as solicitation/promotion (offering services, shilling another project, etc.), which we keep out of the group. Genuine questions and ideas about Magpie are always welcome — feel free to ask! 🙂`
             : `Hey — your message was removed because it matched a scam/phishing pattern we filter (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links, etc.). If that was a genuine misunderstanding, just rephrase — real questions are always welcome. 🙂`;
           await softWarn(
             ctx, sender.id,
-            notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
+            banScammer
+              ? `Your message matched a scam/phishing pattern (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links) and you have been removed from the group. If this was a genuine mistake, reply here and a human will review it.`
+              : notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
           );
           return; // removed; skip remaining checks
         }
