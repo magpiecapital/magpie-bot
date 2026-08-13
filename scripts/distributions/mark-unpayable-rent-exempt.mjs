@@ -81,7 +81,7 @@ const forfeited = unpayable.reduce((a, r) => a + r.reward, 0);
 console.log(`  payable:   ${payable}`);
 console.log(`  unpayable: ${unpayable.length}  (${(forfeited / 1e9).toFixed(6)} SOL)`);
 console.log(
-  `  NOTE: unpayable SOL stays in CHCAM — the pool was already decremented at accrual.`,
+  `  NOTE: this SOL stays in CHCAM and is CARRIED FORWARD to the holder's next payout (migration 102) — the pool was already decremented at accrual, so it is never charged twice.`,
 );
 
 if (!WRITE) {
@@ -105,5 +105,31 @@ const res = await query(
   [DIST_ID, wallets],
 );
 console.log(`✓ marked ${res.rowCount} row(s) unpayable_rent_exempt`);
+
+// CARRY FORWARD (migration 102). Writing these off means the holder never
+// receives them AND the same wallet fails again every cycle, because the amount
+// is always too small. Accumulating instead means it eventually clears the rent
+// floor — or their wallet gets funded, at which point any amount sends.
+//
+// The full reward_lamports carries, which already includes any balance carried
+// in from previous cycles (capture folds carry into the reward), so this
+// accumulates correctly rather than compounding.
+const carried = await query(
+  `INSERT INTO magpie_holder_carryforward (wallet_address, lamports, cycles)
+   SELECT wallet_address, reward_lamports, 1
+     FROM magpie_holder_rewards
+    WHERE distribution_id = $1 AND status = 'unpayable_rent_exempt'
+      AND wallet_address = ANY($2)
+   ON CONFLICT (wallet_address) DO UPDATE
+     SET lamports   = EXCLUDED.lamports,
+         cycles     = magpie_holder_carryforward.cycles + 1,
+         updated_at = NOW()`,
+  [DIST_ID, wallets],
+);
+const { rows: owed } = await query(
+  `SELECT COUNT(*)::int n, COALESCE(SUM(lamports),0)::text total FROM magpie_holder_carryforward WHERE lamports > 0`,
+);
+console.log(`✓ carried forward for ${carried.rowCount} wallet(s)`);
+console.log(`  outstanding carry: ${owed[0].n} wallet(s), ${(Number(owed[0].total)/1e9).toFixed(9)} SOL — paid from CHCAM next cycle`);
 console.log(`Next: DIST_ID=${DIST_ID} railway run --service magpie-bot node run-holder-payout.mjs`);
 process.exit(0);
