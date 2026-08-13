@@ -659,6 +659,20 @@ export async function snapshotMagpieHolders() {
 const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana tx limit)
 
 /**
+ * pg returns `numeric` as a string, sometimes with a decimal part (e.g.
+ * "4772899.00"), and BigInt() throws on that. Lamports are integers by
+ * definition, so truncate at the point rather than round.
+ */
+function toLamportsBigInt(v) {
+  if (v === null || v === undefined || v === "") return 0n;
+  try {
+    return BigInt(String(v).split(".")[0]);
+  } catch {
+    return 0n;
+  }
+}
+
+/**
  * Mirror a $MAGPIE-holder distribution cycle into the protocol-wide
  * `distribution_events` analytics ledger so it sits alongside lp_loyalty
  * and governance distributions. Operator-mandated 2026-06-19 — every
@@ -681,6 +695,8 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
             COUNT(mhr.*)                                                   AS reward_row_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status = 'paid')                AS paid_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
+            COUNT(mhr.*) FILTER (WHERE mhr.status = 'unpayable_rent_exempt')           AS unpayable_count,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'unpayable_rent_exempt'), 0)::numeric AS unpayable_lamports,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')), 0)::numeric AS unpaid_lamports,
             MIN(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS min_paid,
@@ -725,14 +741,25 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
     snapshot_at: s.snapshot_at,
     pool_lamports: s.pool_lamports,
     distributed_lamports: s.paid_lamports,
-    unpaid_lamports: s.unpaid_lamports,
+    // Everything captured but NOT paid — still-accrued AND unpayable-by-rent.
+    // Excluding the unpayable half made the audit trail fail to add up.
+    // pg returns numeric as a STRING and may include a decimal part, which
+    // BigInt() rejects outright — so truncate before converting.
+    unpaid_lamports: (
+      toLamportsBigInt(s.unpaid_lamports) + toLamportsBigInt(s.unpayable_lamports)
+    ).toString(),
     // Eligible count = rows captured for payout, NOT enumerated holders.
     // magpie_holder_distributions.eligible_count is currently miswritten
     // (snapshotAndDistribute passes holders.length twice — same value as
     // holder_count). The reward_row_count from the JOIN is the truth.
     eligible_wallet_count: Number(s.reward_row_count) || Number(s.eligible_count) || Number(s.holder_count) || 0,
     paid_wallet_count: Number(s.paid_count) || 0,
-    unpayable_wallet_count: 0,
+    // Rows Solana physically cannot pay: the transfer would leave an empty
+    // recipient account below the rent-exempt minimum (~0.00089 SOL). This was
+    // hardcoded 0 until dist #9 (2026-08-13), when the holder pool first fell
+    // below that floor and 319 rows became unpayable — leaving 0.0048 SOL
+    // unaccounted for on the PUBLIC audit trail (pool - distributed - unpaid).
+    unpayable_wallet_count: Number(s.unpayable_count) || 0,
     denominator_kind: "magpie_balance_at_snapshot",
     denominator_value: s.total_balance,
     paid_first_at: s.paid_first_at,
