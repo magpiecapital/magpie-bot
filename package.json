@@ -26,6 +26,7 @@
     "check:migration-checksums": "node scripts/check-migration-checksums.mjs",
     "check:borrow-reservation-race": "node scripts/check-borrow-reservation-race.mjs",
     "check:captcha-deeplink": "node scripts/check-captcha-deeplink.mjs",
+    "check:holder-carryforward": "node scripts/check-holder-carryforward.mjs",
     "simulate:expiry-warnings": "node scripts/simulate-expiry-warnings.mjs"
   },
   "dependencies": {
