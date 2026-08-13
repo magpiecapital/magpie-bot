@@ -1013,6 +1013,15 @@ async function payHolderRewardBatches(rows, distributor, onBatchPaid) {
             WHERE id = ANY($1::bigint[])`,
           [batch.map((r) => r.id), sig],
         );
+        // Their carried balance was folded INTO this reward_lamports at
+        // capture, so a successful send settles it — zero it or they would be
+        // paid the same lamports again next cycle.
+        await query(
+          `UPDATE magpie_holder_carryforward
+              SET lamports = 0, cycles = 0, updated_at = NOW()
+            WHERE wallet_address = ANY($1::text[]) AND lamports > 0`,
+          [batch.map((r) => r.wallet_address)],
+        ).catch((e) => console.warn("[holder-rewards] carry clear failed:", e.message));
         paidCount += batch.length;
         paidLamports += batchTotal;
         avail -= batchTotal + TX_FEE_HEADROOM;
@@ -1129,12 +1138,41 @@ export async function snapshotAndDistribute() {
     );
     distributionId = distRow.id;
 
+    // Carried balances: rewards a previous cycle could not deliver because the
+    // transfer would have left an EMPTY recipient below Solana's rent-exempt
+    // minimum. See migration 102.
+    //
+    // ⚠️ ACCOUNTING: carry is deliberately EXCLUDED from `allocatedSum`.
+    // allocatedSum is what decrements magpie_holder_pool, and the pool was
+    // ALREADY decremented for these lamports when they were first allocated —
+    // the SOL has been sitting in CHCAM ever since. Adding carry here would
+    // charge the pool twice for the same SOL.
+    const carry = new Map();
+    try {
+      const { rows: cf } = await client.query(
+        `SELECT wallet_address, lamports FROM magpie_holder_carryforward WHERE lamports > 0`,
+      );
+      for (const r of cf) carry.set(r.wallet_address, BigInt(r.lamports));
+      if (cf.length) {
+        const owed = cf.reduce((a, r) => a + BigInt(r.lamports), 0n);
+        console.log(`[holder-rewards] carrying forward ${owed} lamports owed to ${cf.length} wallet(s)`);
+      }
+    } catch (e) {
+      // A missing/broken carry table must never block a distribution.
+      console.warn("[holder-rewards] carryforward read failed (continuing without):", e.message);
+    }
+
     const inserts = [];
     for (const h of holders) {
-      const reward = (pool * h.balance_raw) / totalBalance;
+      const base = (pool * h.balance_raw) / totalBalance;
+      const owed = carry.get(h.owner) || 0n;
+      const reward = base + owed;
+      // Skip only when there is genuinely nothing to send. A holder with no
+      // new share but an outstanding carry still gets a row — that is the
+      // whole point.
       if (reward <= 0n) continue;
       inserts.push([distributionId, h.owner, h.balance_raw.toString(), reward.toString()]);
-      allocatedSum += reward;
+      allocatedSum += base; // pool portion ONLY — see the accounting note above
     }
 
     if (inserts.length > 0) {
@@ -1377,6 +1415,18 @@ export async function claimHolderRewards({ walletAddress }) {
           SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
         WHERE id = ANY($1::bigint[])`,
       [rows.map((r) => r.id), res.sig],
+    );
+
+    // Use the function's own walletAddress — this query selects only
+    // (id, reward_lamports), so rows carry no wallet_address. Mapping over them
+    // would produce [undefined] here, silently match nothing, and leave the
+    // carry in place to be PAID A SECOND TIME next cycle. Inside the
+    // transaction so it commits or rolls back with the payout itself.
+    await client.query(
+      `UPDATE magpie_holder_carryforward
+          SET lamports = 0, cycles = 0, updated_at = NOW()
+        WHERE wallet_address = $1 AND lamports > 0`,
+      [walletAddress],
     );
 
     await client.query("COMMIT");
