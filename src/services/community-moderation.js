@@ -49,6 +49,22 @@ export const URL_ALLOWLIST = new Set([
 // official site should never be deleted by the link filter.
 export const OWN_DOMAINS = ["magpie.capital"];
 
+// Well-known platforms a legit user naturally references when asking product
+// questions (app stores, official Solana / Seeker, the major wallets, the
+// router Magpie sells through, common explorers). These are NOT phishing
+// vectors, so a question like "are you on the App Store / Seeker?" with a link
+// must never be auto-deleted — and we don't even spend an LLM call judging it.
+// Operator-mandated 2026-06-30: users should feel comfortable asking questions.
+export const SAFE_REFERENCE_DOMAINS = [
+  "apps.apple.com", "apple.com",        // Apple App Store
+  "play.google.com",                    // Google Play
+  "solanamobile.com",                   // Solana Mobile / Seeker (SKR)
+  "solana.com",                         // official Solana
+  "phantom.app", "solflare.com",        // official wallets users ask about
+  "backpack.app", "jup.ag",             // Backpack wallet · Jupiter (our router)
+  "solscan.io", "explorer.solana.com", "solana.fm", // block explorers
+];
+
 // Quarantine: new members can't post links/forwards and are rate-
 // limited for this many days. Captcha must still be passed before
 // the timer even starts.
@@ -76,19 +92,61 @@ export const CAPTCHA_TIMEOUT_MS = 5 * 60 * 1000;
 // Named Magpie protocol personas that must never be impersonated (e.g.
 // "MagpieMatt"). Env-extensible (comma-separated PROTECTED_PERSONA_NAMES) so a
 // new persona can be protected without a code change; "matt" is the default.
-const PROTECTED_PERSONA_NAMES = (process.env.PROTECTED_PERSONA_NAMES || "matt")
-  .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean);
+// Baseline personas are ALWAYS protected. The env var can ADD to them but must
+// never be able to REPLACE/drop them — a stale or partial PROTECTED_PERSONA_NAMES
+// silently un-protecting "matt" is exactly how a "Magpie Matt" impersonator can
+// slip through (operator-flagged 2026-07-04). So we UNION baseline + env.
+const PERSONA_BASELINE = ["matt"];
+const PROTECTED_PERSONA_NAMES = [...new Set([
+  ...PERSONA_BASELINE,
+  ...(process.env.PROTECTED_PERSONA_NAMES || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+])];
 const PERSONA_ALT = (PROTECTED_PERSONA_NAMES.length ? PROTECTED_PERSONA_NAMES : ["matt"]).join("|");
+
+// Standalone role-words that are impersonation ON THEIR OWN (no "magpie"
+// needed) — nobody legitimately names themselves just "Founder" / "Creator" in
+// the project's OWN chat. This is a DELIBERATE, operator-mandated exception to
+// the 2026-06-30 "don't ban bare role words" rule (operator 2026-07-08, after a
+// "Founder" scammer joined Magpie Talk). Baseline is UNIONed with env so a stale
+// or partial env can never silently un-ban a baseline word; add more standalone
+// words later via STANDALONE_IMPERSONATOR_WORDS (comma-separated) with no code
+// change. Homoglyph / spaced-out / styled-unicode variants ("different latin
+// letters") are covered automatically because impersonationVariants() tests each
+// pattern against the homoglyph-folded + despaced forms of the name.
+const STANDALONE_IMPERSONATOR_BASELINE = ["founder", "creator"];
+const STANDALONE_IMPERSONATOR_WORDS = [...new Set([
+  ...STANDALONE_IMPERSONATOR_BASELINE,
+  ...(process.env.STANDALONE_IMPERSONATOR_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+])];
+const STANDALONE_IMPERSONATOR_ALT = STANDALONE_IMPERSONATOR_WORDS.join("|");
 
 export const IMPERSONATION_PATTERNS = [
   // (Near-)exact brand name as the whole display name — no legitimate use.
-  /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help))?\s*[.!]*$/i,
+  // Includes the GROUP name "Magpie Talk" + news/announcement/dev/exec poses.
+  /^\s*magpie(\s*(capital|loans?|lending|finance|labs?|team|support|admin|official|mod|help|talk|news|bot|dev(?:eloper)?|cto|ceo|announce(?:ment)?s?))?\s*[.!]*$/i,
   // Brand word adjacent (any separator) to a staff / official / support role.
   // \b after the role so a FAN name ("Magpie Supporter", "Magpie Teammate")
   // does NOT match while staff poses ("Magpie Support", "Magpie Admin") do.
-  /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|customer)\b/i,
+  /magpie[\s._@-]*(support|admin|team|mod(?:erator)?|official|help(?:\s*desk)?|staff|service|founder|owner|ceo|cto|dev(?:eloper)?|customer|talk|news|announce(?:ment)?s?|bot)\b/i,
   /\b(support|admin|official|staff|mod(?:erator)?|help\s*desk|customer\s*service)[\s._@-]*magpie\b/i,
   /\bofficial\s+magpie\b/i,
+  // Standalone "Founder" / "Creator" (+ any STANDALONE_IMPERSONATOR_WORDS env
+  // additions) as the WHOLE display name — matches Founder, Founders, Cofounder,
+  // Co-Founder, The Creator, Creators, etc., plus homoglyph/spaced variants via
+  // the folded+despaced forms. Operator-mandated 2026-07-08 (a "Founder" scammer
+  // joined). Anchored to the whole name so real members ("Merlin Founder's Fan")
+  // are unaffected — only names that ARE the role word trip it.
+  new RegExp(`^\\s*(co[\\s._-]*|the[\\s._-]+)?(${STANDALONE_IMPERSONATOR_ALT})s?\\s*[.!·•]*$`, "i"),
+  // NOTE (operator 2026-06-30, "calm down on kicks"): we deliberately do NOT
+  // name-ban a STANDALONE role word ("CTO", "Dev", "Support") with no "magpie"
+  // — that over-banned real members (a "$Merlin CTO" / "Dev Dan" who never
+  // impersonated Magpie). The rename attack the operator hit is specifically
+  // "Magpie Talk" / "Magpie Dev" style (brand + role), which the brand-adjacent
+  // patterns above already catch. A non-brand account that ACTUALLY scams
+  // (DM-solicitation, screenshot, phishing link) is still caught + banned by
+  // the behavior pipeline in handleGroupMessage — intent, not just a role word.
   // Impersonating a named protocol persona — "MagpieMatt", "Magpie Matt".
   new RegExp(`magpie[\\s._@-]*(${PERSONA_ALT})\\b`, "i"),
   new RegExp(`\\b(${PERSONA_ALT})[\\s._@-]*magpie\\b`, "i"),
@@ -99,18 +157,43 @@ export const IMPERSONATION_PATTERNS = [
 ];
 
 // Homoglyphs / leetspeak an impersonator uses to dodge the brand filter
-// ("Mаgpie" with a Cyrillic а, "0fficial", "M4gpie"). Folded to ASCII before
-// matching. Ambiguous 1/l/i is deliberately left out to avoid mangling real
-// names; the unicode + despace + combined-field passes cover the common cases.
+// ("Mаgpie" with a Cyrillic а, "0fficial", "M4gpie", "Ðeveloper" with a Latin
+// Eth). Folded to ASCII before matching. This map holds ONLY the NON-decomposable
+// specials (Ð ð Đ đ Ø ł ß Þ) + cross-script VISUAL homoglyphs (Cyrillic / Greek);
+// the huge decomposable space (accented Latin é/à, fullwidth Ｄ, mathematical
+// 𝐃/𝑫/𝔡, superscripts) is folded GENERICALLY by NFKD in foldConfusables below.
+// Only VISUAL look-alikes are mapped (Cyrillic У→y not phonetic u, Н→h not n);
+// ambiguous 1/l/i is left out to avoid mangling real names.
 const CONFUSABLE_MAP = {
-  "а": "a", "ӓ": "a", "@": "a", "4": "a", "е": "e", "ё": "e", "3": "e",
-  "о": "o", "ο": "o", "0": "o", "р": "p", "с": "c", "ѕ": "s", "$": "s", "5": "s",
-  "х": "x", "у": "y", "і": "i", "ӏ": "i", "т": "t", "к": "k", "н": "h", "м": "m",
-  "ԁ": "d", "ɡ": "g", "ⅼ": "l", "ӏ": "l",
+  // leetspeak / symbols
+  "@": "a", "4": "a", "3": "e", "0": "o", "$": "s", "5": "s",
+  // Latin specials NFKD does NOT decompose — the "Ðeveloper" class
+  "Ð": "d", "ð": "d", "Đ": "d", "đ": "d", "Ø": "o", "ø": "o",
+  "Ł": "l", "ł": "l", "ß": "b", "Þ": "p", "þ": "p", "ẞ": "b",
+  // Cyrillic visual homoglyphs (look identical to the Latin letter)
+  "А": "a", "а": "a", "ӓ": "a", "В": "b", "в": "b", "Е": "e", "е": "e", "Ё": "e", "ё": "e",
+  "К": "k", "к": "k", "М": "m", "м": "m", "Н": "h", "н": "h", "О": "o", "о": "o",
+  "Р": "p", "р": "p", "С": "c", "с": "c", "Т": "t", "т": "t", "Х": "x", "х": "x",
+  "У": "y", "у": "y", "І": "i", "і": "i", "ӏ": "i", "Ј": "j", "ј": "j", "Ѕ": "s", "ѕ": "s",
+  "ԁ": "d", "Ԁ": "d", "ɡ": "g",
+  // Greek visual homoglyphs
+  "Α": "a", "Β": "b", "Ε": "e", "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n",
+  "Ο": "o", "ο": "o", "Ρ": "p", "ρ": "p", "Τ": "t", "τ": "t", "Χ": "x", "Υ": "y",
+  "ν": "v", "ⅼ": "l", "ӏ": "l",
 };
+// Invisible / format / bidi-override / variant-selector chars — pure obfuscation
+// with no legit use inside a display name (zero-width space/joiner, RLO/LRO,
+// VS15/16, BOM, soft hyphen). Stripped before folding so "De​veloper" and
+// RTL-scrambled names collapse to their real letters.
+const INVISIBLE_CHARS = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufe00-\ufe0f\ufeff]/g;
 function foldConfusables(s) {
+  if (!s) return "";
+  let t = s.replace(INVISIBLE_CHARS, "");
+  // NFKD + strip combining marks folds accented Latin, fullwidth, mathematical
+  // alphanumeric, and superscripts to plain ASCII generically.
+  try { t = t.normalize("NFKD").replace(/[\u0300-\u036f]/g, ""); } catch { /* keep t */ }
   let out = "";
-  for (const ch of s) out += CONFUSABLE_MAP[ch] ?? CONFUSABLE_MAP[ch.toLowerCase()] ?? ch;
+  for (const ch of t) out += CONFUSABLE_MAP[ch] ?? CONFUSABLE_MAP[ch.toLowerCase()] ?? ch;
   return out;
 }
 
@@ -206,6 +289,16 @@ export const SCAM_PHRASES = [
   // Recovery / refund scams
   /\b(?:lost|recover|refund)\s+(?:your|my)\s+(?:funds?|sol|tokens?|wallet)\b/i,
   /\b(?:rug(?:ged|pull)?|scammed|lost)\b.*\b(?:dm|message|pm|contact)\s+me\b/i,
+  // Fake token-MIGRATION / 1:1-allocation phishing (the "Ðeveloper" 2026-07-04
+  // post). These are SIGNALS into Pip's allow-biased judge (not auto-delete),
+  // and each requires scam STRUCTURE (authority + allocation + redirect), so
+  // real governance / distribution / holder-reward discussion isn't flagged.
+  /\b1\s*[:：]\s*1\s+(?:token\s+)?(?:allocation|swap|claim|distribution)\b/i,
+  /\btransition(?:ing)?\s+to\s+(?:an?\s+)?(?:new|upgraded|revised|different)\s+(?:token\s+)?(?:structure|contract|standard|system)\b/i,
+  /\b(?:eligible|qualif(?:y|ied))\s+for\s+(?:an?\s+)?(?:1\s*[:：]\s*1\s+)?(?:token\s+)?(?:allocation|airdrop|distribution)\b/i,
+  /\b(?:reach\s+out\s+to|contact|message|dm|pm)\s+(?:our\s+)?(?:dev(?:eloper)?s?|admin(?:istrator)?s?|support|team|moderators?|mods?)\b.*\b(?:for|to\s+(?:get|receive))\b.*\b(?:instructions?|next\s+steps?|details?|how\s+to\s+proceed|guidance|allocation)\b/i,
+  /\bclaim\s+(?:your\s+)?(?:new\s+|token\s+)?allocation\b/i,
+  /\bofficial\s+(?:update|announcement)\s+(?:regarding|about|on)\b.*\b(?:token|migration|upgrade|allocation|snapshot|phase)\b/i,
 ];
 
 /**
@@ -339,6 +432,26 @@ export function findImpersonatingHandles(text) {
 
 /* ───────────────────────── URL HANDLING ──────────────────────── */
 
+/**
+ * Collapse common link-obfuscation tricks back into a real URL so the
+ * extractor + allowlist can see them. Handles unicode dot lookalikes,
+ * bracketed dots ("[dot]", "(.)"), and spelled-out "evil dot com".
+ * Deliberately conservative — only transforms high-signal obfuscation
+ * markers, never plain sentence punctuation, so "e.g." / "Node.js" are
+ * left untouched.
+ */
+export function deobfuscateLinks(text) {
+  if (!text) return "";
+  return text
+    // unicode dot lookalikes → "." (one-dot leader, ideographic / fullwidth /
+    // arabic full stops, small full stop, syriac dots)
+    .replace(/[․。．۔﹒܁܂]/g, ".")
+    // bracketed / parenthesized dot: "[dot]" "(dot)" "{dot}" "[.]" "( . )"
+    .replace(/\s*[[({]\s*(?:dot|d0t|\.)\s*[\])}]\s*/gi, ".")
+    // spelled-out "word dot word": "evil dot com" → "evil.com"
+    .replace(/([a-z0-9-])\s+(?:dot|d0t)\s+([a-z0-9-])/gi, "$1.$2");
+}
+
 /** Extract every URL the user sent — both via TG entities + plain text */
 export function extractUrls(msg) {
   const urls = new Set();
@@ -355,6 +468,22 @@ export function extractUrls(msg) {
   // 2. Bare-text fallback (catches anything TG didn't auto-detect)
   const bareRegex = /(?:https?:\/\/|www\.|t\.me\/|x\.com\/|twitter\.com\/)[^\s<>'"`]+/gi;
   for (const m of text.matchAll(bareRegex)) urls.add(m[0]);
+  // 3. De-obfuscated pass — scammers hide links as "evil [dot] com",
+  //    "evil dot com", or with fullwidth/unicode dots to dodge (1)+(2).
+  //    Only runs when an obfuscation marker was actually present
+  //    (deob !== text), so normal messages never hit the broad domain regex.
+  const deob = deobfuscateLinks(text);
+  if (deob !== text) {
+    for (const m of deob.matchAll(bareRegex)) urls.add(m[0]);
+    const domainRe = /\b(?:[a-z0-9-]+\.)+[a-z]{2,24}(?:\/[^\s<>'"`]*)?/gi;
+    for (const m of deob.matchAll(domainRe)) urls.add(m[0]);
+  }
+  // 4. Bare domain WITH a path but no scheme (e.g. "scam.io/claim-airdrop").
+  //    Telegram usually entity-detects these, but this catches stragglers.
+  //    Requiring a path keeps false-positives near zero; the allowlist
+  //    (isAllowedUrl) still lets official/safe domains through.
+  const barePathRe = /\b(?:[a-z0-9-]+\.)+[a-z]{2,24}\/[^\s<>'"`]+/gi;
+  for (const m of text.matchAll(barePathRe)) urls.add(m[0]);
   return [...urls];
 }
 
@@ -380,6 +509,9 @@ export function isAllowedUrl(rawUrl) {
     // Magpie's own domains are always allowed (any path) — official links
     // (magpie.capital, docs.magpie.capital, …) must never be auto-deleted.
     if (OWN_DOMAINS.some((d) => host === d || host.endsWith("." + d))) return true;
+    // Well-known safe platforms (app stores, Solana, wallets, explorers) —
+    // referenced in honest product questions, not phishing vectors.
+    if (SAFE_REFERENCE_DOMAINS.some((d) => host === d || host.endsWith("." + d))) return true;
     // Twitter/X handles are case-insensitive (x.com/MagpieLoans ==
     // x.com/magpieloans on Twitter's side). Compare both sides
     // lowercased to avoid false rejects on case variants.
@@ -404,6 +536,177 @@ export function isAllowedUrl(rawUrl) {
 
 /* ──────────────────── IMPERSONATION + SCAM ───────────────────── */
 
+// ── Fuzzy brand-lookalike layer (operator-mandated 2026-07-04) ───────────────
+// The literal-"magpie" IMPERSONATION_PATTERNS above only match the EXACT string
+// "magpie" (after homoglyph folding). They MISS deliberate misspellings and
+// transpositions the operator called out — "Mapgie", "Magpei", "Mgpie" — plus
+// doubled letters ("Maggpie") and separators the despace pass doesn't strip
+// (zero-width, emoji). This layer collapses the name to bare a-z0-9 and
+// fuzzy-matches the brand root, catching lookalikes too.
+//
+// HIGH-PRECISION so real members are safe: a fuzzy brand hit is a ban ONLY when
+// (A) the whole name is an exact letter-scramble of the brand (an anagram — a
+// real word almost never is), or (B/C) the lookalike sits next to a staff/
+// persona role word. A lone near-miss like "Maggie" is NOT banned. Residual
+// false positives self-heal via the instant /appeal flow.
+const BRAND_ROOT = "magpie";
+const _BRAND_SORTED = BRAND_ROOT.split("").sort().join("");
+const IMPERSONATION_ROLE_WORDS = new Set([
+  ...PROTECTED_PERSONA_NAMES,
+  "support", "admin", "team", "mod", "moderator", "official", "help", "helpdesk",
+  "staff", "service", "founder", "owner", "ceo", "cto", "dev", "developer",
+  "customer", "talk", "news", "announce", "announcement", "announcements", "bot",
+  "capital", "loans", "loan", "lending", "finance", "labs", "lab",
+]);
+
+function collapseToAlnum(s) {
+  return foldConfusables(normalizeUnicode(s || "")).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function alnumTokens(s) {
+  return foldConfusables(normalizeUnicode(s || "")).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+// Bounded Damerau-Levenshtein (adjacent transposition counts as 1 edit).
+function damerau(a, b) {
+  const al = a.length, bl = b.length;
+  if (Math.abs(al - bl) > 2) return 3;
+  const d = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+  for (let i = 0; i <= al; i++) d[i][0] = i;
+  for (let j = 0; j <= bl; j++) d[0][j] = j;
+  for (let i = 1; i <= al; i++) {
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[al][bl];
+}
+// An exact letter-scramble of the brand — very high signal it's deliberate.
+function isBrandAnagram(tok) {
+  return tok.length === BRAND_ROOT.length && tok !== BRAND_ROOT &&
+    tok.split("").sort().join("") === _BRAND_SORTED;
+}
+// A near-miss of the brand (<=1 edit or an anagram). Used ONLY alongside a role
+// word (except the anagram case) so real names like "Maggie" are never banned.
+function isBrandLookalike(tok) {
+  if (tok.length < 5 || tok.length > 8) return false;
+  if (tok === BRAND_ROOT) return true;
+  if (isBrandAnagram(tok)) return true;
+  return damerau(tok, BRAND_ROOT) <= 1;
+}
+
+/** Fuzzy impersonation catch — deliberate brand misspellings / lookalikes that
+ *  the exact IMPERSONATION_PATTERNS miss (e.g. "Mapgie", "Magpei Admin"). */
+export function isBrandLookalikeImpersonation(user) {
+  if (!user) return false;
+  const combined = [user.username || "", user.first_name || "", user.last_name || ""]
+    .filter(Boolean).join(" ");
+  const full = collapseToAlnum(combined);
+  if (!full) return false;
+  // (A) whole collapsed name is a brand scramble → deliberate ("Mapgie","Magpei").
+  if (isBrandAnagram(full)) return true;
+  // (B) collapsed name is <lookalike-brand><role> or <role><lookalike-brand>
+  //     ("mapgiematt", "magpesupport", "adminmagpe") — defeats zero-width spacing.
+  for (const role of IMPERSONATION_ROLE_WORDS) {
+    if (role.length < 2 || full.length <= role.length) continue;
+    if (full.endsWith(role) && isBrandLookalike(full.slice(0, full.length - role.length))) return true;
+    if (full.startsWith(role) && isBrandLookalike(full.slice(role.length))) return true;
+  }
+  // (C) token level: a lookalike-brand token AND a separate role token.
+  const toks = alnumTokens(combined);
+  if (toks.some(isBrandLookalike) && toks.some((t) => IMPERSONATION_ROLE_WORDS.has(t))) return true;
+  return false;
+}
+
+// Role / brand words that must never be spelled with HOMOGLYPHS. A PLAIN-ASCII
+// role word ("Developer", "CryptoDev", "Team Solana") is deliberately allowed
+// (operator 2026-06-30, "don't ban standalone role words") — the malice signal
+// is the DISGUISE: a name that uses non-ASCII look-alikes to spell one of these
+// is impersonation, full stop (a real member types "Developer", never
+// "Ðeveloper"). Env-extensible via HOMOGLYPH_PROTECTED_WORDS.
+const HOMOGLYPH_PROTECTED_WORDS = new Set([
+  "magpie", "pip", ...PROTECTED_PERSONA_NAMES,
+  "developer", "developers", "dev", "devs", "admin", "administrator", "support",
+  "supporter", "staff", "official", "moderator", "mod", "team", "help", "helpdesk",
+  "service", "customer", "founder", "owner", "ceo", "cto", "bot", "announcement",
+  "announcements", "announce", "partner", "verified", "trust",
+  ...(process.env.HOMOGLYPH_PROTECTED_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+]);
+
+/** Catch a name that uses HOMOGLYPHS / confusables to spell a protected role or
+ *  brand word — "Ðeveloper" (Latin Eth), "Аdmin" (Cyrillic А), "Ｍagpie"
+ *  (fullwidth). Precise by construction: fires ONLY when a token folds to a
+ *  protected word AND the fold actually CHANGED it (i.e. a look-alike was used),
+ *  so a plain-ASCII role word and normal names ("José Developer") are untouched. */
+export function isHomoglyphDisguisedImpersonation(user) {
+  if (!user) return false;
+  const fields = [user.username || "", user.first_name || "", user.last_name || ""].filter(Boolean);
+  for (const raw of [...fields, fields.join(" ")]) {
+    if (!raw) continue;
+    // Per-token so a homoglyph in ONE word (the disguised role word) is caught
+    // without a real accented word elsewhere ("José") tripping it. Also test the
+    // whole despaced string (defeats "Ð e v e l o p e r" letter-spacing).
+    const rawToks = raw.split(/[\s._@\-]+/).filter(Boolean);
+    for (const rawTok of [...rawToks, raw.replace(/[\s._@\-]+/g, "")]) {
+      const cleanRaw = rawTok.toLowerCase().replace(/[^a-z0-9]/g, "");        // ASCII-only part of the raw
+      const folded = foldConfusables(normalizeUnicode(rawTok)).toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!folded || folded === cleanRaw) continue;                           // no look-alike used → allowed
+      if (HOMOGLYPH_PROTECTED_WORDS.has(folded)) return true;                 // disguised protected word → ban
+    }
+  }
+  return false;
+}
+
+// Staff/role words that ARE impersonation when they make up the WHOLE name.
+// No legit member in a protocol's group is named exactly "Dev" / "Admin" /
+// "Support" / "Dev Team". This is the precise version of the operator's
+// 2026-06-30 "don't over-ban standalone role words": we ban ONLY when the
+// ENTIRE name is role words, so a role word as PART of a longer name
+// ("CryptoDev", "Dev Dan", "Team Solana") is still allowed. Excludes real first
+// names ("Matt") and the allowed nickname "Pip". Env-extensible.
+const BARE_ROLE_WORDS = new Set([
+  "magpie",
+  "dev", "devs", "developer", "developers", "admin", "admins", "administrator",
+  "administrators", "support", "moderator", "moderators", "mod", "mods",
+  "official", "staff", "team", "founder", "founders", "owner", "ceo", "cto",
+  "announcement", "announcements", "helpdesk", "moderation",
+  ...(process.env.BARE_ROLE_WORDS || "")
+    .split(",").map((s) => s.trim().toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean),
+]);
+
+/** A name that is ENTIRELY staff/role words — "Dev", "Support", "Dev Team",
+ *  "Admin Support", "🛠 Dev" — is impersonation. A role word as PART of a
+ *  longer name ("CryptoDev", "Dev Dan", "Team Solana", "Devon") is NOT flagged,
+ *  preserving the 2026-06-30 anti-over-ban rule. Folds homoglyphs first, so
+ *  "Ðev"/"Аdmin" as the whole name are caught here too. */
+export function isBareRoleWordImpersonation(user) {
+  if (!user) return false;
+  const combined = [user.first_name, user.last_name].filter(Boolean).join(" ");
+  for (const raw of [user.username || "", user.first_name || "", user.last_name || "", combined]) {
+    if (!raw) continue;
+    const folded = foldConfusables(normalizeUnicode(raw)).toLowerCase();
+    // (b) LETTER-/PUNCTUATION-SPACED evasion: the whole name with ALL
+    // separators removed IS a single role word — "D E V" → "dev",
+    // "A.D.M.I.N" → "admin", "s u p p o r t" → "support", "d_e_v" → "dev".
+    // Checked FIRST and regardless of token count: the token-based check (a)
+    // below misses this because each spaced letter becomes its own non-role
+    // token, and a spaced-out word can exceed the 4-token "not a sentence"
+    // guard ("A D M I N" = 5 tokens). A legit name only trips this if it
+    // collapses to an EXACT staff-role word (e.g. "Devon" → "devon" does
+    // NOT), and the appeal path (/appeal) covers the rare edge.
+    const despaced = folded.replace(/[^a-z0-9]/g, "");
+    if (despaced && BARE_ROLE_WORDS.has(despaced)) return true;
+    // (a) every token is itself a role word ("Dev", "Dev Team", "Admin Support").
+    const toks = folded.split(/[^a-z0-9]+/).filter(Boolean);
+    if (!toks.length || toks.length > 4) continue;      // 1–4 tokens; a sentence isn't a name
+    if (toks.every((t) => BARE_ROLE_WORDS.has(t))) return true;
+  }
+  return false;
+}
+
 export function isImpersonationName(user) {
   if (!user) return false;
   // Test raw + unicode-normalized + homoglyph-folded + despaced + combined-field
@@ -414,6 +717,39 @@ export function isImpersonationName(user) {
       if (re.test(c)) return true;
     }
   }
+  // Fuzzy layer — deliberate misspellings / lookalikes ("Mapgie", "Magpei Admin").
+  if (isBrandLookalikeImpersonation(user)) return true;
+  // Homoglyph-disguised role/brand word ("Ðeveloper", "Аdmin", "Ｍagpie").
+  if (isHomoglyphDisguisedImpersonation(user)) return true;
+  // Bare staff/role word as the WHOLE name ("Dev", "Support", "Dev Team").
+  if (isBareRoleWordImpersonation(user)) return true;
+  return false;
+}
+
+/**
+ * HARD impersonation = an UNAMBIGUOUS match: an exact brand pattern
+ * ("Magpie Support"), a homoglyph-disguised brand/role word ("Ðeveloper",
+ * "Аdmin"), or a bare/spaced staff-role word ("Dev", "D E V", "A D M I N").
+ * These are NEVER false positives — no legitimate member is named any of
+ * these — so a CLEARANCE (even a name-agnostic operator /unban) must NOT
+ * shield them. This closes the hole that let a previously-cleared account
+ * (from the 2026-06-30 captcha-bug bulk-unban) rename to "D E V" and stay
+ * immune to every name-ban path.
+ *
+ * DELIBERATELY EXCLUDES the fuzzy `isBrandLookalikeImpersonation` layer
+ * (Damerau-Levenshtein / anagram), which CAN misfire on a real name
+ * (e.g. "Maggie") — that layer stays clearance-protectable so an appeal
+ * winner isn't re-banned for a borderline resemblance.
+ */
+export function isHardImpersonation(user) {
+  if (!user) return false;
+  for (const c of impersonationVariants(user)) {
+    for (const re of IMPERSONATION_PATTERNS) {
+      if (re.test(c)) return true;
+    }
+  }
+  if (isHomoglyphDisguisedImpersonation(user)) return true;
+  if (isBareRoleWordImpersonation(user)) return true;
   return false;
 }
 
@@ -447,6 +783,27 @@ export function matchesScamPattern(text) {
     if (hasObfuscatedUnicode(text, 8)) {
       return "[obfuscated text — math/styled unicode characters]";
     }
+  }
+  return null;
+}
+
+/**
+ * Narrow DM-solicitation matcher for the screenshot-scam ban (operator
+ * 2026-06-30): a PHOTO whose caption/text solicits a DM ("DM me", "message
+ * us", "hit me up", "contact admin") is the canonical "DM me to claim/recover"
+ * phishing setup — that gets BANNED, not merely warned. Tests raw +
+ * unicode-normalized so math-bold/Cyrillic obfuscation can't dodge it.
+ */
+export function matchesDmSolicitation(text) {
+  if (!text) return null;
+  const pats = [
+    /\b(?:dm|direct\s*message|pm|private\s*message|message|msg|text|contact|reach)\s*(?:me|us|out|admin|support|the\s*team)\b/i,
+    /\bhit\s+me\s+up\b/i,
+    /\bsend\s+me\s+a\s+(?:dm|message|pm)\b/i,
+  ];
+  for (const t of [text, normalizeUnicode(text)]) {
+    if (!t) continue;
+    for (const re of pats) if (re.test(t)) return re.source;
   }
   return null;
 }

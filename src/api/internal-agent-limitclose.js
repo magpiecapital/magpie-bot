@@ -104,6 +104,41 @@ async function readJsonBody(req) {
 }
 
 /**
+ * Re-verify the agent STILL holds an active, non-expired delegation for
+ * the wallet that owns this order before honoring a modify/cancel.
+ *
+ * The firing engine snapshots consent at arm time and does not re-read
+ * the delegation, and modify/cancel previously scoped only by
+ * source_agent_pubkey — so a revoked/expired agent could keep re-tuning
+ * or cancelling autonomous forced-sale triggers on the user's custodial
+ * collateral. migrations/026_agent_delegations.sql mandates that any
+ * status != 'active' (or a past expires_at) is treated as "no grant";
+ * this enforces that invariant on the agent write paths too. The
+ * delegation is keyed on the borrower's on-chain wallet, so we bind
+ * through loans.borrower_wallet (same boundary /arm and /eligible-loans
+ * enforce).
+ */
+async function agentHasActiveDelegationForOrder(orderId, agentPubkey) {
+  const { rows } = await query(
+    `SELECT 1
+       FROM limit_close_orders lc
+       JOIN loans l ON l.id = lc.loan_id
+       JOIN agent_delegations ad
+         ON ad.user_wallet = l.borrower_wallet
+        AND ad.agent_pubkey = lc.source_agent_pubkey
+        AND ad.action = 'limit_close'
+        AND ad.status = 'active'
+        AND (ad.expires_at IS NULL OR ad.expires_at > NOW())
+      WHERE lc.id = $1
+        AND lc.source = 'agent_x402'
+        AND lc.source_agent_pubkey = $2
+      LIMIT 1`,
+    [orderId, agentPubkey],
+  );
+  return rows.length > 0;
+}
+
+/**
  * POST /api/v1/internal/agent/limit-close/arm
  *
  * Body:
@@ -233,7 +268,8 @@ export async function handleAgentLimitCloseArm(req) {
               l.original_loan_amount_lamports::text AS owed
          FROM loans l
          JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
-        WHERE l.user_id = $2 AND l.loan_id = $3`,
+        WHERE l.user_id = $2 AND l.loan_id = $3
+          AND l.borrower_wallet = $1`,
       [userWallet, delegation.user_id, loanIdRaw],
     );
     if (rows.length > 0) { walletGuard = rows[0]; break; }
@@ -559,7 +595,8 @@ export async function handleAgentLimitClosePreflight(req) {
               l.original_loan_amount_lamports::text AS owed
          FROM loans l
          JOIN wallets w ON w.user_id = l.user_id AND w.public_key = $1
-        WHERE l.user_id = $2 AND l.loan_id = $3`,
+        WHERE l.user_id = $2 AND l.loan_id = $3
+          AND l.borrower_wallet = $1`,
       [userWallet, delegation.user_id, loanIdRaw],
     );
     if (rows.length > 0) { walletGuard = rows[0]; break; }
@@ -760,6 +797,12 @@ export async function handleAgentLimitCloseModify(req) {
     return bad("no_changes_supplied");
   }
 
+  // Re-verify the delegation is still active — a revoked/expired agent
+  // must not retain control of orders it previously armed.
+  if (!(await agentHasActiveDelegationForOrder(orderIdRaw, agentPubkey))) {
+    return { status: 403, body: { error: "no_active_delegation" } };
+  }
+
   const result = await modifyOrder({
     orderId: Number(orderIdRaw),
     sourceAgentPubkey: agentPubkey,
@@ -798,6 +841,12 @@ export async function handleAgentLimitCloseDelete(req, params) {
   const orderId     = String(params.id ?? "");
   if (!isValidPubkey(agentPubkey)) return bad("invalid_agent_pubkey");
   if (!/^\d+$/.test(orderId))      return bad("invalid_order_id");
+
+  // Re-verify the delegation is still active — a revoked/expired agent
+  // must not retain control of orders it previously armed.
+  if (!(await agentHasActiveDelegationForOrder(orderId, agentPubkey))) {
+    return { status: 403, body: { error: "no_active_delegation" } };
+  }
 
   const result = await query(
     `UPDATE limit_close_orders

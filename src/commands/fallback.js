@@ -3,6 +3,7 @@
  * Maps common phrases to the right command, or shows a helpful nudge.
  */
 import { InlineKeyboard } from "grammy";
+import { query } from "../db/pool.js";
 
 // Keyword → { handler, label } mapping
 // Order matters — first match wins
@@ -316,14 +317,40 @@ export async function handleFallback(ctx) {
     }
   }
 
-  // No match — show helpful suggestions
+  // ── Reply capture ──────────────────────────────────────────────
+  // A plain conversational message that matched no command is almost always a
+  // REAL reply — feedback, a question, a response to an outreach/winback DM.
+  // Historically this hit a canned "I'm not sure what you mean" and was LOST.
+  // Now: forward it to the operator(s) so a human actually sees it and can
+  // respond, and acknowledge the user warmly instead of robotically.
+  try {
+    const ops = (process.env.OPERATOR_TG_IDS || "")
+      .split(",").map((s) => s.trim()).filter(Boolean);
+    if (ops.length) {
+      const u = ctx.from || {};
+      const who = u.username ? "@" + u.username : (u.first_name || "user");
+      const back = u.username ? "@" + u.username : `tg://user?id=${u.id}`;
+      const note = `💬 User reply — ${who} (id ${u.id})\n\n"${text}"\n\n↳ reply to them: ${back}`;
+      for (const op of ops) {
+        try { await ctx.api.sendMessage(op, note); } catch { /* best-effort per operator */ }
+      }
+    }
+    // Durable store so replies are searchable/aggregatable (powers /feedback),
+    // not just a forwarded DM. Best-effort — never blocks the user's reply.
+    await query(
+      `INSERT INTO user_feedback (telegram_id, telegram_username, message) VALUES ($1, $2, $3)`,
+      [ctx.from?.id ?? null, ctx.from?.username ?? null, text],
+    ).catch(() => {});
+    console.log(`[reply-capture] from ${ctx.from?.id} (@${ctx.from?.username || "?"}): ${text.slice(0, 200)}`);
+  } catch { /* capture must never break the user's reply */ }
+
   const kb = new InlineKeyboard()
     .text("💰 Borrow", "start:borrow")
     .text("📋 Wallet", "fallback:deposit")
     .text("📖 Help", "fallback:help");
 
   await ctx.reply(
-    "I'm not sure what you mean. Here are some things I can help with:",
+    "Got it — thanks for the message. A human on the Magpie team sees this and will follow up. In the meantime, here's what I can help with right now:",
     { reply_markup: kb },
   );
 }

@@ -61,7 +61,7 @@ const TOKEN2022 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
  *               if any precondition check fails. The audit row is updated
  *               to sim_rejected before throwing.
  */
-export async function runPrivilegedSign({ service, tx, signers, allowedDeltas }) {
+export async function runPrivilegedSign({ service, tx, signers, allowedDeltas, allowedCloseDestinations }) {
   if (!service || typeof service !== "string") {
     throw new Error("runPrivilegedSign: service name required");
   }
@@ -146,6 +146,31 @@ export async function runPrivilegedSign({ service, tx, signers, allowedDeltas })
       ),
     ],
   );
+
+  // 3.5 Close-account destination guard. The balance-delta sim catches value
+  //     leaving a SIGNER account, but an SPL `closeAccount` sends the closed
+  //     account's lamports (rent + any wSOL) to its DESTINATION — a leak the
+  //     delta check is BLIND to when the destination isn't a signer. Require
+  //     every closeAccount destination to be a signer OR an explicitly-allowed
+  //     destination, else reject. Closes the close-to-arbitrary-dest drain
+  //     (lp-excess-sweeper) + masking-debit-inside-close-credit vectors.
+  const allowedCloseStrs = new Set(
+    (allowedCloseDestinations || []).map((d) =>
+      d.toBase58 ? d.toBase58() : String(d),
+    ),
+  );
+  for (const dest of enumerateCloseAccountDestinations(tx)) {
+    if (!signerPubkeyStrs.has(dest) && !allowedCloseStrs.has(dest)) {
+      await markAuditRejected(
+        auditId,
+        `closeAccount dest ${dest.slice(0, 8)}… not a signer/allowed dest`,
+      );
+      throw new Error(
+        `privileged-sign-guard: closeAccount destination ${dest} not permitted ` +
+          `(must be a signer or declared in allowedCloseDestinations)`,
+      );
+    }
+  }
 
   // 4. Sign with privileged keypair(s)
   try {
@@ -331,6 +356,44 @@ export async function recordPrivilegedSignResult({ auditId, status, txSig, error
       WHERE id = $1`,
     [auditId, status, txSig ?? null, error ?? null],
   );
+}
+
+const SPL_CLOSE_ACCOUNT_IX = 9; // CloseAccount discriminator (SPL Token + Token-2022)
+
+/**
+ * Enumerate the DESTINATION pubkeys of every SPL closeAccount instruction in a
+ * tx. closeAccount layout: accounts = [accountToClose, destination, owner, ...].
+ * Legacy Transaction fully; VersionedTransaction best-effort. Never throws —
+ * the balance-delta sim is the backstop for anything this can't parse.
+ */
+function enumerateCloseAccountDestinations(tx) {
+  const dests = [];
+  try {
+    if (Array.isArray(tx.instructions)) {
+      for (const ix of tx.instructions) {
+        const pid = ix.programId;
+        if (!(pid && (pid.equals(TOKENKEG) || pid.equals(TOKEN2022)))) continue;
+        const data = ix.data;
+        if (!data || data.length < 1 || data[0] !== SPL_CLOSE_ACCOUNT_IX) continue;
+        if (ix.keys && ix.keys[1]?.pubkey) dests.push(ix.keys[1].pubkey.toBase58());
+      }
+    } else if (tx.message) {
+      const msg = tx.message;
+      const keys = msg.staticAccountKeys || [];
+      const compiled = msg.compiledInstructions || [];
+      for (const ci of compiled) {
+        const pid = keys[ci.programIdIndex];
+        if (!(pid && (pid.equals(TOKENKEG) || pid.equals(TOKEN2022)))) continue;
+        const data = ci.data;
+        if (!data || data.length < 1 || data[0] !== SPL_CLOSE_ACCOUNT_IX) continue;
+        const destIdx = ci.accountKeyIndexes?.[1];
+        if (destIdx != null && keys[destIdx]) dests.push(keys[destIdx].toBase58());
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  return dests;
 }
 
 async function markAuditRejected(auditId, detail) {

@@ -454,10 +454,15 @@ export async function handleSiteLimitCloseList(req, url) {
               cancellation_reason
          FROM limit_close_orders
         WHERE loan_id = ANY($1::bigint[])
-          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','cancelled','failed','max_retries_exceeded')
+          -- 'partial_fired' MUST be included (audit 2026-06-28 P1 #3): a TWAP/
+          -- chunked exit that sold SOME collateral into the vault lands in
+          -- 'partial_fired'. Omitting it dropped the order from the dashboard
+          -- entirely → the banner showed "No exit set" despite real proceeds.
+          AND status IN ('armed','firing','twap_in_progress','awaiting_user','fired','partial_fired','cancelled','failed','max_retries_exceeded')
         ORDER BY
-          -- Active states sort first by armed_at DESC, history by fired_at DESC
-          CASE WHEN status IN ('fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
+          -- Active states sort first by armed_at DESC, history by fired_at DESC.
+          -- partial_fired is a FIRED (terminal) state → sort with history.
+          CASE WHEN status IN ('fired','partial_fired','cancelled','failed','max_retries_exceeded') THEN 1 ELSE 0 END,
           armed_at DESC`,
       [loanIds],
     );
@@ -909,6 +914,12 @@ async function _handleSiteLimitCloseArmImpl(req) {
   }
 
   // ── Shared arm ──
+  // Envelope context so arm-core can queue the arm to pending_arms if the
+  // borrow is still finalizing (loan not committed / not yet active) — the
+  // retry-watcher then completes it with NO re-sign. Fixes the stuck
+  // "Signing…" that forced repeated clicks (feedback_v4_every_arm_must_succeed).
+  const envelopeIssuedAtMs = auth.fields?.IssuedAt ? Date.parse(auth.fields.IssuedAt) : NaN;
+  const intentIdFromReq = Number(fields.IntentId);
   const armed = await armOrder({
     userId,
     source: "site",
@@ -922,7 +933,30 @@ async function _handleSiteLimitCloseArmImpl(req) {
     expiresAt,
     slicePct: slicePctApplied,
     armNote: `armed via site (${trailingDistanceBps != null ? `TRAILING-SL ${trailingDistanceBps/100}%` : (isSl ? "SL" : "TP")}${slicePctApplied < 10000 ? ` slice=${(slicePctApplied/100).toFixed(0)}%` : ""}) by ${auth.signerPubkey.slice(0, 8)}…`,
+    intentId: Number.isInteger(intentIdFromReq) ? intentIdFromReq : null,
+    envelope: Number.isFinite(envelopeIssuedAtMs)
+      ? { signer_pubkey: auth.signerPubkey, wallet: auth.signerPubkey, envelope_issued_at_ms: envelopeIssuedAtMs }
+      : null,
   });
+  // Borrow-finalization race: arm was queued for background auto-completion.
+  // Return 202 so the dashboard shows "queued — arms automatically" instead of
+  // a stuck spinner; the user does NOT re-sign.
+  if (armed.ok && armed.pending) {
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        pending: true,
+        pending_arm_id: armed.pending_arm_id,
+        retry_in_ms: armed.retry_in_ms ?? 10_000,
+        envelope_expires_at_ms: armed.envelope_expires_at_ms ?? null,
+        loan_id: fields.LoanId,
+        trigger_kind: triggerKind,
+        trigger_value_micro: triggerValueMicro.toString(),
+        detail: armed.detail || "Auto-sell queued — arms automatically once your loan finishes setting up.",
+      },
+    };
+  }
   if (!armed.ok) {
     return {
       status: 409,

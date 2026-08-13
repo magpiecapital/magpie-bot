@@ -529,20 +529,39 @@ async function getMarketData(mints) {
       const addr = p.baseToken?.address;
       if (!addr) continue;
 
-      const liq = p.liquidity?.usd ?? 0;
+      const liq = Number(p.liquidity?.usd) || 0;
       const existing = result.get(addr);
-      if (existing && (existing.liquidity ?? 0) >= liq) continue;
-
-      result.set(addr, {
-        symbol: p.baseToken?.symbol || "???",
-        name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
-        price: p.priceUsd ? parseFloat(p.priceUsd) : null,
-        liquidity: liq,
-        volume24h: p.volume?.h24 ?? 0,
-        marketCap: p.marketCap ?? p.fdv ?? 0,
-        pairCreatedAt: p.pairCreatedAt ?? null,
-        imageUrl: p.info?.imageUrl ?? null,
-      });
+      if (!existing) {
+        result.set(addr, {
+          symbol: p.baseToken?.symbol || "???",
+          name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
+          price: p.priceUsd ? parseFloat(p.priceUsd) : null,
+          // AGGREGATE: liquidity is the SUM across ALL of this token's pools (a
+          // sell routes via Jupiter across every pool). Single-pool under-read
+          // wrongly blocked a borrow on a multi-pool token ($ANSEM 2026-06-30);
+          // the cached liquidity_usd the borrow gate floors against must be the
+          // TOTAL depth. Price/symbol/metadata come from the LARGEST pool.
+          liquidity: liq,
+          _topPoolLiq: liq,
+          volume24h: p.volume?.h24 ?? 0,
+          marketCap: p.marketCap ?? p.fdv ?? 0,
+          pairCreatedAt: p.pairCreatedAt ?? null,
+          imageUrl: p.info?.imageUrl ?? null,
+        });
+      } else {
+        existing.liquidity += liq; // sum every pool for this token
+        if (liq > (existing._topPoolLiq ?? 0)) {
+          // larger pool → take its price + metadata as the representative
+          existing._topPoolLiq = liq;
+          existing.symbol = p.baseToken?.symbol || existing.symbol;
+          existing.name = p.baseToken?.name || existing.name;
+          existing.price = p.priceUsd ? parseFloat(p.priceUsd) : existing.price;
+          existing.volume24h = p.volume?.h24 ?? existing.volume24h;
+          existing.marketCap = p.marketCap ?? p.fdv ?? existing.marketCap;
+          existing.pairCreatedAt = p.pairCreatedAt ?? existing.pairCreatedAt;
+          existing.imageUrl = p.info?.imageUrl ?? existing.imageUrl;
+        }
+      }
     }
   }
   return result;
@@ -764,10 +783,59 @@ async function _auditTokenExtensionsUncached(mintStr) {
 
 // ─── Holder concentration ───────────────────────────────────────────────────
 
+// Operator-designated TRUSTED SUPPLY HOLDERS. Wallets in this set legitimately
+// hold a large share of many *good* tokens (protocol / market-maker / treasury
+// wallets), so their balance must NOT count against the supply-concentration
+// limits. We resolve the owner of each top token-account and subtract any owned
+// by a trusted wallet from the top-10/top-20 numerator — the concentration gate
+// then measures only the *public float*, so a big trusted position never
+// disqualifies an otherwise well-distributed token, while a scammer's
+// concentration still trips the gate normally.
+//
+// Operator-mandated 2026-07-04. Strict approval guidelines stay in force for
+// every other check; this is a narrow, deliberate carve-out.
+//
+// IMPORTANT — this repo is PUBLIC: the actual wallet addresses are NEVER
+// hardcoded here. They live in the private `screening_trusted_holders` prod
+// table (and/or the TRUSTED_SUPPLY_HOLDERS env var, comma-separated), so the
+// operator's trusted wallets aren't published or trivially trackable. Loaded
+// with a short in-process cache; fail-open (env-only, then empty) on error.
+const _TRUSTED_HOLDERS_TTL_MS = 5 * 60 * 1000;
+let _trustedHoldersCache = { at: 0, set: null };
+
+async function getTrustedSupplyHolders() {
+  const now = Date.now();
+  if (_trustedHoldersCache.set && now - _trustedHoldersCache.at < _TRUSTED_HOLDERS_TTL_MS) {
+    return _trustedHoldersCache.set;
+  }
+  const set = new Set(
+    (process.env.TRUSTED_SUPPLY_HOLDERS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  try {
+    const { rows } = await query(`SELECT wallet_address FROM screening_trusted_holders`);
+    for (const r of rows) {
+      const w = (r.wallet_address || "").trim();
+      if (w) set.add(w);
+    }
+  } catch (e) {
+    // Table missing / transient DB error → fall back to env-only (fail-open).
+    console.warn(`[screener] trusted-holders load failed: ${e.message}`);
+  }
+  _trustedHoldersCache = { at: now, set };
+  return set;
+}
+
 /**
  * Reject tokens where the top 10 holders control >40% of supply — this is
  * the classic dev-dump risk: a tiny group of wallets can crash the price
  * right after we accept the token as collateral.
+ *
+ * Holdings owned by TRUSTED_SUPPLY_HOLDERS are excluded from the numerator
+ * (see the constant above) so a large trusted stake never disqualifies an
+ * otherwise-distributed token.
  *
  * Skips tokens whose top holders are clearly pool addresses (DEX LPs are
  * expected to hold significant supply). For now we treat any holder with
@@ -800,23 +868,54 @@ async function _checkHolderConcentrationUncached(mintStr, opts = {}) {
     const total = BigInt(supplyInfo.value.amount);
     if (total === 0n) return { ok: false, reason: "zero supply" };
 
+    // Exclude any of the largest token-accounts OWNED by a trusted supply
+    // holder. getTokenLargestAccounts returns token-account addresses, not
+    // owner wallets, so we resolve owners for the (<=20) accounts and drop
+    // the trusted ones from the concentration set. Fail-open: if owner
+    // resolution errors, we simply don't exclude (original strict behavior).
+    let holders = largest.value;
+    let trustedExcluded = 0;
+    const trustedHolders = await getTrustedSupplyHolders();
+    if (trustedHolders.size > 0 && holders.length > 0) {
+      try {
+        const infos = await connection.getMultipleParsedAccounts(
+          holders.map((a) => new PublicKey(a.address)),
+          { commitment: "confirmed" },
+        );
+        const trustedAddrs = new Set();
+        (infos?.value || []).forEach((acc, i) => {
+          const owner = acc?.data?.parsed?.info?.owner;
+          if (owner && trustedHolders.has(owner)) {
+            trustedAddrs.add(holders[i].address);
+          }
+        });
+        if (trustedAddrs.size > 0) {
+          holders = holders.filter((a) => !trustedAddrs.has(a.address));
+          trustedExcluded = trustedAddrs.size;
+        }
+      } catch (e) {
+        console.warn(`[screener] trusted-holder owner resolve failed for ${mintStr}: ${e.message}`);
+      }
+    }
+
     // Solana returns up to 20 largest accounts; check both top-10 and
     // top-20 (=full set) so a scammer can't just split 90% across 11
-    // wallets to dodge the top-10 limit.
-    const top10 = largest.value.slice(0, 10);
-    const top20 = largest.value.slice(0, 20);
+    // wallets to dodge the top-10 limit. `holders` here already has any
+    // trusted-holder accounts removed, so % is measured over the public float.
+    const top10 = holders.slice(0, 10);
+    const top20 = holders.slice(0, 20);
     const sum10 = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const sum20 = top20.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const pct10 = Number((sum10 * 10000n) / total) / 100;
     const pct20 = Number((sum20 * 10000n) / total) / 100;
 
     if (pct10 > maxTop10Pct) {
-      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)` };
+      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)`, trustedExcluded };
     }
     if (pct20 > maxTop20Pct) {
-      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)` };
+      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)`, trustedExcluded };
     }
-    return { ok: true, topTenPct: pct10, topTwentyPct: pct20 };
+    return { ok: true, topTenPct: pct10, topTwentyPct: pct20, trustedExcluded };
   } catch (err) {
     // Don't block on transient RPC errors — log and let downstream checks
     // (sellability) be the safety net.
@@ -948,19 +1047,24 @@ export async function checkSellable(mint, decimals) {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
     if (!res.ok) {
-      // Jupiter explicitly fails when the token cannot be routed.
-      return { sellable: false, reason: `Jupiter quote ${res.status}` };
+      // Non-200 conflates a genuinely-unroutable token (400) with infra
+      // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
+      // treats !sellable as a fail (err on caution at approval time); the
+      // borrow-time re-check fails OPEN on non-definitive results.
+      return { sellable: false, definitive: false, reason: `Jupiter quote ${res.status}` };
     }
     const data = await res.json();
     if (!data?.outAmount || data.outAmount === "0") {
-      return { sellable: false, reason: "Jupiter returned no sell route" };
+      // Jupiter returned a SUCCESSFUL response with NO sell route — the
+      // clearest honeypot signal, safe for a borrow-time hard block.
+      return { sellable: false, definitive: true, reason: "Jupiter returned no sell route" };
     }
     return { sellable: true };
   } catch (err) {
     // Network errors don't necessarily mean honeypot, but we err on the
-    // side of caution and require a successful sellability check before
-    // approving anything.
-    return { sellable: false, reason: `quote check failed: ${err.message}` };
+    // side of caution at APPROVAL time and require a successful sellability
+    // check. Not definitive → the borrow-time re-check fails open on this.
+    return { sellable: false, definitive: false, reason: `quote check failed: ${err.message}` };
   }
 }
 
@@ -1114,6 +1218,17 @@ async function autoApproveToken(mint, onChain, market, holderCount, ageHours, ca
       rwa, // RWAs are auto-protected from health monitor delisting
     ],
   );
+  // WARM-ON-ENABLE (operator 2026-06-28): the screener auto-approve path
+  // previously did NOT kick feed-init/attestation (only the user /submit path
+  // did) — so a screener-approved token wasn't V4-borrow-ready for ~90-200s.
+  // Now it warms immediately: feed-init (no AccountNotInitialized) + on-demand
+  // attestation so the V4 TWAP window fills in ~24s. Best-effort.
+  try {
+    const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+    await warmMintForBorrow(mint, "screener_auto_approve");
+  } catch (e) {
+    console.warn(`[screener] warm-on-enable ${mint} failed (sweeps backstop): ${e.message?.slice(0, 100)}`);
+  }
 }
 
 async function queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category) {
@@ -1426,6 +1541,11 @@ export function registerScreenerCallbacks(bot) {
         t.has_mint_authority, t.has_freeze_authority, t.token_age_hours,
       ],
     );
+    // WARM-ON-ENABLE (operator 2026-06-28): manual approve → V4-borrow-ready now.
+    try {
+      const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+      await warmMintForBorrow(t.mint, "review_approve");
+    } catch (e) { console.warn(`[screener] warm-on-enable ${t.mint} failed: ${e.message?.slice(0, 100)}`); }
 
     await query(
       `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,
@@ -1500,6 +1620,19 @@ const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min (retained for compat)
  * Tokens that fall into manual-review-only territory stay there
  * permanently until the operator decides. That is the entire point.
  */
+// Autonomous review-determination policy (operator 2026-06-28: "we CANNOT leave
+// pending tokens in limbo... agents use best determination to APPROVE, with the
+// mindset that our offering needs to EXPAND" — while protecting downside against
+// high-rug tokens). A pending token that passes the full scam gauntlet (not
+// high-rug) and meets a collateral-VIABILITY floor is AUTO-APPROVED even if it
+// missed the strict fast-track quality bar — instead of sitting in manual limbo.
+// Concentration is relaxed from the strict 40% fast-track cap to a high-rug line
+// (genuine rug-setup territory) so moderate concentration doesn't block growth;
+// honeypot/rug/authority/extension/impersonation stay HARD rejects. All env-tunable.
+const REVIEW_AUTO_MAX_TOP10_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP10_PCT) || 65;
+const REVIEW_AUTO_MAX_TOP20_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP20_PCT) || 85;
+const REVIEW_VIABILITY_MIN_LIQ_USD = Number(process.env.REVIEW_VIABILITY_MIN_LIQ_USD) || 15000;
+
 async function processReviewQueue(bot) {
   const { rows } = await query(
     `SELECT * FROM token_screen_queue
@@ -1541,7 +1674,10 @@ async function processReviewQueue(bot) {
         const [sell, ext, conc, rug] = await Promise.all([
           checkSellable(t.mint, onChain.decimals),
           auditTokenExtensions(t.mint, { fresh: true }),
-          checkHolderConcentration(t.mint, { fresh: true }),
+          // Relaxed concentration for the autonomous expand-path: reject only
+          // genuine rug-setup concentration, not the strict 40% fast-track cap
+          // (operator wants moderate concentration to NOT block growth).
+          checkHolderConcentration(t.mint, { fresh: true, maxTop10Pct: REVIEW_AUTO_MAX_TOP10_PCT, maxTop20Pct: REVIEW_AUTO_MAX_TOP20_PCT }),
           rugcheckRisk(t.mint, { fresh: true }),
         ]);
         scamReason =
@@ -1594,35 +1730,48 @@ async function processReviewQueue(bot) {
     );
 
     if (liveVerdict !== "auto_approve") {
-      // Still doesn't meet the auto-approve bar — leave queued for
-      // manual operator review. Update the queue row with the freshest
-      // observations so /reviewtokens shows current state.
-      await query(
-        `UPDATE token_screen_queue
-            SET liquidity_usd = $2,
-                volume_24h_usd = $3,
-                market_cap_usd = $4,
-                holder_count = $5,
-                fail_reasons = $6
-          WHERE mint = $1`,
-        [
-          t.mint,
-          liveMarket.liquidity,
-          liveMarket.volume24h,
-          liveMarket.marketCap,
-          liveHolderCount,
-          liveFails,
-        ],
-      );
-      console.log(
-        `[screener] Review-queue token ${t.symbol} aged but still not auto-approvable ` +
-        `(${liveVerdict}) — leaving for manual review. Live: liq=$${Math.floor(liveMarket.liquidity)}, ` +
-        `holders=${liveHolderCount}, vol24=$${Math.floor(liveMarket.volume24h)}`,
-      );
-      continue;
+      // AUTONOMOUS DETERMINATION — NO LIMBO (operator 2026-06-28: "we CANNOT
+      // leave pending tokens in limbo; agents use best determination to APPROVE
+      // with the mindset that our offering needs to EXPAND" — while protecting
+      // downside against high-rug tokens). By reaching here the token already
+      // PASSED the full scam gauntlet above (not high-rug: sellable, no mint/
+      // freeze authority, safe extensions, not a rug, not impersonation,
+      // concentration within the relaxed high-rug line). It only missed the
+      // strict fast-track QUALITY bar. So DECIDE NOW — never leave it pending:
+      //   • meets the collateral-VIABILITY floor (liquid enough to be sold on
+      //     liquidation / V4 exit) → APPROVE (expand the offering).
+      //   • below the floor → REJECT (too illiquid to be safe collateral).
+      if (!(Number(liveMarket.liquidity) >= REVIEW_VIABILITY_MIN_LIQ_USD)) {
+        await query(
+          `UPDATE token_screen_queue
+              SET status = 'rejected', reviewed_at = NOW(),
+                  liquidity_usd = $2, volume_24h_usd = $3, market_cap_usd = $4,
+                  holder_count = $5,
+                  fail_reasons = $6
+            WHERE mint = $1`,
+          [
+            t.mint, liveMarket.liquidity, liveMarket.volume24h, liveMarket.marketCap, liveHolderCount,
+            [`insufficient liquidity for collateral ($${Math.floor(liveMarket.liquidity)} < $${REVIEW_VIABILITY_MIN_LIQ_USD} floor)`],
+          ],
+        );
+        if (t.submitted_by && bot) {
+          try {
+            await bot.api.sendMessage(
+              t.submitted_by,
+              `Your submitted token *${t.symbol}* wasn't approved — its liquidity ($${Math.floor(liveMarket.liquidity).toLocaleString()}) is below the minimum needed to safely accept it as collateral.`,
+              { parse_mode: "Markdown" },
+            );
+          } catch { /* user may have blocked bot */ }
+        }
+        console.log(`[screener] Review auto-REJECTED ${t.symbol} — below collateral viability floor (liq=$${Math.floor(liveMarket.liquidity)} < $${REVIEW_VIABILITY_MIN_LIQ_USD})`);
+        continue;
+      }
+      // Gauntlet-clean + viable → APPROVE (expand). Fall through to the promote
+      // below; nothing is left pending.
+      console.log(`[screener] Review auto-APPROVING ${t.symbol} (expand-mindset, no limbo) — gauntlet-clean + viable: liq=$${Math.floor(liveMarket.liquidity)}, holders=${liveHolderCount}, fast-track-verdict was '${liveVerdict}'`);
     }
 
-    // Token now meets the FULL auto-approve bar — promote it.
+    // Token is gauntlet-clean + viable (or hit the FULL auto-approve bar) — promote it.
     await query(
       `INSERT INTO supported_mints
          (mint, symbol, name, decimals, category, image_url, liquidity_usd,
@@ -1635,6 +1784,11 @@ async function processReviewQueue(bot) {
         liveMarket.liquidity, liveHolderCount, liveMarket.marketCap, t.token_age_hours,
       ],
     );
+    // WARM-ON-ENABLE (operator 2026-06-28): queue-promote → V4-borrow-ready now.
+    try {
+      const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+      await warmMintForBorrow(t.mint, "review_auto_promote");
+    } catch (e) { console.warn(`[screener] warm-on-enable ${t.mint} failed: ${e.message?.slice(0, 100)}`); }
 
     await query(
       `UPDATE token_screen_queue SET status = 'approved', reviewed_at = NOW() WHERE mint = $1`,

@@ -106,3 +106,41 @@ export function getRewardsDistributorMode() {
 export function getRewardsDistributorPubkey() {
   return getRewardsDistributorKeypair().publicKey;
 }
+
+// The ONE canonical CHCAM rewards wallet pubkey. Its PRIVATE key lives ONLY on
+// the operator's machine (~/.magpie-private/distribution-keypairs/MGP-001-sender.json).
+// The bot must NEVER hold it — distributions are operator-initiated local ops.
+export const CHCAM_REWARDS_PUBKEY = "CHCAMWtnmgyjsJqHcq5MdeDdg4X3Ux1XAwA2rMCXj1Ac";
+
+/**
+ * Boot-time discipline assertion. The entire autonomous-funding safety model
+ * depends on the bot running in LENDER-FALLBACK mode (it CANNOT sign for CHCAM):
+ * every CHCAM-side unwrap is a guarded no-op, and CHCAM is only ever a transfer
+ * DESTINATION. If REWARDS_DISTRIBUTOR_PRIVATE_KEY is ever set, those no-ops
+ * INVERT into active CHCAM signing and the bot holds the rewards key — exactly
+ * what the off-Railway key custody is designed to prevent.
+ *
+ * @param {{ hard?: boolean }} [opts] hard=true → throw (refuse to start) on the
+ *   dangerous private-key-set condition. Default true.
+ * @returns {{ ok: boolean, issues: string[] }}
+ */
+export function assertDistributorKeyDiscipline({ hard = true } = {}) {
+  const issues = [];
+  if (process.env.REWARDS_DISTRIBUTOR_PRIVATE_KEY) {
+    const msg =
+      "REWARDS_DISTRIBUTOR_PRIVATE_KEY is SET — the bot must NEVER hold CHCAM's private key " +
+      "(off-Railway custody). Distributions are operator-initiated local ops. Unset it on Railway.";
+    issues.push(msg);
+    console.error(`[distributor-keypair] FATAL: ${msg}`);
+    if (hard) {
+      throw new Error(`[distributor-keypair] refusing to start: ${msg}`);
+    }
+  }
+  const pub = process.env.REWARDS_DISTRIBUTOR_PUBKEY;
+  if (pub && pub !== CHCAM_REWARDS_PUBKEY) {
+    const msg = `REWARDS_DISTRIBUTOR_PUBKEY=${pub} != canonical CHCAM ${CHCAM_REWARDS_PUBKEY}`;
+    issues.push(msg);
+    console.error(`[distributor-keypair] CRIT: ${msg}`);
+  }
+  return { ok: issues.length === 0, issues };
+}

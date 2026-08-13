@@ -485,6 +485,16 @@ async function addMint(mint, symbol, name, decimals, category, candidate) {
        screened_at = NOW()`,
     [mint, symbol, name, decimals, category, candidate.liquidity],
   );
+  // WARM-ON-ENABLE (operator 2026-06-28): a newly-enabled RWA must be
+  // V4-borrow-ready in seconds, not after the next 90s feed-init sweep. Kick
+  // feed-init + on-demand attestation NOW. RWAs especially need this — the
+  // 8-sample/5-min V4 TWAP can't fill JIT for thin xStocks. Best-effort.
+  try {
+    const { warmMintForBorrow } = await import("./v4-feed-readiness.js");
+    await warmMintForBorrow(mint, "rwa_screener");
+  } catch (e) {
+    console.warn(`[rwa-screener] warm-on-enable ${mint} failed (sweeps backstop): ${e.message?.slice(0, 100)}`);
+  }
 }
 
 async function disableMint(mint, reason) {
@@ -569,11 +579,18 @@ async function tick(bot) {
         continue;
       }
       const top = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+      // AGGREGATE liquidity across ALL of this mint's pools — a sell/liquidation
+      // routes via Jupiter across every pool, so the cached liquidity_usd the
+      // borrow gate floors against must be TOTAL depth, not the single largest
+      // pool. (Single-pool under-read wrongly blocked a borrow on a multi-pool
+      // token — $ANSEM, 2026-06-30.) Price/symbol/name stay from the top pool
+      // (those are per-pair, not summed).
+      const aggLiquidityUsd = pairs.reduce((s, p) => s + (Number(p.liquidity?.usd) || 0), 0);
       const probed = {
         mint: row.mint,
         symbol: top.baseToken?.symbol || row.symbol,
         name: top.baseToken?.name || row.symbol,
-        liquidity: top.liquidity?.usd || 0,
+        liquidity: aggLiquidityUsd,
         volume24h: top.volume?.h24 || 0,
         priceUsd: parseFloat(top.priceUsd) || 0,
       };

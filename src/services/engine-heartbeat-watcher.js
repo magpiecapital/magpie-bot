@@ -149,7 +149,11 @@ async function tick(bot) {
   const now = Date.now();
   const sinceLast = now - lastAlertedAt;
   const tierEscalated = lastAlertedTier && TIERS.indexOf(crossed) > TIERS.indexOf(lastAlertedTier);
-  const enoughTimeElapsed = sinceLast > 6 * 60 * 60 * 1000;
+  // EMERGENCY (engine down 30min+) re-alerts every 1h so a prolonged outage
+  // can't go quiet after a single DM (the 2026-07-08 outage ran ~20h); WARN /
+  // CRITICAL re-alert every 6h.
+  const reAlertMs = crossed.level.includes("EMERGENCY") ? 60 * 60 * 1000 : 6 * 60 * 60 * 1000;
+  const enoughTimeElapsed = sinceLast > reAlertMs;
   if (lastAlertedTier === crossed && !tierEscalated && !enoughTimeElapsed) return;
 
   const ageMin = Math.round(staleMs / 60_000);
@@ -172,12 +176,19 @@ async function tick(bot) {
     lastAlertedAt = now;
     lastAlertedTier = crossed;
   } catch (err) {
-    console.warn("[engine-heartbeat-watch] DM failed:", err.message?.slice(0, 80));
+    console.error("[engine-heartbeat-watch] ❌ ENGINE-DOWN ALERT DM FAILED — operator NOT notified:", err.message?.slice(0, 120));
   }
 }
 
 export function startEngineHeartbeatWatcher(bot) {
-  console.log(`[engine-heartbeat-watch] started; polling every ${POLL_INTERVAL_MS / 1000}s`);
+  const adminId = getAdminId();
+  if (!adminId) {
+    console.error(
+      "[engine-heartbeat-watch] ❌ NO ADMIN ID (ADMIN_TG_ID / ADMIN_TELEGRAM_IDS / ADMIN_TELEGRAM_ID) — engine-down alerts will SILENTLY NOT SEND. Set one now, or the engine can die unnoticed (see the 2026-07-08 ~20h outage).",
+    );
+  } else {
+    console.log(`[engine-heartbeat-watch] started; polling every ${POLL_INTERVAL_MS / 1000}s; alerts → admin ${adminId}`);
+  }
   setTimeout(() => tick(bot).catch((e) => console.error("[engine-heartbeat-watch] tick:", e.message)), 60_000);
   setInterval(() => tick(bot).catch((e) => console.error("[engine-heartbeat-watch] tick:", e.message)), POLL_INTERVAL_MS);
 }

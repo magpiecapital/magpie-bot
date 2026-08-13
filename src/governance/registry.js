@@ -174,13 +174,24 @@ export const PROPOSALS = {
     question_id: "Vote",
     choices: ["A", "B", "C", "D", "ABSTAIN"],
     abstain_discretion_pct: 30.0, // ABSTAIN >= 30% of weight -> operator discretion among A-D
+    // Human labels for the announcement (maps a winning letter → "Option C — …").
+    option_labels: {
+      A: "Patience (36-month re-lock)",
+      B: "Loyalty (24-month holder vest)",
+      C: "Build (24-month locked Growth Treasury)",
+      D: "Discipline + Build (50% burn / 50% treasury)",
+    },
+    // Accurate passed-message for the operator-gated treasury allocation (no false
+    // "auto-applied" claim; reflects the tranche + no-burn). Used by buildVariables.
+    result_message_passed:
+      "Option C — Build wins. The ~50,494,118 $MAGPIE July-1 unlock moves to a NEW dedicated multi-sig Growth Treasury (hardware-key Squads vault, 48h timelock, separate from operational funds): a reserve tranche Streamflow-locked >=24 months (to 2028-07-01) + a working tranche deployable ONLY on the five pre-declared categories. NO burn — total supply unchanged. Execution is operator-signed within 14 days of the unlock; every step posts to magpie.capital/distributions with an on-chain receipt.",
     // Operator executes the winning option's Streamflow lock/burn MANUALLY (no
     // Streamflow integration in the bot). At close the autopilot DMs the operator
     // the winning option's exact instructions from this map (see pipeline.js).
     per_option_execution: {
       A: "PATIENCE — Re-lock 100% (~50M $MAGPIE) into a NEW Streamflow vesting contract: 36-month linear vest ending July 2029, same beneficiary, full unlocked balance, no cliff.",
       B: "LOYALTY — Distribute 100% (~50M) to current $MAGPIE holders via a 24-month linear Streamflow vest, pro-rata by the close snapshot (governance_snapshot_weights snapshot_id 'MGP-003_close'), ~0.137%/day each.",
-      C: "BUILD — Move 100% (~50M) to the multi-sig Magpie Treasury, Streamflow-locked >= 24 months; spend only the pre-declared categories; log on /distributions.",
+      C: "BUILD — Stand up a NEW dedicated Squads multi-sig Growth Treasury (hardware-key signer, 48h timelock, immutable config; SEPARATE from the operational fee-sweep vault). Of the 50,494,118 $MAGPIE claimed: lock a RESERVE tranche (default ~35M / ~70%) in a fresh Streamflow cliff to >=2028-07-01 (provably frozen, cancelableBySender:false, beneficiary=the vault), and hold a WORKING tranche (default ~15.49M / ~30%) liquid in the vault — deployable ONLY on the 5 pre-declared categories (deep $MAGPIE LP Raydium/Meteora; partner integrations + x402 grants; third-party audits w/ public reports; 1:1 matched LP top-ups; 30-day-noticed incentive campaigns). NO burn — supply unchanged. $MAGPIE is Token-2022 -> use the Token-2022 program for every ATA/transfer/lock. Operator-signed within 14 days; log each step on /distributions; then /gov-confirm-manual MGP-003 0.",
       D: "DISCIPLINE + BUILD — (1) Burn 50% (~25M) permanently via SPL burn from the holding wallet; (2) lock the other 50% (~25M) in the Growth Treasury (Option C terms, 24-month).",
     },
     implementation_plan: [

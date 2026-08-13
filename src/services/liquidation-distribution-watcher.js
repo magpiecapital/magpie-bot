@@ -60,9 +60,16 @@
  *   LIQUIDATION_DISTRIBUTION_TICK_MS    — default 90_000 (1.5 min)
  */
 import { query } from "../db/pool.js";
-import { PublicKey, Keypair, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
-import { connection } from "../solana/connection.js";
+import { connection, withFailover } from "../solana/connection.js";
+import { assertAllowedDestination } from "./privileged-destinations.js";
+import {
+  runPrivilegedSign,
+  recordPrivilegedSignResult,
+} from "./privileged-sign-guard.js";
+import { withLenderSpendLock } from "./lender-spend-lock.js";
+import { availableLenderNative } from "./lender-reserve.js";
 
 const TICK_MS = Number(process.env.LIQUIDATION_DISTRIBUTION_TICK_MS) || 90_000;
 const FIRST_TICK_DELAY_MS = 180_000; // wait 3 min after boot so other services init
@@ -118,13 +125,12 @@ async function lookupReferrerForBorrower(borrowerWallet) {
   };
 }
 
-// Safety buffer left in the lender wallet beyond the distributable
-// transfer amount. Covers tx fee + a tiny operational reserve. Tx fee
-// is ~5000 lamports, but we round up generously so the lender never
-// drops below a usable threshold from this code path. Note: this is
-// only used when REWARDS_DISTRIBUTOR_PUBKEY is set (i.e., we're about
-// to actually move SOL); the DB-ledger-only path doesn't need it.
-const LENDER_RESERVE_LAMPORTS = 10_000_000n; // 0.01 SOL
+// Per-tx fee headroom on top of the transfer amount. The canonical
+// 5-SOL lender gas reserve is enforced by availableLenderNative()
+// (lender-reserve.js) — this service NEVER uses its own local reserve
+// floor. See finding: the old 0.01-SOL local floor was replaced by the
+// shared reserve accounting so this path can't starve loan-origination gas.
+const TX_FEE_HEADROOM = 10_000n;
 
 /**
  * Distribute one liquidation_economics row.
@@ -165,26 +171,24 @@ async function distributeOne(row) {
   const transferAmount = holderShare + lpShare + refShare;
 
   // Pre-flight lender balance check (only when on-chain move is
-  // enabled). If lender doesn't have enough SOL for the transfer +
-  // reserve, leave the row at 'awaiting_distribution' so the next
-  // tick can retry — no claim, no credits, no SOL motion. This is
-  // the gate that makes the rest of distributeOne atomic-on-failure.
+  // enabled). Size against availableLenderNative() — the CANONICAL
+  // shared accounting that subtracts the 5-SOL gas reserve AND every
+  // unconfirmed in-flight lender spend, and fails CLOSED (0) if the read
+  // is uncertain. If the lender can't safely cover the transfer + fee,
+  // leave the row at 'awaiting_distribution' so the next tick can retry —
+  // no claim, no credits, no SOL motion. This is the gate that makes the
+  // rest of distributeOne atomic-on-failure. The authoritative check is
+  // re-run inside the shared lock right before signing.
   if (REWARDS_DISTRIBUTOR_PUBKEY && transferAmount > 0n) {
-    try {
-      const lenderBal = BigInt(await connection.getBalance(
-        getLenderKeypairForTransfer()?.publicKey,
-      ));
-      if (lenderBal < transferAmount + LENDER_RESERVE_LAMPORTS) {
-        console.warn(
-          `[liq-distribute] loan ${row.loan_id} skipped — lender balance ` +
-          `${(Number(lenderBal) / 1e9).toFixed(4)} SOL < required ` +
-          `${(Number(transferAmount + LENDER_RESERVE_LAMPORTS) / 1e9).toFixed(4)} SOL. Will retry next tick.`,
-        );
-        return { ok: false, reason: "lender_balance_too_low" };
-      }
-    } catch (err) {
-      console.warn(`[liq-distribute] loan ${row.loan_id} balance check failed: ${err.message?.slice(0, 80)} — skipping for retry`);
-      return { ok: false, reason: "balance_check_failed" };
+    const avail = await availableLenderNative(connection);
+    if (avail < transferAmount + TX_FEE_HEADROOM) {
+      console.warn(
+        `[liq-distribute] loan ${row.loan_id} skipped — lender available ` +
+        `${(Number(avail) / 1e9).toFixed(4)} SOL < required ` +
+        `${(Number(transferAmount + TX_FEE_HEADROOM) / 1e9).toFixed(4)} SOL ` +
+        `(canonical 5-SOL reserve applied). Will retry next tick.`,
+      );
+      return { ok: false, reason: "lender_balance_too_low" };
     }
   }
 
@@ -226,28 +230,129 @@ async function distributeOne(row) {
     if (!lender) {
       errors.push("on_chain_transfer: LENDER_PRIVATE_KEY missing");
     } else {
+      // DESTINATION ALLOWLIST — an env flip of REWARDS_DISTRIBUTOR_PUBKEY can
+      // only ever send to the pre-approved CHCAM rewards wallet. Fail fast
+      // before building/locking.
+      let destOk = true;
       try {
-        const tx = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: lender.publicKey,
-            toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
-            // BigInt precision: SOL amounts here are bounded by the
-            // sale_proceeds of a single liquidation (max ~10s of SOL
-            // realistically), comfortably under 2^53. Number() is safe.
-            lamports: Number(transferAmount),
-          }),
-        );
-        transferSig = await sendAndConfirmTransaction(connection, tx, [lender], {
-          commitment: "confirmed",
-          maxRetries: 3,
-        });
-        console.log(
-          `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
-          `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
-          `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${transferSig.slice(0, 24)}…`,
-        );
+        assertAllowedDestination("liquidation-distribution-watcher", REWARDS_DISTRIBUTOR_PUBKEY);
       } catch (err) {
+        destOk = false;
         errors.push(`on_chain_transfer: ${err.message?.slice(0, 80)}`);
+      }
+      if (destOk) {
+        // ONE shared lender-spend lock across EVERY 4JSS-signing service so at
+        // most one lender-spending tx is ever in flight and the canonical
+        // 5-SOL gas reserve holds ACROSS writers, not just per-tick.
+        const locked = await withLenderSpendLock(async () => {
+          // Re-check available lender native INSIDE the lock (accounts for any
+          // sibling service's just-landed spend). Fails CLOSED (0n) on an
+          // uncertain read, so we never draw toward the gas reserve.
+          const avail = await availableLenderNative(connection);
+          if (avail < transferAmount + TX_FEE_HEADROOM) {
+            return { ok: false, reason: "lender_balance_too_low" };
+          }
+
+          const { blockhash, lastValidBlockHeight } = await withFailover((c) =>
+            c.getLatestBlockhash("confirmed"),
+          );
+          const tx = new Transaction({
+            feePayer: lender.publicKey,
+            blockhash,
+            lastValidBlockHeight,
+          }).add(
+            SystemProgram.transfer({
+              fromPubkey: lender.publicKey,
+              toPubkey: REWARDS_DISTRIBUTOR_PUBKEY,
+              // BigInt precision: SOL amounts here are bounded by the
+              // sale_proceeds of a single liquidation (max ~10s of SOL
+              // realistically), comfortably under 2^53. Number() is safe.
+              lamports: Number(transferAmount),
+            }),
+          );
+
+          // GUARDED SIGN — pre-flight balance-delta simulation + audit row.
+          // Rejects any tx that decreases the lender balance beyond the
+          // declared transfer amount (+ fee headroom).
+          let guard;
+          try {
+            guard = await runPrivilegedSign({
+              service: "liquidation-distribution-watcher",
+              tx,
+              signers: [lender],
+              allowedDeltas: [
+                {
+                  pubkey: lender.publicKey,
+                  kind: "sol",
+                  maxDecrease: transferAmount + TX_FEE_HEADROOM + 5_000n,
+                },
+              ],
+            });
+          } catch (err) {
+            return { ok: false, reason: `sim_reject: ${err.message?.slice(0, 80)}` };
+          }
+
+          let sig;
+          try {
+            sig = await withFailover((c) =>
+              c.sendRawTransaction(tx.serialize(), {
+                skipPreflight: false,
+                preflightCommitment: "confirmed",
+              }),
+            );
+          } catch (err) {
+            await recordPrivilegedSignResult({
+              auditId: guard.auditId,
+              status: "failed",
+              error: err.message?.slice(0, 200),
+            });
+            return { ok: false, reason: `send: ${err.message?.slice(0, 80)}` };
+          }
+          await recordPrivilegedSignResult({ auditId: guard.auditId, status: "broadcast", txSig: sig });
+
+          // Confirm. On a confirm-timeout, do ONE history-aware status check
+          // BEFORE declaring failure — a timed-out tx may have actually
+          // landed. Only revert (retryable) when non-inclusion is unproven,
+          // so we never double-pay a landed transfer on the next tick.
+          try {
+            await withFailover((c) =>
+              c.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"),
+            );
+          } catch (err) {
+            let landed = false;
+            try {
+              const r = await withFailover((c) =>
+                c.getSignatureStatuses([sig], { searchTransactionHistory: true }),
+              );
+              const st = r?.value?.[0];
+              landed = !!(st && !st.err && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized"));
+            } catch { /* status unknown */ }
+            if (!landed) {
+              await recordPrivilegedSignResult({
+                auditId: guard.auditId,
+                status: "broadcast",
+                txSig: sig,
+                error: `confirm-timeout: ${err.message?.slice(0, 120)}`,
+              });
+              return { ok: false, reason: `confirm-timeout: ${err.message?.slice(0, 80)}` };
+            }
+          }
+          await recordPrivilegedSignResult({ auditId: guard.auditId, status: "confirmed", txSig: sig });
+          return { ok: true, sig };
+        });
+
+        if (locked.skipped) {
+          errors.push(`on_chain_transfer: ${locked.reason}`);
+        } else if (!locked.result.ok) {
+          errors.push(`on_chain_transfer: ${locked.result.reason}`);
+        } else {
+          transferSig = locked.result.sig;
+          console.log(
+            `[liq-distribute] loan ${row.loan_id} on-chain move: ` +
+            `${(Number(transferAmount) / 1e9).toFixed(4)} SOL → ` +
+            `${REWARDS_DISTRIBUTOR_PUBKEY.toBase58().slice(0, 8)}…  sig=${transferSig.slice(0, 24)}…`,
+          );
+        }
       }
     }
   }

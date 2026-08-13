@@ -105,7 +105,7 @@ export async function handleShare(ctx) {
     card.text,
     "```",
     "",
-    "_Sharing gives you credit for anyone who joins via your link. 5% of their lifetime fees ↑ to you._",
+    "_Sharing gives you credit for anyone who joins via your link. 10% of their lifetime fees ↑ to you._",
   ].join("\n");
 
   await ctx.reply(preview, {

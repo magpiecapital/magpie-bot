@@ -50,6 +50,25 @@ const READINESS_THRESHOLD_PCT = Number(process.env.V4_READINESS_THRESHOLD_PCT) |
 const ON_DEMAND_HOT_WINDOW_MS = Number(process.env.V4_ON_DEMAND_HOT_WINDOW_MS) || 5 * 60_000;
 const ON_DEMAND_LOOP_SPACING_MS = Number(process.env.V4_ON_DEMAND_LOOP_SPACING_MS) || 3_000;
 
+// FAST COLD-START BURST — the piece that guarantees first-attempt borrow
+// success on a genuinely cold token. The normal on-demand loop drips one
+// attestation per mint per 3s, so a 0→8-sample warmup takes ~30–45s. If
+// a user expands a row and clicks Borrow faster than that, they'd hit the
+// opaque "Signing…" hang. The burst queue attests a not-yet-ready mint
+// aggressively (every ~1.5s, prioritized ahead of the round-robin) until
+// it crosses the TWAP threshold — cutting cold-start to ~12–15s. Bounded:
+// at most BURST_MAX_CONCURRENT mints bursting at once, each for at most
+// BURST_MAX_ATTEMPTS attestations, then it falls back to the normal
+// on-demand cadence. Cost per cold borrow ≈ a few thousand lamports —
+// negligible, and only spent when a real user is mid-borrow on a cold mint.
+// See [[feedback_first_attempt_loan_success_cost_effective]].
+const BURST_SPACING_MS = Number(process.env.V4_BURST_SPACING_MS) || 1_500;
+const BURST_MAX_CONCURRENT = Number(process.env.V4_BURST_MAX_CONCURRENT) || 8;
+const BURST_MAX_ATTEMPTS = Number(process.env.V4_BURST_MAX_ATTEMPTS) || 14;
+// Target a small buffer above the minimum so a sample aging out mid-borrow
+// doesn't drop the feed back below threshold.
+const BURST_TARGET_SAMPLES = MIN_SAMPLES_FOR_TWAP + 1;
+
 // CONTINUOUS ALL-MINTS LOOP — the architecture that makes EVERY enabled
 // V4 mint stay warm 24/7. Operator-mandated 2026-06-19 PM:
 // "every single token... needs to pass every single sample and execute."
@@ -93,6 +112,11 @@ const state = {
   // gets aggressive attestation until it goes cold (unrequested >
   // ON_DEMAND_HOT_WINDOW_MS).
   onDemand: new Map(),       // mint → { lastRequestedAt, requestedCount, decimals }
+  // Fast cold-start burst queue. mint → { decimals, category, attempts,
+  // addedAt }. Populated by requestMintWarm when a requested mint is not
+  // yet ready; drained by burstLoop (aggressive ~1.5s attestation) the
+  // instant it crosses the TWAP threshold or exhausts BURST_MAX_ATTEMPTS.
+  burst: new Map(),
   // Continuous all-mints loop state — list of every enabled V4 mint
   // + round-robin cursor + last-refresh time + counters.
   continuousList: [],        // Array<{ mint, decimals, symbol, category }>
@@ -141,6 +165,8 @@ export function getFeedReadinessSnapshot() {
       errors_total: state.continuousErrors,
     },
     in_flight: state.inFlight.size,
+    burst_queue: state.burst.size,
+    on_demand_tracked: state.onDemand.size,
     started_at: state.startedAt,
     completed_at: state.completedAt,
     eta_seconds: etaSeconds,
@@ -314,6 +340,14 @@ export async function startFeedReadinessWarmup() {
     console.warn("[v4-readiness] on-demand loop threw:", e.message?.slice(0, 120)),
   );
 
+  // FAST COLD-START BURST LOOP — drains the burst queue every ~1.5s so a
+  // freshly-requested cold mint warms in ~12–15s (first-attempt borrow
+  // success). Idle when the queue is empty; see
+  // feedback_first_attempt_loan_success_cost_effective.
+  burstLoop(lenderPk, PROGRAM_ID_V4).catch((e) =>
+    console.warn("[v4-readiness] burst loop threw:", e.message?.slice(0, 120)),
+  );
+
   // CONTINUOUS ALL-MINTS LOOP — every enabled V4 mint stays warm 24/7.
   // Operator-mandated 2026-06-19 PM (feedback_every_mint_must_pass_every_sample).
   // This is THE architectural layer that makes the protocol non-negotiable
@@ -411,7 +445,46 @@ export async function requestMintWarm(mintStr) {
     category: row.category,
   });
   const readiness = await checkMintReadiness(mintStr);
+  // Not ready → enqueue for the fast burst so it warms in ~12–15s rather
+  // than the ~30–45s on-demand drip. Idempotent: re-requesting a mint
+  // already bursting just refreshes its slot without resetting attempts.
+  if (!readiness.ready && !state.burst.has(mintStr)) {
+    state.burst.set(mintStr, {
+      decimals: Number(row.decimals),
+      category: row.category,
+      attempts: 0,
+      addedAt: Date.now(),
+    });
+  }
   return { ok: true, ...readiness };
+}
+
+/**
+ * WARM-ON-ENABLE (operator 2026-06-28, CRITICAL): make a just-enabled token
+ * IMMEDIATELY V4-borrow-ready instead of waiting for a periodic sweep. Called
+ * synchronously by EVERY path that flips supported_mints.enabled=TRUE (screener
+ * auto-approve, RWA screener, review-queue promote, web/TG submit). It (1) inits
+ * the on-chain price-feed PDAs so a borrow never hits AccountNotInitialized, and
+ * (2) pushes the mint onto the on-demand warm queue so attestation starts within
+ * ~3s — filling the V4 TWAP window (8 samples) in ~24s instead of ~140s. New
+ * mints default to attestation_tier='hot', so the continuous attestor then keeps
+ * the window full. Best-effort (the 90s feed-init sweep + 20s attestor still
+ * backstop) — never blocks/aborts the approval. See
+ * feedback_new_token_immediately_v4_borrowable.
+ */
+export async function warmMintForBorrow(mintStr, source = "enable") {
+  try {
+    const { ensureMintFeedsInitialized } = await import("./price-attestor.js");
+    await ensureMintFeedsInitialized(mintStr);
+  } catch (e) {
+    console.warn(`[warm-on-enable] feed-init ${mintStr} failed (sweep backstops): ${e.message?.slice(0, 100)}`);
+  }
+  try {
+    await requestMintWarm(mintStr);
+  } catch (e) {
+    console.warn(`[warm-on-enable] requestMintWarm ${mintStr} failed: ${e.message?.slice(0, 100)}`);
+  }
+  console.log(`[warm-on-enable] kicked feed-init + on-demand attestation for ${mintStr} (source=${source})`);
 }
 
 async function onDemandLoop(lenderPk, programIdV4) {
@@ -443,6 +516,101 @@ async function onDemandLoop(lenderPk, programIdV4) {
 }
 
 /**
+ * Attest a single burst mint. Returns early (no attestation) if it's
+ * already at the target sample count — draining it from the queue — or if
+ * another loop is mid-attestation on it. Otherwise fires one attestation
+ * (initializing the feed PDA first if missing) and bumps its attempt
+ * counter, dropping it back to normal on-demand cadence once exhausted.
+ */
+async function processBurstMint(mint, entry, lenderPk, programIdV4) {
+  if (state.inFlight.has(mint)) return { mint, action: "in_flight_skip" };
+
+  // Already warm enough? drain from burst + mark warm.
+  const readiness = await checkMintReadiness(mint);
+  if (
+    readiness.ready &&
+    typeof readiness.samples_in_window === "number" &&
+    readiness.samples_in_window >= BURST_TARGET_SAMPLES
+  ) {
+    state.burst.delete(mint);
+    state.warmMints.add(mint);
+    return { mint, action: "burst_ready" };
+  }
+
+  state.inFlight.add(mint);
+  try {
+    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
+    try {
+      await attestPrice(mint, entry.decimals, undefined, programIdV4);
+    } catch (err) {
+      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
+        await initializePriceFeed(mint, programIdV4);
+        await attestPrice(mint, entry.decimals, undefined, programIdV4);
+      } else {
+        throw err;
+      }
+    }
+    return { mint, action: "burst_attested" };
+  } catch (err) {
+    state.lastError = `burst attest ${mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`;
+    state.lastErrorAt = new Date().toISOString();
+    return { mint, action: "burst_error" };
+  } finally {
+    state.inFlight.delete(mint);
+    entry.attempts++;
+    // Exhausted the burst budget — drop back to the normal on-demand
+    // cadence (the mint stays in state.onDemand for another few minutes).
+    if (entry.attempts >= BURST_MAX_ATTEMPTS) state.burst.delete(mint);
+  }
+}
+
+/**
+ * FAST COLD-START BURST LOOP — drains state.burst aggressively so a mint a
+ * user just showed intent on reaches its TWAP threshold in ~12–15s. Runs
+ * every BURST_SPACING_MS, processing up to BURST_MAX_CONCURRENT mints in
+ * parallel. Idle (empty queue) cost is one timer tick — no attestations,
+ * no SOL. See [[feedback_first_attempt_loan_success_cost_effective]].
+ */
+async function burstLoop(lenderPk, programIdV4) {
+  // DRAIN GUARD (security): the burst is the most aggressive attestation path
+  // (~1.5s cadence, up to BURST_MAX_ATTEMPTS/mint, unbatched) and it's reachable
+  // from the PUBLIC /warm-mint(s) beacons via requestMintWarm. If the deployer
+  // wallet is low, pause bursting entirely so a spam/IP-rotation attacker can't
+  // amplify a low balance toward drain — the batched continuous loop still keeps
+  // active-loan feeds warm. Queue is retained; it resumes when the wallet refills.
+  try {
+    const { deployerBalanceIsLow } = await import("./price-attestor.js");
+    if (await deployerBalanceIsLow()) {
+      setTimeout(() => {
+        burstLoop(lenderPk, programIdV4).catch((e) =>
+          console.warn("[v4-readiness] burst loop threw:", e.message?.slice(0, 120)),
+        );
+      }, Math.max(BURST_SPACING_MS, 10_000));
+      return;
+    }
+  } catch {
+    /* if the guard read fails, fall through — better to warm than to stall */
+  }
+
+  const mints = Array.from(state.burst.entries()).slice(0, BURST_MAX_CONCURRENT);
+  if (mints.length > 0) {
+    await Promise.all(
+      mints.map(([mint, entry]) =>
+        processBurstMint(mint, entry, lenderPk, programIdV4).catch((e) => {
+          state.burst.delete(mint);
+          return { mint, action: "burst_threw", error: e.message?.slice(0, 120) };
+        }),
+      ),
+    );
+  }
+  setTimeout(() => {
+    burstLoop(lenderPk, programIdV4).catch((e) =>
+      console.warn("[v4-readiness] burst loop threw:", e.message?.slice(0, 120)),
+    );
+  }, BURST_SPACING_MS);
+}
+
+/**
  * CONTINUOUS ALL-MINTS LOOP — the architecture that fulfills the
  * operator's 2026-06-19 PM mandate: every enabled V4 mint must
  * continuously have ≥8 fresh TWAP samples on-chain at all times.
@@ -467,60 +635,69 @@ async function onDemandLoop(lenderPk, programIdV4) {
  * worst-case 5.3 attestations/sec. Mints sitting at 10 samples don't
  * get attested until they drift to 9, then 8.
  */
+// WARM-ALL is the default (2026-07-15). Batched attestation made keeping
+// EVERY enabled token continuously warm cheap (~0.2 SOL/day for ~175 mints
+// vs ~2.3 unbatched), so we no longer leave cold-tier tokens to a slow,
+// failure-prone just-in-time warm at borrow time. Every enabled memecoin/
+// stock is kept warm 24/7 → a borrow on ANY token never hits
+// TwapInsufficientHistory / "oracle warming up". The tiered filter is kept
+// as an env-gated fallback (ATTEST_WARM_ALL=false) for when the catalog
+// grows large enough that warming everything is no longer the cheapest path
+// (then: warm the active core + burst the long tail on demand).
+// Supersedes [[feedback_tiered_attestation_cost_conscious]] for the current
+// scale. See [[feedback_first_attempt_loan_success_cost_effective]].
 async function refreshContinuousList() {
-  // Tiered attestation Phase 2 (2026-06-19 PM): filter by attestation_tier.
-  // Hot mints always in list. Warm mints included when there's borrower
-  // interest. Cold mints excluded — cosign-borrow JIT warmer handles
-  // first-borrow on cold tier.
-  // See [[feedback_tiered_attestation_cost_conscious]].
-  const { rows } = await query(
-    `WITH active_loan_mints AS (
-       SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
-     ),
-     armed_exit_mints AS (
-       SELECT DISTINCT l.collateral_mint
-         FROM limit_close_orders lc
-         JOIN loans l ON l.id = lc.loan_id
-        WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
-     ),
-     recent_intent_mints AS (
-       SELECT DISTINCT l.collateral_mint
-         FROM arm_intents ai
-         JOIN loans l ON l.loan_id::text = ai.loan_id_chain
-        WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
-     ),
-     -- Hot-on-Select beacon: site POSTs /api/v1/v4/warm-mint when user
-     -- opens the V4 exit picker, even for cold mints. Bot UNIONs that
-     -- mint into continuous attestation for the 10-min TTL so samples
-     -- accumulate during user review time. Operator-mandated 2026-06-19
-     -- PM after $TROLL hit "Markets warming up." See migration 086.
-     warming_mints AS (
-       SELECT DISTINCT mint AS collateral_mint
-         FROM mint_warming_intents
-        WHERE expires_at > NOW()
-     )
-     SELECT sm.mint, sm.decimals, sm.symbol, sm.category
-       FROM supported_mints sm
-       LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
-       LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
-       LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
-       LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
-      WHERE sm.enabled = TRUE
-        AND sm.category IN ('memecoin', 'stock')
-        AND (
-          sm.attestation_tier = 'hot'
-          -- Safety net: ANY tier (incl. cold) with borrower activity
-          -- gets auto-attested. A cold mint with active loan/arm MUST
-          -- keep its V4 feed warm or the engine can't fire exits.
-          OR sm.protected = TRUE
-          OR alm.collateral_mint IS NOT NULL
-          OR aem.collateral_mint IS NOT NULL
-          OR rim.collateral_mint IS NOT NULL
-          -- Hot-on-Select: user is staring at the V4 picker right now
-          -- for this mint; we have ~10 min to fill the TWAP window.
-          OR wm.collateral_mint IS NOT NULL
-        )`,
-  );
+  const warmAll = process.env.ATTEST_WARM_ALL !== "false"; // default ON
+  let rows;
+  if (warmAll) {
+    // Warm EVERY enabled memecoin/stock — no tier gate.
+    ({ rows } = await query(
+      `SELECT mint, decimals, symbol, category
+         FROM supported_mints
+        WHERE enabled = TRUE
+          AND category IN ('memecoin', 'stock')`,
+    ));
+  } else {
+    // Tiered fallback: hot + protected + any borrower activity/intent only.
+    ({ rows } = await query(
+      `WITH active_loan_mints AS (
+         SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active'
+       ),
+       armed_exit_mints AS (
+         SELECT DISTINCT l.collateral_mint
+           FROM limit_close_orders lc
+           JOIN loans l ON l.id = lc.loan_id
+          WHERE lc.status IN ('armed', 'firing', 'twap_in_progress', 'firing_started')
+       ),
+       recent_intent_mints AS (
+         SELECT DISTINCT l.collateral_mint
+           FROM arm_intents ai
+           JOIN loans l ON l.loan_id::text = ai.loan_id_chain
+          WHERE ai.created_at > NOW() - INTERVAL '15 minutes'
+       ),
+       warming_mints AS (
+         SELECT DISTINCT mint AS collateral_mint
+           FROM mint_warming_intents
+          WHERE expires_at > NOW()
+       )
+       SELECT sm.mint, sm.decimals, sm.symbol, sm.category
+         FROM supported_mints sm
+         LEFT JOIN active_loan_mints alm ON alm.collateral_mint = sm.mint
+         LEFT JOIN armed_exit_mints aem ON aem.collateral_mint = sm.mint
+         LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
+         LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
+        WHERE sm.enabled = TRUE
+          AND sm.category IN ('memecoin', 'stock')
+          AND (
+            sm.attestation_tier = 'hot'
+            OR sm.protected = TRUE
+            OR alm.collateral_mint IS NOT NULL
+            OR aem.collateral_mint IS NOT NULL
+            OR rim.collateral_mint IS NOT NULL
+            OR wm.collateral_mint IS NOT NULL
+          )`,
+    ));
+  }
   state.continuousList = rows.map((r) => ({
     mint: r.mint,
     decimals: Number(r.decimals),
@@ -528,51 +705,7 @@ async function refreshContinuousList() {
     category: r.category,
   }));
   state.continuousListRefreshedAt = Date.now();
-  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints`);
-}
-
-async function processContinuousMint(target, lenderPk, programIdV4) {
-  if (state.inFlight.has(target.mint)) {
-    return { mint: target.mint, action: "in_flight_skip" };
-  }
-  state.inFlight.add(target.mint);
-  try {
-    const readiness = await checkMintReadiness(target.mint);
-    const buffered =
-      readiness.ready &&
-      typeof readiness.samples_in_window === "number" &&
-      readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
-    if (buffered) {
-      state.continuousSkipped++;
-      return { mint: target.mint, action: "buffered_skip" };
-    }
-    // Fire one attestation. If feed PDA missing, init then attest.
-    const { attestPrice, initializePriceFeed } = await import("./price-attestor.js");
-    try {
-      await attestPrice(target.mint, target.decimals, undefined, programIdV4);
-    } catch (err) {
-      if (/AccountNotInitialized|account.*does not exist|0xbc4|3012/i.test(err.message || "")) {
-        try {
-          await initializePriceFeed(target.mint, programIdV4);
-          await attestPrice(target.mint, target.decimals, undefined, programIdV4);
-        } catch (initErr) {
-          state.continuousErrors++;
-          state.lastError = `init+attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${initErr.message?.slice(0, 120)}`;
-          state.lastErrorAt = new Date().toISOString();
-          return { mint: target.mint, action: "init_failed" };
-        }
-      } else {
-        state.continuousErrors++;
-        state.lastError = `attest failed for ${target.symbol || target.mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`;
-        state.lastErrorAt = new Date().toISOString();
-        return { mint: target.mint, action: "attest_failed" };
-      }
-    }
-    state.continuousAttestations++;
-    return { mint: target.mint, action: "attested" };
-  } finally {
-    state.inFlight.delete(target.mint);
-  }
+  console.log(`[v4-readiness] continuous-loop: refreshed mint list — ${state.continuousList.length} enabled V4 mints (warm_all=${warmAll})`);
 }
 
 async function continuousAllMintsLoop(lenderPk, programIdV4) {
@@ -617,25 +750,103 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
   // 2. Round-robin memecoins fill the remaining slots — same logic as before.
   const stocks = list.filter((m) => m.category === 'stock');
   const memecoins = list.filter((m) => m.category !== 'stock');
+
+  // Size the per-tick batch so the WHOLE list is cycled within a target
+  // window (default 25s, safely under the 37.5s cadence needed for 8
+  // samples in 300s) — otherwise warming ~175 mints (warm-all) with the
+  // old fixed batch of 16 would starve the memecoin round-robin and let
+  // feeds drift below threshold. Batched attestation makes the extra
+  // per-tick throughput cheap; readiness reads are lightweight. Bounded by
+  // V4_CONTINUOUS_MAX_BATCH to cap RPC per tick.
+  // See [[feedback_first_attempt_loan_success_cost_effective]].
+  const TARGET_CYCLE_MS = Number(process.env.V4_CONTINUOUS_TARGET_CYCLE_MS) || 25_000;
+  const MAX_BATCH = Number(process.env.V4_CONTINUOUS_MAX_BATCH) || 64;
+  const memeSlotsNeeded = Math.max(1, Math.ceil((memecoins.length * CONTINUOUS_BATCH_SPACING_MS) / TARGET_CYCLE_MS));
+  const effectiveConcurrency = Math.min(
+    MAX_BATCH,
+    Math.max(CONTINUOUS_CONCURRENCY, stocks.length + memeSlotsNeeded),
+  );
+
   const batch = [];
   for (const s of stocks) {
-    if (batch.length >= CONTINUOUS_CONCURRENCY) break;
+    if (batch.length >= effectiveConcurrency) break;
     batch.push(s);
   }
-  const memeSlots = CONTINUOUS_CONCURRENCY - batch.length;
+  const memeSlots = effectiveConcurrency - batch.length;
   for (let i = 0; i < memeSlots && i < memecoins.length; i++) {
     batch.push(memecoins[(state.continuousCursor + i) % memecoins.length]);
   }
   state.continuousCursor = (state.continuousCursor + memeSlots) % Math.max(memecoins.length, 1);
 
-  // Fire in parallel — each mint independently goes through readiness
-  // check + attestation.
-  await Promise.all(batch.map((m) =>
-    processContinuousMint(m, lenderPk, programIdV4).catch((e) => {
-      state.continuousErrors++;
-      return { mint: m.mint, action: "error", error: e.message?.slice(0, 120) };
+  // Readiness-filter the batch (a cheap on-chain read; buffered mints cost
+  // nothing), then BATCH the needed attestations into multi-instruction
+  // transactions — the same cost win as the main attestor tick. This is
+  // what keeps every V4 mint warm 24/7 affordably.
+  // See [[feedback_first_attempt_loan_success_cost_effective]].
+  const needy = [];
+  await Promise.all(
+    batch.map(async (m) => {
+      if (state.inFlight.has(m.mint)) return;
+      try {
+        const readiness = await checkMintReadiness(m.mint);
+        const buffered =
+          readiness.ready &&
+          typeof readiness.samples_in_window === "number" &&
+          readiness.samples_in_window >= MIN_SAMPLES_FOR_TWAP + CONTINUOUS_BUFFER_SAMPLES;
+        if (buffered) {
+          state.continuousSkipped++;
+          return;
+        }
+        needy.push(m);
+      } catch {
+        // readiness read blip — treat as needy so a feed never starves.
+        needy.push(m);
+      }
     }),
-  ));
+  );
+
+  if (needy.length > 0) {
+    try {
+      const { attestPriceBatch } = await import("./price-attestor.js");
+      const { getPricesInSolBatch, getPriceInSol } = await import("./price.js");
+      let priceMap = new Map();
+      try {
+        priceMap = await getPricesInSolBatch(needy.map((m) => m.mint));
+      } catch {
+        priceMap = new Map();
+      }
+      // Per-mint backfill for anything the batch endpoint omits (Token-2022
+      // stocks need Dex-first routing) — mirrors the main attestor tick.
+      const missing = needy.filter((m) => !priceMap.has(m.mint));
+      for (const m of missing) {
+        try {
+          const p = await getPriceInSol(m.mint);
+          if (p) priceMap.set(m.mint, p);
+        } catch {
+          /* this mint retries next tick */
+        }
+      }
+      const items = needy
+        .map((m) => ({ mint: m.mint, decimals: m.decimals, priceSol: priceMap.get(m.mint) }))
+        .filter((it) => it.priceSol && it.priceSol > 0);
+      // Guard against double-attest races with the on-demand/burst loops.
+      for (const it of items) state.inFlight.add(it.mint);
+      try {
+        const res = await attestPriceBatch(items, programIdV4, { label: "v4-continuous" });
+        state.continuousAttestations += res.attested.length;
+        state.continuousErrors += res.failed.length;
+        if (res.failed.length) {
+          state.lastError = `v4-continuous batch: ${res.failed[0].err}`;
+          state.lastErrorAt = new Date().toISOString();
+        }
+      } finally {
+        for (const it of items) state.inFlight.delete(it.mint);
+      }
+    } catch (e) {
+      state.continuousErrors++;
+      console.warn("[v4-readiness] continuous batch threw:", e.message?.slice(0, 120));
+    }
+  }
 
   setTimeout(() => continuousAllMintsLoop(lenderPk, programIdV4).catch((e) =>
     console.warn("[v4-readiness] continuous loop threw:", e.message?.slice(0, 120)),

@@ -1,5 +1,5 @@
 /**
- * Cross-post @MagpieLoans tweets into the Magpie community group.
+ * Cross-post X posts into the Magpie community group.
  *
  * Two complementary paths, ordered by operational ease:
  *
@@ -18,10 +18,11 @@
  *      worker is a no-op — manual still works.
  *
  * Defense rules:
- *   - Tweets posted to the community MUST be from @MagpieLoans
- *     specifically. Any other tweet URL is rejected. This matches the
- *     existing community URL allowlist (only @MagpieLoans tweets are
- *     allowed in the group at all).
+ *   - MANUAL /crosspost (operator-only) accepts ANY tweet URL — the
+ *     operator is trusted and explicitly chooses what to share (e.g. a
+ *     third-party account amplifying Magpie).
+ *   - The AUTO-poller only ever posts @MagpieLoans tweets (it reads that
+ *     one timeline), so unattended third-party posting never happens.
  *   - We never auto-post the SAME tweet twice — community_x_seen
  *     deduplicates by tweet ID.
  *   - The cross-post text is templated (no LLM). Zero Anthropic cost.
@@ -30,7 +31,7 @@
  *     tweet itself.
  */
 import { query } from "../db/pool.js";
-import { listEnabledChats, isAllowedUrl } from "./community-moderation.js";
+import { listEnabledChats } from "./community-moderation.js";
 
 const X_HANDLE = "MagpieLoans";
 const X_USER_ID_OVERRIDE = process.env.X_MAGPIE_USER_ID || ""; // optional speedup
@@ -39,46 +40,43 @@ const POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 /* ──────────────── SHARED CROSS-POST CORE ───────────────── */
 
-const ENGAGEMENT_LINES = [
+// Engagement lines. Magpie's own tweets keep the protocol-flavored nudge;
+// third-party crossposts use a generic (but still on-brand) amplify line.
+const MAGPIE_ENGAGEMENT_LINES = [
   `Show some love — like + retweet keeps Magpie visible on X 🦅`,
   `If this resonates, RT it — engagement on @MagpieLoans helps the protocol reach more users.`,
   `Like + reply if you have thoughts — community signal helps @MagpieLoans grow.`,
   `Help amplify on X if you're into it — RTs from holders move the needle.`,
 ];
-function pickEngagementLine() {
-  return ENGAGEMENT_LINES[Math.floor(Math.random() * ENGAGEMENT_LINES.length)];
+const GENERIC_ENGAGEMENT_LINES = [
+  `Show some love — like + RT if you're into it 🦅`,
+  `If this resonates, like + RT to help amplify.`,
+  `Like + reply if you have thoughts — community signal helps.`,
+  `Worth a look — like + RT to boost the signal.`,
+];
+function pickEngagementLine(handle) {
+  const lines = (handle || "").toLowerCase() === "magpieloans"
+    ? MAGPIE_ENGAGEMENT_LINES
+    : GENERIC_ENGAGEMENT_LINES;
+  return lines[Math.floor(Math.random() * lines.length)];
 }
 
 /**
- * Validate a tweet URL belongs to @MagpieLoans. Reuses the moderation
- * allowlist so the validation logic lives in one place.
+ * Parse { handle, id } from ANY tweet-status URL (x.com or twitter.com),
+ * or null if it isn't a tweet URL. Manual /crosspost accepts any handle
+ * (the operator is trusted and explicitly chooses what to share); the
+ * auto-poller only ever feeds @MagpieLoans URLs, so generalizing here
+ * doesn't change auto-post behavior. Query strings (?s=20) are ignored.
  */
-function isMagpieLoansTweetUrl(url) {
-  if (!isAllowedUrl(url)) return false;
+function parseTweet(url) {
   try {
     const parsed = new URL(url.startsWith("http") ? url : `https://${url}`);
     const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
-    const path = parsed.pathname.toLowerCase();
-    // Must be a TWEET URL specifically — host/MagpieLoans/status/<id>.
-    // A bare-profile URL (host/MagpieLoans) isn't a tweet, so we
-    // reject it to avoid posting profile links as if they were
-    // announcements.
-    if (!(host === "x.com" || host === "twitter.com")) return false;
-    return /^\/magpieloans\/status\/\d+/.test(path);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Extract the numeric tweet ID from a status URL. Returns null if the
- * URL isn't a valid x.com/MagpieLoans/status/<id> form.
- */
-function extractTweetId(url) {
-  try {
-    const parsed = new URL(url.startsWith("http") ? url : `https://${url}`);
-    const m = parsed.pathname.match(/^\/magpieloans\/status\/(\d+)/i);
-    return m ? m[1] : null;
+    if (!(host === "x.com" || host === "twitter.com")) return null;
+    // /<handle>/status/<id> — handle is 1-15 word chars (X username rules).
+    // A bare-profile URL (host/<handle>) has no /status/<id> and is rejected.
+    const m = parsed.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/status\/(\d+)/);
+    return m ? { handle: m[1], id: m[2] } : null;
   } catch {
     return null;
   }
@@ -117,18 +115,21 @@ async function markTweetPosted(tweetId, source) {
  * `source` is "manual" (operator-triggered) or "auto" (poller).
  */
 export async function crosspostTweet(botApi, tweetUrl, source = "manual") {
-  if (!isMagpieLoansTweetUrl(tweetUrl)) {
-    throw new Error("not a @MagpieLoans tweet URL");
+  const parsed = parseTweet(tweetUrl);
+  if (!parsed) {
+    throw new Error("not a valid tweet URL (expected x.com/<handle>/status/<id>)");
   }
-  const tweetId = extractTweetId(tweetUrl);
-  if (!tweetId) throw new Error("could not extract tweet id");
+  const { handle, id: tweetId } = parsed;
   if (await tweetAlreadyPosted(tweetId)) {
     return { skipped: true, reason: "already_posted", chats: 0 };
   }
 
-  const intro = `🐦 *New from [@MagpieLoans](${tweetUrl}) on X*`;
-  const engagement = pickEngagementLine();
-  const text = `${intro}\n\n${tweetUrl}\n\n_${engagement}_`;
+  // Normalized URL — drops tracking query strings (?s=20) so the OG
+  // preview + dedupe key are clean.
+  const cleanUrl = `https://x.com/${handle}/status/${tweetId}`;
+  const intro = `🐦 *New on X from [@${handle}](${cleanUrl})*`;
+  const engagement = pickEngagementLine(handle);
+  const text = `${intro}\n\n${cleanUrl}\n\n_${engagement}_`;
 
   let chats;
   try {

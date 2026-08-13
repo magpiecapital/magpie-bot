@@ -244,6 +244,70 @@ export async function applyStartupPatches() {
      VALUES ('9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump')
      ON CONFLICT DO NOTHING`,
 
+    // $SOLdiers — operator manual approval 2026-07-15 (full authorization →
+    // screening bypassed per feedback_operator_manual_token_approval_bypasses_screening).
+    // Verified on-chain: pump.fun memecoin, Token-2022, decimals=6, mint+freeze
+    // authority BOTH renounced, metadata-only extensions (no transfer-hook/fee/
+    // permanent-delegate = not a honeypot), ~$295k Jupiter liquidity, routable
+    // BOTH directions (buy + sell, <0.1% impact on ~$2k) so it stays liquidatable.
+    // category='memecoin' → V1 (no-exits) / V4 (with-exits). protected=TRUE =
+    // exempt from auto-disable; attestation_tier='hot' + warm-all (#599) keep the
+    // TWAP feed continuously warm so first-attempt borrows never hit a cold feed.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('B4ptaVsUe6YbtBwAS38WFeweSrVNfQLCcj9JRrtjU8vn',
+             'SOLdiers', 'SOLdiers', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from re-processing $SOLdiers through the audit pipeline.
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('B4ptaVsUe6YbtBwAS38WFeweSrVNfQLCcj9JRrtjU8vn')
+     ON CONFLICT DO NOTHING`,
+
+    // $CARDS (Collector Crypt) — operator manual approval 2026-07-31 (full green
+    // light → screening bypassed per feedback_operator_manual_token_approval_bypasses_screening).
+    // Verified on-chain: classic SPL mint, decimals=6, mint+freeze authority BOTH
+    // renounced (fixed supply, no freeze); ~$2.5M Raydium (CLMM) + Meteora liquidity,
+    // ~$1M 24h volume, price ~$0.15; Jupiter-routable to USDC (~0.002% impact) so it
+    // stays liquidatable ("collateral that can still sell itself"). It's a volatile,
+    // DEX-priced platform token — NOT a stable tokenized-stock — so category='memecoin'
+    // (standard LTV, V1 no-exit / V4 with-exit), NOT an RWA category. protected=TRUE =
+    // exempt from auto-disable; attestation_tier='hot' keeps the TWAP feed warm.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp',
+             'CARDS', 'Collector Crypt', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_approved',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_approved'`,
+
+    // Keep the screener from re-processing $CARDS through the audit pipeline.
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp')
+     ON CONFLICT DO NOTHING`,
+
     // Referral rewards ledger. One row per fee-bearing event (borrow, extend)
     // produced by a referred user. Sum of unpaid rows = claimable balance.
     `CREATE TABLE IF NOT EXISTS referral_earnings (
@@ -480,6 +544,8 @@ export async function applyStartupPatches() {
        turns INTEGER NOT NULL DEFAULT 0,
        total_input_tokens INTEGER NOT NULL DEFAULT 0,
        total_output_tokens INTEGER NOT NULL DEFAULT 0,
+       total_cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+       total_cache_write_tokens BIGINT NOT NULL DEFAULT 0,
        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        escalated_to_ticket_id BIGINT
@@ -1081,6 +1147,47 @@ export async function applyStartupPatches() {
      VALUES ('SNDKbwMUQvZhnLnxLduradgLHG5KrPuKwpnrkkGRhfH')
      ON CONFLICT DO NOTHING`,
 
+    // $BOT — RoboStrategy tokenized stock (Backpack Securities, Token-2022),
+    // operator-trusted MANUAL approval with FULL approval (2026-07-02).
+    // Identical profile to $SNDK/$MU: category='stock' so it (a) shows in the
+    // site's Tokenized Stocks column, (b) routes to V3 (no-exit) + V4 (with-exit)
+    // per chooseProgramId RWA routing, (c) is force-kept hot+protected by the
+    // stocks-rwa-protection-sentinel so it can NEVER be auto-disabled and its
+    // V3/V4 price_feed PDAs stay pre-warmed (hot tier keeps the 8-sample TWAP
+    // window filled — required for the V3/V4 TWAP gate on low-liquidity xStocks).
+    // decimals=6 + Token-2022 owner + name "RoboStrategy - Backpack Securities" +
+    // symbol BOT verified on-chain; Jupiter prices it (~$36.46) so the attestor
+    // fills the TWAP window. mint+freeze authority held by Backpack (same as
+    // $SNDK/$DRAM). ON CONFLICT re-asserts symbol/name/category/enabled/protected/
+    // hot on EVERY boot, so no health watcher / screener can take it off or
+    // mis-categorize it.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('BoTx8y9ynfdxf5ZjWtCoBVkff52qKA82ysaLU8ZM6d8T',
+             'BOT', 'RoboStrategy', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'BOT',
+       name = 'RoboStrategy',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+
+    // Keep the screener from ever re-processing $BOT (operator-trusted, exempt).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('BoTx8y9ynfdxf5ZjWtCoBVkff52qKA82ysaLU8ZM6d8T')
+     ON CONFLICT DO NOTHING`,
+
     // $QUEST — operator-trusted MANUAL approval (full approval 2026-06-23).
     // pump.fun memecoin (Token-2022, mint + freeze authority both renounced,
     // decimals=6, verified on-chain). category='memecoin' → routes V1 (no-exit) +
@@ -1153,6 +1260,481 @@ export async function applyStartupPatches() {
     `INSERT INTO token_screen_seen (mint)
      VALUES ('DRAMjSWR7HRfJKjRkvQWYL2bcaejaVhuxEcjf4pAY4Cw')
      ON CONFLICT DO NOTHING`,
+
+    // ── Backpack Securities tokenized-stock expansion (operator-trusted MANUAL
+    //    approval + full authorization 2026-07-21). Same profile as $MU/$SNDK:
+    //    category='stock' → shows in the site's Tokenized Stocks column, routes
+    //    V3 (no-exit) + V4 (with-exit) per chooseProgramId RWA routing, and is
+    //    force-kept hot+protected by the stocks-rwa-protection-sentinel so it
+    //    can NEVER be auto-disabled and its V3/V4 price_feed PDAs stay pre-warmed.
+    //    ALL THREE VERIFIED ON-CHAIN before onboarding: Token-2022 program
+    //    (TokenzQd…), decimals=6, mint+freeze authority held by Backpack (the
+    //    SAME freeze authority 2cVYpag… as the already-approved $MU — no new risk
+    //    class), and CRUCIALLY **no dangerous Token-2022 extensions** (no
+    //    permanent-delegate, transfer-hook, transfer-fee, or non-transferable —
+    //    plain base mints), and priced by DexScreener/Jupiter so the attestor can
+    //    fill the 8-sample TWAP window. ON CONFLICT re-asserts every boot.
+
+    // $INTC — Intel Corporation (Backpack Securities, Token-2022). DEX ~$200k.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('iNTCy1qTsUEZQe3DSocLz1ZXXai34Gdw8THQh5rxFaF',
+             'INTC', 'Intel Corporation', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'INTC',
+       name = 'Intel Corporation',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('iNTCy1qTsUEZQe3DSocLz1ZXXai34Gdw8THQh5rxFaF')
+     ON CONFLICT DO NOTHING`,
+
+    // $HOOD — Robinhood Markets, Inc. (Backpack Securities, Token-2022). DEX ~$473k.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('HooDYv5RewLRiMLnEVq3VJqdqxhuE6c5eYvqejMC3e9A',
+             'HOOD', 'Robinhood Markets, Inc.', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'HOOD',
+       name = 'Robinhood Markets, Inc.',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('HooDYv5RewLRiMLnEVq3VJqdqxhuE6c5eYvqejMC3e9A')
+     ON CONFLICT DO NOTHING`,
+
+    // $SKHY — SK Hynix (Backpack Securities, Token-2022). DEX ~$1.0M. Fulfills
+    // the long-standing "add $SKHY once trading" TODO (mint verified identical).
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('SKHYhSjuRWHgikq8eRKbtBbpABgJSkd7ytQV14i9EQ3',
+             'SKHY', 'SK Hynix', 6, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'SKHY',
+       name = 'SK Hynix',
+       category = 'stock',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('SKHYhSjuRWHgikq8eRKbtBbpABgJSkd7ytQV14i9EQ3')
+     ON CONFLICT DO NOTHING`,
+
+    // ─────── BACKED FINANCE xStocks (2026-07-21 diligent onboarding) ───────
+    // A second, larger source of tokenized-stock collateral beyond Backpack:
+    // Backed Finance xStocks — freely on-chain, DEX-liquid, Token-2022. Each
+    // mint below was verified on-chain this session: Token-2022 owner,
+    // decimals=8 (NOTE: xStocks are 8-dec, unlike the 6-dec Backpack stocks
+    // above — storing the wrong decimals = 100x mispricing, so it is asserted
+    // per-mint), consistent Backed issuer (mint authority 7pt9tkct… + freeze
+    // authority JDq14BWv… across the whole family), and CRITICALLY **no
+    // dangerous Token-2022 extensions** — no transfer-hook (would brick vault
+    // transfers), no permanent-delegate (seizure), no transfer-fee (over-lend),
+    // no non-transferable. Only the standard issuer freeze authority (same risk
+    // class as $MU, already accepted). Liquidity checked via DexScreener; only
+    // names ≥ ~$100k liquidity are seeded so the attestor can fill the 8-sample
+    // TWAP window. category='stock'|'etf'|'metal' → V3 (no-exit) + V4 (with-exit)
+    // RWA routing; enabled+protected+hot + screen-seen mirrors the $MU pattern,
+    // so no screener/health-watcher can ever auto-disable or re-screen them.
+    // Excluded on purpose: SPCXx (SpaceX — private co, no public price anchor,
+    // consistent with the SPCX Backpack exclusion), STRCx (niche preferred
+    // instrument), AAPLx (~$63k liquidity — below the reliable-pricing bar; the
+    // RWA screener will auto-add it once liquidity grows).
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh',
+             'NVDAx', 'NVIDIA xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'NVDAx',
+       name = 'NVIDIA xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB',
+             'TSLAx', 'Tesla xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'TSLAx',
+       name = 'Tesla xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs7ZdzSHLU9ftNJsii5fCeJhoRWSC32SQGzGQtePxNu',
+             'COINx', 'Coinbase xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'COINx',
+       name = 'Coinbase xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs7ZdzSHLU9ftNJsii5fCeJhoRWSC32SQGzGQtePxNu')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ',
+             'MSTRx', 'MicroStrategy xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'MSTRx',
+       name = 'MicroStrategy xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsvNBAYkrDRNhA7wPHQfX3ZUXZyZLdnCQDfHZ56bzpg',
+             'HOODx', 'Robinhood xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'HOODx',
+       name = 'Robinhood xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsvNBAYkrDRNhA7wPHQfX3ZUXZyZLdnCQDfHZ56bzpg')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs3eBt7uRfJX8QUs4suhyU8p2M6DoUDrJyWBa8LLZsg',
+             'AMZNx', 'Amazon.com xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'AMZNx',
+       name = 'Amazon.com xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs3eBt7uRfJX8QUs4suhyU8p2M6DoUDrJyWBa8LLZsg')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN',
+             'GOOGLx', 'Alphabet xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'GOOGLx',
+       name = 'Alphabet xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX',
+             'MSFTx', 'Microsoft xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'MSFTx',
+       name = 'Microsoft xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu',
+             'METAx', 'Meta xStock', 8, 'stock', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'METAx',
+       name = 'Meta xStock',
+       category = 'stock',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W',
+             'SPYx', 'SP500 xStock', 8, 'etf', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'SPYx',
+       name = 'SP500 xStock',
+       category = 'etf',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ',
+             'QQQx', 'Nasdaq xStock', 8, 'etf', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'QQQx',
+       name = 'Nasdaq xStock',
+       category = 'etf',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ')
+     ON CONFLICT DO NOTHING`,
+
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re',
+             'GLDx', 'Gold xStock', 8, 'metal', NULL,
+             0, 0, 0,
+             TRUE, TRUE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'hot')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'GLDx',
+       name = 'Gold xStock',
+       category = 'metal',
+       decimals = 8,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'hot',
+       source = 'operator_trusted'`,
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re')
+     ON CONFLICT DO NOTHING`,
+
+    // $PUMP — Pump.fun platform token. OPERATOR-TRUSTED EXEMPT LARGE-CAP
+    // (manual approval 2026-07-02; operator trusts it despite it not fitting
+    // the auto-screener thresholds). It was auto-removed once; this seed
+    // re-adds it AND exempts it so no screener/health-watcher can EVER take it
+    // off again. Token-2022, decimals=6, mint+freeze authority BOTH renounced
+    // (verified on-chain, CA pumpCmXq…H9Dfn). category='memecoin' → routes V1
+    // (no-exit) + V4 (with-exit, Token-2022 in-vault). attestation_tier='warm'
+    // (NOT hot on purpose): it's a deep-liquidity large-cap, so warm/JIT
+    // attestation fills the TWAP window fine at borrow time — keeps it fully
+    // borrowable WITHOUT adding to the always-on attestation burn (operator is
+    // cost-conscious on deployer SOL spend). ON CONFLICT re-asserts
+    // enabled/protected on EVERY boot = never-removed. To exempt another
+    // trusted large-cap in future, add it right here in the same two-insert form.
+    `INSERT INTO supported_mints
+       (mint, symbol, name, decimals, category, image_url,
+        liquidity_usd, holder_count, market_cap_usd,
+        has_mint_authority, has_freeze_authority, lp_burned,
+        token_age_hours, auto_approved, screened_at, source,
+        enabled, protected, attestation_tier)
+     VALUES ('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn',
+             'PUMP', 'Pump', 6, 'memecoin', NULL,
+             0, 0, 0,
+             FALSE, FALSE, FALSE,
+             0, FALSE, NOW(), 'operator_trusted',
+             TRUE, TRUE, 'warm')
+     ON CONFLICT (mint) DO UPDATE SET
+       symbol = 'PUMP',
+       name = 'Pump',
+       category = 'memecoin',
+       decimals = 6,
+       enabled = TRUE,
+       protected = TRUE,
+       attestation_tier = 'warm',
+       source = 'operator_trusted'`,
+    // Keep the screener from ever re-processing $PUMP (operator-trusted, exempt).
+    `INSERT INTO token_screen_seen (mint)
+     VALUES ('pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn')
+     ON CONFLICT DO NOTHING`,
+
+    // ─────── DEPLOYER-SPEND CONTROL: warm idle memecoins ───────
+    // Root cause of the ~2.4 SOL/day deployer attestation spend: the
+    // attestation_tier column DEFAULTS to 'hot', so EVERY approved memecoin is
+    // continuously attested forever — even idle ones never borrowed. That's the
+    // bulk of the on-chain attestation-write firehose (verified live: 61 mints
+    // continuously attested). The tiered-attestation cost design intends
+    // memecoins to be 'warm' (attested only when there's borrower interest,
+    // JIT-warmed at borrow + pre-warmed by the hot-on-select beacon). This keeps
+    // NON-protected memecoins on 'warm'. SAFE: the attestor's fetchMintsToAttest
+    // query AUTO-includes any mint with an active loan, armed/firing exit,
+    // recent arm intent, hot-on-select warming, OR protected=TRUE — regardless
+    // of tier — so this ONLY drops truly-idle, non-borrowed, non-protected
+    // memecoins from the continuous loop. Stocks/RWAs stay 'hot' (the
+    // stocks-rwa-protection-sentinel forces it). Idempotent; runs every boot to
+    // hold the cost-conscious steady state. Operator-mandated 2026-07-02:
+    // deployer daily spend 1-1.5 SOL, not ~2.5. [[feedback_tiered_attestation_cost_conscious]]
+    `UPDATE supported_mints
+        SET attestation_tier = 'warm'
+      WHERE category = 'memecoin'
+        AND protected = FALSE
+        AND attestation_tier = 'hot'`,
 
     // 2026-06-17 — Fee-wallet auto-sweeper audit ledger
     // (feedback_distribution_wallet_must_be_auto_funded.md).

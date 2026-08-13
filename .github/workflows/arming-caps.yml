@@ -1,0 +1,25 @@
+# The V4.1 arming caps decide how much collateral a borrower authorizes the
+# engine to convert. Deriving them wrongly breaks laddered exits quietly: the
+# ladder arms, fires leg 1, and every later leg is refused on-chain.
+name: arming-caps
+on:
+  pull_request:
+    paths:
+      - "src/solana/v4-arm-conversion.js"
+      - "scripts/check-arming-caps.mjs"
+      - ".github/workflows/arming-caps.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/solana/v4-arm-conversion.js"
+      - "scripts/check-arming-caps.mjs"
+jobs:
+  caps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Dependency-free on purpose — no install step to break.
+      - run: node scripts/check-arming-caps.mjs
