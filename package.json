@@ -25,6 +25,7 @@
     "check:push-subscribe": "node scripts/check-push-subscribe.mjs",
     "check:migration-checksums": "node scripts/check-migration-checksums.mjs",
     "check:borrow-reservation-race": "node scripts/check-borrow-reservation-race.mjs",
+    "check:captcha-deeplink": "node scripts/check-captcha-deeplink.mjs",
     "simulate:expiry-warnings": "node scripts/simulate-expiry-warnings.mjs"
   },
   "dependencies": {
