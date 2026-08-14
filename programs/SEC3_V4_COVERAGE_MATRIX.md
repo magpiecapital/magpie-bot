@@ -6,9 +6,11 @@ accounted for in the two live unaudited lending programs — V1 (memecoin, `magp
 `4FEFPeMH…`) and V3 (RWA, `magpie-lending-v3`, `B8AwYzFm…`) — either **ported**, **already
 covered**, **not applicable**, or **documented as an accepted design choice**.
 
-**Status:** code complete on branch `security/port-sec3-h01-v1-v3` (PR #674). **Both programs
-`cargo check` clean. Program IDs unchanged. NOT deployed** — deploy is gated on operator go + a
-migration plan at a new program id.
+**Status:** code complete on branch `security/port-sec3-h01-v1-v3` (PR #674, merged). **Both programs
+`cargo check` clean AND now build to deployable SBF `.so` artifacts** (verified 2026-08-14 — V1
+465,328 B `2621723b…`, V3 500,848 B `763d698c…`; toolchain + reproducible pin recipe in
+`V1_V3_DEPLOY_PLAN.md` §3a/§3b). **Program IDs unchanged. NOT deployed** — deploy is gated on operator
+go + a migration plan at a new program id.
 
 Legend: ✅ ported · ☑️ already covered (verified) · ⊘ not applicable · 📝 documented choice ·
 ⚠️ operator decision needed.
