@@ -45,13 +45,14 @@ Full summary and the report itself: https://github.com/magpiecapital/audits
 | Firm | Engagement status |
 | --- | --- |
 | **Sec3** | **V4 assessment COMPLETE — final report 2026-08-09 · 20 resolved · 4 acknowledged · 0 open.** V3 + credit-oracle next. |
-| **Hashlock** | Accepted collaborator; formal proposal received — engagement being finalized. |
-| **QuillAudits** | Repository access accepted; review underway. |
-| **OtterSec** | Invited to audit; awaiting response. |
-| **Neodyme** | Invited to audit; awaiting response. |
+| **Hashlock** | Read-only repository access granted; engagement not yet started. |
+| **QuillAudits** | Read-only repository access granted; engagement not yet started. |
+| **OtterSec**, **Neodyme** | Contacted; no engagement and no repository access at this time. |
 
 The audit-target program, `magpiecapital/magpie-v4`, is kept **private** during
-pre-audit review, and every engaged firm is granted **read-only** access.
+pre-audit review, and every engaged firm is granted **read-only** access. The
+table reflects verified repository access — we would rather understate an
+engagement than imply a review that is not happening.
 
 Completed reports will be published at:
 **https://github.com/magpiecapital/audits**
