@@ -1,0 +1,47 @@
+# Loan-expiry warnings are the last thing standing between a borrower and
+# losing collateral they didn't know was at risk. In August 2026 nine borrowers
+# were liquidated having received no warning at all, because the only channel
+# was Telegram and site-native accounts have no Telegram behind them.
+#
+# These two guards protect the properties that fix depends on:
+#   - a TRANSIENT delivery failure is never mistaken for a permanent one
+#     (mistaking it silently suppresses a warning that would have arrived)
+#   - the watcher never DMs a non-positive telegram_id, whose range overlaps
+#     real Telegram supergroup ids
+#   - a push subscription cannot be pointed at an internal host (SSRF), and a
+#     captured signature cannot be replayed with a different endpoint
+name: warning-delivery
+on:
+  pull_request:
+    paths:
+      - "src/services/loan-watcher.js"
+      - "src/services/telegram-delivery.js"
+      - "src/services/push-send.js"
+      - "src/api/push-subscribe.js"
+      - "scripts/check-warning-delivery.mjs"
+      - "scripts/check-push-subscribe.mjs"
+      - ".github/workflows/warning-delivery.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/services/loan-watcher.js"
+      - "src/services/telegram-delivery.js"
+      - "src/services/push-send.js"
+      - "src/api/push-subscribe.js"
+      - "scripts/check-warning-delivery.mjs"
+      - "scripts/check-push-subscribe.mjs"
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # check-warning-delivery is dependency-free, but check-push-subscribe
+      # needs tweetnacl/bs58/@solana/web3.js to build a real signed envelope.
+      - run: npm ci --ignore-scripts
+      - name: telegram delivery classification + watcher wiring
+        run: node scripts/check-warning-delivery.mjs
+      - name: push subscription validation + envelope replay resistance
+        run: node scripts/check-push-subscribe.mjs
