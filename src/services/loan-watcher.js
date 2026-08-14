@@ -318,6 +318,8 @@ async function warn24h(bot) {
       `Repay *${solOwed.toFixed(4)} SOL* to reclaim your collateral.`,
       "",
       `Tap the loan number above to open it in the dashboard, or use the buttons below.`,
+      "",
+      `💡 Worried about forgetting? /autoextend can renew this loan automatically before it expires.`,
     ].join("\n");
     const kb = new InlineKeyboard()
       .text("🔧 Repay now", `repay:loan:${row.id}`)
