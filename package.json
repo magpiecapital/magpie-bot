@@ -20,6 +20,7 @@
     "check:v41": "node scripts/check-v41-accounts.mjs",
     "check:cosign-admission": "node scripts/check-cosign-admission.mjs",
     "check:conversion-metric": "node scripts/check-conversion-metric.mjs",
+    "check:sim-compat": "node scripts/check-sim-compat.mjs",
     "check:rpc-failover": "node scripts/check-rpc-failover.mjs",
     "check:warning-delivery": "node scripts/check-warning-delivery.mjs",
     "check:push-subscribe": "node scripts/check-push-subscribe.mjs",

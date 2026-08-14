@@ -53,6 +53,7 @@ import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection, withFailover } from "../solana/connection.js";
 import { getDynamicPriorityFee } from "../solana/priority-fee.js";
+import { toVersionedForSim } from "../solana/simulate-compat.js";
 import {
   chooseProgramIdForLoan,
   getProgramForSigner,
@@ -301,8 +302,12 @@ export async function handleAgentBuildRepay(req) {
     // (i.e. the program itself rejected) blocks the response. The on-chain
     // program is the authoritative lower defense layer.
     try {
+      // Legacy Transaction + config object makes web3.js throw "Invalid
+      // arguments" client-side — this guard silently never ran (the catch
+      // below failed open on every call). Promote legacy → versioned so the
+      // (tx, config) overload is valid. [[simulate-compat.js]]
       const sim = await withFailover((conn) =>
-        conn.simulateTransaction(tx, { sigVerify: false, commitment: "confirmed" }),
+        conn.simulateTransaction(toVersionedForSim(tx), { sigVerify: false, commitment: "confirmed" }),
       );
       if (sim?.value?.err) {
         const logs = (sim.value.logs || []).slice(-5).join(" | ").slice(0, 400);
