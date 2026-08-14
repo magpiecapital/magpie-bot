@@ -1054,6 +1054,28 @@ async function maybeAnswerPipQuestion(ctx, msg, sender) {
   }
   if (!question) return false;
 
+  // ── Easter egg: "mag my fucking pie" ─────────────────────────────────────
+  // Answered BEFORE the rate limit and the LLM call: it costs nothing, should
+  // never be throttled away, and must never be paraphrased by the model into
+  // something less funny. Deterministic in, deterministic out.
+  //
+  // Mirrors the caller's own wording rather than hardcoding the profanity, so
+  // "mag my pie" gets a clean reply and "mag my fucking pie" gets the version
+  // the joke is actually about. Matched loosely (any filler between "my" and
+  // "pie") so near-misses still land.
+  const magMyPie = question.match(/\bmag\s+my\s+(.{0,20}?)\bpie\b/i);
+  if (magMyPie) {
+    const filler = (magMyPie[1] || "").trim();
+    const reply = filler
+      ? `Your ${filler} pie has been Magged. 🥧`
+      : `Your pie has been Magged. 🥧`;
+    await ctx.api.sendMessage(ctx.chat.id, reply, {
+      reply_to_message_id: msg.message_id,
+      allow_sending_without_reply: true,
+    }).catch(() => {});
+    return true;
+  }
+
   // Rate limit + safety gate
   const { checkRateLimit, answerGroupQuestion, looksLikePromptInjection } =
     await import("../services/community-pip.js");
