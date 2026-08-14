@@ -55,6 +55,7 @@ import { rejectIfSiteDisabled } from "../services/site-global.js";
 import { rejectIfLocked } from "../services/site-lock.js";
 import { getTierByOption } from "../services/loan-tier-resolver.js";
 import { isNonBorrowAttempt } from "./conversion-attempt.js";
+import { toVersionedForSim } from "../solana/simulate-compat.js";
 
 // Rolling counter of borrow failure classifications. self-monitor reads
 // this via getRecentBorrowFailures() and CRIT-alerts the operator when
@@ -390,12 +391,18 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
   // vs. RPC infrastructure issue vs. unexpected) instead of a generic
   // "oracle settling" message that masks the actual cause.
   // [[feedback_loans_must_never_fail_no_regressions]]
+  // The (tx, config) overload is ONLY valid for VersionedTransaction —
+  // with a legacy Transaction web3.js throws "Invalid arguments" client-side,
+  // which rejected every legacy-tx site borrow here (4 real borrowers turned
+  // away 2026-08-12..14, surfaced by the fixed conversion metric). Promote
+  // legacy → versioned first. [[simulate-compat.js]]
+  const txForSim = toVersionedForSim(tx);
   let sim;
   let lastSimErr = null;
   const MAX_ATTEMPTS = 4;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      sim = await withFailover((conn) => conn.simulateTransaction(tx, {
+      sim = await withFailover((conn) => conn.simulateTransaction(txForSim, {
         sigVerify: false,
         commitment: "confirmed",
         accounts: {
