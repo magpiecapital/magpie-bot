@@ -223,19 +223,28 @@ async function handleNewMembers(ctx) {
       // we auto-delete it on pass/timeout to keep the group tidy. A DM is
       // still attempted as a bonus for users who have started the bot.
       const escHtml = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
-      const kb = new InlineKeyboard()
-        .text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}:${m.id}`);
       const mins = CAPTCHA_TIMEOUT_MS / 60000;
       const mention = `<a href="tg://user?id=${m.id}">${escHtml(m.first_name || m.username || "there")}</a>`;
+      // Verification happens in the new member's OWN private DM via a deep-link
+      // — so it's genuinely theirs alone. Telegram can't hide an inline button
+      // per-user in a group, so instead of a shared callback button (which any
+      // member could tap, even if only the target could pass), the in-group
+      // post carries a URL deep-link: tapping it opens a private 1:1 with the
+      // bot and verifies THAT user (start.js, id-scoped via the payload). The
+      // deep-link also STARTS the bot, fixing the old "hasn't DM'd the bot →
+      // unreachable → kicked blind" churn problem. Other members tapping it
+      // just open their own (empty) DM — they can't touch this member's check.
+      const botUsername = ctx.me?.username;
+      const verifyKb = botUsername
+        ? new InlineKeyboard().url("✅ Tap to verify", `https://t.me/${botUsername}?start=cap_${ctx.chat.id}_${m.id}`)
+        : new InlineKeyboard().text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}:${m.id}`); // fallback if username unavailable
       const groupCaptcha =
-        `👋 Welcome ${mention}! Tap "✅ I'm not a bot" within ${mins} min to verify you're human and start chatting — this just keeps scammers out.`;
-      const dmCaptcha =
-        `👋 Welcome to the Magpie group.\n\nTap the button below within ${mins} minutes to verify you're human. If you miss it you'll be briefly removed and can rejoin any time.`;
+        `👋 Welcome ${mention}! Tap "✅ Tap to verify" within ${mins} min to confirm you're human and start chatting — it opens a quick private check with the bot. Just keeps scammers out.`;
 
       let groupPosted = false;
       try {
         const sent = await ctx.api.sendMessage(ctx.chat.id, groupCaptcha, {
-          reply_markup: kb,
+          reply_markup: verifyKb,
           parse_mode: "HTML",
           reply_to_message_id: ctx.message?.message_id,
         });
@@ -244,19 +253,13 @@ async function handleNewMembers(ctx) {
       } catch (err) {
         console.warn("[community] in-group captcha post failed:", err.message);
       }
-      let dmOk = false;
-      try {
-        await ctx.api.sendMessage(m.id, dmCaptcha, { reply_markup: kb });
-        dmOk = true;
-      } catch { /* expected for users who haven't started the bot */ }
 
-      // Fail-OPEN: only schedule a kick if the member actually had a way to
-      // see the captcha (in-group post or a delivered DM). If we couldn't
-      // reach them at all, booting them is hostile and pointless — message
-      // moderation + the impersonator ban still cover real abuse. Growing
-      // the community beats over-zealous gatekeeping.
-      if (groupPosted || dmOk) {
-        scheduleCaptchaKick(ctx, m.id, !dmOk);
+      // Fail-OPEN: only schedule a kick if we actually posted a way for them to
+      // verify. If we couldn't even post in-group, booting them is hostile and
+      // pointless — message moderation + the impersonator ban still cover abuse.
+      // Growing the community beats over-zealous gatekeeping.
+      if (groupPosted) {
+        scheduleCaptchaKick(ctx, m.id, false);
       } else {
         console.warn(`[community] captcha unreachable for ${m.id} — failing open (no kick).`);
       }
@@ -590,12 +593,44 @@ async function handleGroupMessage(ctx) {
           );
           const count = await bumpWarnedCount(ctx.chat.id, sender.id);
           const isSolicit = cat === "solicitation" || cat === "spam";
+
+          // ── Operator directive 2026-08-13: a SCAMMER who posts is removed
+          // immediately, not warned. Previously every removal was warn-only
+          // with a possible mute at strike 3, which let a wallet-drainer keep
+          // posting into the group between strikes.
+          //
+          // Scoped to SCAM/PHISHING only. Solicitation and spam stay warn-only
+          // on purpose: shilling another project is obnoxious, not theft, and
+          // banning for it would remove real members over a judgement call —
+          // the opposite of the allow-biased standard. Impersonation already
+          // bans on sight further up, so this closes the last gap.
+          //
+          // Confidence gate: only an explicit judge verdict bans. The LLM-down
+          // hard-scam fallback still DELETES but does NOT ban, because nobody
+          // should be removed on a regex alone.
+          const isScamCategory = !isSolicit;
+          const banScammer = isScamCategory && verdict && isConfidentRemoval(verdict);
+          if (banScammer) {
+            try {
+              await ctx.api.banChatMember(ctx.chat.id, sender.id);
+              await recordModAction(
+                ctx.chat.id, sender.id, "ban_scammer_post",
+                `conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}`,
+                bodyText.slice(0, 500),
+              );
+            } catch (err) {
+              // A failed ban must never swallow the delete + warning above.
+              console.warn("[community] scammer ban failed:", err.message);
+            }
+          }
           const notice = isSolicit
             ? `Hey — your message was removed because it read as solicitation/promotion (offering services, shilling another project, etc.), which we keep out of the group. Genuine questions and ideas about Magpie are always welcome — feel free to ask! 🙂`
             : `Hey — your message was removed because it matched a scam/phishing pattern we filter (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links, etc.). If that was a genuine misunderstanding, just rephrase — real questions are always welcome. 🙂`;
           await softWarn(
             ctx, sender.id,
-            notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
+            banScammer
+              ? `Your message matched a scam/phishing pattern (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links) and you have been removed from the group. If this was a genuine mistake, reply here and a human will review it.`
+              : notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
           );
           return; // removed; skip remaining checks
         }
@@ -1393,4 +1428,4 @@ export function registerCommunityHandlers(bot) {
 }
 
 /** Convenience exposed for the admin-command module to verify state. */
-export { isAdmin, handleAppealCommand };
+export { isAdmin, handleAppealCommand, clearGroupCaptcha };

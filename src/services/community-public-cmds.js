@@ -772,7 +772,7 @@ export async function handleCommunityWhitepaper(ctx) {
 
 export async function handleCommunityAudit(ctx) {
   // Honest answer — no audit REPORT has shipped yet. Sec3's assessment is
-  // complete and their SECOND review of our fixes is back (18 resolved, 4
+  // COMPLETE — final report delivered 2026-08-09 (20 resolved, 4
   // acknowledged, 2 returned and since fixed + resubmitted). Never say
   // "audited" until the final re-checked report publishes. Counts are fine to
   // share; finding MECHANICS are not — the remediated build is not deployed,
@@ -780,7 +780,7 @@ export async function handleCommunityAudit(ctx) {
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. Sec3's assessment is *complete* and their *second review* of our fixes is back. Across the engagement: *24 findings* — *18 resolved*, *4 acknowledged*, and *2* returned for more work (one of them an issue our own earlier fix introduced, which their re-review caught). Both are now fixed and *resubmitted for the final round*. Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off. *V3 + the credit-oracle program are next in line.* So the protocol is *not yet "audited"* — we don't claim that until the re-checked report ships — and remember an audit reduces risk, it doesn't eliminate it.`,
+    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. *Their final report is in, delivered 2026-08-09.* Across the engagement: *24 findings* — *20 resolved*, *4 acknowledged* (accepted with documented rationale), and *none left open*. *Both High-severity findings are resolved.* Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off, so the audited build is *not the live program yet* — which is why we say V4's assessment is complete rather than "Magpie is audited". *V3 + the credit-oracle program are next in line.* And remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -821,7 +821,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `The final audit *report* hasn't shipped yet, but *Sec3's assessment of V4 is complete and their second review of our fixes is back — 18 resolved, 4 acknowledged, 2 returned and since fixed* (see /audit). Source is open. Until the re-checked report lands, a bug anywhere in the program could result in loss of funds.`,
+    `*Sec3's final report on V4 is in* — 24 findings, *20 resolved, 4 acknowledged, none open*, both High-severity resolved (see /audit). The remediated build deploys at a new program ID after sign-off, so it isn't live yet. An audit reduces risk but doesn't eliminate it — a bug anywhere in the program could still result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,

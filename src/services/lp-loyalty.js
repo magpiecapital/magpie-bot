@@ -751,6 +751,9 @@ export async function snapshotAndDistributeLpLoyalty() {
   // confirm-reconciled (findings 3 + 4).
   const { paidCount, paidLamports } = await payLpRewardBatches(rewardRows, distributor);
 
+  // Mirror into the public audit trail. Fails soft — see the function header.
+  await syncLpLoyaltyDistributionEvent(distId);
+
   return {
     distribution_id: distId,
     pool_lamports: pool,
@@ -762,12 +765,103 @@ export async function snapshotAndDistributeLpLoyalty() {
   };
 }
 
+
+/**
+ * Mirror an LP-loyalty distribution into the `distribution_events` ledger —
+ * the table behind the PUBLIC /distributions audit trail.
+ *
+ * WHY THIS EXISTS. The holder path has called upsertDistributionEvent() since
+ * the ledger became the audit surface; this path never did. The result was a
+ * silent, six-cycle divergence between two public surfaces: as of 2026-08-13
+ * /api/v1/transparency reported 10 LP distributions while the audit trail
+ * showed 4 (lp-1, 22, 23, 24 only — everything from #25 on was missing).
+ *
+ * Derived entirely from lp_loyalty_distributions + lp_loyalty_rewards, so it is
+ * safe to run against historical ids to backfill, and idempotent
+ * (upsertDistributionEvent is ON CONFLICT (kind, external_ref) DO UPDATE).
+ *
+ * Never throws into the payout path — an analytics write must not be able to
+ * fail a distribution that already moved real SOL.
+ */
+export async function syncLpLoyaltyDistributionEvent(distributionId) {
+  try {
+    const { upsertDistributionEvent } = await import("./distribution-events.js");
+    const { rows } = await query(
+      `SELECT d.snapshot_at, d.pool_lamports, d.total_weight, d.eligible_count,
+              COUNT(r.*)                                                     AS reward_row_count,
+              COUNT(r.*) FILTER (WHERE r.status = 'paid')                    AS paid_count,
+              COUNT(r.*) FILTER (WHERE r.status = 'unpayable_rent_exempt')   AS unpayable_count,
+              COUNT(r.*) FILTER (WHERE r.status IN ('accrued','snapshot_pending')) AS unpaid_count,
+              COALESCE(SUM(r.reward_lamports) FILTER (WHERE r.status = 'paid'), 0)::numeric AS paid_lamports,
+              COALESCE(SUM(r.reward_lamports) FILTER (WHERE r.status <> 'paid'), 0)::numeric AS unpaid_lamports,
+              MIN(r.reward_lamports) FILTER (WHERE r.status = 'paid')        AS min_paid,
+              MAX(r.reward_lamports) FILTER (WHERE r.status = 'paid')        AS max_paid,
+              MIN(r.paid_at)                                                 AS paid_first_at,
+              MAX(r.paid_at)                                                 AS paid_last_at
+         FROM lp_loyalty_distributions d
+         LEFT JOIN lp_loyalty_rewards r ON r.distribution_id = d.id
+        WHERE d.id = $1
+        GROUP BY d.id`,
+      [distributionId],
+    );
+    if (rows.length === 0) {
+      console.warn(`[lp-loyalty] syncLpLoyaltyDistributionEvent: distribution ${distributionId} not found`);
+      return null;
+    }
+    const d = rows[0];
+
+    let medianPaid = null;
+    if (Number(d.paid_count) > 0) {
+      const { rows: med } = await query(
+        `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY reward_lamports::numeric) AS median
+           FROM lp_loyalty_rewards WHERE distribution_id = $1 AND status = 'paid'`,
+        [distributionId],
+      );
+      medianPaid = med[0]?.median ?? null;
+    }
+
+    // 'complete' means nothing is still payable — rent-exempt rows can never be
+    // paid, so they must not hold a finished distribution at 'partial' forever.
+    let status;
+    if (Number(d.paid_count) === 0) status = "planned";
+    else if (Number(d.unpaid_count) === 0) status = "complete";
+    else status = "partial";
+
+    return await upsertDistributionEvent({
+      kind: "lp_loyalty",
+      external_ref: `lp-${distributionId}`,
+      snapshot_at: d.snapshot_at,
+      pool_lamports: d.pool_lamports,
+      distributed_lamports: d.paid_lamports,
+      unpaid_lamports: d.unpaid_lamports,
+      eligible_wallet_count: Number(d.reward_row_count) || Number(d.eligible_count) || 0,
+      paid_wallet_count: Number(d.paid_count) || 0,
+      unpayable_wallet_count: Number(d.unpayable_count) || 0,
+      denominator_kind: "lp_shares_x_seconds_held",
+      denominator_value: d.total_weight,
+      paid_first_at: d.paid_first_at,
+      paid_last_at: d.paid_last_at,
+      min_payout_lamports: d.min_paid,
+      max_payout_lamports: d.max_paid,
+      median_payout_lamports: medianPaid,
+      source_borrow_fees_lamports: d.pool_lamports, // 10% of loan fees per MGP-001
+      source_liquidation_lamports: 0,
+      source_other_lamports: 0,
+      status,
+    });
+  } catch (err) {
+    // Analytics must never fail a distribution that already moved SOL.
+    console.error(`[lp-loyalty] distribution_events sync failed for ${distributionId}:`, err.message);
+    return null;
+  }
+}
+
 /**
  * Retry any 'accrued' rewards from prior failed batches.
  */
 export async function retryAccruedLpLoyaltyPayouts() {
   const { rows } = await query(
-    `SELECT id, wallet_address, reward_lamports
+    `SELECT id, wallet_address, reward_lamports, distribution_id
        FROM lp_loyalty_rewards
       WHERE status = 'accrued'
       ORDER BY created_at ASC
@@ -780,6 +874,13 @@ export async function retryAccruedLpLoyaltyPayouts() {
   // per-batch reserve gate means partial payment is possible — rows that don't
   // fit under the gas reserve stay 'accrued' for the next cycle.
   const { paidCount, deferred } = await payLpRewardBatches(rows, distributor);
+
+  // Re-sync every distribution these retried rows belong to, so a late payment
+  // is reflected in the public audit trail instead of leaving it stuck at the
+  // counts recorded when the distribution first ran.
+  const touched = [...new Set(rows.map((r) => r.distribution_id).filter(Boolean))];
+  for (const id of touched) await syncLpLoyaltyDistributionEvent(id);
+
   return { retried: rows.length, paid: paidCount, skipped: deferred };
 }
 
