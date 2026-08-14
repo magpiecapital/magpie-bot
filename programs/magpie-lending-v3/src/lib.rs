@@ -144,6 +144,20 @@ const TWAP_WINDOW_SECONDS: i64 = 30 * 60; // 30 min
 // ---------------------------------------------------------------------------
 
 
+/// [M-04 · Sec3] Per-update price sanity bound (fat-finger / compromised-
+/// authority blast-radius limiter, not a volatility cap).
+const MAX_PRICE_UPDATE_FACTOR: u64 = 100;
+
+fn price_change_within_bound(prev: u64, new: u64) -> bool {
+    if prev == 0 {
+        return true;
+    }
+    let prev = prev as u128;
+    let new = new as u128;
+    let factor = MAX_PRICE_UPDATE_FACTOR as u128;
+    new <= prev.saturating_mul(factor) && new.saturating_mul(factor) >= prev
+}
+
 /// [H-01 · Sec3, ported from V4 — RWA CARVE-OUT] Reject collateral mints whose
 /// Token-2022 extensions break vault custody.
 ///
@@ -289,6 +303,11 @@ pub mod magpie_lending {
         // (clock skew or replay). Time must move forward.
         if let Some(latest) = feed.latest() {
             require!(now >= latest.timestamp, ErrorCode::PriceTimestampWentBackwards);
+            // [M-04 · Sec3] Bound a single update's blast radius.
+            require!(
+                price_change_within_bound(latest.price_lamports, price_lamports),
+                ErrorCode::PriceChangeExceedsBound
+            );
         }
 
         feed.append(PriceSample {
@@ -671,11 +690,16 @@ pub mod magpie_lending {
             .ok_or(ErrorCode::MathOverflow)?;
 
         // Compute fee
+        // [I-04 · Sec3] Round the origination fee UP and require it be > 0 so a
+        // tiny loan cannot dodge the fee via floor division.
         let fee = gross_loan
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(fee > 0, ErrorCode::InvalidAmount);
 
         let net_loan = gross_loan
             .checked_sub(fee)
@@ -998,6 +1022,10 @@ pub mod magpie_lending {
     pub fn extend_loan(ctx: Context<ExtendLoan>) -> Result<()> {
         let loan = &ctx.accounts.loan;
         require!(loan.status == LoanStatus::Active, ErrorCode::LoanNotActive);
+        // [Q-02 · Sec3] An overdue loan is liquidatable and must not be
+        // extendable.
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= loan.due_timestamp, ErrorCode::LoanOverdueForExtension);
 
         // Resolve tier from the loan's stored (category, option) — the option
         // is derived from ltv_bps within the category's ladder. RWA Standard
@@ -1008,12 +1036,17 @@ pub mod magpie_lending {
             resolve_tier_for_loan(loan.category, loan.ltv_bps)
                 .ok_or(ErrorCode::InvalidLoanOption)?;
 
+        // [L-06 · Sec3] Round the extension fee UP and require > 0 so a
+        // dust-balance loan cannot be extended for free.
         let extension_fee = loan
             .repay_amount
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(extension_fee > 0, ErrorCode::InvalidAmount);
 
         // Borrower pays extension fee
         token::transfer(
@@ -1995,6 +2028,10 @@ pub enum ErrorCode {
     InvalidLoanOption,
     #[msg("Invalid collateral amount.")]
     InvalidCollateralAmount,
+    #[msg("Loan is overdue and cannot be extended")]
+    LoanOverdueForExtension,
+    #[msg("Price update exceeds the per-update sanity bound")]
+    PriceChangeExceedsBound,
     #[msg("Collateral mint carries a Token-2022 extension that breaks vault custody")]
     UnsupportedCollateralExtension,
     #[msg("Fee-on-transfer collateral is not supported: vault received less than sent")]

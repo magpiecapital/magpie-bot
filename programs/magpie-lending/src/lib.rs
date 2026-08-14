@@ -36,6 +36,21 @@ const MAX_VALUE_TOLERANCE_BPS: u64 = 300;
 // ---------------------------------------------------------------------------
 
 
+/// [M-04 · Sec3] Generous per-update price sanity bound. A single price update
+/// may not move by more than this factor in either direction — a fat-finger /
+/// compromised-authority blast-radius limiter, not a real volatility cap.
+const MAX_PRICE_UPDATE_FACTOR: u64 = 100;
+
+fn price_change_within_bound(prev: u64, new: u64) -> bool {
+    if prev == 0 {
+        return true; // first sample — nothing to bound against
+    }
+    let prev = prev as u128;
+    let new = new as u128;
+    let factor = MAX_PRICE_UPDATE_FACTOR as u128;
+    new <= prev.saturating_mul(factor) && new.saturating_mul(factor) >= prev
+}
+
 /// [H-01 · Sec3, ported from V4] Reject collateral mints whose Token-2022
 /// extensions break vault custody. V1 is MEMECOIN-ONLY, so it rejects BOTH:
 ///   - PermanentDelegate: an external delegate could move collateral OUT of the
@@ -163,9 +178,16 @@ pub mod magpie_lending {
         require!(price_lamports > 0, ErrorCode::InvalidCollateralValue);
 
         let feed = &mut ctx.accounts.price_feed;
+        let now = Clock::get()?.unix_timestamp;
+        // [M-04 · Sec3] Reject a time-travelling or grossly-wrong single update.
+        require!(now >= feed.timestamp, ErrorCode::PriceTimestampWentBackwards);
+        require!(
+            price_change_within_bound(feed.price_lamports, price_lamports),
+            ErrorCode::PriceChangeExceedsBound
+        );
         feed.price_lamports = price_lamports;
         feed.confidence_bps = confidence_bps;
-        feed.timestamp = Clock::get()?.unix_timestamp;
+        feed.timestamp = now;
 
         emit!(PriceUpdated {
             mint: feed.mint,
@@ -461,11 +483,16 @@ pub mod magpie_lending {
             .ok_or(ErrorCode::MathOverflow)?;
 
         // Compute fee
+        // [I-04 · Sec3] Round the origination fee UP and require it be > 0 so a
+        // tiny loan cannot dodge the fee via floor division.
         let fee = gross_loan
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(fee > 0, ErrorCode::InvalidAmount);
 
         let net_loan = gross_loan
             .checked_sub(fee)
@@ -766,6 +793,11 @@ pub mod magpie_lending {
     pub fn extend_loan(ctx: Context<ExtendLoan>) -> Result<()> {
         let loan = &ctx.accounts.loan;
         require!(loan.status == LoanStatus::Active, ErrorCode::LoanNotActive);
+        // [Q-02 · Sec3] An overdue loan is liquidatable and must not be
+        // extendable — otherwise a borrower could dodge liquidation by rolling
+        // at the deadline.
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= loan.due_timestamp, ErrorCode::LoanOverdueForExtension);
 
         let tier = match loan.ltv_bps {
             3_000 => 0usize,
@@ -775,12 +807,17 @@ pub mod magpie_lending {
         };
 
         let fee_bps = TIER_FEE_BPS[tier];
+        // [L-06 · Sec3] Round the extension fee UP and require it be > 0, so a
+        // dust-balance loan cannot be extended for free via floor division.
         let extension_fee = loan
             .repay_amount
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(extension_fee > 0, ErrorCode::InvalidAmount);
 
         // Borrower pays extension fee
         token::transfer(
@@ -1625,6 +1662,12 @@ pub enum ErrorCode {
     InvalidLoanOption,
     #[msg("Invalid collateral amount.")]
     InvalidCollateralAmount,
+    #[msg("Loan is overdue and cannot be extended")]
+    LoanOverdueForExtension,
+    #[msg("Price update exceeds the per-update sanity bound")]
+    PriceChangeExceedsBound,
+    #[msg("Price update timestamp went backwards")]
+    PriceTimestampWentBackwards,
     #[msg("Collateral mint carries a Token-2022 extension that breaks vault custody")]
     UnsupportedCollateralExtension,
     #[msg("Fee-on-transfer collateral is not supported: vault received less than sent")]
