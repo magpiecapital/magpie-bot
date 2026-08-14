@@ -29,13 +29,19 @@ const DEFAULTS = {
   // repay options. Earlier than the health-watcher's liquidation
   // tiers so users have time to act.
   notify_downside_alerts: true,
+  // Auto-extend (strategy doc 18): bot auto-renews a loan in the
+  // T-2h..T-30m pre-due window (fee from the user's wallet, capped at
+  // 2 per loan, skipped when underwater). Unlike auto_protect this
+  // CHARGES a fee, so it is explicit opt-in — spending is never
+  // default-on. Toggled via /autoextend.
+  auto_extend: false,
 };
 
 export async function getPrefs(userId) {
   const { rows } = await query(
     `SELECT notify_deposits, notify_loan_warnings, notify_liquidations,
             notify_health, notify_pump, auto_repay, auto_protect,
-            notify_upside_alerts, notify_downside_alerts
+            notify_upside_alerts, notify_downside_alerts, auto_extend
      FROM user_prefs WHERE user_id = $1`,
     [userId],
   );

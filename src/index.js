@@ -111,6 +111,7 @@ import { handleDistributions } from "./commands/distributions.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
 import { handleMyTickets, registerMyTicketsCallbacks } from "./commands/my-tickets.js";
 import { handleAutoProtect, registerAutoProtectCallbacks } from "./commands/autoprotect.js";
+import { handleAutoExtend, registerAutoExtendCallbacks } from "./commands/autoextend.js";
 import { handleCalendar, registerCalendarCallbacks } from "./commands/calendar.js";
 import { handleHealth } from "./commands/health.js";
 import { handleShare } from "./commands/share.js";
@@ -245,7 +246,7 @@ bot.use(rateLimit());
 // (/stats, /price, /audit, /refer, etc.) are intentionally NOT gated.
 const DM_ONLY_COMMANDS = new Set([
   "deposit", "borrow", "repay", "partialrepay", "reborrow", "withdraw",
-  "topup", "extend", "lock", "autoprotect", "protect", "tp", "sl",
+  "topup", "extend", "lock", "autoprotect", "protect", "autoextend", "tp", "sl",
   "export", "exportdata", "import", "wallet", "wallets", "switchwallet",
   "signedhistory", "me", "positions", "loans", "history",
   // Agent-delegation commands are account-scoped (they authorize a delegate to
@@ -345,6 +346,7 @@ bot.command("ticket", handleSupport); // alias
 bot.command("mytickets", handleMyTickets);
 bot.command("tickets_mine", handleMyTickets); // alias
 bot.command("autoprotect", handleAutoProtect);
+bot.command("autoextend", handleAutoExtend);
 bot.command("protect", handleAutoProtect); // alias
 bot.command("calendar", handleCalendar);
 bot.command("health", handleHealth);
@@ -645,6 +647,7 @@ registerSupportVigilCallbacks(bot);
 registerLcStalenessCallbacks(bot);
 registerLcRetryingCallbacks(bot);
 registerAutoProtectCallbacks(bot);
+registerAutoExtendCallbacks(bot);
 registerCalendarCallbacks(bot);
 registerUnlockCallbacks(bot);
 registerWalletsCallbacks(bot);
@@ -849,6 +852,7 @@ bot.start({
     setTimeout(() => startLoanWatcher(bot), 5_000);
     setTimeout(() => startHealthWatcher(bot), 10_000);
     setTimeout(() => startRiskEngine(bot), 15_000);
+    setTimeout(() => import("./services/auto-extend-watcher.js").then((m) => m.startAutoExtendWatcher(bot)), 25_000);
     setTimeout(() => startPumpWatcher(bot), 20_000);
     setTimeout(() => startTokenScreener(bot), 25_000);
     setTimeout(() => startTokenHealth(bot), 30_000);
