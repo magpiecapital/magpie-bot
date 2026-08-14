@@ -55,3 +55,6 @@ scripts/loop-withdraw-vault.js
 *.bak
 scripts/inspect-loan-*.js
 scripts/decode-partial-repay-tx.js
+
+# in-place upgrade staging (binaries, do not commit)
+programs/.upgrade-artifacts/
