@@ -720,6 +720,12 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     }
   }
 
+  // Attribute the attempt to the borrower (fee payer) as soon as the tx
+  // parses. Until 2026-08-14 nothing ever set _convCtx.wallet, so every
+  // conversion_events row — success or failure — had wallet=null and a
+  // failing borrower could never be identified or helped from the metric.
+  if (tx.feePayer) _convCtx.wallet = tx.feePayer.toBase58();
+
   // ── SECURITY GATES ──────────────────────────────────────────────
 
   // Gate 0 (NEW, post-2026-06-07 exploit): outer-program allowlist.
