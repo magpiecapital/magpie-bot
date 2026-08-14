@@ -35,7 +35,6 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
 import {
@@ -48,6 +47,8 @@ import {
 import bs58 from "bs58";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { connection, withFailover } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
+import { sendWithPriorityAndConfirm } from "../solana/tx-send.js";
 import { query } from "../db/pool.js";
 import { loadKeypair } from "../services/wallet.js";
 import { alertWithdraw } from "../services/security-alerts.js";
@@ -364,7 +365,7 @@ export async function handleSiteWithdraw(req) {
     let tx;
     if (Asset === "SOL") {
       tx = new Transaction().add(
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "site-withdraw" }) }),
         ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
         SystemProgram.transfer({
           fromPubkey: signer.publicKey,
@@ -378,7 +379,7 @@ export async function handleSiteWithdraw(req) {
       const fromAta = getAssociatedTokenAddressSync(mintPk, signer.publicKey, false, tokenProgram);
       const toAta = getAssociatedTokenAddressSync(mintPk, destPk, false, tokenProgram);
       tx = new Transaction().add(
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "site-withdraw" }) }),
         ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
         createAssociatedTokenAccountIdempotentInstruction(
           signer.publicKey,
@@ -399,7 +400,11 @@ export async function handleSiteWithdraw(req) {
         ),
       );
     }
-    signature = await sendAndConfirmTransaction(connection, tx, [signer]);
+    signature = await sendWithPriorityAndConfirm(tx, [signer], {
+      label: "site-withdraw",
+      feePayer: signer.publicKey,
+      cuLimit: 200_000,
+    });
   } catch (e) {
     await query(
       `UPDATE site_withdrawals SET status='failed', error_text=$2 WHERE id=$1`,

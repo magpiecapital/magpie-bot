@@ -22,7 +22,9 @@ import {
   isChatEnabled,
   isVerifiedAccount,
   isImpersonationName,
+  isHardImpersonation,
   matchesScamPattern,
+  matchesDmSolicitation,
   findImpersonatingHandles,
   extractUrls,
   isAllowedUrl,
@@ -40,6 +42,12 @@ import {
   CAPTCHA_TIMEOUT_MS,
 } from "../services/community-moderation.js";
 import { classifyImage, actionForImageVerdict } from "../services/community-image-ocr.js";
+import {
+  judgeCommunityPost,
+  hasSolicitationSignal,
+  isConfidentRemoval,
+  HARD_SCAM_RE,
+} from "../services/community-intent-classifier.js";
 import { findUserByTelegramId } from "../services/users.js";
 
 /**
@@ -57,6 +65,16 @@ function escMd(s) {
   if (s == null) return "";
   return String(s).replace(/([_*`\[\]()])/g, "\\$1");
 }
+
+// New-member PROACTIVE scam review: a brand-new account is the scam cohort, so
+// its substantive messages get a FULL AI judge even when nothing pre-flagged
+// them by a known coarse signal. This is how the bot catches NOVEL scam methods
+// it has no pattern for yet (operator 2026-07-04, "keep monitoring for new scam
+// methods"). Established members' chatter is never proactively judged (no
+// over-moderation, and cost stays negligible since only fresh accounts qualify).
+// Env-tunable.
+const NEW_MEMBER_JUDGE_WINDOW_HOURS = Number(process.env.NEW_MEMBER_JUDGE_WINDOW_HOURS) || 72;
+const NEW_MEMBER_JUDGE_MIN_CHARS = Number(process.env.NEW_MEMBER_JUDGE_MIN_CHARS) || 25;
 
 /**
  * Trusted members are TG users who already have a Magpie wallet through
@@ -156,23 +174,44 @@ async function handleNewMembers(ctx) {
 
       // Pip's memory: a previously-cleared member (same name) rejoining via
       // their appeal invite is not re-shamed on join or captcha-kicked again.
-      if (await isUserCleared(ctx.chat.id, m.id, nameKey(m))) continue;
+      // BUT a clearance never shields a HARD impersonation name — a cleared
+      // account that (re)joins as "D E V" / "Magpie Support" / "Ðev" is still
+      // banned (closes the name-agnostic-clearance weaponization).
+      if (!isHardImpersonation(m) && (await isUserCleared(ctx.chat.id, m.id, nameKey(m)))) continue;
 
-      // Impersonation check on join — fastest way to catch
-      // fake-support accounts.
+      // Impersonation check on join — BAN immediately, don't just warn.
+      // Impersonation IS the attack (there's no legitimate reason to join
+      // named "Magpie Matt" / "Mapgie Support"), so we remove them BEFORE
+      // they can post a single scam message — closing the join→first-post
+      // window (and the case where the bot misses the first message during a
+      // restart). Verified accounts + appeal-cleared users are already exempt
+      // (isVerifiedAccount here; isUserCleared checked at the top of the loop).
+      // False positives recover instantly via the /appeal path in softWarn.
       if (isImpersonationName(m) && !isVerifiedAccount(m)) {
+        try { await ctx.api.banChatMember(ctx.chat.id, m.id); }
+        catch (err) { console.warn("[community] impersonator join-ban failed:", err.message); }
         await recordModAction(
-          ctx.chat.id, m.id, "warn_impersonation_join",
-          "name contains impersonation pattern",
+          ctx.chat.id, m.id, "ban_impersonator_join",
+          "name matches impersonation pattern (banned on join)",
           JSON.stringify({ username: m.username, first: m.first_name, last: m.last_name }),
         );
+        await softWarn(
+          ctx, m.id,
+          `You were removed from the Magpie community because your name matched our Magpie-staff impersonation filter.\n\n` +
+          `If you're a real member and this was a mistake, reply /appeal and Pip will review it instantly and let you back in if it was wrong.`,
+        );
         try {
-          await ctx.api.sendMessage(
-            ctx.chat.id,
-            `⚠️ *Heads up:* a new account named "${m.first_name || m.username}" just joined and uses a name that resembles official Magpie support. Never DM strangers about your wallet. The only official account is @magpie_capital_bot.`,
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            { api: ctx.api },
+            `🛡 *Magpie impersonator banned on JOIN*\n\n` +
+            `*Name:* ${m.username ? `@${m.username}` : (m.first_name || m.id)}\n` +
+            `*ID:* \`${m.id}\`\n\n` +
+            `Removed before they could post. \`/unban ${m.id}\` if a false positive.`,
             { parse_mode: "Markdown" },
           );
-        } catch { /* permission issue — skip */ }
+        } catch { /* silent */ }
+        continue; // banned — don't captcha-challenge them
       }
 
       // Captcha. Post it IN THE GROUP so the new member can actually SEE
@@ -184,19 +223,28 @@ async function handleNewMembers(ctx) {
       // we auto-delete it on pass/timeout to keep the group tidy. A DM is
       // still attempted as a bonus for users who have started the bot.
       const escHtml = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
-      const kb = new InlineKeyboard()
-        .text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}:${m.id}`);
       const mins = CAPTCHA_TIMEOUT_MS / 60000;
       const mention = `<a href="tg://user?id=${m.id}">${escHtml(m.first_name || m.username || "there")}</a>`;
+      // Verification happens in the new member's OWN private DM via a deep-link
+      // — so it's genuinely theirs alone. Telegram can't hide an inline button
+      // per-user in a group, so instead of a shared callback button (which any
+      // member could tap, even if only the target could pass), the in-group
+      // post carries a URL deep-link: tapping it opens a private 1:1 with the
+      // bot and verifies THAT user (start.js, id-scoped via the payload). The
+      // deep-link also STARTS the bot, fixing the old "hasn't DM'd the bot →
+      // unreachable → kicked blind" churn problem. Other members tapping it
+      // just open their own (empty) DM — they can't touch this member's check.
+      const botUsername = ctx.me?.username;
+      const verifyKb = botUsername
+        ? new InlineKeyboard().url("✅ Tap to verify", `https://t.me/${botUsername}?start=cap_${ctx.chat.id}_${m.id}`)
+        : new InlineKeyboard().text("✅ I'm not a bot", `comm:captcha:${ctx.chat.id}:${m.id}`); // fallback if username unavailable
       const groupCaptcha =
-        `👋 Welcome ${mention}! Tap "✅ I'm not a bot" within ${mins} min to verify you're human and start chatting — this just keeps scammers out.`;
-      const dmCaptcha =
-        `👋 Welcome to the Magpie group.\n\nTap the button below within ${mins} minutes to verify you're human. If you miss it you'll be briefly removed and can rejoin any time.`;
+        `👋 Welcome ${mention}! Tap "✅ Tap to verify" within ${mins} min to confirm you're human and start chatting — it opens a quick private check with the bot. Just keeps scammers out.`;
 
       let groupPosted = false;
       try {
         const sent = await ctx.api.sendMessage(ctx.chat.id, groupCaptcha, {
-          reply_markup: kb,
+          reply_markup: verifyKb,
           parse_mode: "HTML",
           reply_to_message_id: ctx.message?.message_id,
         });
@@ -205,19 +253,13 @@ async function handleNewMembers(ctx) {
       } catch (err) {
         console.warn("[community] in-group captcha post failed:", err.message);
       }
-      let dmOk = false;
-      try {
-        await ctx.api.sendMessage(m.id, dmCaptcha, { reply_markup: kb });
-        dmOk = true;
-      } catch { /* expected for users who haven't started the bot */ }
 
-      // Fail-OPEN: only schedule a kick if the member actually had a way to
-      // see the captcha (in-group post or a delivered DM). If we couldn't
-      // reach them at all, booting them is hostile and pointless — message
-      // moderation + the impersonator ban still cover real abuse. Growing
-      // the community beats over-zealous gatekeeping.
-      if (groupPosted || dmOk) {
-        scheduleCaptchaKick(ctx, m.id, !dmOk);
+      // Fail-OPEN: only schedule a kick if we actually posted a way for them to
+      // verify. If we couldn't even post in-group, booting them is hostile and
+      // pointless — message moderation + the impersonator ban still cover abuse.
+      // Growing the community beats over-zealous gatekeeping.
+      if (groupPosted) {
+        scheduleCaptchaKick(ctx, m.id, false);
       } else {
         console.warn(`[community] captcha unreachable for ${m.id} — failing open (no kick).`);
       }
@@ -257,9 +299,15 @@ function scheduleCaptchaKick(ctx, userId, dmFailed) {
       // Pip's memory: a previously-cleared member (appeal / operator unban)
       // who rejoined is not re-kicked for missing the captcha.
       if (await isUserCleared(ctx.chat.id, userId)) { await clearGroupCaptcha(ctx.api, ctx.chat.id, userId); return; }
-      // Kick (= ban for 30s then unban, lets them rejoin if real)
-      const until = Math.floor(Date.now() / 1000) + 30;
-      await ctx.api.banChatMember(ctx.chat.id, userId, { until_date: until });
+      // Kick the captcha-misser but DO NOT leave them banned — a real member
+      // who missed it must be able to rejoin and retry. CRITICAL BUG (fixed
+      // 2026-06-30): a short until_date is unsafe — Telegram treats a ban of
+      // < 30s (or > 366 days) as PERMANENT, so the old `now + 30` silently
+      // PERMABANNED users under any processing latency (it false-permabanned 11
+      // real members, incl. @Jmackbjm). Ban-then-unban is the reliable "kick":
+      // it removes them with NO lingering ban so the invite link works on retry.
+      await ctx.api.banChatMember(ctx.chat.id, userId);
+      await ctx.api.unbanChatMember(ctx.chat.id, userId, { only_if_banned: true });
       await clearGroupCaptcha(ctx.api, ctx.chat.id, userId);
       await recordModAction(
         ctx.chat.id, userId, "kick_captcha_timeout",
@@ -307,16 +355,15 @@ async function handleCaptchaCallback(ctx) {
     } catch { /* edit might fail if msg was deleted — silent */ }
     await recordModAction(chatId, userId, "captcha_pass", null, null);
 
-    // Post a warm in-group welcome. Static template, no LLM cost.
-    // The captcha message above lives in the user's DM with the bot —
-    // they need to see something IN the group too so the rest of the
-    // community knows someone new is here, and so the new member feels
-    // greeted rather than "you passed a test, now figure it out".
+    // Warm welcome — sent PRIVATELY to the new member (operator 2026-06-30:
+    // no longer broadcast to the whole group, which was noise for everyone
+    // else). The user already saw the per-user pass toast above; this DM is a
+    // bonus greeting and silently skips if they haven't started the bot.
     try {
       const { postCaptchaWelcome } = await import("../services/community-proactive.js");
       await postCaptchaWelcome(ctx.api, chatId, ctx.callbackQuery.from);
     } catch (err) {
-      console.warn("[community] welcome post failed (non-critical):", err.message);
+      console.warn("[community] welcome DM failed (non-critical):", err.message);
     }
   } catch (err) {
     console.warn("[community] captcha callback failed:", err.message);
@@ -382,7 +429,12 @@ async function handleGroupMessage(ctx) {
     // pointless (they'd be banned again on their next message). Name-scoped:
     // if a cleared user RENAMES into a fresh impersonation pattern, the
     // clearance no longer applies and the ban fires.
-    if (isImpersonationName(sender) && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+    // A HARD impersonation name (exact brand / homoglyph / bare-or-spaced
+    // role word) is banned even if the account is cleared — no clearance,
+    // not even a name-agnostic operator /unban, shields a blatant
+    // impersonation handle. Only the fuzzy-lookalike layer stays
+    // clearance-protectable (see isHardImpersonation).
+    if (isImpersonationName(sender) && (isHardImpersonation(sender) || !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender))))) {
       await tryDelete(ctx, msg.message_id);
       try {
         await ctx.api.banChatMember(ctx.chat.id, sender.id);
@@ -432,64 +484,170 @@ async function handleGroupMessage(ctx) {
       return;
     }
 
-    // ── URL allowlist ───────────────────────────────────────
-    const urls = extractUrls(msg);
-    for (const u of urls) {
-      if (!isAllowedUrl(u)) {
+    // ── Links are no longer auto-deleted ────────────────────
+    // A non-allowlisted link is now just ONE signal into Pip's judgement
+    // block below — a real user asking "are you on the App Store? <link>"
+    // must never be removed merely for including a link. (operator
+    // 2026-06-30: "we cant just delete their posts or boot them.")
+
+    // ── Screenshot + "DM me" → PERMANENT BAN (operator-mandated 2026-06-30) ──
+    // A photo whose caption solicits a DM ("DM me to claim", "message admin")
+    // is the canonical screenshot-phishing setup: an image for credibility +
+    // a redirect to a scammer DM. Unlike a plain-text "DM me" (deleted + warned
+    // below), the screenshot form is a deliberate scam → delete + PERMANENT
+    // ban. (In-image text with no caption is caught by the vision classifier.)
+    {
+      const hasImage = !!(msg.photo || (msg.document && /^image\//.test(msg.document.mime_type || "")));
+      const dmSolicit = hasImage ? matchesDmSolicitation(msg.caption || msg.text || "") : null;
+      if (dmSolicit && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
         await tryDelete(ctx, msg.message_id);
-        await recordModAction(ctx.chat.id, sender.id, "delete_link", "url not on allowlist", u);
-        const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-        await softWarn(
-          ctx,
-          sender.id,
-          `Your message was removed from the Magpie community group because it contained a link.\n\n` +
-          `*Only tweets from the official @MagpieLoans X account are allowed.* This is to keep scammers and phishing links out — almost every other "useful link" in a DeFi community turns out to be a scam.\n\n` +
-          `Allowed format: https://x.com/MagpieLoans/... or https://twitter.com/MagpieLoans/...` +
-          (count >= 3 ? `\n\nThis is warning #${count}. Repeated removals may result in a temporary mute.` : ``),
+        try { await ctx.api.banChatMember(ctx.chat.id, sender.id); }
+        catch (err) { console.warn("[community] screenshot-DM ban failed:", err.message); }
+        await recordModAction(
+          ctx.chat.id, sender.id, "ban_screenshot_dm_solicitation",
+          dmSolicit, msg.caption || msg.text || null,
         );
-        return; // already removed; don't run other checks
+        await softWarn(
+          ctx, sender.id,
+          `You were removed from the Magpie community for posting a screenshot soliciting DMs — a classic phishing pattern. If this was a genuine mistake, reply /appeal and Pip will review it.`,
+        );
+        try {
+          const { notifyAdmin } = await import("../services/admin-notify.js");
+          await notifyAdmin(
+            { api: ctx.api },
+            `🛡 *Screenshot-DM scammer banned*\n\n` +
+            `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
+            `*ID:* \`${sender.id}\`\n` +
+            `*Caption:* ${(msg.caption || msg.text || "(none)").slice(0, 200)}\n\n` +
+            `Auto-deleted + banned. \`/unban ${sender.id}\` if a false positive.`,
+            { parse_mode: "Markdown" },
+          );
+        } catch { /* silent */ }
+        return;
       }
     }
 
-    // ── Scam pattern (non-impersonator users) ──────────────
-    // Impersonators are already banned above, so anyone reaching here
-    // is a regular user posting a phishing-shaped phrase. Delete +
-    // warn via the strike ladder.
-    const scam = matchesScamPattern(msg.text || msg.caption || "");
-    if (scam) {
-      await tryDelete(ctx, msg.message_id);
-      await recordModAction(ctx.chat.id, sender.id, "delete_scam_pattern", scam, msg.text || msg.caption);
-      const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-      await softWarn(
-        ctx,
-        sender.id,
-        `Your message was removed from the Magpie group — it matched a pattern we automatically flag (seed phrase requests, "send X SOL", "DM me", "claim airdrop", etc.). If this was a misunderstanding, just rephrase.` +
-        (count >= 3 ? `\n\n#${count} warning. Repeated matches may result in a mute.` : ``),
-      );
-      return;
+    // ── Pip's judgement on flagged content (operator 2026-06-30) ──
+    // Coarse signals — a non-allowlisted link, scam-shaped phrasing, an
+    // unofficial Magpie handle, or service-solicitation markers — DO NOT
+    // auto-delete. They only FLAG the post; Pip then judges whether it's a
+    // genuine user (question / idea / interest / criticism → KEEP) or a
+    // scam / solicitation (→ remove). Operator mandate, verbatim: "if they
+    // are asking clear questions or giving ideas or showing interest in
+    // the Magpie platform, we cant just delete their posts or boot them.
+    // Pip really needs to use their best judgement with every single post."
+    {
+      const bodyText = msg.text || msg.caption || "";
+      const badUrls = extractUrls(msg).filter((u) => !isAllowedUrl(u));
+      const scamHit = matchesScamPattern(bodyText);
+      const handleHits = findImpersonatingHandles(bodyText);
+      const solicits = hasSolicitationSignal(bodyText);
+      const flagged = badUrls.length || scamHit || handleHits.length || solicits;
+
+      // New-member PROACTIVE check: even with NO known coarse signal, a
+      // substantive message from a brand-new account gets a full AI judge, so a
+      // never-seen scam phrasing (novel migration/airdrop/etc.) is still caught.
+      const member = await getMember(ctx.chat.id, sender.id);
+      const memberAgeHours = member?.joined_at
+        ? (Date.now() - new Date(member.joined_at).getTime()) / 3_600_000
+        : null;
+      const proactiveNewMember =
+        !flagged &&
+        memberAgeHours != null &&
+        memberAgeHours < NEW_MEMBER_JUDGE_WINDOW_HOURS &&
+        bodyText.trim().length >= NEW_MEMBER_JUDGE_MIN_CHARS;
+
+      if ((flagged || proactiveNewMember) && !(await isUserCleared(ctx.chat.id, sender.id, nameKey(sender)))) {
+        const signalParts = [];
+        if (badUrls.length) signalParts.push(`link not on allowlist: ${badUrls.join(", ").slice(0, 180)}`);
+        if (scamHit) signalParts.push(`scam-phrase: ${scamHit}`);
+        if (handleHits.length) signalParts.push(`unofficial handle: ${handleHits.join(", ")}`);
+        if (solicits) signalParts.push(`possible solicitation`);
+        if (proactiveNewMember) signalParts.push(`new-member proactive check (${Math.round(memberAgeHours)}h old)`);
+
+        const verdict = await judgeCommunityPost(bodyText, {
+          signal: signalParts.join(" · "),
+          member_age_hours: memberAgeHours,
+          has_link: badUrls.length > 0,
+        });
+
+        // Heavy ALLOW bias. On LLM failure (verdict == null) fail OPEN
+        // (keep) for soft signals; fail CLOSED (remove) ONLY for an
+        // unambiguous hard-scam phrase, which a real user essentially never
+        // types — so a wallet-drainer can't slip through during an LLM
+        // outage, yet a genuine post is never deleted on uncertainty. For a
+        // PROACTIVE (unflagged) new-member check we NEVER fall back to removal
+        // on LLM failure — fail fully open so a normal newcomer post is never
+        // deleted just because the model was briefly down.
+        const remove = verdict
+          ? isConfidentRemoval(verdict)
+          : (flagged && HARD_SCAM_RE.test(bodyText));
+
+        if (remove) {
+          await tryDelete(ctx, msg.message_id);
+          const cat = verdict?.category || (scamHit ? "scam" : solicits ? "solicitation" : "scam");
+          await recordModAction(
+            ctx.chat.id, sender.id, `judge_remove_${cat}`,
+            `${verdict ? `conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}` : "LLM down → hard-scam fallback"} · ${signalParts.join(" · ")}`,
+            bodyText.slice(0, 500),
+          );
+          const count = await bumpWarnedCount(ctx.chat.id, sender.id);
+          const isSolicit = cat === "solicitation" || cat === "spam";
+
+          // ── Operator directive 2026-08-13: a SCAMMER who posts is removed
+          // immediately, not warned. Previously every removal was warn-only
+          // with a possible mute at strike 3, which let a wallet-drainer keep
+          // posting into the group between strikes.
+          //
+          // Scoped to SCAM/PHISHING only. Solicitation and spam stay warn-only
+          // on purpose: shilling another project is obnoxious, not theft, and
+          // banning for it would remove real members over a judgement call —
+          // the opposite of the allow-biased standard. Impersonation already
+          // bans on sight further up, so this closes the last gap.
+          //
+          // Confidence gate: only an explicit judge verdict bans. The LLM-down
+          // hard-scam fallback still DELETES but does NOT ban, because nobody
+          // should be removed on a regex alone.
+          const isScamCategory = !isSolicit;
+          const banScammer = isScamCategory && verdict && isConfidentRemoval(verdict);
+          if (banScammer) {
+            try {
+              await ctx.api.banChatMember(ctx.chat.id, sender.id);
+              await recordModAction(
+                ctx.chat.id, sender.id, "ban_scammer_post",
+                `conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}`,
+                bodyText.slice(0, 500),
+              );
+            } catch (err) {
+              // A failed ban must never swallow the delete + warning above.
+              console.warn("[community] scammer ban failed:", err.message);
+            }
+          }
+          const notice = isSolicit
+            ? `Hey — your message was removed because it read as solicitation/promotion (offering services, shilling another project, etc.), which we keep out of the group. Genuine questions and ideas about Magpie are always welcome — feel free to ask! 🙂`
+            : `Hey — your message was removed because it matched a scam/phishing pattern we filter (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links, etc.). If that was a genuine misunderstanding, just rephrase — real questions are always welcome. 🙂`;
+          await softWarn(
+            ctx, sender.id,
+            banScammer
+              ? `Your message matched a scam/phishing pattern (seed-phrase or private-key asks, "DM me to claim", fake airdrops, drainer links) and you have been removed from the group. If this was a genuine mistake, reply here and a human will review it.`
+              : notice + (count >= 3 ? `\n\n(Heads up: warning #${count} — repeated removals may lead to a temporary mute.)` : ``),
+          );
+          return; // removed; skip remaining checks
+        }
+
+        // KEPT — log Pip's rescue so the operator can see judgement at work.
+        await recordModAction(
+          ctx.chat.id, sender.id, "judge_keep",
+          `${verdict ? `${verdict.category} · conf=${verdict.confidence.toFixed(2)} · ${verdict.reason}` : "LLM unavailable → kept (favor the user)"} · ${signalParts.join(" · ")}`,
+          bodyText.slice(0, 300),
+        );
+      }
     }
 
-    // ── Verbal handle impersonation ──────────────────────────
-    // Catches "DM @MagpieSupport for help" — no link, just text, but
-    // routes the user to a scammer. URL filter doesn't see it because
-    // it's a bare handle. Strict on Magpie-flavored handles only —
-    // legit cross-mentions like "@MagpieLoans posted X" pass.
-    const impersonators = findImpersonatingHandles(msg.text || msg.caption || "");
-    if (impersonators.length > 0) {
-      await tryDelete(ctx, msg.message_id);
-      await recordModAction(
-        ctx.chat.id, sender.id, "delete_handle_impersonation",
-        impersonators.join(","), msg.text || msg.caption,
-      );
-      const count = await bumpWarnedCount(ctx.chat.id, sender.id);
-      await softWarn(
-        ctx,
-        sender.id,
-        `Your message was removed because it referenced an unofficial Magpie-related handle (${impersonators.join(", ")}). The ONLY official Magpie accounts are *@MagpieLoans* on X and *@magpie_capital_bot* on Telegram. Anyone else claiming to be Magpie support is a scammer.` +
-        (count >= 3 ? `\n\n#${count} warning. Repeated removals may result in a mute.` : ``),
-      );
-      return;
-    }
+    // (Verbal handle impersonation — e.g. "DM @MagpieSupport for help" —
+    // is now folded into the Pip-judgement block above: findImpersonatingHandles
+    // is one of the signals it weighs, so a scam handle is removed while a
+    // legit cross-mention like "@MagpieLoans posted X" is kept.)
 
     // ── Impersonation (re-check per-message in case they rename) ─
     if (isImpersonationName(sender)) {
@@ -518,6 +676,26 @@ async function handleGroupMessage(ctx) {
         await recordModAction(ctx.chat.id, sender.id, "delete_quarantine_rate", `wait_ms=${wait}`, null);
         return;
       }
+    }
+
+    // ── Captcha auto-pass on genuine activity (operator 2026-06-30) ──
+    // The message survived every removal gate above, so it's a real,
+    // non-scam post. A human who actually chats has proven they're human
+    // far better than a button tap — so if a captcha kick is still pending
+    // for this user, cancel it. We NEVER boot someone for asking a question
+    // or sharing an idea. ("my chat keeps getting removed" was a brand-new
+    // member kicked by the 5-min captcha timer before they tapped verify.)
+    try {
+      const pendingKey = kickKey(ctx.chat.id, sender.id);
+      if (pendingKicks.has(pendingKey)) {
+        clearTimeout(pendingKicks.get(pendingKey));
+        pendingKicks.delete(pendingKey);
+        await markCaptchaPassed(ctx.chat.id, sender.id);
+        await clearGroupCaptcha(ctx.api, ctx.chat.id, sender.id);
+        await recordModAction(ctx.chat.id, sender.id, "captcha_pass_via_message", "genuine message = proof of human", null);
+      }
+    } catch (err) {
+      console.warn("[community] captcha auto-pass-on-message failed (non-critical):", err.message);
     }
 
     // ── Image vision classifier ─────────────────────────────────
@@ -578,6 +756,41 @@ async function maybeRunImageCheck(ctx, msg, sender) {
   // pattern as the text/FUD path.
   const member = await getMember(ctx.chat.id, sender.id);
   const trusted = await isTrustedMember(sender.id);
+
+  // Operator-mandated 2026-06-30: a HIGH-confidence phishing / Magpie-
+  // impersonation screenshot (e.g. a "DM me to claim" solicitation INSIDE the
+  // image) is a deliberate scam → delete + PERMANENT ban, bypassing the strike
+  // ladder. Conservative bar: confidence >= 0.95 AND not a trusted member (real
+  // borrowers fall through to delete + warn), so a vision misread can't ban a
+  // genuine user; /unban recovers a false positive either way.
+  if (!trusted && result.confidence >= 0.95 &&
+      (result.verdict === "scam_screenshot" || result.verdict === "impersonation_screenshot")) {
+    await tryDelete(ctx, msg.message_id);
+    try { await ctx.api.banChatMember(ctx.chat.id, sender.id); }
+    catch (err) { console.warn("[image-mod] screenshot scam ban failed:", err.message); }
+    await recordModAction(
+      ctx.chat.id, sender.id, `ban_image_${result.verdict}`,
+      `confidence=${result.confidence.toFixed(2)} reason=${result.reason}`,
+      result.extractedText?.slice(0, 500) || null,
+    );
+    await softWarn(
+      ctx, sender.id,
+      `You were removed from the Magpie community — your image was flagged as a phishing / impersonation screenshot. If this was a genuine mistake, reply /appeal and Pip will review it.`,
+    );
+    try {
+      const { notifyAdmin } = await import("../services/admin-notify.js");
+      await notifyAdmin(
+        { api: ctx.api },
+        `🛡 *Scam-screenshot scammer banned* (vision ${result.confidence.toFixed(2)})\n\n` +
+        `*Name:* ${sender.username ? `@${sender.username}` : (sender.first_name || sender.id)}\n` +
+        `*ID:* \`${sender.id}\`\n*Verdict:* ${result.verdict}\n\n` +
+        `Auto-deleted + banned. \`/unban ${sender.id}\` if a false positive.`,
+        { parse_mode: "Markdown" },
+      );
+    } catch { /* silent */ }
+    return;
+  }
+
   const baseDecision = actionForImageVerdict(result, {
     warned_count: member?.warned_count ?? 0,
   });
@@ -894,7 +1107,7 @@ async function maybeAnswerPipQuestion(ctx, msg, sender) {
 
   let answer;
   try {
-    answer = await answerGroupQuestion(question, { repliedTo });
+    answer = await answerGroupQuestion(question, { repliedTo, chatId: ctx.chat?.id });
   } catch (err) {
     console.warn("[community] Pip group answer failed:", err.message);
     answer = null;
@@ -1204,10 +1417,15 @@ export function registerCommunityHandlers(bot) {
   bot.on("message:new_chat_members", handleNewMembers);
   bot.on("message", handleGroupMessage);
   bot.on("edited_message", handleGroupMessage);
-  bot.callbackQuery(/^comm:captcha:(-?\d+)$/, handleCaptchaCallback);
+  // NOTE: the button data is `comm:captcha:<chat>:<user>` (user-scoped), so the
+  // registration regex MUST allow the optional :<user> suffix — otherwise the
+  // `$` after the chat id makes grammY's .test() fail and the callback NEVER
+  // fires (tap does nothing → user kicked at timeout despite verifying). Keep
+  // this in sync with the parser regex in handleCaptchaCallback.
+  bot.callbackQuery(/^comm:captcha:(-?\d+)(?::(\d+))?$/, handleCaptchaCallback);
   bot.callbackQuery(/^appeal:(\d+)$/, handleAppeal);
   console.log("[community] handlers registered");
 }
 
 /** Convenience exposed for the admin-command module to verify state. */
-export { isAdmin, handleAppealCommand };
+export { isAdmin, handleAppealCommand, clearGroupCaptcha };

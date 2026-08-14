@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { query } from "../db/pool.js";
 import crypto from "node:crypto";
 import { constantTimeEqual } from "./auth-utils.js";
+import { getV4ConvertDrainWatcherHealth } from "../services/v4-convert-drain-watcher.js";
 
 const gzipAsync = promisify(gzip);
 const brotliAsync = promisify(brotliCompress);
@@ -59,6 +60,7 @@ async function writeJson(req, res, status, headers, body) {
 }
 import { getHeartbeats, getStartedAt } from "../lib/heartbeat.js";
 import { handleCosignBorrow } from "./cosign-borrow.js";
+import { admitCosign } from "../middleware/cosign-admission.js";
 import { handleAgentBuildBorrow } from "./agent.js";
 import { handleAgentBuildRepay } from "./agent-repay.js";
 import {
@@ -74,11 +76,17 @@ import {
 } from "./agent-intents.js";
 import { handleSyncLoan } from "./sync-loan.js";
 import { handleWarmMint } from "./warm-mint.js";
+import { handleWarmMintsBatch } from "./warm-mints-batch.js";
 import { handleDebugRecentErrors } from "./debug-recent-errors.js";
 import { handleAiChatStream } from "./ai-chat-stream.js";
 import { handleBackfillWalletLoans } from "./backfill-wallet-loans.js";
 import { handleLenderAlarmWebhook } from "./lender-alarm-webhook.js";
 import { handleLinkRequest, handleLinkStatus } from "./account-link.js";
+import {
+  handlePushSubscribe,
+  handlePushUnsubscribe,
+  handleVapidPublicKey,
+} from "./push-subscribe.js";
 import { handleSiteWithdraw } from "./withdraw.js";
 import {
   handleSupportTickets,
@@ -87,6 +95,7 @@ import {
 } from "./support-api.js";
 import { handleSupportAsk } from "./support-ask.js";
 import { handleWalletsList, handleWalletsSetActive } from "./wallets-api.js";
+import { handleReferralSetCode } from "./referral-set-code.js";
 import { handlePrefsList, handlePrefsSet } from "./prefs-api.js";
 import {
   handleGovernanceVoteSubmit,
@@ -1117,15 +1126,21 @@ async function handleAdminPoolStats(req, url) {
     if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
-  } else {
-    console.warn(
-      "[admin] ADMIN_API_TOKEN unset — falling back to LENDER_PUBKEY-equality gate (audit HIGH#4 mitigation). Set ADMIN_API_TOKEN to a 32-byte random hex/base64 string and rotate the deploy.",
+  } else if (process.env.ALLOW_INSECURE_ADMIN_FALLBACK === "1") {
+    // Explicit, off-by-default bootstrap escape hatch. LENDER_PUBKEY is a PUBLIC
+    // on-chain identifier (stamped into every loan PDA, readable from any tx) —
+    // it is NOT a secret, so this path is insecure by construction.
+    console.error(
+      "[admin][INSECURE] ADMIN_API_TOKEN unset + ALLOW_INSECURE_ADMIN_FALLBACK=1 — admin data gated ONLY by a public pubkey. Set ADMIN_API_TOKEN and remove this flag now.",
     );
-    if (!wallet) return { status: 400, body: { error: "Provide ?wallet=<address>" } };
     const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
-    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    if (!wallet || !LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden" } };
     }
+  } else {
+    // Fail CLOSED — never treat a public identifier as a credential.
+    console.error("[admin] ADMIN_API_TOKEN not configured — refusing admin request (fail-closed). Set ADMIN_API_TOKEN.");
+    return { status: 503, body: { error: "Admin auth not configured" } };
   }
   const LENDER_PUBKEY = process.env.LENDER_PUBKEY;
 
@@ -1445,13 +1460,16 @@ async function handleAdminLifetimeStats(req, url) {
     if (!provided || !constantTimeEqual(provided, ADMIN_API_TOKEN)) {
       return { status: 403, body: { error: "Forbidden" } };
     }
-  } else {
-    console.warn(
-      "[admin] ADMIN_API_TOKEN unset on lifetime-stats — falling back to LENDER_PUBKEY-equality gate. Set ADMIN_API_TOKEN and rotate the deploy.",
+  } else if (process.env.ALLOW_INSECURE_ADMIN_FALLBACK === "1") {
+    console.error(
+      "[admin][INSECURE] ADMIN_API_TOKEN unset on lifetime-stats + ALLOW_INSECURE_ADMIN_FALLBACK=1 — gated ONLY by a public pubkey. Set ADMIN_API_TOKEN and remove this flag now.",
     );
-    if (!LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
-      return { status: 403, body: { error: "Forbidden — not the protocol creator wallet" } };
+    if (!wallet || !LENDER_PUBKEY || wallet !== LENDER_PUBKEY) {
+      return { status: 403, body: { error: "Forbidden" } };
     }
+  } else {
+    console.error("[admin] ADMIN_API_TOKEN not configured — refusing lifetime-stats (fail-closed). Set ADMIN_API_TOKEN.");
+    return { status: 503, body: { error: "Admin auth not configured" } };
   }
 
   const now = Date.now();
@@ -1593,6 +1611,37 @@ async function handleProtocolPulse() {
          AS liquidations_24h
      FROM loans`,
   );
+  // Per-version breakdown of ACTIVE loans — "how much value is on-loan in each
+  // deployed program." Useful for the site /stats and for audit-scope / risk-per-
+  // program decisions (each version is a separate program custodying its own funds).
+  const VERSION_LABELS = {
+    "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh": "V1 (memecoin)",
+    "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe": "V2 (deprecated)",
+    "B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP": "V3 (RWA)",
+    "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo": "V4 (in-vault)",
+  };
+  let byVersion = [];
+  try {
+    const { rows } = await query(
+      `SELECT program_id,
+              COUNT(*) FILTER (WHERE status = 'active')::int AS active_loans,
+              COALESCE(SUM(CASE WHEN status = 'active'
+                                 THEN loan_amount_lamports::numeric ELSE 0 END), 0)::text
+                AS active_borrowed_lamports
+         FROM loans
+        WHERE program_id IS NOT NULL
+        GROUP BY program_id`,
+    );
+    byVersion = rows
+      .map((r) => ({
+        program_id: r.program_id,
+        version: VERSION_LABELS[r.program_id] || "unknown",
+        active_loans: r.active_loans,
+        active_borrowed_sol: Number(r.active_borrowed_lamports) / 1e9,
+      }))
+      .filter((v) => v.active_loans > 0)
+      .sort((a, b) => b.active_borrowed_sol - a.active_borrowed_sol);
+  } catch { /* non-fatal — omit the breakdown if this query errors */ }
   return {
     status: 200,
     body: {
@@ -1603,6 +1652,7 @@ async function handleProtocolPulse() {
       borrowed_24h_sol: Number(agg.borrowed_24h_lamports) / 1e9,
       repays_24h: agg.repays_24h,
       liquidations_24h: agg.liquidations_24h,
+      by_version: byVersion,
       generated_at: new Date().toISOString(),
     },
   };
@@ -1764,6 +1814,16 @@ const PUBLIC_ROUTES = new Set([
   // keyspace + 5-codes-per-wallet throttle.
   "/api/v1/link/request",
   "/api/v1/link/status",
+  // Web-push subscription. No API-key gate — the site calls these from any
+  // borrower's browser. Security is INTERNAL to the handler: Ed25519 signature
+  // from a linked wallet, a SHA-256 of the endpoint bound INTO the signed
+  // message (so a captured signature cannot be replayed with someone else's
+  // endpoint), one-shot nonce, freshness window and per-signer rate limit.
+  // The vapid key route returns a PUBLIC key and unsubscribe requires
+  // possession of the endpoint string. See src/api/push-subscribe.js.
+  "/api/v1/push/subscribe",
+  "/api/v1/push/unsubscribe",
+  "/api/v1/push/vapid-public-key",
   // Site-initiated withdraw. Security is enforced INTERNALLY: Ed25519
   // signature from a linked wallet, one-shot nonce, freshness window,
   // destination = signer (unless MAGPIE_SITE_WITHDRAW_ANY_DEST=1).
@@ -1784,6 +1844,8 @@ const PUBLIC_ROUTES = new Set([
   // Wallets list (by-wallet read) and signed set-active.
   "/api/v1/wallets",
   "/api/v1/wallets/set-active",
+  // Signed vanity referral-code setter (site dashboard).
+  "/api/v1/referral/set-code",
   // User prefs (notifications, auto-protect). Read is wallet-keyed,
   // write is signed JSON.
   "/api/v1/prefs",
@@ -1841,6 +1903,12 @@ const PUBLIC_ROUTES = new Set([
   // supported_mints check. Operator-mandated 2026-06-19 PM after
   // $TROLL V4 borrow hit "Markets warming up."
   "/api/v1/v4/warm-mint",
+  // Batch pre-warm (Just-Ahead Warming) — dashboard POSTs the user's
+  // whole borrowable-holdings set on load so their feeds warm during
+  // token-pick/amount-entry time → first-attempt borrow success with
+  // no perceived wait, warming only the tokens this user holds (auto-
+  // expiring). See feedback_first_attempt_loan_success_cost_effective.
+  "/api/v1/v4/warm-mints",
   // Live-debug ring buffer of recent console.error/warn output. No
   // PII; bounded in-memory; cleared on restart.
   "/api/v1/debug/recent-errors",
@@ -1970,6 +2038,48 @@ async function router(req, res) {
       v4Feeds = getFeedReadinessSnapshot();
     } catch { /* module not loaded yet — safe to omit */ }
 
+    // External engine liveness — the limit-close fire engine runs as a
+    // SEPARATE service (magpiecapital/magpie-limitclose) and UPSERTs
+    // engine_heartbeats id=1 each tick. The bot's engine-heartbeat-watcher
+    // already DMs the operator on staleness; this surfaces the same signal
+    // on the health JSON so the fire engine's liveness is observable at a
+    // glance (dashboards, curl). Read-only and non-fatal: a missing/stale
+    // engine heartbeat NEVER flips the bot's own status to degraded (the
+    // engine is a different process — folding it into `reasons` could trip
+    // the site's BOT-DOWN watchdog for something that isn't the bot).
+    let limitCloseEngine = null;
+    try {
+      const r = await query(
+        `SELECT last_tick_at, last_tick_status, armed_count
+           FROM engine_heartbeats
+          WHERE id = 1 AND service = 'limit_close_watcher'`,
+      );
+      if (r.rows[0]) {
+        const ageMs = now - new Date(r.rows[0].last_tick_at).getTime();
+        const stale = ageMs > 5 * 60_000; // matches engine-heartbeat-watcher WARN tier
+        limitCloseEngine = {
+          state: stale ? "stale" : (r.rows[0].last_tick_status === "ok" ? "ok" : "degraded"),
+          last_tick_at: r.rows[0].last_tick_at,
+          last_tick_status: r.rows[0].last_tick_status,
+          armed_count: r.rows[0].armed_count,
+          age_ms: ageMs,
+        };
+      } else {
+        limitCloseEngine = { state: "no_heartbeat", detail: "engine service has not written a heartbeat row yet" };
+      }
+    } catch (err) {
+      // Table might not exist on an old DB, or a transient read error —
+      // never let this break the health response.
+      limitCloseEngine = { state: "unknown", detail: err.message?.slice(0, 100) };
+    }
+
+    // Interim V4 convert-slice drain watcher liveness — a silently-dead security
+    // monitor is a liability, so surface it here. In-process (runs in the bot),
+    // read-only, and NEVER folded into `reasons` (must not flip bot status).
+    let v4DrainWatcher = null;
+    try { v4DrainWatcher = getV4ConvertDrainWatcherHealth(); }
+    catch (err) { v4DrainWatcher = { state: "unknown", detail: err.message?.slice(0, 100) }; }
+
     const failing = reasons.length > 0;
     res.writeHead(failing ? 503 : 200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
@@ -1981,6 +2091,8 @@ async function router(req, res) {
       startedAt: hb.startedAt,
       heartbeats: hb.services,
       v4_feeds: v4Feeds,
+      limit_close_engine: limitCloseEngine,
+      v4_convert_drain_watcher: v4DrainWatcher,
     }));
   }
 
@@ -2231,9 +2343,24 @@ async function router(req, res) {
       case "/api/v1/lp-loyalty":
         result = await handleLpLoyalty(req, url);
         break;
-      case "/api/v1/cosign-borrow":
-        result = await handleCosignBorrow(req);
+      case "/api/v1/cosign-borrow": {
+        // Admission control (availability, not security — the handler's
+        // discriminator allowlist is what keeps this safe to expose). The path
+        // is unauthenticated and a single request can hold ~95s while a cold
+        // V4 feed TWAP-warms, so an unbounded flood starves REAL borrows.
+        // Fails OPEN; every rejection is explicitly retryable.
+        const adm = admitCosign(req);
+        if (!adm.ok) {
+          result = adm.response;
+          break;
+        }
+        try {
+          result = await handleCosignBorrow(req);
+        } finally {
+          adm.release();
+        }
         break;
+      }
       case "/api/v1/agent/build-borrow":
         result = await handleAgentBuildBorrow(req);
         break;
@@ -2275,6 +2402,13 @@ async function router(req, res) {
         // time the user signs the borrow tx, samples are in window.
         result = await handleWarmMint(req);
         break;
+      case "/api/v1/v4/warm-mints":
+        // Batch pre-warm — Just-Ahead Warming. Dashboard sends the
+        // user's borrowable holdings on load so feeds are warm by the
+        // time they click Borrow. Bounded fan-out (MAX_BATCH), auto-
+        // expiring intents, only this user's held tokens.
+        result = await handleWarmMintsBatch(req);
+        break;
       case "/api/v1/debug/recent-errors":
         // Live tail of console.error/warn. Safe to expose — no PII,
         // cleared on restart, bounded at 200 entries.
@@ -2299,6 +2433,15 @@ async function router(req, res) {
       case "/api/v1/link/status":
         result = await handleLinkStatus(req, url);
         break;
+      case "/api/v1/push/subscribe":
+        result = await handlePushSubscribe(req);
+        break;
+      case "/api/v1/push/unsubscribe":
+        result = await handlePushUnsubscribe(req);
+        break;
+      case "/api/v1/push/vapid-public-key":
+        result = await handleVapidPublicKey();
+        break;
       case "/api/v1/withdraw":
         result = await handleSiteWithdraw(req);
         break;
@@ -2319,6 +2462,9 @@ async function router(req, res) {
         break;
       case "/api/v1/wallets/set-active":
         result = await handleWalletsSetActive(req);
+        break;
+      case "/api/v1/referral/set-code":
+        result = await handleReferralSetCode(req);
         break;
       case "/api/v1/prefs":
         result = await handlePrefsList(req, url);

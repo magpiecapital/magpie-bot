@@ -37,6 +37,14 @@ import "dotenv/config";
 import { connection } from "../solana/connection.js";
 import { query } from "../db/pool.js";
 import { getRewardsDistributorKeypair } from "./distributor-keypair.js";
+// SECURITY (findings 3 + 4): in production the distributor resolves to the
+// LENDER gas wallet (lender-fallback mode). Reward payouts are therefore lender-
+// key spends and MUST hold the ONE shared lender-spend lock, be sized against
+// the canonical 5-SOL gas reserve, and reconcile every broadcast on a confirm-
+// timeout so a landed-but-unconfirmed tx is never re-sent (double-pay of SOL).
+import { withLenderSpendLock } from "./lender-spend-lock.js";
+import { availableLenderNative, LENDER_PUBKEY, TX_FEE_HEADROOM } from "./lender-reserve.js";
+import { runPrivilegedSign, recordPrivilegedSignResult } from "./privileged-sign-guard.js";
 
 export const MAGPIE_MINT = new PublicKey(
   "9UuLsJ3jf8ViBNeRcwXD53re5G3ypgfKK3s2EiMMpump",
@@ -567,9 +575,31 @@ export async function snapshotMagpieHolders() {
   // would otherwise siphon ~14% of every distribution to non-holders
   // (e.g. PumpSwap AMM, Token-2022 protocol accounts, etc).
   //
+  // BUT: a holder whose native SOL balance is 0 has NO on-chain account
+  // (getAccountInfo → null), and a null account looks identical whether
+  // it's a drained real wallet or an unfunded PDA. Excluding all nulls
+  // (the pre-2026-07-16 behaviour) silently dropped legitimate 0-SOL
+  // holders from every round — e.g. a wallet holding millions of $MAGPIE
+  // but zero SOL would receive nothing, then get re-included the moment
+  // it happened to hold a little SOL at snapshot time. The reliable
+  // discriminator: real user wallets are ON-curve ed25519 addresses;
+  // program-derived addresses (the AMM/vault/bonding-curve accounts we
+  // must never pay) are OFF-curve by construction. So for a null account
+  // we keep it iff it's on-curve — a 0-SOL wallet can still receive SOL,
+  // and the payout itself creates its account. Funded accounts still get
+  // the strict System-Program owner check (an on-curve keypair account
+  // reassigned to a program is caught here by its non-System owner).
+  //
   // Batch fetch (100 per call) keeps RPC cost minimal even with thousands
   // of holders.
   const SystemProgramId = SystemProgram.programId.toBase58();
+  const isOnCurveAddress = (addr) => {
+    try {
+      return PublicKey.isOnCurve(new PublicKey(addr).toBytes());
+    } catch {
+      return false; // unparseable → treat as non-wallet, exclude
+    }
+  };
   const allOwners = Array.from(byOwner.keys());
   const BATCH = 100;
   for (let i = 0; i < allOwners.length; i += BATCH) {
@@ -579,16 +609,24 @@ export async function snapshotMagpieHolders() {
     try {
       infos = await connection.getMultipleAccountsInfo(pubkeys, { commitment: "confirmed" });
     } catch (err) {
-      console.error("[holder-rewards] account-owner lookup failed (keeping conservatively, excluding all in batch):", err.message);
-      // Conservative: if we can't verify, exclude rather than risk paying to PDAs.
-      for (const o of batch) byOwner.delete(o);
+      // RPC lookup failed — we can't read owners. Don't silently drop
+      // legitimate holders over a transient blip: fall back to the
+      // on-curve test, which still excludes every off-curve PDA (the
+      // actual siphon threat) while keeping real wallets in the round.
+      console.error("[holder-rewards] account-owner lookup failed — falling back to on-curve filter for this batch:", err.message);
+      for (const o of batch) {
+        if (!isOnCurveAddress(o)) byOwner.delete(o);
+      }
       continue;
     }
     for (let j = 0; j < batch.length; j++) {
       const info = infos[j];
-      // No account info → owner doesn't exist (could be a PDA never funded);
-      // OR owner is a contract — exclude to be safe.
-      if (!info || info.owner?.toBase58() !== SystemProgramId) {
+      if (!info) {
+        // Unfunded/null account: keep on-curve real wallets (0-SOL
+        // holders can still be paid), drop off-curve unfunded PDAs.
+        if (!isOnCurveAddress(batch[j])) byOwner.delete(batch[j]);
+      } else if (info.owner?.toBase58() !== SystemProgramId) {
+        // Funded account owned by a program → contract/PDA, never pay.
         byOwner.delete(batch[j]);
       }
     }
@@ -621,6 +659,20 @@ export async function snapshotMagpieHolders() {
 const BATCH_SIZE = 10; // SystemProgram.transfer ixs per tx (well under Solana tx limit)
 
 /**
+ * pg returns `numeric` as a string, sometimes with a decimal part (e.g.
+ * "4772899.00"), and BigInt() throws on that. Lamports are integers by
+ * definition, so truncate at the point rather than round.
+ */
+function toLamportsBigInt(v) {
+  if (v === null || v === undefined || v === "") return 0n;
+  try {
+    return BigInt(String(v).split(".")[0]);
+  } catch {
+    return 0n;
+  }
+}
+
+/**
  * Mirror a $MAGPIE-holder distribution cycle into the protocol-wide
  * `distribution_events` analytics ledger so it sits alongside lp_loyalty
  * and governance distributions. Operator-mandated 2026-06-19 — every
@@ -643,6 +695,8 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
             COUNT(mhr.*)                                                   AS reward_row_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status = 'paid')                AS paid_count,
             COUNT(mhr.*) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')) AS unpaid_count,
+            COUNT(mhr.*) FILTER (WHERE mhr.status = 'unpayable_rent_exempt')           AS unpayable_count,
+            COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'unpayable_rent_exempt'), 0)::numeric AS unpayable_lamports,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid'), 0)::numeric                      AS paid_lamports,
             COALESCE(SUM(mhr.reward_lamports) FILTER (WHERE mhr.status IN ('accrued','snapshot_pending')), 0)::numeric AS unpaid_lamports,
             MIN(mhr.reward_lamports) FILTER (WHERE mhr.status = 'paid')    AS min_paid,
@@ -687,14 +741,25 @@ export async function syncMagpieHolderDistributionEvent(distributionId) {
     snapshot_at: s.snapshot_at,
     pool_lamports: s.pool_lamports,
     distributed_lamports: s.paid_lamports,
-    unpaid_lamports: s.unpaid_lamports,
+    // Everything captured but NOT paid — still-accrued AND unpayable-by-rent.
+    // Excluding the unpayable half made the audit trail fail to add up.
+    // pg returns numeric as a STRING and may include a decimal part, which
+    // BigInt() rejects outright — so truncate before converting.
+    unpaid_lamports: (
+      toLamportsBigInt(s.unpaid_lamports) + toLamportsBigInt(s.unpayable_lamports)
+    ).toString(),
     // Eligible count = rows captured for payout, NOT enumerated holders.
     // magpie_holder_distributions.eligible_count is currently miswritten
     // (snapshotAndDistribute passes holders.length twice — same value as
     // holder_count). The reward_row_count from the JOIN is the truth.
     eligible_wallet_count: Number(s.reward_row_count) || Number(s.eligible_count) || Number(s.holder_count) || 0,
     paid_wallet_count: Number(s.paid_count) || 0,
-    unpayable_wallet_count: 0,
+    // Rows Solana physically cannot pay: the transfer would leave an empty
+    // recipient account below the rent-exempt minimum (~0.00089 SOL). This was
+    // hardcoded 0 until dist #9 (2026-08-13), when the holder pool first fell
+    // below that floor and 319 rows became unpayable — leaving 0.0048 SOL
+    // unaccounted for on the PUBLIC audit trail (pool - distributed - unpaid).
+    unpayable_wallet_count: Number(s.unpayable_count) || 0,
     denominator_kind: "magpie_balance_at_snapshot",
     denominator_value: s.total_balance,
     paid_first_at: s.paid_first_at,
@@ -784,6 +849,212 @@ async function unwrapDistributorWsolBestEffort() {
   }
 }
 
+const HOLDER_REWARDS_SERVICE = "magpie-holder-rewards";
+
+/**
+ * Broadcast an already-built+signed reward-payout tx and resolve its TRUE
+ * on-chain fate (finding 4). web3.js sendAndConfirmTransaction throws on a
+ * confirm timeout EVEN WHEN THE TX LANDED — leaving the rows retryable then
+ * DOUBLE-PAYS real SOL on the next cycle. So we send once and, on any confirm
+ * timeout, reconcile with getSignatureStatuses(searchTransactionHistory) —
+ * definitive once the blockhash has expired — before deciding. Mirrors
+ * distribution-auto-funder.js's confirm-timeout guard.
+ *
+ * @returns {{ outcome: 'paid'|'retry'|'unresolved', sig: string|null, error?: string }}
+ *   paid       → proven on-chain (mark rows paid)
+ *   retry      → proven NOT on-chain (safe to leave 'accrued' for retry)
+ *   unresolved → RPC could not confirm inclusion (rare — total RPC outage);
+ *                treat as landed to protect the lender from a double-pay + flag.
+ */
+async function broadcastAndReconcile(signedTx, blockhash, lastValidBlockHeight) {
+  let sig = null;
+  try {
+    sig = await connection.sendRawTransaction(signedTx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+  } catch (err) {
+    // Never broadcast (e.g. preflight reject) → definitively safe to retry.
+    return { outcome: "retry", sig: null, error: err.message?.slice(0, 160) };
+  }
+  try {
+    await connection.confirmTransaction(
+      { signature: sig, blockhash, lastValidBlockHeight },
+      "confirmed",
+    );
+    return { outcome: "paid", sig };
+  } catch (confirmErr) {
+    for (let i = 0; i < 5; i++) {
+      try {
+        const r = await connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
+        const st = r?.value?.[0];
+        if (st) {
+          if (st.err) {
+            // Processed but failed on-chain → funds did NOT move → safe to retry.
+            return { outcome: "retry", sig, error: `on-chain failure: ${JSON.stringify(st.err).slice(0, 80)}` };
+          }
+          if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") {
+            return { outcome: "paid", sig };
+          }
+          // processed but not yet confirmed — keep polling
+        } else if (i >= 2) {
+          // RPC answered null after the blockhash expired + a couple polls: the
+          // tx is not in the ledger, so it never landed → safe to retry.
+          return { outcome: "retry", sig };
+        }
+      } catch {
+        /* RPC blip — keep polling */
+      }
+      await new Promise((res) => setTimeout(res, 3000));
+    }
+    // Could not resolve (RPC unavailable throughout). Fail CLOSED to protect the
+    // lender gas wallet from a double-pay: treat as landed + flag for manual
+    // verification rather than auto-retrying.
+    return { outcome: "unresolved", sig, error: confirmErr.message?.slice(0, 160) };
+  }
+}
+
+/**
+ * Build, guard-sign, broadcast + reconcile ONE payout batch. When the signer is
+ * the lender gas wallet, routes through runPrivilegedSign so the spend is
+ * audited and the lender SOL decrease is bounded to the batch total. (No
+ * per-destination allowlist applies — payouts go to arbitrary holder wallets.)
+ */
+async function payRewardBatch({ service, batch, distributor, isLenderSigner }) {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  const tx = new Transaction();
+  tx.feePayer = distributor.publicKey;
+  tx.recentBlockhash = blockhash;
+  for (const r of batch) {
+    tx.add(
+      SystemProgram.transfer({
+        fromPubkey: distributor.publicKey,
+        toPubkey: new PublicKey(r.wallet_address),
+        lamports: BigInt(r.reward_lamports),
+      }),
+    );
+  }
+  const batchTotal = batch.reduce((a, r) => a + BigInt(r.reward_lamports), 0n);
+
+  let auditId = null;
+  if (isLenderSigner) {
+    let guard;
+    try {
+      guard = await runPrivilegedSign({
+        service,
+        tx,
+        signers: [distributor],
+        allowedDeltas: [
+          { pubkey: distributor.publicKey, kind: "sol", maxDecrease: batchTotal + TX_FEE_HEADROOM },
+        ],
+      });
+    } catch (err) {
+      // Sim/guard rejected → nothing broadcast → safe to retry.
+      return { outcome: "retry", sig: null, error: err.message?.slice(0, 160) };
+    }
+    auditId = guard.auditId;
+  } else {
+    tx.sign(distributor);
+  }
+
+  const res = await broadcastAndReconcile(tx, blockhash, lastValidBlockHeight);
+  if (auditId) {
+    const status = res.outcome === "paid" ? "confirmed" : res.outcome === "unresolved" ? "broadcast" : "failed";
+    await recordPrivilegedSignResult({ auditId, status, txSig: res.sig ?? undefined, error: res.error }).catch(() => {});
+  }
+  return res;
+}
+
+/**
+ * Pay a set of magpie_holder_rewards rows in batches (findings 3 + 4). When the
+ * distributor is the lender gas wallet the whole run holds the ONE shared
+ * lender-spend lock and is sized against availableLenderNative() (canonical
+ * 5-SOL reserve) so reward payouts can NEVER starve loan-origination gas. Rows
+ * that don't fit under the reserve — or a proven-failed broadcast — stay
+ * 'accrued' for the next cycle. `onBatchPaid` (optional) is awaited after every
+ * paid batch so distribution_events never lags the canonical reward rows.
+ * Returns { paidCount, paidLamports, deferred }.
+ */
+async function payHolderRewardBatches(rows, distributor, onBatchPaid) {
+  if (rows.length === 0) return { paidCount: 0, paidLamports: 0n, deferred: 0 };
+  const isLenderSigner = distributor.publicKey.equals(LENDER_PUBKEY);
+  let paidCount = 0;
+  let paidLamports = 0n;
+  let deferred = 0;
+
+  const runBatches = async () => {
+    let avail;
+    if (isLenderSigner) {
+      avail = await availableLenderNative(connection);
+    } else {
+      const bal = BigInt(await connection.getBalance(distributor.publicKey));
+      avail = bal > MIN_LENDER_RESERVE_LAMPORTS ? bal - MIN_LENDER_RESERVE_LAMPORTS : 0n;
+    }
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const batch = rows.slice(i, i + BATCH_SIZE);
+      const batchTotal = batch.reduce((a, r) => a + BigInt(r.reward_lamports), 0n);
+      if (avail < batchTotal + TX_FEE_HEADROOM) {
+        deferred += rows.length - i;
+        console.warn(
+          `[holder-rewards] reserve floor reached — ${rows.length - i} reward row(s) remain 'accrued' for the next cycle`,
+        );
+        break;
+      }
+      const { outcome, sig, error } = await payRewardBatch({
+        service: HOLDER_REWARDS_SERVICE,
+        batch,
+        distributor,
+        isLenderSigner,
+      });
+      if (outcome === "paid" || outcome === "unresolved") {
+        await query(
+          `UPDATE magpie_holder_rewards
+              SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
+            WHERE id = ANY($1::bigint[])`,
+          [batch.map((r) => r.id), sig],
+        );
+        // Their carried balance was folded INTO this reward_lamports at
+        // capture, so a successful send settles it — zero it or they would be
+        // paid the same lamports again next cycle.
+        await query(
+          `UPDATE magpie_holder_carryforward
+              SET lamports = 0, cycles = 0, updated_at = NOW()
+            WHERE wallet_address = ANY($1::text[]) AND lamports > 0`,
+          [batch.map((r) => r.wallet_address)],
+        ).catch((e) => console.warn("[holder-rewards] carry clear failed:", e.message));
+        paidCount += batch.length;
+        paidLamports += batchTotal;
+        avail -= batchTotal + TX_FEE_HEADROOM;
+        if (outcome === "unresolved") {
+          console.error(
+            `[holder-rewards] CRIT payout ${sig} confirm UNRESOLVED — marked paid to prevent a double-pay; VERIFY on-chain. ${error || ""}`,
+          );
+        }
+        if (onBatchPaid) {
+          try { await onBatchPaid(); } catch { /* best-effort ledger mirror */ }
+        }
+      } else {
+        deferred += batch.length;
+        console.error(`[holder-rewards] Batch payout failed (rows remain 'accrued' for retry): ${error || ""}`);
+      }
+    }
+  };
+
+  if (isLenderSigner) {
+    const lockRes = await withLenderSpendLock(runBatches);
+    if (lockRes.skipped) {
+      deferred = rows.length;
+      console.warn(
+        `[holder-rewards] lender-spend lock held by another service — payouts deferred; ${rows.length} row(s) remain 'accrued' for retry`,
+      );
+    }
+  } else {
+    await runBatches();
+  }
+
+  return { paidCount, paidLamports, deferred };
+}
+
 export async function snapshotAndDistribute() {
   const state = await getHolderPoolState();
   const pool = state.accrued_lamports;
@@ -814,17 +1085,32 @@ export async function snapshotAndDistribute() {
   // until the operator flips that env var on Railway it transparently
   // falls back to the lender wallet, preserving prior behaviour.
   const distributor = getRewardsDistributorKeypair();
+  const isLenderSigner = distributor.publicKey.equals(LENDER_PUBKEY);
   if (!snapshotOnly) {
     // Make any stranded wSOL (fees sweep in wrapped) spendable BEFORE the
     // native-balance pre-flight, so a fully-funded distribution never skips
     // just because its SOL is wrapped. Best-effort + guarded to CHCAM.
     await unwrapDistributorWsolBestEffort().catch(() => 0n);
-    const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
-    if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
-      console.warn(
-        `[holder-rewards] Distribution skipped: distributor ${distributorBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
-      );
-      return null;
+    if (isLenderSigner) {
+      // Lender-fallback (production): gate on the canonical 5-SOL gas reserve via
+      // availableLenderNative — NOT the 0.1-SOL floor — so a holder payout can
+      // never draw the loan-origination gas wallet toward empty (finding 3). The
+      // per-batch in-lock check below is the authoritative gate.
+      const avail = await availableLenderNative(connection);
+      if (avail < pool) {
+        console.warn(
+          `[holder-rewards] Distribution skipped: lender available ${avail} < pool ${pool} (canonical gas reserve protected)`,
+        );
+        return null;
+      }
+    } else {
+      const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
+      if (distributorBalance < pool + MIN_LENDER_RESERVE_LAMPORTS) {
+        console.warn(
+          `[holder-rewards] Distribution skipped: distributor ${distributorBalance} < pool ${pool} + reserve ${MIN_LENDER_RESERVE_LAMPORTS}`,
+        );
+        return null;
+      }
     }
   }
 
@@ -852,12 +1138,41 @@ export async function snapshotAndDistribute() {
     );
     distributionId = distRow.id;
 
+    // Carried balances: rewards a previous cycle could not deliver because the
+    // transfer would have left an EMPTY recipient below Solana's rent-exempt
+    // minimum. See migration 102.
+    //
+    // ⚠️ ACCOUNTING: carry is deliberately EXCLUDED from `allocatedSum`.
+    // allocatedSum is what decrements magpie_holder_pool, and the pool was
+    // ALREADY decremented for these lamports when they were first allocated —
+    // the SOL has been sitting in CHCAM ever since. Adding carry here would
+    // charge the pool twice for the same SOL.
+    const carry = new Map();
+    try {
+      const { rows: cf } = await client.query(
+        `SELECT wallet_address, lamports FROM magpie_holder_carryforward WHERE lamports > 0`,
+      );
+      for (const r of cf) carry.set(r.wallet_address, BigInt(r.lamports));
+      if (cf.length) {
+        const owed = cf.reduce((a, r) => a + BigInt(r.lamports), 0n);
+        console.log(`[holder-rewards] carrying forward ${owed} lamports owed to ${cf.length} wallet(s)`);
+      }
+    } catch (e) {
+      // A missing/broken carry table must never block a distribution.
+      console.warn("[holder-rewards] carryforward read failed (continuing without):", e.message);
+    }
+
     const inserts = [];
     for (const h of holders) {
-      const reward = (pool * h.balance_raw) / totalBalance;
+      const base = (pool * h.balance_raw) / totalBalance;
+      const owed = carry.get(h.owner) || 0n;
+      const reward = base + owed;
+      // Skip only when there is genuinely nothing to send. A holder with no
+      // new share but an outstanding carry still gets a row — that is the
+      // whole point.
       if (reward <= 0n) continue;
       inserts.push([distributionId, h.owner, h.balance_raw.toString(), reward.toString()]);
-      allocatedSum += reward;
+      allocatedSum += base; // pool portion ONLY — see the accounting note above
     }
 
     if (inserts.length > 0) {
@@ -946,49 +1261,21 @@ export async function snapshotAndDistribute() {
     };
   }
 
-  // Phase 2: send SOL in batches, mark rows paid as each batch confirms
-  let paidCount = 0;
-  let paidLamports = 0n;
-  for (let i = 0; i < rewardRows.length; i += BATCH_SIZE) {
-    const batch = rewardRows.slice(i, i + BATCH_SIZE);
-    const tx = new Transaction();
-    for (const r of batch) {
-      tx.add(
-        SystemProgram.transfer({
-          fromPubkey: distributor.publicKey,
-          toPubkey: new PublicKey(r.wallet_address),
-          lamports: BigInt(r.reward_lamports),
-        }),
-      );
-    }
-    try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
-        commitment: "confirmed",
-      });
-      await query(
-        `UPDATE magpie_holder_rewards
-            SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
-          WHERE id = ANY($1::bigint[])`,
-        [batch.map((r) => r.id), sig],
-      );
-      paidCount += batch.length;
-      paidLamports += batch.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
-      // Keep distribution_events fresh after every successful batch so
-      // it never lags behind the canonical reward rows even if the
-      // process dies mid-cycle. [[feedback_distributions_must_be_kept_organized_synced]]
+  // Phase 2: send SOL in batches — reserve-gated, lock-serialized, and
+  // confirm-reconciled (findings 3 + 4). distribution_events is refreshed after
+  // every paid batch so it never lags the canonical reward rows even if the
+  // process dies mid-cycle. [[feedback_distributions_must_be_kept_organized_synced]]
+  const { paidCount, paidLamports } = await payHolderRewardBatches(
+    rewardRows,
+    distributor,
+    async () => {
       try {
         await syncMagpieHolderDistributionEvent(distributionId);
       } catch (syncErr) {
         console.warn(`[holder-rewards] distribution_events sync (mid-batch) failed for dist ${distributionId}:`, syncErr.message);
       }
-    } catch (err) {
-      console.error(
-        `[holder-rewards] Batch payout failed (rows remain 'accrued' for retry):`,
-        err.message,
-      );
-      // Leave 'accrued' — a manual /payaccrued admin command or next cycle can clean up.
-    }
-  }
+    },
+  );
 
   // Final sync — guarantees the row reflects final paid/unpaid state
   // even if a mid-batch sync failed transiently.
@@ -1026,41 +1313,10 @@ export async function retryAccruedPayouts() {
   if (rows.length === 0) return { retried: 0, paid: 0 };
 
   const distributor = getRewardsDistributorKeypair();
-  const totalNeeded = rows.reduce((acc, r) => acc + BigInt(r.reward_lamports), 0n);
-  const distributorBalance = BigInt(await connection.getBalance(distributor.publicKey));
-  if (distributorBalance < totalNeeded + MIN_LENDER_RESERVE_LAMPORTS) {
-    console.warn("[holder-rewards] Retry skipped: distributor balance too low");
-    return { retried: 0, paid: 0, skipped: rows.length };
-  }
-
-  let paid = 0;
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
-    const tx = new Transaction();
-    for (const r of batch) {
-      tx.add(
-        SystemProgram.transfer({
-          fromPubkey: distributor.publicKey,
-          toPubkey: new PublicKey(r.wallet_address),
-          lamports: BigInt(r.reward_lamports),
-        }),
-      );
-    }
-    try {
-      const sig = await sendAndConfirmTransaction(connection, tx, [distributor], {
-        commitment: "confirmed",
-      });
-      await query(
-        `UPDATE magpie_holder_rewards
-            SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
-          WHERE id = ANY($1::bigint[])`,
-        [batch.map((r) => r.id), sig],
-      );
-      paid += batch.length;
-    } catch (err) {
-      console.error("[holder-rewards] retry batch failed:", err.message);
-    }
-  }
+  // Reserve-gated, lock-serialized, confirm-reconciled (findings 3 + 4). The
+  // per-batch reserve gate means partial payment is possible — rows that don't
+  // fit under the gas reserve stay 'accrued' for the next cycle.
+  const { paidCount: paid } = await payHolderRewardBatches(rows, distributor);
   // Sync every touched distribution into distribution_events so the
   // ledger never lags after a retry sweep.
   // [[feedback_distributions_must_be_kept_organized_synced]]
@@ -1128,6 +1384,7 @@ export async function claimHolderRewards({ walletAddress }) {
       };
     }
 
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
     const tx = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey: distributor.publicKey,
@@ -1135,19 +1392,45 @@ export async function claimHolderRewards({ walletAddress }) {
         lamports: total,
       }),
     );
-    const signature = await sendAndConfirmTransaction(connection, tx, [distributor], {
-      commitment: "confirmed",
-    });
+    tx.feePayer = distributor.publicKey;
+    tx.recentBlockhash = blockhash;
+    tx.sign(distributor);
+
+    // Reconcile the broadcast (finding 4): a confirm-timeout on a tx that
+    // actually landed must NOT roll back — that would let the user re-claim and
+    // double-pay real SOL. Only a PROVEN non-inclusion rolls back for retry.
+    const res = await broadcastAndReconcile(tx, blockhash, lastValidBlockHeight);
+    if (res.outcome === "retry") {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "broadcast_failed" };
+    }
+    if (res.outcome === "unresolved") {
+      console.error(
+        `[holder-rewards] CRIT claim payout ${res.sig} confirm UNRESOLVED — committing as paid to prevent a double-pay; VERIFY on-chain.`,
+      );
+    }
 
     await client.query(
       `UPDATE magpie_holder_rewards
           SET status = 'paid', paid_at = NOW(), paid_tx_signature = $2
         WHERE id = ANY($1::bigint[])`,
-      [rows.map((r) => r.id), signature],
+      [rows.map((r) => r.id), res.sig],
+    );
+
+    // Use the function's own walletAddress — this query selects only
+    // (id, reward_lamports), so rows carry no wallet_address. Mapping over them
+    // would produce [undefined] here, silently match nothing, and leave the
+    // carry in place to be PAID A SECOND TIME next cycle. Inside the
+    // transaction so it commits or rolls back with the payout itself.
+    await client.query(
+      `UPDATE magpie_holder_carryforward
+          SET lamports = 0, cycles = 0, updated_at = NOW()
+        WHERE wallet_address = $1 AND lamports > 0`,
+      [walletAddress],
     );
 
     await client.query("COMMIT");
-    return { ok: true, signature, paid_lamports: total, row_count: rows.length };
+    return { ok: true, signature: res.sig, paid_lamports: total, row_count: rows.length };
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     throw err;

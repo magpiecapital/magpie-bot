@@ -87,6 +87,11 @@ import { handleHelp } from "./commands/help.js";
 import { handleCommunity } from "./commands/community.js";
 import { handleMagpie } from "./commands/magpie.js";
 import { handleStats } from "./commands/stats.js";
+import { handleFeedback } from "./commands/feedback.js";
+import { handleCollectibleSubmissions } from "./commands/collectible-submissions.js";
+import { handleRecoverCollateral } from "./commands/recover-collateral.js";
+import { startCollectibleRetention } from "./services/collectible-retention.js";
+import { startSchemaContractMonitor } from "./services/schema-contract.js";
 import { handleHistory } from "./commands/history.js";
 import { handleSimulate } from "./commands/simulate.js";
 import { handleMe, registerMeCallbacks } from "./commands/me.js";
@@ -99,7 +104,8 @@ import { handleCredit } from "./commands/credit.js";
 import { handleRisk } from "./commands/risk.js";
 import { handleLend, registerLendCallbacks } from "./commands/lend.js";
 import { handleImport, registerImportCallbacks } from "./commands/import-wallet.js";
-import { handleRefer, registerReferCallbacks } from "./commands/refer.js";
+import { handleRefer, handleReferSet, registerReferCallbacks } from "./commands/refer.js";
+import { handleAudit } from "./commands/audit.js";
 import { handleHolders, registerHoldersCallbacks } from "./commands/holders.js";
 import { handleDistributions } from "./commands/distributions.js";
 import { handleSupport, registerSupportCallbacks } from "./commands/support.js";
@@ -168,6 +174,7 @@ import { startPriceSnapshotter } from "./services/price-snapshotter.js";
 import { startExtendLoanWatcher } from "./services/extend-loan-watcher.js";
 import { startRwaScreener } from "./services/rwa-screener.js";
 import { startHeliusUsageWatcher } from "./services/helius-usage-watcher.js";
+import { startRpcHealthWatcher } from "./services/rpc-health-watcher.js";
 import { startHolderDistributor } from "./services/magpie-holder-rewards.js";
 import { startLpLoyaltyDistributor } from "./services/lp-loyalty.js";
 import { startLoanReconciler } from "./services/loan-reconciler.js";
@@ -207,6 +214,7 @@ import { startFirstV2FireWatcher } from "./services/first-v2-fire-watcher.js";
 import { startLimitCloseFirstV3FireWatcher } from "./services/limit-close-first-v3-fire-watcher.js";
 import { startLimitCloseFirstV4FireWatcher } from "./services/limit-close-first-v4-fire-watcher.js";
 import { startV4FireFailureRateWatcher } from "./services/limit-close-v4-fire-failure-rate-watcher.js";
+import { startV4ConvertDrainWatcher } from "./services/v4-convert-drain-watcher.js";
 import { startNeonSync } from "./services/neon-sync.js";
 import { registerTxErrorCallbacks } from "./services/tx-error-callbacks.js";
 import { startAiAgentHealth } from "./services/ai-agent-health.js";
@@ -227,6 +235,63 @@ if (!token) {
 const bot = new Bot(token);
 
 bot.use(rateLimit());
+
+// ── DM-only guard for account-scoped commands ──────────────────────────
+// Personal wallet / loan / security actions must run ONLY in the user's
+// private 1:1 chat with the bot — never in the Magpie Talk community group
+// (which is a public forum for chat + protocol questions with Pip).
+// Operator-mandated 2026-07-03 after a /lock ran in the group and posted a
+// personal security notice publicly. Read-only/community/info commands
+// (/stats, /price, /audit, /refer, etc.) are intentionally NOT gated.
+const DM_ONLY_COMMANDS = new Set([
+  "deposit", "borrow", "repay", "partialrepay", "reborrow", "withdraw",
+  "topup", "extend", "lock", "autoprotect", "protect", "tp", "sl",
+  "export", "exportdata", "import", "wallet", "wallets", "switchwallet",
+  "signedhistory", "me", "positions", "loans", "history",
+  // Agent-delegation commands are account-scoped (they authorize a delegate to
+  // act on the caller's wallet) — NEVER let them run in a public group, where a
+  // copy-pasted /agent_authorize could silently grant an attacker's key access.
+  "agent_authorize", "agent_revoke", "agent_list",
+]);
+bot.use(async (ctx, next) => {
+  const text = ctx.message?.text || "";
+  const m = text.match(/^\/([a-z_]+)(?:@\w+)?/i);
+  if (
+    m &&
+    ctx.chat?.type &&
+    ctx.chat.type !== "private" &&
+    DM_ONLY_COMMANDS.has(m[1].toLowerCase())
+  ) {
+    await ctx
+      .reply(
+        "🔒 That's a personal wallet command — for your security it only works in our private 1:1 chat. Open your Magpie wallet: DM @magpie_capital_bot.\n\nMagpie Talk is for community chat + protocol questions with Pip. 🐦‍⬛",
+        { disable_web_page_preview: true },
+      )
+      .catch(() => {});
+    return; // stop — never run an account command in a group
+  }
+  return next();
+});
+
+// Pinned-message awareness: capture pin events so Pip treats operator
+// announcements (e.g. "we chose Sec3") as current authoritative state and
+// never gives a stale answer. Fire-and-forget; always continues the chain.
+bot.use(async (ctx, next) => {
+  const pm = ctx.msg?.pinned_message;
+  if (pm && ctx.chat?.id) {
+    import("./services/community-pins.js")
+      .then(({ recordPinnedMessage }) =>
+        recordPinnedMessage({
+          chatId: ctx.chat.id,
+          messageId: pm.message_id,
+          text: pm.text || pm.caption || "",
+          pinnedBy: ctx.from?.username || String(ctx.from?.id || ""),
+        }),
+      )
+      .catch(() => {});
+  }
+  return next();
+});
 
 // User commands
 bot.command("start", handleStart);
@@ -290,6 +355,9 @@ bot.command("potential", handleUnlock); // alias
 bot.command("refer", handleRefer);
 bot.command("referral", handleRefer); // alias
 bot.command("invite", handleRefer); // alias — common term users guess
+bot.command("setref", handleReferSet); // claim a custom vanity referral code
+bot.command("refcode", handleReferSet); // alias
+bot.command("audit", handleAudit); // public audit status (Sec3 engaged for V4)
 bot.command("holders", handleHolders);
 bot.command("holder", handleHolders); // alias
 bot.command("distributions", handleDistributions);
@@ -388,9 +456,9 @@ bot.command("pools", handleHolderPool); // alias
 // Community moderation operator commands. Always registered so the
 // operator can enable it on demand; the per-chat enable check inside
 // the handlers ensures it does nothing in groups that haven't opted in.
-import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
+import { handleCommunityEnable, handleCommunityDisable, handleCommunityStatus, handleCommunityAllowlist, handleCommunityBroadcastNow, handleCommunityRepostGuidelines, handleCommunityUnban, handleCommunityBan, handleCommunityStrikes, handleCommunityClearStrikes, handleCommunityCrosspost } from "./commands/community-admin.js";
 import { handleGovPause, handleGovResume, handleGovStatus, handleGovConfirmManual } from "./commands/gov-admin.js";
-import { handleBurnConfirm, handleBurnRecord, handleBurnStats } from "./commands/burn-admin.js";
+import { handleBurnConfirm, handleBurnRecord, handleBurnStats, handleBurnPending } from "./commands/burn-admin.js";
 import { handleVote, handleVotingPower } from "./commands/vote.js";
 import {
   handleNominate,
@@ -407,6 +475,7 @@ bot.command("community_allowlist", handleCommunityAllowlist);
 bot.command("community_broadcast_now", handleCommunityBroadcastNow);
 bot.command("community_repost_guidelines", handleCommunityRepostGuidelines);
 // Member-management ops (operator-only)
+bot.command("ban", handleCommunityBan);
 bot.command("unban", handleCommunityUnban);
 bot.command("strikes", handleCommunityStrikes);
 bot.command("clear_strikes", handleCommunityClearStrikes);
@@ -523,6 +592,9 @@ bot.command("crosspost", handleCommunityCrosspost);
 // via OPERATOR_TG_IDS env var. /gov-pause is the master kill switch.
 bot.command("gov-pause", handleGovPause);
 bot.command("gov_pause", handleGovPause);   // underscore alias (TG strips dashes inconsistently on some clients)
+bot.command("feedback", handleFeedback);    // operator-only: review captured user replies (see fallback reply-capture)
+bot.command("submissions", handleCollectibleSubmissions); // operator-only: collectible submission review queue
+bot.command("recover", handleRecoverCollateral);         // operator-only: return off-chain SPL sale proceeds to LPs (V4.1 L-02)
 bot.command("gov-resume", handleGovResume);
 bot.command("gov_resume", handleGovResume);
 bot.command("gov-status", handleGovStatus);
@@ -537,6 +609,8 @@ bot.command("burn-record", handleBurnRecord);
 bot.command("burn_record", handleBurnRecord);
 bot.command("burn-stats", handleBurnStats);
 bot.command("burn_stats", handleBurnStats);
+bot.command("burn-pending", handleBurnPending);
+bot.command("burn_pending", handleBurnPending);
 
 // Public voter-engagement commands
 bot.command("vote", handleVote);
@@ -660,7 +734,7 @@ async function registerBotCommands() {
       { command: "supported", description: "Approved collateral tokens" },
       { command: "credit", description: "Your credit score + points" },
       { command: "history", description: "Loan history" },
-      { command: "refer", description: "Earn 5% of friends' loan fees" },
+      { command: "refer", description: "Earn 10% of friends' loan fees" },
       { command: "share", description: "Flex your loan / streak on Twitter" },
       { command: "holders", description: "$MAGPIE holder rewards" },
       { command: "distributions", description: "Your full distribution history" },
@@ -706,6 +780,9 @@ bot.start({
     // X_BEARER_TOKEN is set. No-op without the token; operator can
     // still manually use /crosspost <tweet-url> in either path.
     import("./services/community-x-crosspost.js").then((m) => m.startXCrosspostPoller(bot));
+    // Seed current pinned messages so Pip is aware of announcements pinned
+    // while the bot was offline (Telegram doesn't re-send pin events on boot).
+    import("./services/community-pins.js").then((m) => m.seedPinsForEnabledChats(bot.api)).catch(() => {});
     // Token-catalog → @MagpieLoans auto-announce — reconciliation worker that
     // diffs supported_mints.enabled and tweets when a token is added/removed
     // from the approved-collateral catalog (the /tokens page). No-op posting
@@ -885,6 +962,11 @@ bot.start({
     // auto-closes after 7d total of silence.
     import("./services/support-vigil.js").then((m) => m.startSupportVigil(bot));
     setTimeout(() => startHeliusUsageWatcher(bot), 60_000); // Helius credit alerts
+    // RPC health: catches what the credit watcher structurally cannot — a
+    // provider serving HTTP 200 with STALE data. On 2026-08-12 Helius sat ~35
+    // min behind mainnet for an hour with credits perfectly fine. Starts early
+    // (10s) because every other service depends on chain reads being truthful.
+    setTimeout(() => startRpcHealthWatcher(bot), 10_000);
     // Neon quota watcher — hourly probe of Neon's HTTP API; pages
     // the operator when usage crosses NEON_ALERT_THRESHOLD_PCT (default
     // 70%) on compute or storage. Closes the 2026-06-14 outage class
@@ -923,6 +1005,19 @@ bot.start({
     // Auto-disables enabled RWAs that degrade or get paused by the issuer.
     // Delayed start to avoid bunching with other startup workers.
     setTimeout(() => startRwaScreener(bot), 180_000);
+    // COLLECTIBLE SUBMISSION RETENTION — applies the data-retention clock from
+    // the design repo (doc 05): rolls demand into the persisted aggregate, then
+    // redacts stale contacts, clears old provenance hashes, and reduces aged
+    // declines to the aggregate row that already represents them. Rollup runs
+    // BEFORE any reduction, so retention can never destroy the demand history.
+    // Daily; slow clock by design.
+    setTimeout(() => startCollectibleRetention(), 240_000);
+    // SCHEMA CONTRACT — the site writes tables whose schema the bot owns, and
+    // nothing verified the two agreed. That gap let the collectible submission
+    // feature fail SILENTLY from the day it shipped (every INSERT rejected,
+    // caught by a best-effort try/catch, found only by chance). Declares the
+    // columns each writer depends on and alerts when one goes missing.
+    setTimeout(() => startSchemaContractMonitor(bot), 300_000);
     // $MAGPIE holder reward distributions — DISABLED as of MGP-001 (2026-06-10).
     // Distributions now flow through the governance autopilot (MGP-XXX) instead
     // of an automated bot-driven cadence. The auto-snapshotter previously created
@@ -931,7 +1026,7 @@ bot.start({
     // permanently off; if a future MGP proposal restores automated distributions,
     // re-enable this line as part of that proposal's ratified implementation.
     // setTimeout(() => startHolderDistributor(bot), 90_000);
-    // LP Loyalty distributor — rewards long-term LPs from 2% of fees
+    // LP Loyalty distributor — rewards long-term LPs from 10% of fees
     setTimeout(() => startLpLoyaltyDistributor(), 120_000);
     // Loan reconciler — proactively syncs DB state with on-chain truth
     // every 5 min. Catches partial-repay/extend/liquidation drift.
@@ -952,6 +1047,14 @@ bot.start({
     // uniqueness on protocol_reserve_events + referral_earnings.
     import("./services/liquidation-distribution-watcher.js").then((m) =>
       m.startLiquidationDistributionWatcher(),
+    );
+    // Liquidation safety watchdog — the "keeper canary." READ-ONLY: DMs the
+    // operator if any active loan goes overdue and is NOT liquidated (i.e. the
+    // separate keeper process is down/stalled/unfunded). The post-liquidation
+    // watchers above assume liquidations happen; this makes the EXECUTOR's
+    // health observable so a silent keeper death can't accrue bad debt unseen.
+    import("./services/liquidation-safety-watchdog.js").then((m) =>
+      m.startLiquidationSafetyWatchdog(bot),
     );
     // Exploit-detector — auto-bans wallets/users matching the
     // pump-and-borrow attack pattern, alerts on weaker signals.
@@ -1106,6 +1209,9 @@ bot.start({
     // First-fire watcher catches "V4 wired up?" — this one catches "V4
     // is wired but something is silently failing repeatedly."
     setTimeout(() => startV4FireFailureRateWatcher(bot), 180_000);
+    // INTERIM detection for the unpatched V4 convert_collateral_slice drain
+    // (audit #1 critical; on-chain fix ships as V4.x pending Sec3). Read-only.
+    setTimeout(() => startV4ConvertDrainWatcher(bot), 190_000);
     // Auto-Protect — opt-in anti-liquidation. Watches every 90s.
     setTimeout(() => startAutoProtect(bot), 50_000);
     // Fee-wallet auto-sweeper — every 1h moves accrued fee SOL from

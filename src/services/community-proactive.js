@@ -111,19 +111,29 @@ function displayName(tgUser) {
   return first ? escapeMdName(first) : "friend";
 }
 
-/** Post an in-group welcome after a member passes the captcha.
+/** Welcome a member privately after they pass the captcha.
+ *  Operator 2026-06-30: this used to broadcast to the WHOLE group on every
+ *  join — pure noise for everyone else. It now DMs the new member instead, so
+ *  only they see it. If they passed via the in-group captcha button they may
+ *  not have started the bot, so the DM can fail (403) — that's fine: on pass
+ *  they ALREADY got the per-user "Welcome to Magpie!" callback toast + their
+ *  captcha message edited to "✅ verified", so we simply skip rather than fall
+ *  back to a group post. `chatId` is kept in the signature for compatibility.
  *  Templated, zero LLM cost. Best-effort; failures are non-fatal. */
 export async function postCaptchaWelcome(botApi, chatId, tgUser) {
   if (PROACTIVE_DISABLED) return;
+  if (!tgUser?.id) return;
   const name = displayName(tgUser);
   const text = pickWelcome(name);
   try {
-    await botApi.sendMessage(Number(chatId), text, {
+    await botApi.sendMessage(Number(tgUser.id), text, {
       parse_mode: "Markdown",
       disable_web_page_preview: true,
     });
   } catch (err) {
-    console.warn(`[proactive] captcha-welcome to ${chatId} failed:`, err.message);
+    // Expected when the member hasn't started the bot — do NOT post to the
+    // group; the per-user pass toast already greeted them.
+    console.warn(`[proactive] captcha-welcome DM to ${tgUser.id} skipped:`, err.message?.slice(0, 80));
   }
 }
 
@@ -346,7 +356,7 @@ async function sweepProactiveQuestions(botApi) {
       if (!q) continue;
 
       // Single Sonnet call via the existing /ask path. ~$0.005.
-      const answer = await answerGroupQuestion(q.text);
+      const answer = await answerGroupQuestion(q.text, { chatId });
       if (!answer) {
         // Fail-open: don't mark picked up so it can be retried next sweep
         // (and naturally ages out via QUESTION_MAX_AGE_MS).
@@ -650,11 +660,15 @@ async function sweepCommandHints(botApi) {
 // 8 content rotators so 8 consecutive posts are all different. Each
 // pulls live data where applicable so the chat sees changing numbers
 // not static slogans.
+// Cadence: hourly. Community felt the old ~7min default too frequent
+// (operator-flagged 2026-07-04). Floor raised to 30min so it can never
+// regress to spammy sub-hourly without an intentional code change; env
+// var still lets the operator make it *slower* (e.g. 120 = every 2h).
 const VIBE_BASE_GAP_MS = Math.max(
-  3 * 60 * 1000,
-  Number(process.env.PIP_VIBE_GAP_MIN) * 60 * 1000 || 7 * 60 * 1000, // default ~7min
+  30 * 60 * 1000,
+  Number(process.env.PIP_VIBE_GAP_MIN) * 60 * 1000 || 60 * 60 * 1000, // default hourly
 );
-const VIBE_JITTER_MS = 3 * 60 * 1000;          // ±3min so posts don't feel robotic
+const VIBE_JITTER_MS = 8 * 60 * 1000;          // ±8min so hourly posts don't feel robotic
 const VIBE_HUMAN_QUIET_MS = 2 * 60 * 1000;     // skip if humans posted <2min ago
 const VIBE_PIP_GAP_MS = 3 * 60 * 1000;         // never within 3min of another Pip post
 const vibeChatState = new Map();               // chatId → { lastVibeAt, lastHumanAt, idx }
@@ -713,7 +727,7 @@ const VIBE_ROTATORS = [
   // 8. Safety reminder (rotates with the four-handle trust line)
   () => `🛡 Quick reminder: Magpie has *exactly four* official accounts. Anyone else claiming to be us is a scammer. Verify at magpie.capital/links.`,
   // 9. Two-surface reminder
-  () => `📲 Two Magpies: *@magpie\\_capital\\_bot* (your private wallet) and *@magpietalk* (this community). No DM support. No airdrops. No surprises.`,
+  () => `📲 Two Magpies: \`@magpie_capital_bot\` (your private wallet) and \`@magpietalk\` (this community). No DM support. No airdrops. No surprises.`,
   // 10. Lifetime repaid milestone
   (s) => `✅ *${s.repaid}* loans repaid lifetime. Zero LP losses. Every flow on-chain.`,
 ];
@@ -792,7 +806,8 @@ export function startCommunityProactive(bot) {
   console.log(
     `[proactive] starting — pickup ${Math.round(QUESTION_PICKUP_INTERVAL_MS/60000)}min (max ${DAILY_PROACTIVE_MAX}/chat/day), ` +
     `milestones ${Math.round(MILESTONE_INTERVAL_MS/60000)}min, ` +
-    `cmd hints ${Math.round(COMMAND_HINT_GAP_MS/60000)}min + ${COMMAND_HINT_MIN_MESSAGES} msgs`,
+    `cmd hints ${Math.round(COMMAND_HINT_GAP_MS/60000)}min + ${COMMAND_HINT_MIN_MESSAGES} msgs, ` +
+    `vibe ${Math.round(VIBE_BASE_GAP_MS/60000)}min ±${Math.round(VIBE_JITTER_MS/60000)}min`,
   );
   questionTimer = setInterval(() => {
     sweepProactiveQuestions(bot.api).catch((err) =>
@@ -810,8 +825,8 @@ export function startCommunityProactive(bot) {
     );
   }, COMMAND_HINT_INTERVAL_MS);
   // Vibe poster — checks every minute, posts only when gap + quiet-chat
-  // + no-recent-Pip-post conditions all met. Default cadence ~7min,
-  // configurable via PIP_VIBE_GAP_MIN env var (minimum 3).
+  // + no-recent-Pip-post conditions all met. Default cadence hourly,
+  // configurable via PIP_VIBE_GAP_MIN env var (minimum 30).
   vibeTimer = setInterval(() => {
     sweepVibePosts(bot.api).catch((err) =>
       console.error("[proactive] vibe sweep failed:", err.message),

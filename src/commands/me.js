@@ -65,12 +65,12 @@ function mePipCoachLine({
     if (solBalance > lamports(0.5)) {
       return `${(solBalance/1e9).toFixed(2)} SOL idle. Consider /lend for ~80% of fees pro-rata, or /borrow if you have a bag to put to work.`;
     }
-    return `Track record looks clean. /borrow when you're ready, or /refer to earn 5% of friends' loan fees lifetime.`;
+    return `Track record looks clean. /borrow when you're ready, or /refer to earn 10% of friends' loan fees lifetime.`;
   }
 
   // Default: healthy general
   if (referredCount === 0 && repaidCount > 0) {
-    return `You've got the playbook down. /refer earns you 5% of every loan fee your friends pay, in SOL, lifetime.`;
+    return `You've got the playbook down. /refer earns you 10% of every loan fee your friends pay, in SOL, lifetime.`;
   }
   return null;
 }

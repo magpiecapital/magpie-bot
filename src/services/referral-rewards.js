@@ -1,9 +1,11 @@
 /**
  * Referral fee-share rewards.
  *
- * Economics: 5% of every loan fee (REFERRAL_REWARD_BPS=500) accrues to the
- * referrer who brought in the borrower. Sourced from the protocol's 20%
- * fee slice — LPs are unaffected. Tracked off-chain in `referral_earnings`;
+ * Economics: 10% of every loan fee (REFERRAL_REWARD_BPS=1000, MGP-001) accrues to
+ * the referrer who brought in the borrower. When the borrower has NO referrer,
+ * that 10% is rolled into the $MAGPIE holder pool by recordLoan's
+ * rollUnreferredShareToHolders (→ 80/10/10), so 100% of every fee is always
+ * routed and nothing is retained. Tracked off-chain in `referral_earnings`;
  * paid out in SOL via /claim from the lender wallet.
  *
  * Anti-abuse:

@@ -312,7 +312,10 @@ export async function armOrder(args) {
   // hides automatically once the intent is no longer 'pending'.
   // Best-effort — a reconciliation failure must NOT mask the real
   // arm result.
-  if (result.ok && args.intentId != null) {
+  // NB: a queued (result.pending === true) arm is ok:true but NOT armed yet —
+  // leave its intent 'pending' so the recovery banner keeps showing "queued"
+  // until the watcher actually arms it (then the watcher/reconcile marks armed).
+  if (result.ok && result.pending !== true && args.intentId != null) {
     try {
       await query(
         `UPDATE arm_intents
@@ -379,6 +382,15 @@ async function armOrderImpl({
   // notifications either (none happen in armOrder anyway today,
   // but the contract holds).
   dryRun = false,
+  // Signed-envelope context (site/agent single arms). When the loan isn't
+  // yet committed OR still finalizing (borrow→active race), we persist the
+  // arm to the pending_arms queue so the retry-watcher REPLAYS it with the
+  // user's still-valid signature — NO re-sign. Mirrors armOrderBatchImpl.
+  // The batch path already does this for ladders; single arms were the gap
+  // that stranded users on a stuck "Signing…" (feedback_v4_every_arm_must_succeed).
+  envelope = null,        // { signer_pubkey, wallet, envelope_issued_at_ms }
+  skipPendingQueue = false, // watcher replay sets this so it can't self-requeue
+  intentId = null,        // arm_intents row id to link for banner clear
 }) {
   // ── Shape validation ─────────────────────────────────────────
   if (!VALID_TRIGGER_KINDS.has(triggerKind)) {
@@ -501,7 +513,59 @@ async function armOrderImpl({
     if (Date.now() >= LOAN_LOOKUP_DEADLINE_MS) break;
     await new Promise((r) => setTimeout(r, LOAN_LOOKUP_INTERVAL_MS));
   }
+  // Borrow-finalization race recovery: persist the signed arm to pending_arms
+  // so the retry-watcher replays it (NO re-sign) the instant the loan commits
+  // AND goes active. Returns a pending result the caller surfaces as "queued";
+  // returns null when queuing isn't possible (no envelope / stale / insert fail)
+  // so the hard-fail path below still runs.
+  const tryQueuePendingArm = async () => {
+    if (!envelope || skipPendingQueue) return null;
+    const issuedAtMs = Number(envelope.envelope_issued_at_ms);
+    if (!Number.isFinite(issuedAtMs) || issuedAtMs <= 0) return null;
+    const ENVELOPE_FRESH_MS = 5 * 60 * 1000;
+    // Need >30s of freshness left so the 10s watcher gets ≥1 replay attempt.
+    if (Date.now() - issuedAtMs >= ENVELOPE_FRESH_MS - 30_000) return null;
+    try {
+      // 1-leg batch, in the exact shape armOrderBatch (the watcher's replay
+      // entrypoint) parses. Trigger value is already resolved (fixed strike).
+      const leg = {
+        direction: triggerDirection,
+        kind: triggerKind,
+        valueMicro: String(triggerValueMicro),
+        sliceBps: slicePct,
+        slippageBps,
+        expiresAt: expiresAt || null,
+        trailingDistanceBps: trailingDistanceBps ?? null,
+      };
+      const pending = await persistPendingArm({
+        userId,
+        signerPubkey: envelope.signer_pubkey || null,
+        wallet: envelope.wallet || envelope.signer_pubkey || null,
+        loanIdChain: String(loanIdChain),
+        legs: [leg],
+        intentIds: intentId != null ? [intentId] : null,
+        source,
+        armNotePrefix: null,
+        envelopeIssuedAtMs: issuedAtMs,
+      });
+      return {
+        ok: true,
+        pending: true,
+        pending_arm_id: pending.id,
+        envelope_expires_at_ms: issuedAtMs + ENVELOPE_FRESH_MS,
+        retry_in_ms: 10_000,
+        detail: "Your loan is still finishing setup — the auto-sell is queued and arms automatically in a few seconds. No need to sign again.",
+      };
+    } catch (qErr) {
+      console.warn(`[arm-core single] pending_arms insert failed: ${qErr.message?.slice(0, 160)} — falling back to hard-fail`);
+      return null;
+    }
+  };
+
   if (!loan) {
+    // Tier-2 recovery: queue for the watcher before the hard-fail path.
+    const queued = await tryQueuePendingArm();
+    if (queued) return queued;
     // Tier-1 defense: admin DM on first occurrence per
     // feedback_loan_830_full_postmortem_and_defenses.md.
     try {
@@ -520,6 +584,14 @@ async function armOrderImpl({
     return { ok: false, error: "loan_not_found_for_user" };
   }
   if (loan.status !== "active") {
+    // A loan that exists but is still FINALIZING (not yet 'active') is the
+    // same race — queue it. Only for non-terminal statuses: a genuinely
+    // repaid/liquidated/closed loan will never become active, so hard-fail.
+    const TERMINAL = new Set(["repaid", "liquidated", "cancelled", "closed", "defaulted", "refunded"]);
+    if (!TERMINAL.has(String(loan.status).toLowerCase())) {
+      const queued = await tryQueuePendingArm();
+      if (queued) return queued;
+    }
     return { ok: false, error: "loan_not_active", detail: loan.status };
   }
   if (BigInt(loan.owed) < MIN_LOAN_LAMPORTS) {

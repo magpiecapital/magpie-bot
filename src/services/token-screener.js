@@ -529,20 +529,39 @@ async function getMarketData(mints) {
       const addr = p.baseToken?.address;
       if (!addr) continue;
 
-      const liq = p.liquidity?.usd ?? 0;
+      const liq = Number(p.liquidity?.usd) || 0;
       const existing = result.get(addr);
-      if (existing && (existing.liquidity ?? 0) >= liq) continue;
-
-      result.set(addr, {
-        symbol: p.baseToken?.symbol || "???",
-        name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
-        price: p.priceUsd ? parseFloat(p.priceUsd) : null,
-        liquidity: liq,
-        volume24h: p.volume?.h24 ?? 0,
-        marketCap: p.marketCap ?? p.fdv ?? 0,
-        pairCreatedAt: p.pairCreatedAt ?? null,
-        imageUrl: p.info?.imageUrl ?? null,
-      });
+      if (!existing) {
+        result.set(addr, {
+          symbol: p.baseToken?.symbol || "???",
+          name: p.baseToken?.name || p.baseToken?.symbol || "Unknown",
+          price: p.priceUsd ? parseFloat(p.priceUsd) : null,
+          // AGGREGATE: liquidity is the SUM across ALL of this token's pools (a
+          // sell routes via Jupiter across every pool). Single-pool under-read
+          // wrongly blocked a borrow on a multi-pool token ($ANSEM 2026-06-30);
+          // the cached liquidity_usd the borrow gate floors against must be the
+          // TOTAL depth. Price/symbol/metadata come from the LARGEST pool.
+          liquidity: liq,
+          _topPoolLiq: liq,
+          volume24h: p.volume?.h24 ?? 0,
+          marketCap: p.marketCap ?? p.fdv ?? 0,
+          pairCreatedAt: p.pairCreatedAt ?? null,
+          imageUrl: p.info?.imageUrl ?? null,
+        });
+      } else {
+        existing.liquidity += liq; // sum every pool for this token
+        if (liq > (existing._topPoolLiq ?? 0)) {
+          // larger pool → take its price + metadata as the representative
+          existing._topPoolLiq = liq;
+          existing.symbol = p.baseToken?.symbol || existing.symbol;
+          existing.name = p.baseToken?.name || existing.name;
+          existing.price = p.priceUsd ? parseFloat(p.priceUsd) : existing.price;
+          existing.volume24h = p.volume?.h24 ?? existing.volume24h;
+          existing.marketCap = p.marketCap ?? p.fdv ?? existing.marketCap;
+          existing.pairCreatedAt = p.pairCreatedAt ?? existing.pairCreatedAt;
+          existing.imageUrl = p.info?.imageUrl ?? existing.imageUrl;
+        }
+      }
     }
   }
   return result;
@@ -764,10 +783,59 @@ async function _auditTokenExtensionsUncached(mintStr) {
 
 // ─── Holder concentration ───────────────────────────────────────────────────
 
+// Operator-designated TRUSTED SUPPLY HOLDERS. Wallets in this set legitimately
+// hold a large share of many *good* tokens (protocol / market-maker / treasury
+// wallets), so their balance must NOT count against the supply-concentration
+// limits. We resolve the owner of each top token-account and subtract any owned
+// by a trusted wallet from the top-10/top-20 numerator — the concentration gate
+// then measures only the *public float*, so a big trusted position never
+// disqualifies an otherwise well-distributed token, while a scammer's
+// concentration still trips the gate normally.
+//
+// Operator-mandated 2026-07-04. Strict approval guidelines stay in force for
+// every other check; this is a narrow, deliberate carve-out.
+//
+// IMPORTANT — this repo is PUBLIC: the actual wallet addresses are NEVER
+// hardcoded here. They live in the private `screening_trusted_holders` prod
+// table (and/or the TRUSTED_SUPPLY_HOLDERS env var, comma-separated), so the
+// operator's trusted wallets aren't published or trivially trackable. Loaded
+// with a short in-process cache; fail-open (env-only, then empty) on error.
+const _TRUSTED_HOLDERS_TTL_MS = 5 * 60 * 1000;
+let _trustedHoldersCache = { at: 0, set: null };
+
+async function getTrustedSupplyHolders() {
+  const now = Date.now();
+  if (_trustedHoldersCache.set && now - _trustedHoldersCache.at < _TRUSTED_HOLDERS_TTL_MS) {
+    return _trustedHoldersCache.set;
+  }
+  const set = new Set(
+    (process.env.TRUSTED_SUPPLY_HOLDERS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  try {
+    const { rows } = await query(`SELECT wallet_address FROM screening_trusted_holders`);
+    for (const r of rows) {
+      const w = (r.wallet_address || "").trim();
+      if (w) set.add(w);
+    }
+  } catch (e) {
+    // Table missing / transient DB error → fall back to env-only (fail-open).
+    console.warn(`[screener] trusted-holders load failed: ${e.message}`);
+  }
+  _trustedHoldersCache = { at: now, set };
+  return set;
+}
+
 /**
  * Reject tokens where the top 10 holders control >40% of supply — this is
  * the classic dev-dump risk: a tiny group of wallets can crash the price
  * right after we accept the token as collateral.
+ *
+ * Holdings owned by TRUSTED_SUPPLY_HOLDERS are excluded from the numerator
+ * (see the constant above) so a large trusted stake never disqualifies an
+ * otherwise-distributed token.
  *
  * Skips tokens whose top holders are clearly pool addresses (DEX LPs are
  * expected to hold significant supply). For now we treat any holder with
@@ -800,23 +868,54 @@ async function _checkHolderConcentrationUncached(mintStr, opts = {}) {
     const total = BigInt(supplyInfo.value.amount);
     if (total === 0n) return { ok: false, reason: "zero supply" };
 
+    // Exclude any of the largest token-accounts OWNED by a trusted supply
+    // holder. getTokenLargestAccounts returns token-account addresses, not
+    // owner wallets, so we resolve owners for the (<=20) accounts and drop
+    // the trusted ones from the concentration set. Fail-open: if owner
+    // resolution errors, we simply don't exclude (original strict behavior).
+    let holders = largest.value;
+    let trustedExcluded = 0;
+    const trustedHolders = await getTrustedSupplyHolders();
+    if (trustedHolders.size > 0 && holders.length > 0) {
+      try {
+        const infos = await connection.getMultipleParsedAccounts(
+          holders.map((a) => new PublicKey(a.address)),
+          { commitment: "confirmed" },
+        );
+        const trustedAddrs = new Set();
+        (infos?.value || []).forEach((acc, i) => {
+          const owner = acc?.data?.parsed?.info?.owner;
+          if (owner && trustedHolders.has(owner)) {
+            trustedAddrs.add(holders[i].address);
+          }
+        });
+        if (trustedAddrs.size > 0) {
+          holders = holders.filter((a) => !trustedAddrs.has(a.address));
+          trustedExcluded = trustedAddrs.size;
+        }
+      } catch (e) {
+        console.warn(`[screener] trusted-holder owner resolve failed for ${mintStr}: ${e.message}`);
+      }
+    }
+
     // Solana returns up to 20 largest accounts; check both top-10 and
     // top-20 (=full set) so a scammer can't just split 90% across 11
-    // wallets to dodge the top-10 limit.
-    const top10 = largest.value.slice(0, 10);
-    const top20 = largest.value.slice(0, 20);
+    // wallets to dodge the top-10 limit. `holders` here already has any
+    // trusted-holder accounts removed, so % is measured over the public float.
+    const top10 = holders.slice(0, 10);
+    const top20 = holders.slice(0, 20);
     const sum10 = top10.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const sum20 = top20.reduce((acc, a) => acc + BigInt(a.amount), 0n);
     const pct10 = Number((sum10 * 10000n) / total) / 100;
     const pct20 = Number((sum20 * 10000n) / total) / 100;
 
     if (pct10 > maxTop10Pct) {
-      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)` };
+      return { ok: false, reason: `top-10 holders own ${pct10.toFixed(1)}% (max ${maxTop10Pct}%)`, trustedExcluded };
     }
     if (pct20 > maxTop20Pct) {
-      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)` };
+      return { ok: false, reason: `top-20 holders own ${pct20.toFixed(1)}% (max ${maxTop20Pct}%)`, trustedExcluded };
     }
-    return { ok: true, topTenPct: pct10, topTwentyPct: pct20 };
+    return { ok: true, topTenPct: pct10, topTwentyPct: pct20, trustedExcluded };
   } catch (err) {
     // Don't block on transient RPC errors — log and let downstream checks
     // (sellability) be the safety net.
@@ -948,19 +1047,24 @@ export async function checkSellable(mint, decimals) {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
     if (!res.ok) {
-      // Jupiter explicitly fails when the token cannot be routed.
-      return { sellable: false, reason: `Jupiter quote ${res.status}` };
+      // Non-200 conflates a genuinely-unroutable token (400) with infra
+      // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
+      // treats !sellable as a fail (err on caution at approval time); the
+      // borrow-time re-check fails OPEN on non-definitive results.
+      return { sellable: false, definitive: false, reason: `Jupiter quote ${res.status}` };
     }
     const data = await res.json();
     if (!data?.outAmount || data.outAmount === "0") {
-      return { sellable: false, reason: "Jupiter returned no sell route" };
+      // Jupiter returned a SUCCESSFUL response with NO sell route — the
+      // clearest honeypot signal, safe for a borrow-time hard block.
+      return { sellable: false, definitive: true, reason: "Jupiter returned no sell route" };
     }
     return { sellable: true };
   } catch (err) {
     // Network errors don't necessarily mean honeypot, but we err on the
-    // side of caution and require a successful sellability check before
-    // approving anything.
-    return { sellable: false, reason: `quote check failed: ${err.message}` };
+    // side of caution at APPROVAL time and require a successful sellability
+    // check. Not definitive → the borrow-time re-check fails open on this.
+    return { sellable: false, definitive: false, reason: `quote check failed: ${err.message}` };
   }
 }
 

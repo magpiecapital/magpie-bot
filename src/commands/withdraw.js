@@ -3,7 +3,6 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
 import {
@@ -17,6 +16,8 @@ import { upsertUser } from "../services/users.js";
 import { ensureWallet, loadKeypair } from "../services/wallet.js";
 import { getSupportedBalances, getSolBalance } from "../services/deposits.js";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
+import { sendWithPriorityAndConfirm } from "../solana/tx-send.js";
 import { translateTxError, errorActionKeyboard } from "../services/tx-error-translator.js";
 import { parseAmountInput, clampToMax } from "../lib/amount-input.js";
 
@@ -215,7 +216,7 @@ async function doWithdraw({ userId, asset, destination, rawAmount, decimals }) {
 
   if (asset === "SOL") {
     const tx = new Transaction().add(
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "tg-withdraw" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
       SystemProgram.transfer({
         fromPubkey: signer.publicKey,
@@ -223,7 +224,11 @@ async function doWithdraw({ userId, asset, destination, rawAmount, decimals }) {
         lamports: rawAmount,
       }),
     );
-    return sendAndConfirmTransaction(connection, tx, [signer]);
+    return sendWithPriorityAndConfirm(tx, [signer], {
+    label: "tg-withdraw",
+    feePayer: signer.publicKey,
+    cuLimit: 200_000,
+  });
   }
 
   // SPL token withdraw
@@ -234,7 +239,7 @@ async function doWithdraw({ userId, asset, destination, rawAmount, decimals }) {
   const toAta = getAssociatedTokenAddressSync(mint, dest, false, tokenProgram);
 
   const tx = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "tg-withdraw" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       signer.publicKey,
@@ -254,5 +259,9 @@ async function doWithdraw({ userId, asset, destination, rawAmount, decimals }) {
       tokenProgram,
     ),
   );
-  return sendAndConfirmTransaction(connection, tx, [signer]);
+  return sendWithPriorityAndConfirm(tx, [signer], {
+    label: "tg-withdraw",
+    feePayer: signer.publicKey,
+    cuLimit: 200_000,
+  });
 }

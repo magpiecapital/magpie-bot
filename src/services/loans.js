@@ -21,10 +21,12 @@ import fs from "node:fs";
 import path from "node:path";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   getProgramForSigner,
   PROGRAM_ID,
   PROGRAM_ID_V4,
+  PROGRAM_ID_V4_1,
   chooseProgramIdForCategory,
   chooseProgramId,
   assertProgramMatchesCategory,
@@ -257,7 +259,7 @@ export async function executeBorrow({
   // fee_wallet_token_account constraint. Borrower pays the rent (~0.002 SOL,
   // one-time) — fee ATA persists thereafter as long as it holds wSOL.
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -470,7 +472,7 @@ async function _executeRepayImpl({ userId, loanDbRow }) {
   //   2. Wrap SOL → wSOL in borrower's loan-token ATA so they can pay back
   //      the principal: create ATA, fund it, sync_native.
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -564,6 +566,43 @@ async function _executeRepayImpl({ userId, loanDbRow }) {
   const sig = await buildRepayMethod().rpc({ commitment: "confirmed" });
 
   return { signature: sig };
+}
+
+/**
+ * No-referrer rollover — the MGP-001 "0% retained" guarantee.
+ *
+ * Every loan fee splits 70/10/10/10 (holders / LP loyalty / referrer / reserve).
+ * The referrer's 10% is only paid when the borrower actually has a referrer. When
+ * they DON'T, that 10% would otherwise be retained (undistributed) — which both
+ * contradicts MGP-001's "100% routed, 0% retained" promise AND is inconsistent
+ * with the liquidation/default distribution path, which already rolls the
+ * unreferred slice into holders (→ 80/10/10).
+ *
+ * This closes that gap on the loan-fee path: if the borrower has no referrer,
+ * roll the referral share into the $MAGPIE holder pool. No-op when a referrer
+ * exists (their 10% was already accrued). Idempotent via creditHolderPoolDirect's
+ * ON CONFLICT (source_type, source_id, pool_kind).
+ */
+export async function rollUnreferredShareToHolders({ refereeUserId, feeLamports, sourceId }) {
+  const fee = BigInt(feeLamports);
+  if (fee <= 0n || !refereeUserId || !sourceId) return;
+  try {
+    const { rows } = await query(`SELECT referred_by FROM users WHERE id = $1`, [refereeUserId]);
+    if (rows[0]?.referred_by) return; // has a referrer → their 10% was paid; nothing to roll
+    const { getReferralRewardBps } = await import("./referral-rewards.js");
+    const { creditHolderPoolDirect } = await import("./magpie-holder-rewards.js");
+    const refBps = await getReferralRewardBps();
+    const rollover = (fee * BigInt(Math.round(refBps))) / 10_000n;
+    if (rollover <= 0n) return;
+    await creditHolderPoolDirect({
+      sourceType: "referral_rollover_no_referrer",
+      sourceId,
+      lamports: rollover,
+      metadata: { fee_lamports: fee.toString(), referral_bps: refBps, reason: "no_referrer_rollover" },
+    });
+  } catch (err) {
+    console.error("[loans] no-referrer holder rollover failed (continuing):", err.message);
+  }
 }
 
 /**
@@ -859,6 +898,11 @@ export async function recordLoan({
     console.error("[loans] holder pool accrual on borrow failed (continuing):", err.message);
   }
 
+  // No-referrer rollover — if the borrower has no referrer, roll the unpaid 10%
+  // referral slice into holders (→80/10/10), so 100% is always routed (MGP-001
+  // "0% retained") and the loan-fee path matches the liquidation path. No-op if referred.
+  await rollUnreferredShareToHolders({ refereeUserId: userId, feeLamports, sourceId: `loan_${rows[0].id}` });
+
   // LP Loyalty Bonus Pool accrual (bps live-read from governance_config)
   try {
     const { accrueToLpLoyaltyPool } = await import("./lp-loyalty.js");
@@ -1022,7 +1066,7 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
       tokenProgram: collateralTokenProgram,
     })
     .preInstructions([
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
     ])
     .rpc({ commitment: "confirmed" });
@@ -1054,7 +1098,7 @@ export async function executePartialRepay({ userId, loanDbRow, repayLamports }) 
   );
 
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -1138,7 +1182,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   const feeLamports = (owedLive * feeBps) / 10_000n;
 
   const preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "loan-op" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
     createAssociatedTokenAccountIdempotentInstruction(
       borrower.publicKey,
@@ -1173,6 +1217,20 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     ),
   ];
 
+  // V4.1 (Sec3 M-01): extend_loan re-checks collateral health on-chain, so it
+  // additionally takes collateral_mint + price_history. `authority` is an
+  // OPTIONAL signer — a provably-healthy loan self-extends without it. We do
+  // NOT pass it: an unhealthy loan should fail loudly rather than be silently
+  // co-signed into an extension. Inert until PROGRAM_ID_V4_1 is set.
+  const v41ExtendAccounts = {};
+  if (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)) {
+    const { priceFeedPda } = await import("../solana/pdas.js");
+    const extendCollateralMint = new PublicKey(loanDbRow.collateral_mint);
+    const [priceHistoryPda] = priceFeedPda(extendCollateralMint, lendingPool, programId);
+    v41ExtendAccounts.collateralMint = extendCollateralMint;
+    v41ExtendAccounts.priceHistory = priceHistoryPda;
+  }
+
   const sig = await program.methods
     .extendLoan()
     .accounts({
@@ -1183,6 +1241,7 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
       feeWalletTokenAccount: feeWalletWsolAta,
       borrower: borrower.publicKey,
       loanTokenProgram,
+      ...v41ExtendAccounts,
     })
     .preInstructions(preIxs)
     .postInstructions(postIxs)
@@ -1212,6 +1271,13 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
   } catch (err) {
     console.error("[loans] holder pool accrual on extend failed (continuing):", err.message);
   }
+
+  // No-referrer rollover on the extend fee (same 0%-retained guarantee as borrow).
+  await rollUnreferredShareToHolders({
+    refereeUserId: userId,
+    feeLamports,
+    sourceId: `loan_${loanDbRow.id}_extend_${loanDbRow.duration_days || "n"}`,
+  });
 
   // LP Loyalty Bonus Pool accrual on the extend fee.
   try {

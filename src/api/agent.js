@@ -57,6 +57,7 @@ import {
 import BN from "bn.js";
 import { query } from "../db/pool.js";
 import { connection, withFailover } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   PROGRAM_ID,
   PROGRAM_ID_V2,
@@ -351,7 +352,7 @@ export async function buildBorrowTx({
     );
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "agent-borrow" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
       createAssociatedTokenAccountIdempotentInstruction(
         borrowerPk, borrowerWsolAta, borrowerPk, NATIVE_MINT, loanTokenProgram,

@@ -30,6 +30,7 @@ import {
 } from "@solana/spl-token";
 import "dotenv/config";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import {
   getReadOnlyProgram,
   getProgramForSigner,
@@ -37,6 +38,7 @@ import {
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
   PROGRAM_ID_V4,
+  PROGRAM_ID_V4_1,
 } from "../solana/program.js";
 import { lendingPoolPda } from "../solana/pdas.js";
 import { readFileSync } from "node:fs";
@@ -150,12 +152,18 @@ async function liquidateLoan(program, keeper, loan, pool) {
   // SOL in sol_proceeds_vault). Without these, every V4 overdue loan
   // fails with AccountNotEnoughKeys and stays uncollected.
   const isV4 = PROGRAM_ID_V4 && program.programId.equals(PROGRAM_ID_V4);
+  // V4.1 (Sec3 L-02): liquidate_loan additionally takes loan_token_vault,
+  // because wSOL recovered at liquidation now routes back to the LPs instead
+  // of the authority. V4.1 is a SUPERSET of V4's list here, so it reuses the
+  // V4 block below and only adds the one account. Inert until the operator
+  // sets PROGRAM_ID_V4_1 after a signed-off deploy.
+  const isV41 = PROGRAM_ID_V4_1 && program.programId.equals(PROGRAM_ID_V4_1);
   let v4ExtraAccounts = {};
   let preIxs = [
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "liquidation" }) }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
   ];
-  if (isV4) {
+  if (isV4 || isV41) {
     const { NATIVE_MINT } = await import("@solana/spl-token");
     const { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction } =
       await import("@solana/spl-token");
@@ -185,6 +193,15 @@ async function liquidateLoan(program, keeper, loan, pool) {
       systemProgram: SystemProgram.programId,
       rent: SYSVAR_RENT_PUBKEY,
     };
+    if (isV41) {
+      // [L-02] Recovered wSOL goes to the pool's loan-token vault (the LPs),
+      // not the authority. Same PDA the pool itself uses.
+      const [loanTokenVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("loan-token-vault"), loanData.pool.toBuffer()],
+        program.programId,
+      );
+      v4ExtraAccounts.loanTokenVault = loanTokenVaultPda;
+    }
     // Create the wSOL ATAs idempotently — keeper pays.
     preIxs.push(
       createAssociatedTokenAccountIdempotentInstruction(

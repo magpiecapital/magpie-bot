@@ -616,13 +616,13 @@ export async function handleCommunityRefer(ctx) {
   const text = [
     `🤝 *Magpie referral program*`,
     ``,
-    `Refer a friend → earn *5% of every loan fee they ever pay*. Lifetime. Paid in SOL.`,
+    `Refer a friend → earn *10% of every loan fee they ever pay*. Lifetime. Paid in SOL.`,
     ``,
     `*How it works*`,
     `• DM @magpie\\_capital\\_bot and run /refer`,
     `• You get a unique link — share it`,
     `• Anyone who starts the bot through your link is linked to you forever`,
-    `• 5% of every fee they pay is airdropped to your wallet automatically`,
+    `• 10% of every fee they pay is airdropped to your wallet automatically`,
     ``,
     `*No cap, no claim, no signup* — just hold the wallet that originated the link.`,
   ].join("\n");
@@ -771,14 +771,16 @@ export async function handleCommunityWhitepaper(ctx) {
 /* ─────────────────────────── /audit ─────────────────────────── */
 
 export async function handleCommunityAudit(ctx) {
-  // Honest answer — there is no formal third-party audit yet.
-  // Saying "audited" when we're not would be misrepresentation,
-  // and the community will eventually find out. Instead: explain
-  // what compensates for the missing audit + what's planned.
+  // Honest answer — no audit REPORT has shipped yet. Sec3's assessment is
+  // COMPLETE — final report delivered 2026-08-09 (20 resolved, 4
+  // acknowledged, 2 returned and since fixed + resubmitted). Never say
+  // "audited" until the final re-checked report publishes. Counts are fine to
+  // share; finding MECHANICS are not — the remediated build is not deployed,
+  // so describing an unresolved issue would point at the live program.
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie has *not* yet shipped a formal third-party audit. The team is *actively researching and vetting auditors* right now — that's the current posture. No public timeline yet; the operator will announce when scope + firm are locked.`,
+    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. *Their final report is in, delivered 2026-08-09.* Across the engagement: *24 findings* — *20 resolved*, *4 acknowledged* (accepted with documented rationale), and *none left open*. *Both High-severity findings are resolved.* Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off, so the audited build is *not the live program yet* — which is why we say V4's assessment is complete rather than "Magpie is audited". *V3 + the credit-oracle program are next in line.* And remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -819,7 +821,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `A formal third-party audit hasn't shipped yet — team is *researching and vetting auditors* (see /audit for the current posture). Source is open. Until an audit lands, a bug anywhere in the program could result in loss of funds.`,
+    `*Sec3's final report on V4 is in* — 24 findings, *20 resolved, 4 acknowledged, none open*, both High-severity resolved (see /audit). The remediated build deploys at a new program ID after sign-off, so it isn't live yet. An audit reduces risk but doesn't eliminate it — a bug anywhere in the program could still result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
@@ -951,7 +953,7 @@ export async function handleCommunityApy(ctx) {
       RULE,
       "```",
       ``,
-      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee (≈ 2% avg) flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
+      `_Rough estimate — assumes the 10% LP loyalty share of every loan fee flows to LPs per MGP-001, annualized over 30 days. Actual yield depends on borrow demand. Past performance is not a guarantee of future returns._`,
       ``,
       `Deposit at [magpie.capital/earn](${SITE_URL}/earn). See /lend for how it works.`,
     ].join("\n");

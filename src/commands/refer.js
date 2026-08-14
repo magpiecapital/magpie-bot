@@ -2,12 +2,12 @@
  * /refer — show the user's referral code, share link, lifetime earnings,
  * and a button to claim their accrued SOL payout.
  *
- * Economics: 5% of every loan fee from users they bring in. Sourced from
+ * Economics: 10% of every loan fee from users they bring in. Sourced from
  * the protocol's share — LPs are unaffected. Paid out in SOL on demand.
  */
 import { InlineKeyboard } from "grammy";
 import { upsertUser } from "../services/users.js";
-import { getOrCreateCode } from "../services/referrals.js";
+import { getOrCreateCode, setCustomCode } from "../services/referrals.js";
 import {
   getReferralSummary,
   getReferralRewardBps,
@@ -25,6 +25,13 @@ export async function handleRefer(ctx) {
   if (!tgUser) return;
 
   const user = await upsertUser(tgUser.id, tgUser.username);
+
+  // /refer set <name> — claim a custom vanity code.
+  const args = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  if (args[0]?.toLowerCase() === "set") {
+    return applyCustomCode(ctx, user.id, args[1] || "");
+  }
+
   const code = await getOrCreateCode(user.id);
   const [summary, liveBps] = await Promise.all([
     getReferralSummary(user.id),
@@ -43,6 +50,7 @@ export async function handleRefer(ctx) {
     `\`${shareLink}\``,
     "",
     "*Your code:* `" + code + "`",
+    "_✏️ Prefer a custom code? `/refer set yourname`_",
     "",
     "*Stats:*",
     `• Invited: ${summary.referred_count} user${summary.referred_count === 1 ? "" : "s"}`,
@@ -68,6 +76,7 @@ export async function handleRefer(ctx) {
     kb.text(`💸 Claim ${fmtSol(summary.claimable_lamports)} SOL`, "refer:claim").row();
   }
 
+  kb.text("✏️ Set custom code", "refer:setcode").row();
   kb.text("🏠 Home", "start:home");
 
   await ctx.reply(lines.join("\n"), {
@@ -77,7 +86,64 @@ export async function handleRefer(ctx) {
   });
 }
 
+/** Shared logic for /refer set <name> and /setref <name>. */
+async function applyCustomCode(ctx, userId, desired) {
+  if (!desired) {
+    return ctx.reply(
+      "✏️ *Set a custom referral code*\n\n" +
+        "Usage: `/refer set yourname`\n\n" +
+        "3–20 characters — letters, numbers, `_` or `-` only. It becomes your link:\n" +
+        "`https://t.me/" + BOT_USERNAME + "?start=YOURNAME`\n" +
+        "(and `magpie.capital?ref=yourname`). You can change it once every 7 days.",
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  }
+  const res = await setCustomCode(userId, desired);
+  if (!res.ok) return ctx.reply(`❌ ${res.reason}`);
+  const link = `https://t.me/${BOT_USERNAME}?start=${res.code}`;
+  return ctx.reply(
+    [
+      "✅ *Custom referral code set!*",
+      "",
+      "*Your code:* `" + res.code + "`",
+      "*Your link:* `" + link + "`",
+      "Also works as `magpie.capital?ref=" + res.code + "` (case-insensitive).",
+    ].join("\n"),
+    { parse_mode: "Markdown", disable_web_page_preview: true },
+  );
+}
+
+/** /setref <name> — direct alias for claiming a vanity code. */
+export async function handleReferSet(ctx) {
+  const tgUser = ctx.from;
+  if (!tgUser) return;
+  const user = await upsertUser(tgUser.id, tgUser.username);
+  const args = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  return applyCustomCode(ctx, user.id, args[0] || "");
+}
+
 export function registerReferCallbacks(bot) {
+  // Guided "set a custom code" — walks the user through it on a tap.
+  bot.callbackQuery("refer:setcode", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply(
+      [
+        "✏️ *Set your custom referral code*",
+        "",
+        "Just send me this (fill in your nickname):",
+        "`/refer set yourname`",
+        "",
+        "Example: `/refer set moon` → your link becomes",
+        "`t.me/" + BOT_USERNAME + "?start=MOON`  (and `magpie.capital?ref=moon`)",
+        "",
+        "Rules: 3–20 characters · letters, numbers, `_` or `-` · must be unique · changeable once every 7 days.",
+        "",
+        "Prefer the website? You can also set it in the *Referrals* card on magpie.capital/dashboard — type it in and sign with your wallet.",
+      ].join("\n"),
+      { parse_mode: "Markdown", disable_web_page_preview: true },
+    );
+  });
+
   bot.callbackQuery("refer:claim", async (ctx) => {
     await ctx.answerCallbackQuery();
 

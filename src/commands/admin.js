@@ -7,6 +7,7 @@ import {
 import { PublicKey } from "@solana/web3.js";
 import { query } from "../db/pool.js";
 import { connection } from "../solana/connection.js";
+import { getDynamicPriorityFee } from "../solana/priority-fee.js";
 import { ensureMintFeedsInitialized } from "../services/price-attestor.js";
 import { estimateCostUsd } from "../services/ai-support.js";
 import { getHealthSnapshot } from "../services/infra-health.js";
@@ -922,8 +923,9 @@ export async function handleHolderPool(ctx) {
   // Read the LIVE bps from governance_config — flips automatically when
   // MGP-001 ratifies.
   const { getHolderRewardBps } = await import("../services/magpie-holder-rewards.js");
+  const { getLpLoyaltyRewardBps } = await import("../services/lp-loyalty.js");
   const HOLDER_REWARD_BPS = await getHolderRewardBps();
-  const LP_LOYALTY_BPS = 200;        // 2% (no governance flip planned)
+  const LP_LOYALTY_BPS = await getLpLoyaltyRewardBps();   // live bps (10% post-MGP-001), not a hardcoded 2% guess
 
   const { rows: [hp] } = await query(
     `SELECT accrued_lamports::text, last_distribution_at, updated_at,
@@ -971,7 +973,7 @@ export async function handleHolderPool(ctx) {
     "",
     "*$MAGPIE Holder Pool*",
     `  Actual accrued:  \`${fmt(actualHolder)} SOL\``,
-    `  Expected (10% of all loan fees${hp?.last_distribution_at ? " since last dist" : ""}):`,
+    `  Expected (${(HOLDER_REWARD_BPS / 100).toFixed(0)}% of all loan fees${hp?.last_distribution_at ? " since last dist" : ""}):`,
     `                   \`${fmt(expectedHolderAccrual)} SOL\``,
     `  Δ (expected − actual): *\`${sign(holderDelta)}${fmt(holderDelta)} SOL\`*`,
     `  Last distribution:  ${hp?.last_distribution_at ? new Date(hp.last_distribution_at).toISOString() : "_never_"}`,
@@ -980,7 +982,7 @@ export async function handleHolderPool(ctx) {
     "",
     "*LP Loyalty Pool*",
     `  Actual accrued:  \`${fmt(actualLp)} SOL\``,
-    `  Expected (2%):   \`${fmt(expectedLpAccrual)} SOL\``,
+    `  Expected (${(LP_LOYALTY_BPS / 100).toFixed(0)}%):   \`${fmt(expectedLpAccrual)} SOL\``,
     `  Δ: *\`${sign(lpDelta)}${fmt(lpDelta)} SOL\`*`,
     `  Pool last touched: ${lp?.updated_at ? new Date(lp.updated_at).toISOString() : "_never_"}`,
     "",
@@ -1403,7 +1405,7 @@ export async function handleFundPool(ctx) {
     const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, lender.publicKey);
 
     const preIxs = [
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await getDynamicPriorityFee({ label: "fundpool" }) }),
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
       createAssociatedTokenAccountIdempotentInstruction(
         lender.publicKey,
@@ -1773,6 +1775,8 @@ export async function handleAiStats(ctx) {
          COALESCE(SUM(turns), 0)::int                           AS turns,
          COALESCE(SUM(total_input_tokens), 0)::bigint           AS input_tok,
          COALESCE(SUM(total_output_tokens), 0)::bigint          AS output_tok,
+         COALESCE(SUM(total_cache_read_tokens), 0)::bigint      AS cache_read_tok,
+         COALESCE(SUM(total_cache_write_tokens), 0)::bigint     AS cache_write_tok,
          COUNT(DISTINCT user_id)::int                           AS unique_users
        FROM support_conversations
        WHERE last_active_at >= NOW() - INTERVAL '24 hours'`,
@@ -1789,8 +1793,10 @@ export async function handleAiStats(ctx) {
     // Today (UTC) for spend cap comparison
     const { rows: [today] } = await query(
       `SELECT
-         COALESCE(SUM(total_input_tokens), 0)::bigint  AS input_tok,
-         COALESCE(SUM(total_output_tokens), 0)::bigint AS output_tok
+         COALESCE(SUM(total_input_tokens), 0)::bigint       AS input_tok,
+         COALESCE(SUM(total_output_tokens), 0)::bigint      AS output_tok,
+         COALESCE(SUM(total_cache_read_tokens), 0)::bigint  AS cache_read_tok,
+         COALESCE(SUM(total_cache_write_tokens), 0)::bigint AS cache_write_tok
        FROM support_conversations
        WHERE last_active_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')`,
     );
@@ -1798,10 +1804,14 @@ export async function handleAiStats(ctx) {
     const cost24h = estimateCostUsd({
       input_tokens: Number(agg.input_tok),
       output_tokens: Number(agg.output_tok),
+      cache_read_input_tokens: Number(agg.cache_read_tok),
+      cache_creation_input_tokens: Number(agg.cache_write_tok),
     });
     const costToday = estimateCostUsd({
       input_tokens: Number(today.input_tok),
       output_tokens: Number(today.output_tok),
+      cache_read_input_tokens: Number(today.cache_read_tok),
+      cache_creation_input_tokens: Number(today.cache_write_tok),
     });
     const cap = Number(process.env.AI_DAILY_SPEND_USD) || 20;
     const capPct = ((costToday / cap) * 100).toFixed(0);
