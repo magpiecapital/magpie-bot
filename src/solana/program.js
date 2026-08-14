@@ -210,8 +210,29 @@ export function chooseProgramId(category, opts = {}) {
     // once the operator flips ROUTE_EXITS_TO_V4_1. Resolved BEFORE the
     // not-configured check so retiring V4 later doesn't block exits, and placed
     // AFTER the pause check above so V4_BORROWS_PAUSED still freezes both.
+    // ── RWA EXITS STAY ON V4, NOT V4.1 ──────────────────────────────────
+    // V4.1 ships Sec3's [H-01] fix, which REJECTS any Token-2022 collateral
+    // carrying PermanentDelegate. Measured on mainnet 2026-08-13: ALL 25
+    // enabled RWAs carry it — every Backed xStock, all 3 ETFs, and both metals
+    // (GLDx, SILV). Regulated issuers use it for compliance clawback and
+    // redemption, so it is the norm for the asset class, not an anomaly.
+    // Memecoins are unaffected: 0 of 233 are blocked.
+    //
+    // Without this guard, flipping ROUTE_EXITS_TO_V4_1 would send an
+    // exit-armed RWA borrow to a program that refuses the mint outright, and
+    // the borrower gets an opaque UnsupportedCollateralExtension failure. RWA
+    // exit arming is small but REAL — 34 orders armed to date, 5 still armed —
+    // so this is a live path, not a hypothetical one.
+    //
+    // Operator decision 2026-08-13: ship Sec3's recommendation as written and
+    // keep RWAs on V4, rather than carve an exemption into audited custody
+    // logic. Revisit only if Sec3 reviews and accepts the exemption proposal
+    // (branch proposal/rwa-custody-exemption in magpie-v4-1).
+    const rwaMustStayOnV4 = isRwaCategory(category);
     const exitProgram =
-      PROGRAM_ID_V4_1 && ROUTE_EXITS_TO_V4_1 ? PROGRAM_ID_V4_1 : PROGRAM_ID_V4;
+      PROGRAM_ID_V4_1 && ROUTE_EXITS_TO_V4_1 && !rwaMustStayOnV4
+        ? PROGRAM_ID_V4_1
+        : PROGRAM_ID_V4;
     if (!exitProgram) {
       throw new Error(
         "EXIT_ARMING_REQUIRES_V4: exit-armed borrow requested but PROGRAM_ID_V4 is not configured. " +
