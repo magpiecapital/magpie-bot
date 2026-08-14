@@ -17,6 +17,25 @@
  * process and outcome only.
  */
 export async function handleAudit(ctx) {
+  // Compute the liquidation rate LIVE. It was hardcoded as "sub-1%" and had
+  // silently drifted false (22/1838 = 1.20% before three stale V1 loans were
+  // closed out on 2026-08-14, 25/1841 = 1.36% after). We invite people to
+  // verify this number, so it has to be the real one — a claim that says
+  // "check it yourself" is the worst possible place to be wrong.
+  let liqLine = "• A low lifetime liquidation rate — check it yourself with /stats";
+  try {
+    const { query } = await import("../db/pool.js");
+    const { rows } = await query(
+      `SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status='liquidated')::int liq FROM loans`,
+    );
+    const { total, liq } = rows[0] || {};
+    if (total > 0) {
+      liqLine = `• A verifiable *${((liq / total) * 100).toFixed(2)}%* lifetime liquidation rate (${liq} of ${total} loans) — check it yourself with /stats`;
+    }
+  } catch {
+    /* fall back to the unquantified line rather than print a stale number */
+  }
+
   const msg = [
     "🔒 *The Sec3 audit of Magpie V4 has CONCLUDED.*",
     "",
@@ -41,7 +60,7 @@ export async function handleAudit(ctx) {
     "• Short, fixed loan terms + low LTV caps — no margin calls, ever",
     "• No admin override on your collateral — only a borrower-signed repay moves funds",
     "• Continuous internal adversarial security reviews",
-    "• A verifiable sub-1% lifetime liquidation rate — check it yourself with /stats",
+    liqLine,
     "",
     "*Don't take our word for it:* Sec3 publishes their own report set at github.com/sec3-service/reports — cross-check us against the auditor directly.",
     "",
