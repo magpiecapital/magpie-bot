@@ -1,0 +1,62 @@
+# Guards for logic whose failures are SILENT — the code keeps running and
+# returns a plausible answer, so nothing alerts and nobody looks. Each of these
+# exists because of a real incident or a real near-miss:
+#
+#   captcha-deeplink     The community gate. Its payload is user-supplied, so
+#                        the guard pins that you cannot verify someone else,
+#                        cannot pre-verify into a group you never joined, and
+#                        cannot make the bot delete arbitrary messages. The gate
+#                        previously ejected 893 legitimate users.
+#   holder-carryforward  Money. Carry must never be added to the pool decrement
+#                        (double-charges the pool every cycle) and must clear on
+#                        payment (or the same lamports are paid twice).
+#   v41-rwa-routing      V4.1 rejects PermanentDelegate, which ALL 25 RWAs carry.
+#                        Without the guard, flipping ROUTE_EXITS_TO_V4_1 sends
+#                        stock/metal borrowers to a program that refuses them.
+#   cosign-admission     Availability of the public cosign endpoint.
+#   conversion-metric    Borrow-conversion tracking; it once never recorded a
+#                        real borrow at all.
+#   rpc-failover         The Helius incident: a provider served HTTP 200 with
+#                        35-minute-stale data and failover never fired.
+#
+# Every job is dependency-free and runs in seconds. Nothing here needs a
+# database, so CI needs no secrets.
+name: protocol-guards
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "scripts/check-*.mjs"
+      - ".github/workflows/protocol-guards.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/check-*.mjs"
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Dependency-free guards first — they can never be skipped by a broken
+      # lockfile, so a dependency problem cannot silently disable them.
+      - name: community captcha deep-link (forgery / SSRF / arbitrary delete)
+        run: node scripts/check-captcha-deeplink.mjs
+      - name: holder carry-forward accounting (pool double-charge / double-pay)
+        run: node scripts/check-holder-carryforward.mjs
+      - name: V4.1 RWA routing (RWA exits must stay on V4)
+        run: node scripts/check-v41-rwa-routing.mjs
+
+      # These import from src/ and need the dependency tree.
+      - name: install
+        run: npm ci --ignore-scripts
+      - name: cosign admission control
+        run: npm run check:cosign-admission
+      - name: borrow conversion metric
+        run: npm run check:conversion-metric
+      - name: RPC failover + stale-provider detection
+        run: npm run check:rpc-failover
