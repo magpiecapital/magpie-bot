@@ -3,8 +3,13 @@
  *
  * Read-only + informational, so it's fine in the community group. Reflects
  * the operator's decision (2026-07-03): Sec3 selected + engaged for the V4
- * audit. HARD RULE: never say the protocol is "audited" — Sec3's assessment
- * is complete and the remediated fixes are in RE-REVIEW, not yet published.
+ * audit. FINAL REPORT DELIVERED 2026-08-09 (audited commit 33ebdc5): 24
+ * findings — 20 resolved, 4 acknowledged, NONE open. Both High-severity
+ * findings resolved.
+ *
+ * HARD RULE, still: the remediated build deploys at a NEW program ID after
+ * sign-off, so the audited code is NOT the live program yet. "V4's assessment
+ * is complete" is true; "Magpie is audited" is NOT, and must not be implied.
  */
 export async function handleAudit(ctx) {
   const msg = [
@@ -12,9 +17,9 @@ export async function handleAudit(ctx) {
     "",
     "We've engaged *Sec3* — a Solana-native security firm (formerly Soteria) — to audit *Magpie V4*, our in-vault auto-sell program and the flagship of where the protocol is headed.",
     "",
-    "*Status: Sec3's V4 assessment is complete, and their second review of our fixes is back.* Across the engagement: *24 findings* — *18 resolved*, *4 acknowledged*, and *2* returned for more work (one of them an issue our own earlier fix introduced, which their re-review caught). Both are now fixed and resubmitted for the final round. Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off. V3 + our credit-oracle program are next in line.",
+    "*Status: COMPLETE — Sec3 delivered their final report on 2026-08-09.* Across the engagement: *24 findings* — *20 resolved*, *4 acknowledged* (accepted with documented rationale), and *none left open*. Both *High*-severity findings are resolved. Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off, so the audited build is not the live program yet. V3 + our credit-oracle program are next in line.",
     "",
-    "Straight talk: an audit is an independent, rigorous review — *not a guarantee*. It reduces risk; it doesn't eliminate it. And to be clear, *Magpie is not \"audited\" yet* — we won't claim that until Sec3 publishes the final, re-checked report.",
+    "Straight talk: an audit is an independent, rigorous review — *not a guarantee*. It reduces risk; it doesn't eliminate it. And to be precise: *V4's assessment is complete*, but the remediated build hasn't shipped to mainnet yet, so we still don't describe the live protocol as \"audited\". We'll say that when the audited build is the one you're borrowing against.",
     "",
     "*What protects you in the meantime:*",
     "• Fully open source — read every line: github.com/magpiecapital",
@@ -23,7 +28,7 @@ export async function handleAudit(ctx) {
     "• Continuous internal adversarial security reviews",
     "• A verifiable sub-1% lifetime liquidation rate (see /stats)",
     "",
-    "Run /risk for the full risk breakdown. We'll announce here the moment the Sec3 report ships.",
+    "Run /risk for the full risk breakdown. The report gets published at github.com/magpiecapital/audits.",
   ].join("\n");
   await ctx.reply(msg, { parse_mode: "Markdown", disable_web_page_preview: true });
 }
