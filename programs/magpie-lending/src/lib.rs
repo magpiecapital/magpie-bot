@@ -35,6 +35,59 @@ const MAX_VALUE_TOLERANCE_BPS: u64 = 300;
 // Program
 // ---------------------------------------------------------------------------
 
+
+/// [M-04 · Sec3] Generous per-update price sanity bound. A single price update
+/// may not move by more than this factor in either direction — a fat-finger /
+/// compromised-authority blast-radius limiter, not a real volatility cap.
+const MAX_PRICE_UPDATE_FACTOR: u64 = 100;
+
+fn price_change_within_bound(prev: u64, new: u64) -> bool {
+    if prev == 0 {
+        return true; // first sample — nothing to bound against
+    }
+    let prev = prev as u128;
+    let new = new as u128;
+    let factor = MAX_PRICE_UPDATE_FACTOR as u128;
+    new <= prev.saturating_mul(factor) && new.saturating_mul(factor) >= prev
+}
+
+/// [H-01 · Sec3, ported from V4] Reject collateral mints whose Token-2022
+/// extensions break vault custody. V1 is MEMECOIN-ONLY, so it rejects BOTH:
+///   - PermanentDelegate: an external delegate could move collateral OUT of the
+///     vault without updating loan accounting — a direct drain vector.
+///   - NonTransferable: seized or repaid collateral could never be returned to
+///     the borrower or moved to a liquidator.
+/// A memecoin has no legitimate reason to carry either. Legacy SPL Token mints
+/// have no extension TLV and always pass. (V3/RWA uses a DIFFERENT policy:
+/// PermanentDelegate is the norm for regulated tokenized assets and is accepted
+/// there for vetted issuers — do not copy this full-reject into V3.)
+fn assert_collateral_custody_safe(mint_ai: &AccountInfo) -> Result<()> {
+    use anchor_spl::token_2022::spl_token_2022::extension::{
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+    };
+    use anchor_spl::token_2022::spl_token_2022::state::Mint as Mint2022;
+
+    // Legacy SPL Token program mints carry no extensions.
+    if mint_ai.owner == &anchor_spl::token::ID {
+        return Ok(());
+    }
+    let data = mint_ai.try_borrow_data()?;
+    let state = StateWithExtensions::<Mint2022>::unpack(&data)
+        .map_err(|_| error!(ErrorCode::UnsupportedCollateralExtension))?;
+    let exts = state
+        .get_extension_types()
+        .map_err(|_| error!(ErrorCode::UnsupportedCollateralExtension))?;
+    for ext in exts {
+        if matches!(
+            ext,
+            ExtensionType::PermanentDelegate | ExtensionType::NonTransferable
+        ) {
+            return err!(ErrorCode::UnsupportedCollateralExtension);
+        }
+    }
+    Ok(())
+}
+
 #[program]
 pub mod magpie_lending {
     use super::*;
@@ -125,9 +178,16 @@ pub mod magpie_lending {
         require!(price_lamports > 0, ErrorCode::InvalidCollateralValue);
 
         let feed = &mut ctx.accounts.price_feed;
+        let now = Clock::get()?.unix_timestamp;
+        // [M-04 · Sec3] Reject a time-travelling or grossly-wrong single update.
+        require!(now >= feed.timestamp, ErrorCode::PriceTimestampWentBackwards);
+        require!(
+            price_change_within_bound(feed.price_lamports, price_lamports),
+            ErrorCode::PriceChangeExceedsBound
+        );
         feed.price_lamports = price_lamports;
         feed.confidence_bps = confidence_bps;
-        feed.timestamp = Clock::get()?.unix_timestamp;
+        feed.timestamp = now;
 
         emit!(PriceUpdated {
             mint: feed.mint,
@@ -375,6 +435,10 @@ pub mod magpie_lending {
         require!(collateral_amount > 0, ErrorCode::InvalidCollateralAmount);
         require!(collateral_value > 0, ErrorCode::InvalidCollateralValue);
 
+        // [H-01 · Sec3] Reject collateral whose Token-2022 extensions break
+        // vault custody (permanent-delegate / non-transferable).
+        assert_collateral_custody_safe(&ctx.accounts.collateral_mint.to_account_info())?;
+
         // --- Price attestation validation ---
         let feed = &ctx.accounts.price_feed;
         let now = Clock::get()?.unix_timestamp;
@@ -419,11 +483,16 @@ pub mod magpie_lending {
             .ok_or(ErrorCode::MathOverflow)?;
 
         // Compute fee
+        // [I-04 · Sec3] Round the origination fee UP and require it be > 0 so a
+        // tiny loan cannot dodge the fee via floor division.
         let fee = gross_loan
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(fee > 0, ErrorCode::InvalidAmount);
 
         let net_loan = gross_loan
             .checked_sub(fee)
@@ -442,6 +511,12 @@ pub mod magpie_lending {
         let now = Clock::get()?.unix_timestamp;
 
         // --- Transfer collateral from borrower to vault (Token or Token-2022) ---
+        // [H-01 · Sec3] Measure what the vault ACTUALLY receives. A
+        // fee-on-transfer Token-2022 mint would credit less than
+        // `collateral_amount`, letting the pool over-lend against collateral it
+        // never received. V1 does not support fee-bearing collateral: require
+        // the vault balance to increase by EXACTLY the transferred amount.
+        let vault_balance_before = ctx.accounts.collateral_vault.amount;
         token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -455,6 +530,17 @@ pub mod magpie_lending {
             collateral_amount,
             decimals,
         )?;
+        ctx.accounts.collateral_vault.reload()?;
+        let received = ctx
+            .accounts
+            .collateral_vault
+            .amount
+            .checked_sub(vault_balance_before)
+            .ok_or(ErrorCode::MathOverflow)?;
+        require!(
+            received == collateral_amount,
+            ErrorCode::CollateralTransferFeeUnsupported
+        );
 
         // --- Disburse loan tokens from pool vault to borrower ---
         let authority_key = ctx.accounts.pool.authority.key();
@@ -707,6 +793,11 @@ pub mod magpie_lending {
     pub fn extend_loan(ctx: Context<ExtendLoan>) -> Result<()> {
         let loan = &ctx.accounts.loan;
         require!(loan.status == LoanStatus::Active, ErrorCode::LoanNotActive);
+        // [Q-02 · Sec3] An overdue loan is liquidatable and must not be
+        // extendable — otherwise a borrower could dodge liquidation by rolling
+        // at the deadline.
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= loan.due_timestamp, ErrorCode::LoanOverdueForExtension);
 
         let tier = match loan.ltv_bps {
             3_000 => 0usize,
@@ -716,12 +807,17 @@ pub mod magpie_lending {
         };
 
         let fee_bps = TIER_FEE_BPS[tier];
+        // [L-06 · Sec3] Round the extension fee UP and require it be > 0, so a
+        // dust-balance loan cannot be extended for free via floor division.
         let extension_fee = loan
             .repay_amount
             .checked_mul(fee_bps)
             .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(BPS_DENOM - 1)
+            .ok_or(ErrorCode::MathOverflow)?
             .checked_div(BPS_DENOM)
             .ok_or(ErrorCode::MathOverflow)?;
+        require!(extension_fee > 0, ErrorCode::InvalidAmount);
 
         // Borrower pays extension fee
         token::transfer(
@@ -1566,6 +1662,16 @@ pub enum ErrorCode {
     InvalidLoanOption,
     #[msg("Invalid collateral amount.")]
     InvalidCollateralAmount,
+    #[msg("Loan is overdue and cannot be extended")]
+    LoanOverdueForExtension,
+    #[msg("Price update exceeds the per-update sanity bound")]
+    PriceChangeExceedsBound,
+    #[msg("Price update timestamp went backwards")]
+    PriceTimestampWentBackwards,
+    #[msg("Collateral mint carries a Token-2022 extension that breaks vault custody")]
+    UnsupportedCollateralExtension,
+    #[msg("Fee-on-transfer collateral is not supported: vault received less than sent")]
+    CollateralTransferFeeUnsupported,
     #[msg("Invalid collateral value.")]
     InvalidCollateralValue,
     #[msg("Invalid amount.")]
