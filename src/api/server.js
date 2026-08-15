@@ -1690,6 +1690,9 @@ const PUBLIC_ROUTES = new Set([
   "/api/v1/livez",
   "/healthz",
   "/api/v1/tokens",
+  // Live tokenized-collectible inventory (counts per catalog slug) —
+  // public read powering the site's asset pages.
+  "/api/v1/collectibles/tokenized",
   "/api/v1/loans",
   "/api/v1/wallet/balance",
   "/api/v1/loan-tiers",
@@ -2299,6 +2302,11 @@ async function router(req, res) {
       case "/api/v1/tokens":
         result = await handleTokens();
         break;
+      case "/api/v1/collectibles/tokenized": {
+        const { handleTokenizedInventory } = await import("./collectibles-inventory-api.js");
+        result = await handleTokenizedInventory(url);
+        break;
+      }
       case "/api/v1/loan-tiers": {
         const { handleLoanTiers } = await import("./loan-tiers-api.js");
         result = await handleLoanTiers(req, url);
