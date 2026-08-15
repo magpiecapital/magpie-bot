@@ -1192,7 +1192,32 @@ function vetToken(onChain, market, holderCount, category) {
 
 // ─── Actions ────────────────────────────────────────────────────────────────
 
+/**
+ * Approval-time symbol-collision guard. A serial-launch farm (UOTF/SAOF/
+ * USWR/TNOS, 2026-08-15) got up to five near-identical tokens auto-approved
+ * under one ticker days apart; two enabled rows sharing a symbol means
+ * mis-valuation and UI ambiguity, so no approval path may create one.
+ * Returns the enabled row currently holding the symbol, or null.
+ */
+async function enabledSymbolHolder(symbol, mint) {
+  const { rows } = await query(
+    `SELECT mint, symbol, source, protected FROM supported_mints
+      WHERE enabled = TRUE AND UPPER(symbol) = UPPER($1) AND mint <> $2
+      LIMIT 1`,
+    [symbol, mint],
+  );
+  return rows[0] ?? null;
+}
+
 async function autoApproveToken(mint, onChain, market, holderCount, ageHours, category) {
+  // Automatic path: the incumbent always wins the ticker. The newcomer is
+  // simply not listed (it can be added manually if it's the "real" one —
+  // an operator decision, never the screener's guess).
+  const holder = await enabledSymbolHolder(market.symbol, mint);
+  if (holder) {
+    console.log(`[screener] NOT auto-approving ${market.symbol} (${mint}) — ticker already held by enabled mint ${holder.mint} (source=${holder.source})`);
+    return false;
+  }
   const rwa = isRwa(category);
   await query(
     `INSERT INTO supported_mints
@@ -1362,9 +1387,11 @@ async function tick(bot) {
     }
 
     if (verdict === "auto_approve") {
-      await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
+      const listed = await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
       await markSeen(mint);
-      approved.push({ symbol: market.symbol, mint, liquidity: market.liquidity, marketCap: market.marketCap, category });
+      if (listed !== false) {
+        approved.push({ symbol: market.symbol, mint, liquidity: market.liquidity, marketCap: market.marketCap, category });
+      }
     } else if (verdict === "review") {
       await queueForReview(mint, onChain, market, holderCount, safetyScore, fails, ageHours, category);
       await markSeen(mint);
@@ -1525,6 +1552,32 @@ export function registerScreenerCallbacks(bot) {
         );
         return;
       }
+    }
+
+    // Manual path: the operator's pick is authoritative for the ticker
+    // (QENIS precedent) — an unprotected auto-listed collider with no
+    // active loans is disabled to make room. A protected/operator-sourced
+    // collider is a genuine conflict only the operator can resolve.
+    const symbolHolder = await enabledSymbolHolder(t.symbol, mint);
+    if (symbolHolder) {
+      if (symbolHolder.protected) {
+        await ctx.answerCallbackQuery(`Blocked: $${t.symbol} ticker held by a protected listing`);
+        await ctx.editMessageText(`${t.symbol} NOT approved: enabled mint ${symbolHolder.mint} (source=${symbolHolder.source}, protected) already holds this ticker. Disable it first if this new mint is the intended $${t.symbol}.`);
+        return;
+      }
+      const displaced = await query(
+        `UPDATE supported_mints
+            SET enabled = FALSE, source = 'disabled_symbol_collision'
+          WHERE mint = $1 AND enabled = TRUE AND protected = FALSE
+            AND NOT EXISTS (SELECT 1 FROM loans l WHERE l.collateral_mint = supported_mints.mint AND l.status = 'active')`,
+        [symbolHolder.mint],
+      );
+      if (displaced.rowCount === 0) {
+        await ctx.answerCallbackQuery(`Blocked: $${t.symbol} collider has active loans`);
+        await ctx.editMessageText(`${t.symbol} NOT approved: enabled mint ${symbolHolder.mint} holds this ticker and has active loans — resolve manually before approving.`);
+        return;
+      }
+      console.log(`[screener] manual approve ${t.symbol}: displaced colliding mint ${symbolHolder.mint} (disabled, 0 active loans)`);
     }
 
     // Add to supported_mints
@@ -1769,6 +1822,21 @@ async function processReviewQueue(bot) {
       // Gauntlet-clean + viable → APPROVE (expand). Fall through to the promote
       // below; nothing is left pending.
       console.log(`[screener] Review auto-APPROVING ${t.symbol} (expand-mindset, no limbo) — gauntlet-clean + viable: liq=$${Math.floor(liveMarket.liquidity)}, holders=${liveHolderCount}, fast-track-verdict was '${liveVerdict}'`);
+    }
+
+    // Automatic path: an enabled incumbent always keeps the ticker — a
+    // copycat approved alongside it would make every "$SYMBOL" surface
+    // ambiguous (which of two live tokens does a price/loan refer to?).
+    const symbolHolder = await enabledSymbolHolder(t.symbol, t.mint);
+    if (symbolHolder) {
+      await query(
+        `UPDATE token_screen_queue
+            SET status = 'rejected', reviewed_at = NOW(), fail_reasons = $2
+          WHERE mint = $1`,
+        [t.mint, [`symbol collision: $${t.symbol} is already held by enabled mint ${symbolHolder.mint} (source=${symbolHolder.source}) — two live tokens must never share a ticker`]],
+      );
+      console.log(`[screener] Review NOT promoting ${t.symbol} (${t.mint}) — ticker held by ${symbolHolder.mint}`);
+      continue;
     }
 
     // Token is gauntlet-clean + viable (or hit the FULL auto-approve bar) — promote it.
