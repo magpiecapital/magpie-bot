@@ -13,6 +13,7 @@
  */
 import { query } from "../db/pool.js";
 import { Connection, PublicKey } from "@solana/web3.js";
+import { assessFarmRisk } from "./farm-guard.js";
 import { connection } from "../solana/connection.js";
 import { cachedJson } from "../lib/http-cache.js";
 import { markCycle } from "../lib/heartbeat.js";
@@ -1387,6 +1388,24 @@ async function tick(bot) {
     }
 
     if (verdict === "auto_approve") {
+      // Farm guard (see farm-guard.js): hard signatures never list; soft
+      // anomalies demote to the manual review queue instead of auto-listing.
+      const farm = await assessFarmRisk({
+        mint, name: market.name, imageUrl: market.imageUrl,
+        liquidity: market.liquidity, volume24h: market.volume24h,
+      });
+      if (farm.hard.length > 0) {
+        await markSeen(mint);
+        console.log(`[screener] FARM-GUARD reject ${market.symbol} (${mint}): ${farm.hard.join("; ")}`);
+        continue;
+      }
+      if (farm.soft.length > 0) {
+        await queueForReview(mint, onChain, market, holderCount, safetyScore, [...fails, ...farm.soft], ageHours, category);
+        await markSeen(mint);
+        queued.push({ symbol: market.symbol, mint, safetyScore, fails: farm.soft, category });
+        console.log(`[screener] FARM-GUARD demoted ${market.symbol} to manual review: ${farm.soft.join("; ")}`);
+        continue;
+      }
       const listed = await autoApproveToken(mint, onChain, market, holderCount, ageHours, category);
       await markSeen(mint);
       if (listed !== false) {
@@ -1685,6 +1704,13 @@ const REVIEW_AUTO_APPROVE_MS = 30 * 60 * 1000; // 30 min (retained for compat)
 const REVIEW_AUTO_MAX_TOP10_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP10_PCT) || 65;
 const REVIEW_AUTO_MAX_TOP20_PCT = Number(process.env.REVIEW_AUTO_MAX_TOP20_PCT) || 85;
 const REVIEW_VIABILITY_MIN_LIQ_USD = Number(process.env.REVIEW_VIABILITY_MIN_LIQ_USD) || 15000;
+// Maturity floors for UNATTENDED promotion (farm incident 2026-08-15: the
+// UOTF/SAOF/USWR/TNOS cluster was 0–2 days old at approval — an age floor
+// alone would have stopped it). Young/thin tokens stay QUEUED and promote
+// once they mature — self-resolving, so this never strands a legit token.
+const REVIEW_PROMOTE_MIN_AGE_HOURS = Number(process.env.REVIEW_PROMOTE_MIN_AGE_HOURS) || 48;
+const REVIEW_PROMOTE_MIN_HOLDERS = Number(process.env.REVIEW_PROMOTE_MIN_HOLDERS) || 100;
+const REVIEW_PROMOTE_GIVE_UP_HOURS = Number(process.env.REVIEW_PROMOTE_GIVE_UP_HOURS) || 336;
 
 async function processReviewQueue(bot) {
   const { rows } = await query(
@@ -1822,6 +1848,50 @@ async function processReviewQueue(bot) {
       // Gauntlet-clean + viable → APPROVE (expand). Fall through to the promote
       // below; nothing is left pending.
       console.log(`[screener] Review auto-APPROVING ${t.symbol} (expand-mindset, no limbo) — gauntlet-clean + viable: liq=$${Math.floor(liveMarket.liquidity)}, holders=${liveHolderCount}, fast-track-verdict was '${liveVerdict}'`);
+    }
+
+    // Maturity floors: unattended promotion requires a track record. Young
+    // or thin tokens WAIT in the queue (self-resolving as they age); only
+    // tokens that never mature within the give-up window get rejected.
+    const liveAgeHours = liveMarket.pairCreatedAt
+      ? Math.floor((Date.now() - liveMarket.pairCreatedAt) / 3_600_000)
+      : Number(t.token_age_hours) || 0;
+    if (liveAgeHours < REVIEW_PROMOTE_MIN_AGE_HOURS) {
+      continue; // stays queued; promotes once it has ≥48h of history
+    }
+    if (liveHolderCount >= 0 && liveHolderCount < REVIEW_PROMOTE_MIN_HOLDERS) {
+      if (liveAgeHours > REVIEW_PROMOTE_GIVE_UP_HOURS) {
+        await query(
+          `UPDATE token_screen_queue
+              SET status = 'rejected', reviewed_at = NOW(), fail_reasons = $2
+            WHERE mint = $1`,
+          [t.mint, [`never matured: ${liveHolderCount} holders after ${Math.floor(liveAgeHours / 24)} days (needs ${REVIEW_PROMOTE_MIN_HOLDERS} for unattended promotion)`]],
+        );
+        console.log(`[screener] Review REJECTED ${t.symbol} — never matured (${liveHolderCount} holders after ${Math.floor(liveAgeHours / 24)}d)`);
+      }
+      continue; // young + thin → wait
+    }
+
+    // Farm guard: hard signatures (name clones, image reuse, creator
+    // launch-clusters) are rejected; soft anomalies (approval wave,
+    // wash-shaped volume) wait for the anomaly to clear or an admin.
+    const farm = await assessFarmRisk({
+      mint: t.mint, name: t.name, imageUrl: t.image_url,
+      liquidity: liveMarket.liquidity, volume24h: liveMarket.volume24h,
+    });
+    if (farm.hard.length > 0) {
+      await query(
+        `UPDATE token_screen_queue
+            SET status = 'rejected', reviewed_at = NOW(), fail_reasons = $2
+          WHERE mint = $1`,
+        [t.mint, farm.hard],
+      );
+      console.log(`[screener] FARM-GUARD rejected ${t.symbol} (${t.mint}) at promote: ${farm.hard.join("; ")}`);
+      continue;
+    }
+    if (farm.soft.length > 0) {
+      console.log(`[screener] FARM-GUARD holding ${t.symbol} in queue: ${farm.soft.join("; ")}`);
+      continue;
     }
 
     // Automatic path: an enabled incumbent always keeps the ticker — a
