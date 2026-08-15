@@ -984,6 +984,9 @@ bot.start({
     // credit-score penalty on detected fee-wallet evasion. Removed
     // once v3 ships with the on-chain owner constraint.
     setTimeout(() => startExtendLoanWatcher(), 40_000);
+    // Ongoing on-chain knowledge of partner-vaulted collectibles (sweeps
+    // DB-configured collections; no-ops until collections are configured).
+    setTimeout(() => import("./services/collectible-inventory-indexer.js").then((m) => m.startCollectibleInventoryIndexer()).catch((e) => console.warn("[cti] start failed:", e.message?.slice(0, 100))), 55_000);
     // Push fresh prices to on-chain price feeds. DB-driven: the attestor
     // queries supported_mints (enabled=TRUE) every tick, so newly approved
     // tokens get attested without a restart.
