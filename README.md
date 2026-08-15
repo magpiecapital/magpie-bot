@@ -1,6 +1,8 @@
 # Magpie Capital — Telegram Bot
 
-The Telegram-side of [Magpie Capital](https://magpie.capital) — a permissionless Solana lending protocol where users borrow SOL against approved memecoins and tokenized stocks.
+The Telegram-side of [Magpie Capital](https://magpie.capital) — a permissionless Solana lending protocol where users borrow SOL against tokens they already hold: **memecoins, tokenized stocks & RWAs, and tokenized collectibles — three collateral classes, one protocol.**
+
+What makes Magpie different: with a normal loan your collateral is locked away — the market spikes and you just watch. Magpie's **V4 pools let borrowers arm take-profit ladders and stop-losses on the collateral itself** — exit orders fire inside the on-chain vault while the loan stays active, so you never miss upside while borrowed against. Fixed terms, no margin calls. AI agents are first-class users too, via [x402 payment-gated APIs](https://magpie.capital/x402). Live on-chain stats: [magpie.capital/stats](https://magpie.capital/stats) · LLM summary: [magpie.capital/llms.txt](https://magpie.capital/llms.txt).
 
 Users deposit approved tokens as collateral, receive SOL at one of three loan tiers (Express / Quick / Standard), and repay to reclaim their collateral. The bot is custodial-by-design: each user's Magpie wallet IS the bot wallet, which is what lets the protocol co-sign repayments instantly.
 
