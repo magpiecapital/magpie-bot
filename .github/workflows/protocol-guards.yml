@@ -23,6 +23,10 @@
 #                        (support brain stuck on a stale, less-favorable
 #                        posture). Pins the load-bearing facts consistent
 #                        across both.
+#   x402-contracts       Cross-service field couplings with magpie-x402 that
+#                        the type system can't see. Their drift caused the
+#                        5-bug x402 outage (2026-06-24): agents charged, no
+#                        loan, no refund. Pins the exact field/error strings.
 #
 # Every job is dependency-free and runs in seconds. Nothing here needs a
 # database, so CI needs no secrets.
@@ -57,6 +61,8 @@ jobs:
         run: node scripts/check-v41-rwa-routing.mjs
       - name: pip knowledge-brain parity (canonical facts must not drift)
         run: node scripts/check-pip-parity.mjs
+      - name: x402 cross-service field contracts (charged-but-no-loan drift)
+        run: node scripts/check-x402-contracts.mjs
 
       # These import from src/ and need the dependency tree.
       - name: install
