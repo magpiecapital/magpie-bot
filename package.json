@@ -28,6 +28,7 @@
     "check:warning-delivery": "node scripts/check-warning-delivery.mjs",
     "check:push-subscribe": "node scripts/check-push-subscribe.mjs",
     "check:migration-checksums": "node scripts/check-migration-checksums.mjs",
+    "check:pip-parity": "node scripts/check-pip-parity.mjs",
     "check:borrow-reservation-race": "node scripts/check-borrow-reservation-race.mjs",
     "check:captcha-deeplink": "node scripts/check-captcha-deeplink.mjs",
     "check:holder-carryforward": "node scripts/check-holder-carryforward.mjs",
