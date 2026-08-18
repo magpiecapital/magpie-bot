@@ -18,6 +18,11 @@
 #                        real borrow at all.
 #   rpc-failover         The Helius incident: a provider served HTTP 200 with
 #                        35-minute-stale data and failover never fired.
+#   pip-parity           Pip answers from two independently-worded knowledge
+#                        brains; they once drifted on the Sec3 audit status
+#                        (support brain stuck on a stale, less-favorable
+#                        posture). Pins the load-bearing facts consistent
+#                        across both.
 #
 # Every job is dependency-free and runs in seconds. Nothing here needs a
 # database, so CI needs no secrets.
@@ -50,6 +55,8 @@ jobs:
         run: node scripts/check-holder-carryforward.mjs
       - name: V4.1 RWA routing (RWA exits must stay on V4)
         run: node scripts/check-v41-rwa-routing.mjs
+      - name: pip knowledge-brain parity (canonical facts must not drift)
+        run: node scripts/check-pip-parity.mjs
 
       # These import from src/ and need the dependency tree.
       - name: install
