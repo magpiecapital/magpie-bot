@@ -17,6 +17,8 @@ import { collateralValueLamports } from "./price.js";
 import { getPrefs } from "./prefs.js";
 import { connection } from "../solana/connection.js";
 import { getSupportedBalances } from "./deposits.js";
+import { isPermanentDeliveryFailure, deliveryFailureReason } from "./telegram-delivery.js";
+import { sendPushToUser, isPushConfigured } from "./push-send.js";
 
 /**
  * Look at the user's wallet and recommend the ONE best action to take
@@ -232,20 +234,65 @@ async function checkLoan(bot, row) {
     rec ? `*Recommended:* ${rec.text}` : "Options: /repay · /partialrepay · /topup collateral · /extend",
   ].filter((s) => s !== null).join("\n");
 
-  try {
-    await bot.api.sendMessage(row.telegram_id, msg, {
-      parse_mode: "Markdown",
-      reply_markup: kb,
-      // Suppress the big card from the magpie.capital dashboard link
-      // so the alert stays compact.
-      disable_web_page_preview: true,
-    });
+  // Delivery discipline — same rules as loan-watcher's warning path:
+  //
+  //  1. NEVER DM a negative telegram_id. Site-native users carry synthetic
+  //     negative ids that share the id space with real Telegram GROUPS. If the
+  //     bot happens to be a member of a colliding group, this alert — loan id,
+  //     collateral value, amount owed, wallet label — would post into a public
+  //     chat. Those users go straight to web push.
+  //  2. On DM failure, classify (permanent vs transient) so the log tells the
+  //     truth, then fall back to web push.
+  //  3. Only a DELIVERED alert marks last_health_alert. A failure must keep
+  //     retrying next tick rather than laundering into "alerted".
+  const tgId = Number(row.telegram_id);
+  const tgDeliverable = Number.isFinite(tgId) && tgId > 0;
+  let delivered = false;
+
+  if (tgDeliverable) {
+    try {
+      await bot.api.sendMessage(row.telegram_id, msg, {
+        parse_mode: "Markdown",
+        reply_markup: kb,
+        // Suppress the big card from the magpie.capital dashboard link
+        // so the alert stays compact.
+        disable_web_page_preview: true,
+      });
+      delivered = true;
+    } catch (err) {
+      const permanent = isPermanentDeliveryFailure(err);
+      console.error(
+        `[health-watcher] DM failed for loan ${row.loan_id} ` +
+          `(${permanent ? "PERMANENT" : "transient"}): ${deliveryFailureReason(err)}`,
+      );
+    }
+  }
+
+  // Web push fallback. Body deliberately carries NO wallet and NO loan id —
+  // a lock screen is a far more public surface than a DM.
+  if (!delivered) {
+    try {
+      if (isPushConfigured()) {
+        const r = await sendPushToUser(row.user_id, {
+          title: "Loan health alert",
+          body: "A loan's collateral health has dropped — open your dashboard to review it.",
+          url: "https://www.magpie.capital/dashboard",
+        });
+        if (r.sent > 0) {
+          delivered = true;
+          console.log(`[health-watcher] alert delivered via web push for loan ${row.loan_id}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[health-watcher] push attempt failed for loan ${row.loan_id}: ${err.message}`);
+    }
+  }
+
+  if (delivered) {
     await query(`UPDATE loans SET last_health_alert = $2 WHERE id = $1`, [
       row.id,
       alert.ratio,
     ]);
-  } catch (err) {
-    console.error(`[health-watcher] DM failed for loan ${row.loan_id}: ${err.message}`);
   }
 }
 
