@@ -43,13 +43,21 @@ const MAX_MINTS_PER_TICK = Math.max(
 const DISABLED = process.env.PRICE_SNAPSHOTTER_DISABLED === "true";
 
 async function fetchMintsToSnapshot() {
-  // Snapshot enabled non-RWA mints. RWAs track real-world prices
-  // (xStocks, etc.) and don't share the pump-and-borrow attack model
-  // — their oracle is the underlying market, not a Solana DEX.
+  // Snapshot ALL enabled mints — including RWAs (stock/etf/metal).
+  //
+  // RWAs were originally excluded on the theory that "their oracle is the
+  // underlying market, not a Solana DEX". But collateral VALUATION for RWAs
+  // reads the on-chain pool price (price.js routes rwa-category=* through
+  // DexScreener/Jupiter), and a thin xStock pool can be pumped independently
+  // of the real-world quote — exactly the pump-and-borrow model this TWAP
+  // exists to catch. The exclusion left every RWA borrow with fail-open
+  // off-chain protection ("TWAP pump-gate SKIPPED" warns on every RWA
+  // borrow eval) and only the on-chain V3/V4 TWAP as backstop. Genuine
+  // fast market moves are handled by a looser RWA threshold in
+  // anti-exploit.js, not by blinding the guard.
   const { rows } = await query(
     `SELECT mint FROM supported_mints
       WHERE enabled = TRUE
-        AND COALESCE(category, 'memecoin') NOT IN ('stock', 'metal', 'etf')
       ORDER BY mint
       LIMIT $1`,
     [MAX_MINTS_PER_TICK],
