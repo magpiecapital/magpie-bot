@@ -10,6 +10,8 @@ import { InlineKeyboard } from "grammy";
 import { query } from "../db/pool.js";
 import { collateralValueLamports } from "./price.js";
 import { getPrefs } from "./prefs.js";
+import { isPermanentDeliveryFailure, deliveryFailureReason } from "./telegram-delivery.js";
+import { sendPushToUser, isPushConfigured } from "./push-send.js";
 
 const POLL_INTERVAL_MS = Number(process.env.PUMP_WATCH_MS) || 300_000; // 5 min
 
@@ -87,17 +89,53 @@ async function checkLoan(bot, row) {
     .row()
     .text("🔕 Mute pump alerts", "pump:mute");
 
-  try {
-    await bot.api.sendMessage(row.telegram_id, msg, {
-      parse_mode: "Markdown",
-      reply_markup: kb,
-    });
+  // Same delivery discipline as health-watcher / loan-watcher:
+  // never DM a negative (site-native synthetic) id — group-id collision would
+  // post this user's position into a public chat; classify DM failures; fall
+  // back to web push; only a DELIVERED alert marks last_pump_alert_value.
+  const tgId = Number(row.telegram_id);
+  const tgDeliverable = Number.isFinite(tgId) && tgId > 0;
+  let delivered = false;
+
+  if (tgDeliverable) {
+    try {
+      await bot.api.sendMessage(row.telegram_id, msg, {
+        parse_mode: "Markdown",
+        reply_markup: kb,
+      });
+      delivered = true;
+    } catch (err) {
+      const permanent = isPermanentDeliveryFailure(err);
+      console.error(
+        `[pump-watcher] DM failed for loan ${row.loan_id} ` +
+          `(${permanent ? "PERMANENT" : "transient"}): ${deliveryFailureReason(err)}`,
+      );
+    }
+  }
+
+  if (!delivered) {
+    try {
+      if (isPushConfigured()) {
+        const r = await sendPushToUser(row.user_id, {
+          title: "Your collateral is up",
+          body: "A loan's collateral has pumped — open your dashboard to review it.",
+          url: "https://www.magpie.capital/dashboard",
+        });
+        if (r.sent > 0) {
+          delivered = true;
+          console.log(`[pump-watcher] alert delivered via web push for loan ${row.loan_id}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[pump-watcher] push attempt failed for loan ${row.loan_id}: ${err.message}`);
+    }
+  }
+
+  if (delivered) {
     await query(
       `UPDATE loans SET last_pump_alert_value = $2 WHERE id = $1`,
       [row.id, bestThreshold.multiple],
     );
-  } catch (err) {
-    console.error(`[pump-watcher] DM failed for loan ${row.loan_id}: ${err.message}`);
   }
 }
 
