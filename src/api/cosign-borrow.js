@@ -692,12 +692,32 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
   const globalReject = await rejectIfSiteDisabled();
   if (globalReject) return globalReject;
 
+  // ── Borrow-latency telemetry ────────────────────────────────────────────
+  // Stage marks (ms since request start) logged on every outcome and echoed
+  // in the response body, so the SITE can report real user-experienced
+  // latency and we can see p50/p95 per stage in prod logs. Measure → cut.
+  const _t0 = Date.now();
+  const _marks = {};
+  const _mark = (n) => { _marks[n] = Date.now() - _t0; };
+
   let body;
   try {
     body = await readJsonBody(req);
   } catch {
     return { status: 400, body: { error: "Invalid JSON body" } };
   }
+  _mark("parse");
+
+  // Client-declared JIT-warm budget. Interactive clients (the site) send a
+  // SHORT budget (~6s) and handle the oracle_warming 503 with live progress
+  // + auto-retry — no more 90s frozen spinner. Non-interactive clients
+  // (x402 SDK via the site proxy, agents) omit it and keep the full 90s
+  // block, which is the right trade for a machine caller. Clamped so a
+  // malicious client can neither zero it (spam attests) nor extend it.
+  const _warmBudgetMs = Math.min(
+    90_000,
+    Math.max(1_500, Number(body?.warming_wait_budget_ms) || 90_000),
+  );
   const partialSignedTxBase64 = body?.partialSignedTxBase64;
   if (typeof partialSignedTxBase64 !== "string" || !partialSignedTxBase64) {
     return { status: 400, body: { error: "Missing partialSignedTxBase64" } };
@@ -1559,11 +1579,13 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
           // the borrow. The single-shot freshness attest below is
           // necessary but not sufficient — we MUST loop until the
           // PriceHistory PDA has the count it needs.
+          _mark("pre_warm");
           const warm = await ensureV4TwapReady(
             mintStr,
             Number(mintRow.decimals),
-            { programIdOverride: borrowProgramId },
+            { programIdOverride: borrowProgramId, maxWaitMs: _warmBudgetMs },
           );
+          _mark("warm");
           if (!warm.ok) {
             console.warn(
               `[cosign-borrow] TWAP warming TIMED OUT prog=${borrowProgramId.toBase58().slice(0, 8)}… mint=${mintStr.slice(0, 8)} inWindow=${warm.inWindow}/8 waited=${warm.waitedMs}ms attests=${warm.attests} reason=${warm.reason}`,
@@ -1603,6 +1625,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
                 in_window: warm.inWindow,
                 required_in_window: 8,
                 retry_after_seconds: secs,
+                timings: _marks,
               },
             };
           }
@@ -2034,6 +2057,7 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     // (Externally-signed → we can't re-sign, so this helper never re-signs; it
     // gives up only once the blockhash can no longer land the tx = no dup loan.)
     const { sendSignedRawWithRebroadcast } = await import("../solana/tx-send.js");
+    _mark("pre_send");
     signature = await sendSignedRawWithRebroadcast(connection, raw, {
       commitment: "confirmed",
       blockhash: tx.recentBlockhash,
@@ -2188,8 +2212,13 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     );
   }
 
+  _mark("done");
+  console.log(
+    `[cosign-borrow] timings total=${_marks.done}ms ` +
+      Object.entries(_marks).map(([k, v]) => `${k}=${v}`).join(" "),
+  );
   return {
     status: 200,
-    body: { ok: true, signature, loan_pda: recordedLoanPda },
+    body: { ok: true, signature, loan_pda: recordedLoanPda, timings: _marks },
   };
 }
