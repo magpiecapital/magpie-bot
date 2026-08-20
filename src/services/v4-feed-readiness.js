@@ -188,7 +188,7 @@ async function listPriorityMints() {
   const { rows: stocks } = await query(
     `SELECT mint, symbol, category
        FROM supported_mints
-      WHERE enabled = true AND category = 'stock'`,
+      WHERE enabled = true AND category IN ('stock', 'etf', 'metal')`,
   );
   // Materialize with metadata.
   const mintSet = new Set([
@@ -655,7 +655,7 @@ async function refreshContinuousList() {
       `SELECT mint, decimals, symbol, category
          FROM supported_mints
         WHERE enabled = TRUE
-          AND category IN ('memecoin', 'stock')`,
+          AND category IN ('memecoin', 'stock', 'etf', 'metal')`,
     ));
   } else {
     // Tiered fallback: hot + protected + any borrower activity/intent only.
@@ -687,7 +687,7 @@ async function refreshContinuousList() {
          LEFT JOIN recent_intent_mints rim ON rim.collateral_mint = sm.mint
          LEFT JOIN warming_mints wm ON wm.collateral_mint = sm.mint
         WHERE sm.enabled = TRUE
-          AND sm.category IN ('memecoin', 'stock')
+          AND sm.category IN ('memecoin', 'stock', 'etf', 'metal')
           AND (
             sm.attestation_tier = 'hot'
             OR sm.protected = TRUE
@@ -748,8 +748,12 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
   //    Operator-mandated 2026-06-19 PM after xStock SPCX oscillated at 7/8
   //    while every memecoin sat at 8+. Per-stock extra cost: ~0.005 SOL/day.
   // 2. Round-robin memecoins fill the remaining slots — same logic as before.
-  const stocks = list.filter((m) => m.category === 'stock');
-  const memecoins = list.filter((m) => m.category !== 'stock');
+  // RWAs (stock/etf/metal) all get the always-first slot treatment —
+  // etf/metal were previously excluded from continuous warming entirely,
+  // which left GLDx/SILV/DRAM-class feeds cold until a user selected them.
+  const RWA_SET = new Set(['stock', 'etf', 'metal']);
+  const stocks = list.filter((m) => RWA_SET.has(m.category));
+  const memecoins = list.filter((m) => !RWA_SET.has(m.category));
 
   // Size the per-tick batch so the WHOLE list is cycled within a target
   // window (default 25s, safely under the 37.5s cadence needed for 8
