@@ -470,6 +470,62 @@ async function decideForCandidate(candidate, dbRow) {
 
 // ─── DB actions ──────────────────────────────────────────────────────────
 
+/**
+ * [Operator mandate 2026-08-20] Every stock/etf/metal on /tokens MUST show its
+ * proper logo, permanently. Resolve the issuer-official icon for a mint:
+ * Jupiter metadata first (returns backed.fi / backpack.exchange CDN URLs),
+ * then issuer URL patterns. Only a URL that answers HTTP 200 is accepted.
+ */
+async function resolveRwaLogo(mint, symbol) {
+  const ok = async (u) => {
+    if (!u) return false;
+    try {
+      const r = await fetch(u, { method: "GET", headers: { "User-Agent": "magpie-bot" }, signal: AbortSignal.timeout(8000) });
+      return r.ok;
+    } catch { return false; }
+  };
+  try {
+    const r = await fetch(`https://lite-api.jup.ag/tokens/v2/search?query=${mint}`, { headers: { "User-Agent": "magpie-bot" }, signal: AbortSignal.timeout(8000) });
+    const d = await r.json();
+    const t = (d || []).find((x) => x.id === mint);
+    const icon = t?.icon || t?.logoURI;
+    if (await ok(icon)) return icon;
+  } catch { /* fall through to patterns */ }
+  const cands = [];
+  if (/x$/.test(symbol)) cands.push(`https://xstocks-metadata.backed.fi/logos/tokens/${symbol}.png`);
+  cands.push(`https://backpack.exchange/api/stock-logo/${symbol.replace(/x$/, "")}`);
+  for (const c of cands) if (await ok(c)) return c;
+  return null;
+}
+
+/**
+ * Periodic self-heal: any enabled RWA with a missing/empty image_url gets a
+ * resolution attempt; unresolvable ones page the operator (once per cycle).
+ * Guarantees /tokens never silently shows blank stock tiles again.
+ */
+async function sweepRwaLogos() {
+  const { rows } = await query(
+    `SELECT mint, symbol FROM supported_mints
+      WHERE enabled AND category IN ('stock','etf','metal')
+        AND (image_url IS NULL OR image_url = '')`,
+  );
+  if (!rows.length) return;
+  const unresolved = [];
+  for (const r of rows) {
+    const url = await resolveRwaLogo(r.mint, r.symbol);
+    if (url) {
+      await query(`UPDATE supported_mints SET image_url = $1 WHERE mint = $2`, [url, r.mint]);
+      console.log(`[rwa-screener] logo self-heal: ${r.symbol} → ${url}`);
+    } else unresolved.push(r.symbol);
+  }
+  if (unresolved.length) {
+    try {
+      const { notifyAdmin } = await import("./admin-notify.js");
+      await notifyAdmin(`⚠️ [rwa-screener] no logo source found for: ${unresolved.join(", ")} — /tokens shows blank tiles until image_url is set.`);
+    } catch { /* best-effort */ }
+  }
+}
+
 async function addMint(mint, symbol, name, decimals, category, candidate) {
   await query(
     `INSERT INTO supported_mints
@@ -485,6 +541,13 @@ async function addMint(mint, symbol, name, decimals, category, candidate) {
        screened_at = NOW()`,
     [mint, symbol, name, decimals, category, candidate.liquidity],
   );
+  // [Operator mandate 2026-08-20] Logo at listing time — an RWA never enters
+  // /tokens as a blank tile. Best-effort; the periodic sweep self-heals misses.
+  try {
+    const logo = await resolveRwaLogo(mint, symbol);
+    if (logo) await query(`UPDATE supported_mints SET image_url = $1 WHERE mint = $2 AND (image_url IS NULL OR image_url = '')`, [logo, mint]);
+  } catch { /* sweep backstops */ }
+
   // WARM-ON-ENABLE (operator 2026-06-28): a newly-enabled RWA must be
   // V4-borrow-ready in seconds, not after the next 90s feed-init sweep. Kick
   // feed-init + on-demand attestation NOW. RWAs especially need this — the
@@ -514,6 +577,7 @@ async function disableMint(mint, reason) {
 
 async function tick(bot) {
   console.log("[rwa-screener] cycle start");
+  try { await sweepRwaLogos(); } catch (e) { console.warn(`[rwa-screener] logo sweep failed: ${e.message?.slice(0,100)}`); }
   let candidates;
   try {
     candidates = await discoverRwaCandidates();
