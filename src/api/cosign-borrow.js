@@ -47,7 +47,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { connection, withFailover } from "../solana/connection.js";
 import { isWalletBanned } from "../services/bans.js";
-import { preBorrowAntiExploitCheck } from "../services/anti-exploit.js";
+import { preBorrowAntiExploitCheck, releaseBorrowReservationsFor } from "../services/anti-exploit.js";
 import { collateralValueLamports as fetchValueLamports } from "../services/price.js";
 import { getTrailingPriceStats } from "../services/price-snapshotter.js";
 import { query } from "../db/pool.js";
@@ -1614,6 +1614,12 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
             // now in the continuous loop (transient interest above), so the span
             // WILL build and the retry lands.
             const secs = Math.min(300, Math.max(15, warm.secondsToReady ?? 30));
+            // This borrow is NOT proceeding — free its exposure reservation so
+            // it can't crowd the per-token cap for other borrowers (and so the
+            // site's warming auto-retry never collides with its own ghost).
+            try {
+              await releaseBorrowReservationsFor(mintStr, borrowerSig?.publicKey?.toBase58?.() || null);
+            } catch { /* best-effort */ }
             return {
               status: 503,
               body: {
@@ -1665,6 +1671,13 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
     }
   } catch (attestErr) {
     console.error("[cosign-borrow] JIT price attestation failed:", attestErr.message);
+    // Borrow is not proceeding — free this wallet's exposure reservation.
+    try {
+      await releaseBorrowReservationsFor(
+        _convCtx?.mint || null,
+        borrowerSig?.publicKey?.toBase58?.() || null,
+      );
+    } catch { /* best-effort */ }
     return {
       status: 502,
       body: {

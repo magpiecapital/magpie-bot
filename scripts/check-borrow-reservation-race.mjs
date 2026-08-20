@@ -139,6 +139,31 @@ try {
     const r = await reserveBorrowExposure(m, 1n, 0n, "w");
     expect("zero cap admits nothing", r.ok, false);
   }
+  console.log("\n== same-wallet retry REPLACES its reservation (2026-08-20 AAPLx bug) ==");
+  {
+    // The site's oracle-warming auto-retry re-POSTs the same signed borrow
+    // every few seconds. Each attempt used to INSERT a fresh reservation, so
+    // a wallet blocked ITSELF on the cap by attempt 3 with zero real loans
+    // ("18.22 of 20 SOL already borrowed"). A retry from the same wallet must
+    // replace its own in-flight reservation, not stack on top of it.
+    const m = mint("selfretry");
+    const cap = 20n * SOL;
+    for (let i = 0; i < 5; i++) {
+      const r = await reserveBorrowExposure(m, 9n * SOL, cap, "same-wallet");
+      expect(`retry ${i + 1} admitted (never self-collides)`, r.ok, true);
+    }
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n FROM borrow_reservations WHERE collateral_mint = $1`, [m]);
+    expect("exactly ONE live reservation after 5 retries", rows[0].n, 1);
+    // …while a DIFFERENT wallet's reservation still counts additively.
+    const other = await reserveBorrowExposure(m, 9n * SOL, cap, "other-wallet");
+    expect("second wallet admitted under remaining cap", other.ok, true);
+    const third = await reserveBorrowExposure(m, 9n * SOL, cap, "third-wallet");
+    expect("third wallet blocked — cross-wallet exposure still additive", third.ok, false);
+    expect("blocked result reports the reserved split honestly",
+      third.reservedLamports === 18n * SOL && third.loanLamports === 0n, true);
+  }
+
   console.log("\n== a DB failure must NEVER block a legitimate borrow ==");
   {
     // Blocking real borrowers would be a worse outcome than the vulnerability
