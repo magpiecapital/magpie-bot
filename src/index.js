@@ -202,6 +202,7 @@ import { startImpersonatorWatchdog } from "./services/impersonator-watchdog.js";
 import { startCanaryWatcher } from "./services/canary-watcher.js";
 import { startBorrowCanary } from "./services/borrow-canary.js";
 import { startX402PathCanary } from "./services/x402-path-canary.js";
+import { startAgentSurfaceCanary } from "./services/agent-surface-canary.js";
 import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
 import { ensureX402DestinationAtas } from "./services/x402-destination-atas.js";
 import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
@@ -1137,6 +1138,11 @@ bot.start({
     // fails per hop, recovery DM on first success, logs to
     // conversion_events(path='x402_path_canary').
     setTimeout(() => startX402PathCanary(bot), 115_000);
+    // agent-surface canary — every ~15 min, verifies the PUBLIC agent-DISCOVERY
+    // surface (MCP registry listing active/latest, catalog/pulse/tiers/pool/
+    // OpenAPI/llms.txt) that the AI-agent adoption strategy depends on. Pure
+    // read-only GETs; isolated from every program/on-chain surface.
+    setTimeout(() => startAgentSurfaceCanary(bot), 120_000);
     // Boot-time V4 PriceFeed sync — at +90s, walk every enabled
     // supported_mints entry and ensure the V4 PriceFeed PDA exists.
     // Eliminates the AccountNotInitialized class for never-borrowed-
