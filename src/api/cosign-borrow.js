@@ -615,6 +615,13 @@ export async function handleCosignBorrow(req) {
     // must not pollute the conversion metric — see isNonBorrowAttempt().
     if (isNonBorrowAttempt(result)) return result;
     const { outcome, klass } = classifyBorrowOutcome(result);
+    // Persist per-stage timings on success so stage-level p50/p95 survives
+    // log rotation — Railway retention is hours, and the 2026-08-21 latency
+    // review had to reconstruct the picture from aggregate latency_ms alone.
+    const successDetail =
+      outcome === "success" && result?.body?.timings
+        ? { timings: result.body.timings, signature: result.body.signature }
+        : undefined;
     // Fire-and-forget — never let telemetry block the response.
     import("../services/conversion-tracker.js")
       .then(({ recordConversionEvent }) =>
@@ -627,6 +634,7 @@ export async function handleCosignBorrow(req) {
           wallet: _convCtx.wallet,
           surface: _convCtx.surface,
           latencyMs: Date.now() - _convCtx.startedAt,
+          detail: successDetail,
         }),
       )
       .catch(() => {});
