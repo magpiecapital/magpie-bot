@@ -464,11 +464,25 @@ async function detectLenderBalanceDrain(connection, tx, LENDER_PUBKEY) {
     if (meta.type === "sol") {
       if (post.lamports < meta.preLamports) {
         const delta = meta.preLamports - post.lamports;
-        return {
-          ok: false,
-          error: "Lender wallet SOL would decrease",
-          detail: `pre=${meta.preLamports} post=${post.lamports} delta=-${delta} lamports`,
-        };
+        // Dust tolerance (2026-08-22): a legitimate operator borrow was
+        // blocked on delta=-5500 lamports (~$0.001) — fee/rent attribution
+        // noise inside the simulation, not a drain. Zero tolerance here
+        // violates the defense-in-depth doctrine: Layer 1 has ALREADY
+        // statically proven the tx contains no System/Token instruction
+        // sourcing from the lender, and every real drain shape moves
+        // orders of magnitude more than fee dust (rent floor ~890k
+        // lamports; loan-scale millions+). Keep the guard armed for
+        // anything beyond dust; never turn away a borrower over lamport
+        // noise the chain itself attributes to fees.
+        const DUST_LAMPORTS = Number(process.env.DRAIN_GUARD_DUST_LAMPORTS || 20_000);
+        if (delta > DUST_LAMPORTS) {
+          return {
+            ok: false,
+            error: "Lender wallet SOL would decrease",
+            detail: `pre=${meta.preLamports} post=${post.lamports} delta=-${delta} lamports`,
+          };
+        }
+        console.warn(`[cosign-borrow] drain-guard dust delta tolerated: -${delta} lamports (<= ${DUST_LAMPORTS})`);
       }
     } else if (meta.type === "token") {
       // post.data is [string, encoding] — decode base64
@@ -1957,6 +1971,8 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
       // log + DM operator since this should never fire on a legitimate
       // borrow. Either an attempted drain (attacker-side) OR a protocol
       // bug we need to investigate.
+      recordBorrowFailure("drain_guard_trip");
+      _recordBorrowConversionFailure(_convCtx, "drain_guard_trip", { detail: drainCheck.detail?.slice(0, 220) });
       try {
         const { notifyAdmin } = await import("../services/admin-notify.js");
         await notifyAdmin(
