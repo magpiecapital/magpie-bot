@@ -185,7 +185,7 @@ export async function getPriceFeedAgeSeconds(mintStr, programIdOverride = null) 
  * the head and overwrites the oldest sample. So we ALWAYS iterate every
  * populated slot and count by timestamp rather than trusting `count`.
  */
-export async function getV4TwapSampleCount(mintStr, windowSec = 300, programIdOverride = null) {
+export async function getV4TwapSampleCount(mintStr, windowSec = 1800, programIdOverride = null) {
   try {
     const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
     // Default to V4 for backward compatibility, but accept V3 too — both
@@ -259,7 +259,15 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
   // age out between the moment we measure and the moment the cosigned
   // tx lands on-chain. Targeting 10 gives 2 samples of headroom.
   const REQUIRED_IN_WINDOW = Number(opts.requiredInWindow ?? 10);
-  const WINDOW_SEC = 300;
+  // MIRROR THE CHAIN EXACTLY (magpie-v4 lib.rs): sample membership uses
+  // TWAP_WINDOW_SECONDS = 1800 (30 min); the SEPARATE history requirement is
+  // oldest-in-window age >= MIN_HISTORY_SECONDS = 300. These are two different
+  // constants. Conflating them (window=300 AND span>=300) made the gate
+  // unsatisfiable except in the 1-second knife-edge when a sample's age is
+  // exactly 300 — feeds reported "span_warming" forever while the chain would
+  // have accepted the borrow. Operator hit this live on TripleT 2026-08-22.
+  const WINDOW_SEC = 1800;
+  const MIN_HISTORY_SEC = 300;
   // 90s budget, 1.5s spacing — comfortably fits 10 samples even from a
   // cold-start PDA that needs init first. Previous 45s/4s budget was too
   // tight: init took ~1s, then 8 attests × 4s = 32s, plus ~2s/attest
@@ -300,15 +308,16 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
       await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
-    // The on-chain V3/V4 TWAP gate requires BOTH >= MIN_SAMPLES in-window AND
-    // >= MIN_HISTORY_SECONDS (300s) of span since the oldest in-window sample
-    // (magpie-lending-v3 lib.rs). Checking the COUNT alone false-readies a
-    // stone-cold feed (10 samples fired in 15s → count ok, span 15s → the chain
-    // REJECTS at broadcast). So require the span too: "ready" here now means
-    // "will pass on-chain", which is what closes the sign-then-fail path.
+    // The on-chain V3/V4 TWAP gate requires BOTH >= MIN_SAMPLES within the
+    // 30-min window AND oldest-in-window age >= MIN_HISTORY_SECONDS (300s)
+    // (magpie-v4 lib.rs `twap()` + borrow validation). Checking the COUNT
+    // alone false-readies a stone-cold feed (10 samples fired in 15s → count
+    // ok, span 15s → the chain REJECTS at broadcast). So require the span
+    // too — against MIN_HISTORY_SEC, NOT the membership window: "ready" here
+    // means "will pass on-chain", which closes the sign-then-fail path.
     const nowSec = Math.floor(Date.now() / 1000);
     const spanSec = status.oldestInWindowTs != null ? nowSec - status.oldestInWindowTs : 0;
-    if (status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= WINDOW_SEC) {
+    if (status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= MIN_HISTORY_SEC) {
       return {
         ok: true,
         inWindow: status.inWindow,
@@ -357,7 +366,7 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
     ok: false,
     inWindow: final?.inWindow ?? 0,
     spanSec: finalSpanSec,
-    secondsToReady: Math.max(5, WINDOW_SEC - finalSpanSec),
+    secondsToReady: Math.max(5, MIN_HISTORY_SEC - finalSpanSec),
     waitedMs: Date.now() - START,
     attests,
     reason: lastErr || (countShort ? "timeout" : "span_warming"),

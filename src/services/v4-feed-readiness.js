@@ -36,7 +36,8 @@ import { query } from "../db/pool.js";
 import { withFailover } from "../solana/connection.js";
 
 const MIN_SAMPLES_FOR_TWAP = 8;
-const TWAP_WINDOW_SECONDS = 300;
+const TWAP_WINDOW_SECONDS = 1800; // chain membership window (magpie-v4 lib.rs)
+const MIN_HISTORY_SECONDS = 300;  // chain: oldest in-window age requirement
 
 const WARMUP_CONCURRENCY = Number(process.env.V4_WARMUP_CONCURRENCY) || 8;
 const WARMUP_BATCH_SPACING_MS = Number(process.env.V4_WARMUP_BATCH_SPACING_MS) || 4_000;
@@ -228,16 +229,25 @@ async function feedIsWarm(mintStr, lenderPk, programIdV4) {
 
   const now = BigInt(Math.floor(Date.now() / 1000));
   const windowStart = now - BigInt(TWAP_WINDOW_SECONDS);
+  // Mirror the chain: >= MIN_SAMPLES in the 30-min window AND the oldest
+  // in-window sample >= MIN_HISTORY_SECONDS old (two separate constants).
   let inWindow = 0;
+  let oldestInWindowTs = null;
   for (let i = 0; i < Math.min(count, 32); i++) {
     const idx = (head - 1 - i + 32) % 32;
     const start = 112 + idx * 16;
     if (start + 16 > info.data.length) break;
     const ts = info.data.readBigInt64LE(start + 8);
-    if (ts >= windowStart) inWindow++;
-    if (inWindow >= MIN_SAMPLES_FOR_TWAP) return true;
+    if (ts >= windowStart) {
+      inWindow++;
+      if (oldestInWindowTs == null || ts < oldestInWindowTs) oldestInWindowTs = ts;
+    }
   }
-  return false;
+  return (
+    inWindow >= MIN_SAMPLES_FOR_TWAP &&
+    oldestInWindowTs != null &&
+    Number(now - oldestInWindowTs) >= MIN_HISTORY_SECONDS
+  );
 }
 
 async function ensureMintWarm(mint, lenderPk, programIdV4) {
@@ -394,20 +404,37 @@ export async function checkMintReadiness(mintStr) {
   const now = BigInt(Math.floor(Date.now() / 1000));
   const windowStart = now - BigInt(TWAP_WINDOW_SECONDS);
   let inWindow = 0;
+  let oldestInWindowTs = null;
   for (let i = 0; i < Math.min(count, 32); i++) {
     const idx = (head - 1 - i + 32) % 32;
     const start = 112 + idx * 16;
     if (start + 16 > info.data.length) break;
     const ts = info.data.readBigInt64LE(start + 8);
-    if (ts >= windowStart) inWindow++;
+    if (ts >= windowStart) {
+      inWindow++;
+      if (oldestInWindowTs == null || ts < oldestInWindowTs) oldestInWindowTs = ts;
+    }
+  }
+  const spanSec = oldestInWindowTs != null ? Number(now - oldestInWindowTs) : 0;
+  if (inWindow >= MIN_SAMPLES_FOR_TWAP && spanSec >= MIN_HISTORY_SECONDS) {
+    return { ready: true, samples_in_window: inWindow, span_seconds: spanSec };
   }
   if (inWindow >= MIN_SAMPLES_FOR_TWAP) {
-    return { ready: true, samples_in_window: inWindow };
+    // Count met — only history age is missing. ETA is exact: the remaining
+    // seconds until the oldest in-window sample turns MIN_HISTORY_SECONDS old.
+    return {
+      ready: false,
+      reason: "history_aging",
+      samples_in_window: inWindow,
+      span_seconds: spanSec,
+      eta_seconds: Math.max(1, MIN_HISTORY_SECONDS - spanSec),
+    };
   }
   // Estimate ETA: at 3s on-demand spacing per round + ~2s per attest
-  // confirmation, each missing sample costs ~5s.
+  // confirmation, each missing sample costs ~5s; then the history-age
+  // requirement dominates for a cold feed.
   const missing = MIN_SAMPLES_FOR_TWAP - inWindow;
-  const etaSeconds = missing * 5;
+  const etaSeconds = Math.max(missing * 5, MIN_HISTORY_SECONDS - spanSec);
   return {
     ready: false,
     reason: "insufficient_samples_in_window",

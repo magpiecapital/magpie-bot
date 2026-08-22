@@ -62,7 +62,8 @@ import { withFailover } from "../solana/connection.js";
 import { headroomBpsForCategory } from "./safe-collateral-value.js";
 
 const MIN_SAMPLES_FOR_TWAP = 8;
-const TWAP_WINDOW_SECONDS = 300; // V4: MIN_HISTORY_SECONDS = 300
+const TWAP_WINDOW_SECONDS = 1800; // chain membership window (magpie-v4 lib.rs: 30 min)
+const MIN_HISTORY_SECONDS = 300;  // chain: oldest in-window sample must be >= this old
 // Drift headroom is category-sized (see safe-collateral-value.js). The old fixed
 // 30bps (0.3%) tolerated almost no quote→execution movement → volatile V4
 // collateral failed with CollateralValueExceedsAttestation. Single source of
@@ -214,6 +215,26 @@ export async function handleV4Twap(req, url) {
         reason: `only_${inWindow.length}_samples_in_window_need_${MIN_SAMPLES_FOR_TWAP}`,
         latest_sample_age_seconds: latestSample ? Number(now - latestSample.ts) : null,
         samples_total: samples.length,
+        samples_in_window: inWindow.length,
+        fallback_multiplier: 0.89,
+      },
+    };
+  }
+
+  // Mirror the chain's SECOND requirement (magpie-v4 lib.rs): the oldest
+  // in-window sample must be >= MIN_HISTORY_SECONDS old. Count alone is not
+  // enough — the chain rejects TwapInsufficientHistory until history ages.
+  const oldestInWindowTs = inWindow.reduce((min, s) => (s.ts < min ? s.ts : min), inWindow[0].ts);
+  const historySpanSec = Number(now - oldestInWindowTs);
+  if (historySpanSec < MIN_HISTORY_SECONDS) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        mint: mintStr,
+        recommendation: "wait_for_warmup",
+        reason: `history_aging_${historySpanSec}s_of_${MIN_HISTORY_SECONDS}s`,
+        eta_seconds: Math.max(1, MIN_HISTORY_SECONDS - historySpanSec),
         samples_in_window: inWindow.length,
         fallback_multiplier: 0.89,
       },
