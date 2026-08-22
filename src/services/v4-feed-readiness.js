@@ -261,6 +261,14 @@ async function ensureMintWarm(mint, lenderPk, programIdV4) {
       state.warmMints.add(mint.mint);
       return { mint: mint.mint, action: "already_warm_onchain" };
     }
+    // Count met, only history age missing: do NOT attest — an extra sample
+    // wraps the ring and resets the span clock (see burst_paused_history_aging).
+    // Site polls hit this path repeatedly; without the gate, each poll would
+    // keep the feed perpetually 150s from ready.
+    const r = await checkMintReadiness(mint.mint);
+    if (r.reason === "history_aging") {
+      return { mint: mint.mint, action: "history_aging_no_attest", eta_seconds: r.eta_seconds };
+    }
     // Not warm — fire one attestation. Subsequent burst rounds add
     // more samples. We don't try to add 8 samples in this call; the
     // burst loop does that across rounds.
@@ -562,6 +570,17 @@ async function processBurstMint(mint, entry, lenderPk, programIdV4) {
     state.burst.delete(mint);
     state.warmMints.add(mint);
     return { mint, action: "burst_ready" };
+  }
+  // Count met, only history AGE is missing: STOP burst-attesting. Each extra
+  // attest wraps the 32-slot ring and evicts the oldest sample, so the span
+  // can NEVER reach MIN_HISTORY_SECONDS while the burst continues — the
+  // warming itself was blocking the warmth (CATE incident 2026-08-22:
+  // 32 samples, span pinned at ~150s by ~5s attest cadence). Drain from
+  // burst WITHOUT marking warm; the normal ~30s continuous cadence keeps
+  // the latest sample fresh while the span ages to ready on its own.
+  if (readiness.reason === "history_aging") {
+    state.burst.delete(mint);
+    return { mint, action: "burst_paused_history_aging", eta_seconds: readiness.eta_seconds };
   }
 
   state.inFlight.add(mint);
