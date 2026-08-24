@@ -43,6 +43,7 @@ const TOKENS_URL = "https://www.magpie.capital/tokens";
 // every tweet we post is ALSO autonomously cross-posted into the Magpie
 // community TG chats via the shared /crosspost primitive (operator 2026-06-28).
 let _botApi = null;
+let _lastFailAlarmAt = 0;
 
 /** Strip a token symbol to a tweet-safe token. Removes anything that could
  *  hijack the post (newlines, @, #, $, URLs, control chars) and caps length.
@@ -143,12 +144,6 @@ async function tick() {
     }
     const text = t.type === "added" ? composeAdded(t.row) : composeRemoved(t.row);
     const res = await postTweet(text);
-    await upsertState(
-      t.row,
-      t.row.enabled,
-      res.ok ? t.type : `${t.type}_failed`,
-      res.tweetId ?? null,
-    );
     if (res.ok) posted++;
 
     // AUTONOMOUS TG ANNOUNCEMENT (operator 2026-06-28): the community MUST get
@@ -159,22 +154,44 @@ async function tick() {
     //   • tweet failed/skipped (no creds, 402, rate-limit) → post the
     //     announcement TEXT directly so MagPie Talk still gets it.
     // Best-effort: a TG failure never blocks the announce loop or state write.
-    if (_botApi) {
-      try {
-        if (res.ok && res.tweetId) {
-          await crosspostTweet(
-            _botApi,
-            `https://x.com/MagpieLoans/status/${res.tweetId}`,
-            "auto",
-          );
-        } else {
-          await postAnnouncementToCommunity(_botApi, text);
-        }
-      } catch (e) {
-        console.warn(
-          `[token-announcer] TG announce failed: ${e.message?.slice(0, 120)}`,
+    let tgDelivered = false;
+    try {
+      if (res.ok && res.tweetId && _botApi) {
+        await crosspostTweet(
+          _botApi,
+          `https://x.com/MagpieLoans/status/${res.tweetId}`,
+          "auto",
         );
+        tgDelivered = true;
+      } else {
+        tgDelivered = await postAnnouncementToCommunity(_botApi, text);
       }
+    } catch (e) {
+      console.warn(
+        `[token-announcer] TG announce failed: ${e.message?.slice(0, 120)}`,
+      );
+    }
+    // State records the WHOLE announcement outcome: 'added' if the community
+    // saw it anywhere (X or TG); '<type>_failed' only if BOTH channels failed.
+    const announcedSomewhere = res.ok || tgDelivered;
+    await upsertState(
+      t.row,
+      t.row.enabled,
+      announcedSomewhere ? t.type : `${t.type}_failed`,
+      res.tweetId ?? null,
+    );
+    // Silent-failure alarm (lesson: 48 adds went unannounced with no page).
+    if (!announcedSomewhere) {
+      try {
+        const { notifyAdmin } = await import("./admin-notify.js");
+        const now = Date.now();
+        if (now - (_lastFailAlarmAt || 0) > 6 * 60 * 60 * 1000) {
+          _lastFailAlarmAt = now;
+          await notifyAdmin(
+            `⚠️ token-catalog announcement FAILED on both X and TG for $${t.row.symbol} — X status: ${res.skipped ? "no creds" : "post rejected (check API credits — 402?)"}. New collateral is going unannounced.`,
+          );
+        }
+      } catch { /* alarm is best-effort */ }
     }
   }
 
@@ -192,20 +209,36 @@ async function tick() {
  *  starved of a catalog change. Plain text (no parse_mode) so a token
  *  symbol containing a Markdown char can never break or hijack the post;
  *  Telegram still auto-links the /tokens URL and renders its preview. */
-async function postAnnouncementToCommunity(botApi, text) {
+async function postAnnouncementToCommunity(_botApiUnused, text) {
+  // HARDENED (2026-08-24): the TG mirror previously depended on the in-process
+  // grammY handle; when that path failed it only warn-logged and the community
+  // silently got nothing — 48 catalog adds went unannounced before anyone
+  // noticed. The mirror now posts via the raw Bot API with the bot token
+  // (independent of the grammY instance/lifecycle) and RETURNS delivery truth
+  // so the caller can alarm on failure instead of swallowing it.
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!TOKEN) { console.warn("[token-announcer] no TELEGRAM_BOT_TOKEN — TG mirror skipped"); return false; }
   const { listEnabledChats } = await import("./community-moderation.js");
   let chats = [];
   try { chats = await listEnabledChats(); } catch (e) {
     console.warn(`[token-announcer] listEnabledChats failed: ${e.message?.slice(0, 90)}`);
-    return;
+    return false;
   }
+  let delivered = false;
   for (const c of chats) {
     try {
-      await botApi.sendMessage(Number(c.chat_id), text, { disable_web_page_preview: false });
+      const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: Number(c.chat_id), text, disable_web_page_preview: false }),
+      });
+      const j = await r.json();
+      if (j.ok) delivered = true;
+      else console.warn(`[token-announcer] TG send to ${c.chat_id} failed: ${JSON.stringify(j).slice(0, 120)}`);
     } catch (e) {
       console.warn(`[token-announcer] TG send to ${c.chat_id} failed: ${e.message?.slice(0, 90)}`);
     }
   }
+  return delivered;
 }
 
 export function startTokenCatalogAnnouncer(bot) {
