@@ -27,7 +27,6 @@
  */
 import { query } from "../db/pool.js";
 import { postTweet, xPosterConfigured } from "./x-poster.js";
-import { crosspostTweet } from "./community-x-crosspost.js";
 
 const POLL_MS = Number(process.env.TOKEN_ANNOUNCE_POLL_MS || 5 * 60_000);
 const MAX_PER_TICK = Number(process.env.TOKEN_ANNOUNCE_MAX_PER_TICK || 3);
@@ -154,18 +153,13 @@ async function tick() {
     //   • tweet failed/skipped (no creds, 402, rate-limit) → post the
     //     announcement TEXT directly so MagPie Talk still gets it.
     // Best-effort: a TG failure never blocks the announce loop or state write.
+    // TG IS THE PRIMARY CHANNEL (operator 2026-08-24: "I dont want X
+    // announcement, I want TG announcement"). MagPie Talk ALWAYS gets the
+    // clean template text — never a tweet-crosspost card — regardless of
+    // whether X succeeded. X remains best-effort secondary.
     let tgDelivered = false;
     try {
-      if (res.ok && res.tweetId && _botApi) {
-        await crosspostTweet(
-          _botApi,
-          `https://x.com/MagpieLoans/status/${res.tweetId}`,
-          "auto",
-        );
-        tgDelivered = true;
-      } else {
-        tgDelivered = await postAnnouncementToCommunity(_botApi, text);
-      }
+      tgDelivered = await postAnnouncementToCommunity(_botApi, text);
     } catch (e) {
       console.warn(
         `[token-announcer] TG announce failed: ${e.message?.slice(0, 120)}`,
