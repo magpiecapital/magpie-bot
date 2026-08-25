@@ -453,22 +453,9 @@ export async function handleStats(ctx) {
       // OPERATOR-ONLY funder-health (empty array for everyone else).
       ...funderLines,
       ``,
-      // Prior-snapshots section only renders once at least one snapshot
-      // has happened. Until then, hide the section entirely — operator
-      // prefers terse output over an empty placeholder.
-      ...(priorSnapshots.length > 0
-        ? [
-            `REWARDS — PRIOR SNAPSHOTS ($MAGPIE holders)`,
-            ...snapshotHistoryRows,
-          ]
-        : []),
-      ...(priorLpSnapshots.length > 0
-        ? [
-            ``,
-            `REWARDS — PRIOR SNAPSHOTS (SOL LPs)`,
-            ...lpSnapshotHistoryRows,
-          ]
-        : []),
+      // Prior-snapshot history sections removed 2026-08-25 (operator:
+      // /stats layout trim). Full history stays on the public
+      // /distributions page + transparency API.
       // Defaulted-loan profit section. Only renders when ANY meaningful
       // signal is present, to avoid noisy empty rows on fresh deploys.
       ...((defaultProfitLifetime > 0n || defaultedLoansWithProfit > 0 ||
@@ -490,22 +477,8 @@ export async function handleStats(ctx) {
                     : `${magpieBurnedCount} burned / ${magpieBurnPendingCount} awaiting burn`)] : []),
           ]
         : []),
-      // ── AUTO-SELL FEES (limit-close fires) ─────────────────────
-      // Surfaces the 1% protocol fee revenue stream from successful
-      // auto-sells. This is real revenue that flows into the same
-      // 70/10/10/10 split as borrow origination — making it visible
-      // here closes the transparency gap the operator flagged.
-      // Renders only once a single fire has landed.
-      ...(lcFiresLifetime > 0
-        ? [
-            ``,
-            `AUTO-SELLS (1% fee → rewards)`,
-            row("Lifetime fires", String(lcFiresLifetime)),
-            row("Last 24h fires", String(lcFiresLast24h)),
-            row("Lifetime fees", `${fmtSol(lcFeesLifetime.toString())} SOL`),
-            row("Last 24h fees", `${fmtSol(lcFeesLast24h.toString())} SOL`),
-          ]
-        : []),
+      // AUTO-SELLS section removed 2026-08-25 (operator layout trim) —
+      // fee revenue still flows into the accrual rows above.
       // $MAGPIE BURNED — supply contraction headline. Renders whenever
       // the ledger has any entry (always true once the migration's
       // baseline-burn seed lands).
