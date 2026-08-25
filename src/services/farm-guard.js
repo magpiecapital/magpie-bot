@@ -176,9 +176,14 @@ export async function assessFarmRisk({ mint, name, imageUrl, liquidity, volume24
 
   try {
     const { rows } = await query(
-      `SELECT COUNT(*) AS n FROM supported_mints
-        WHERE auto_approved = TRUE AND source IN ('screener', 'review_auto')
-          AND screened_at > NOW() - INTERVAL '24 hours'`,
+      // Count real approval EVENTS (queue transitions), not supported_mints
+      // screened_at — token-health re-stamps screened_at on every periodic
+      // liquidity refresh for ALL enabled tokens, which made this counter
+      // read ~54 forever and hold every clean candidate in a phantom
+      // "approval wave" that could never clear.
+      `SELECT COUNT(*) AS n FROM token_screen_queue
+        WHERE status = 'approved'
+          AND reviewed_at > NOW() - INTERVAL '24 hours'`,
     );
     ctx.autoApprovals24h = Number(rows[0]?.n);
   } catch (e) {
