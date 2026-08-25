@@ -183,6 +183,15 @@ async function tick() {
         const { notifyAdmin } = await import("./admin-notify.js");
         await notifyAdmin(`✅ Auto-announced ${t.type === "added" ? "new collateral" : "catalog change"}: $${t.row.symbol} → MagPie Talk${res.ok ? " + X" : " (TG only — X credits depleted)"}`);
       } catch { /* receipt is best-effort */ }
+      // Instant search-index ping for the token's borrow landing page —
+      // the trending-attention window is hours, so indexing must be too.
+      // Fail-soft: never blocks the announce loop.
+      if (t.type === "added") {
+        try {
+          const { pingIndexNowForListing } = await import("./indexnow.js");
+          await pingIndexNowForListing(t.row.symbol);
+        } catch { /* indexing is best-effort */ }
+      }
     }
     // Silent-failure alarm (lesson: 48 adds went unannounced with no page).
     if (!announcedSomewhere) {
