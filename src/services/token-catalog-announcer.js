@@ -174,6 +174,16 @@ async function tick() {
       announcedSomewhere ? t.type : `${t.type}_failed`,
       res.tweetId ?? null,
     );
+    // Success receipt to the operator (2026-08-25: "they need to start
+    // happening again" — silence must never be ambiguous). Every auto-post
+    // DMs the admin a confirmation, so working-and-quiet is distinguishable
+    // from broken.
+    if (announcedSomewhere) {
+      try {
+        const { notifyAdmin } = await import("./admin-notify.js");
+        await notifyAdmin(`✅ Auto-announced ${t.type === "added" ? "new collateral" : "catalog change"}: $${t.row.symbol} → MagPie Talk${res.ok ? " + X" : " (TG only — X credits depleted)"}`);
+      } catch { /* receipt is best-effort */ }
+    }
     // Silent-failure alarm (lesson: 48 adds went unannounced with no page).
     if (!announcedSomewhere) {
       try {
