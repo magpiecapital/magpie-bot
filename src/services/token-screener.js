@@ -1044,9 +1044,18 @@ export async function checkSellable(mint, decimals) {
   // not require huge depth; large enough that fee/precision rounding doesn't
   // zero it out.
   const amount = Math.pow(10, Math.max(0, decimals ?? 6));
-  const url = `${JUP_QUOTE_API}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+  const qs = `inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+  const url = `${JUP_QUOTE_API}?${qs}`;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    let res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (res.status === 429 || res.status >= 500) {
+      // Paid tier rate-limited/down — the FREE lite quote endpoint has a
+      // separate quota and unblocks the review queue (2026-08-25: 116
+      // pending candidates were deferring forever on paid-tier 429s).
+      try {
+        res = await fetch(`https://lite-api.jup.ag/swap/v1/quote?${qs}`, { signal: AbortSignal.timeout(8_000) });
+      } catch { /* fall through with the original res */ }
+    }
     if (!res.ok) {
       // Non-200 conflates a genuinely-unroutable token (400) with infra
       // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
