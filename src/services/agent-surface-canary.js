@@ -60,7 +60,9 @@ async function getText(url, timeoutMs = 12000) {
 // Each check returns { ok, latencyMs, detail? } or throws.
 const CHECKS = [
   ["mcp_registry_listing", async () => {
-    const d = await getJson(REGISTRY);
+    // registry API can be slow (7s+ observed) — generous timeout; the check
+    // asserts LISTING, not their latency
+    const d = await getJson(REGISTRY, 25_000);
     const mine = (d.servers || []).filter((s) => s.server?.name === MCP_NAME);
     if (!mine.length) throw new Error("magpie not found in MCP registry");
     const latest = mine.find((s) => s._meta?.["io.modelcontextprotocol.registry/official"]?.isLatest);

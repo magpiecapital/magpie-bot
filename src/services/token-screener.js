@@ -1759,6 +1759,14 @@ async function processReviewQueue(bot) {
           checkHolderConcentration(t.mint, { fresh: true, maxTop10Pct: REVIEW_AUTO_MAX_TOP10_PCT, maxTop20Pct: REVIEW_AUTO_MAX_TOP20_PCT }),
           rugcheckRisk(t.mint, { fresh: true }),
         ]);
+        // A sell-check that failed NON-definitively (Jupiter 429/5xx/network)
+        // is a TRANSIENT infrastructure error, not a honeypot verdict — skip
+        // this tick and retry next cycle instead of permanently rejecting.
+        // (CYBERLEEK was wrongly branded honeypot off a quote 429, 2026-08-25.)
+        if (!sell.sellable && sell.definitive === false) {
+          console.log(`[screener] Review deferred ${t.symbol} (transient sell-check: ${sell.reason}) — will retry`);
+          continue;
+        }
         scamReason =
           !sell.sellable ? `honeypot — ${sell.reason}`
           : !ext.safe ? `unsafe extension — ${ext.reason}`
