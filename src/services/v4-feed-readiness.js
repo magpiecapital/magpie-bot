@@ -870,7 +870,7 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
       const missing = needy.filter((m) => !priceMap.has(m.mint));
       for (const m of missing) {
         try {
-          const p = await getPriceInSol(m.mint);
+          const p = await getPriceInSol(m.mint, { cls: "bulk" });
           if (p) priceMap.set(m.mint, p);
         } catch {
           /* this mint retries next tick */

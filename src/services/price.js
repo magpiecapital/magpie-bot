@@ -7,12 +7,17 @@ import {
   tryAcquireJupiterToken,
   recordJupiterOk,
   recordJupiter429,
+  recordJupiter429Global,
   recordJupiterErr,
   recordBudgetDefer,
   recordBackoffSkip,
   clearMintJupiterBackoff,
   isMintInJupiterBackoff,
 } from "./jupiter-budget.js";
+import {
+  isClientEnabled as jupClientEnabled,
+  requestUsdPrice as jupRequestUsd,
+} from "./jupiter-price-client.js";
 
 // Jupiter v2 was deprecated in 2025. v3 returns USD only, so SOL-denominated
 // prices are derived as token_usd / sol_usd.
@@ -64,7 +69,13 @@ const JUP_BATCH_SIZE = 50;
  * Jupiter-primary (cross-source posture intact) instead of dropping to the
  * single-source escape hatch. No key sent — this is the anonymous tier.
  */
-async function jupiterLitePriceInSol(mint) {
+async function jupiterLitePriceInSol(mint, opts = {}) {
+  // Client mode: the coalescing client already prefers paid and falls to
+  // lite internally with correct windowed budgets — route through it so a
+  // "lite rescue" can't independently hammer the shared per-IP lite quota.
+  if (jupClientEnabled()) {
+    return jupiterPriceInSol(mint, opts);
+  }
   const resp = await axios.get("https://lite-api.jup.ag/price/v3", {
     params: { ids: `${mint},${SOL_MINT}` },
     timeout: 8_000,
@@ -74,7 +85,29 @@ async function jupiterLitePriceInSol(mint) {
   if (!tokenUsd || !solUsd) throw new Error(`lite: no price data for ${mint}`);
   return tokenUsd / solUsd;
 }
-async function jupiterPriceInSol(mint) {
+async function jupiterPriceInSol(mint, opts = {}) {
+  // Coalescing client path (default): per-mint lookups from every caller
+  // in the process merge into batched ids= calls under window-accurate
+  // budgets. Metric note: recordJupiterOk here counts LOGICAL lookups (many
+  // share one HTTP call); the client's own stats carry true HTTP counts.
+  if (jupClientEnabled()) {
+    const cls = opts.cls === "bulk" ? "bulk" : "interactive";
+    try {
+      const [tokenUsd, solUsd] = await Promise.all([
+        jupRequestUsd(mint, { cls }),
+        jupRequestUsd(SOL_MINT, { cls }),
+      ]);
+      recordJupiterOk();
+      clearMintJupiterBackoff(mint);
+      return tokenUsd / solUsd;
+    } catch (err) {
+      // A 429 is a WINDOW signal, not a mint signal — record the metric but
+      // never bump per-mint backoff for it (that pollutes routing for 30s+).
+      if (err?.code === "JUP_RATE_LIMITED") recordJupiter429Global();
+      else recordJupiterErr();
+      throw err;
+    }
+  }
   try {
     const resp = await axios.get(JUPITER_API, {
       params: { ids: `${mint},${SOL_MINT}` },
@@ -134,7 +167,7 @@ export async function getPriceInSol(mint, opts = {}) {
         `strict-jupiter unavailable for ${mint} (route=${route}, reason=${reason})`,
       );
     }
-    return await jupiterPriceInSol(mint); // pure Jupiter; throws on failure, no Dex fallback
+    return await jupiterPriceInSol(mint, { cls: opts.cls }); // pure Jupiter; throws on failure, no Dex fallback
   }
 
   if (route === "dexscreener_only") {
@@ -156,7 +189,7 @@ export async function getPriceInSol(mint, opts = {}) {
         throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter skipped: ${reason})`);
       }
       try {
-        return await jupiterPriceInSol(mint);
+        return await jupiterPriceInSol(mint, { cls: opts.cls });
       } catch (errJup) {
         throw new Error(`No price for ${mint} (Dex: ${errDex.message}; Jupiter: ${errJup.message})`);
       }
@@ -174,7 +207,7 @@ export async function getPriceInSol(mint, opts = {}) {
     }
   }
   try {
-    return await jupiterPriceInSol(mint);
+    return await jupiterPriceInSol(mint, { cls: opts.cls });
   } catch (err1) {
     if (!isTransientPriceError(err1)) {
       try {
@@ -188,7 +221,8 @@ export async function getPriceInSol(mint, opts = {}) {
 
     // Transient — first try the FREE lite tier (separate quota from the Pro
     // key) so a paid-tier 429 storm doesn't degrade us off Jupiter at all.
-    if (JUPITER_API_KEY) {
+    // Legacy mode only: the coalescing client already tried lite internally.
+    if (JUPITER_API_KEY && !jupClientEnabled()) {
       try {
         const lite = await jupiterLitePriceInSol(mint);
         console.warn(`[price] ${mint.slice(0, 8)} served by Jupiter LITE tier (paid tier: ${err1.message})`);
@@ -208,7 +242,7 @@ export async function getPriceInSol(mint, opts = {}) {
       }
     }
     try {
-      return await jupiterPriceInSol(mint);
+      return await jupiterPriceInSol(mint, { cls: opts.cls });
     } catch (err2) {
       try {
         const dex = await dexscreenerPriceInSol(mint);
@@ -229,6 +263,32 @@ export async function getPriceInSol(mint, opts = {}) {
  */
 export async function getPricesInSolBatch(mints) {
   const unique = [...new Set(mints)];
+  // Client mode: fan every mint into the coalescing client concurrently —
+  // it packs them into ≤JUP_MAX_IDS_PER_CALL chunks under window-accurate
+  // budgets, and CHUNKS ARE INDEPENDENT: one rate-limited chunk no longer
+  // abandons the rest of the list (the legacy `break` below turned one 429
+  // into a 75+-mint per-mint fallback storm). API contract unchanged:
+  // returns Map<mint, priceInSol>; mints Jupiter omits are simply ABSENT
+  // (never null/0) so existing per-mint backfill loops keep working.
+  if (jupClientEnabled()) {
+    const settled = await Promise.allSettled(
+      unique.map(async (m) => {
+        const [tokenUsd, solUsd] = await Promise.all([
+          jupRequestUsd(m, { cls: "bulk" }),
+          jupRequestUsd(SOL_MINT, { cls: "bulk" }),
+        ]);
+        return tokenUsd / solUsd;
+      }),
+    );
+    const result = new Map();
+    unique.forEach((m, i) => {
+      if (settled[i].status === "fulfilled" && settled[i].value > 0) {
+        result.set(m, settled[i].value);
+        clearMintJupiterBackoff(m);
+      }
+    });
+    return result;
+  }
   const result = new Map();
   let solUsd = null;
 
@@ -603,6 +663,12 @@ export function warmPriceCache(mint) {
  * DexScreener, agree-or-throw when both respond. Returns USD per token.
  */
 async function jupiterPriceInUsd(mint) {
+  // Client mode: coalesced + budgeted like every other Jupiter lookup.
+  // USD callers (limit-close arming, Pip, dashboards) are user-facing →
+  // interactive class.
+  if (jupClientEnabled()) {
+    return await jupRequestUsd(mint, { cls: "interactive" });
+  }
   const resp = await axios.get(JUPITER_API, {
     params: { ids: mint },
     headers: JUPITER_HEADERS,
@@ -610,6 +676,23 @@ async function jupiterPriceInUsd(mint) {
   });
   const tokenUsd = resp.data?.[mint]?.usdPrice;
   if (!tokenUsd) throw new Error(`Jupiter has no USD price for ${mint}`);
+  return tokenUsd;
+}
+
+// USD twin of jupiterLitePriceInSol. The USD cross-source rescue below MUST
+// use this and never the InSol variant: injecting a SOL-denominated price
+// into the USD slot makes the sources "disagree" by ~SOL/USD (~180x) and
+// fails the whole valuation — worse than no rescue at all.
+async function jupiterLitePriceInUsd(mint) {
+  if (jupClientEnabled()) {
+    return await jupRequestUsd(mint, { cls: "interactive" });
+  }
+  const resp = await axios.get("https://lite-api.jup.ag/price/v3", {
+    params: { ids: mint },
+    timeout: 8_000,
+  });
+  const tokenUsd = resp.data?.[mint]?.usdPrice;
+  if (!tokenUsd) throw new Error(`lite: no USD price data for ${mint}`);
   return tokenUsd;
 }
 
@@ -651,7 +734,7 @@ export async function getPriceInUsdCrossSourced(mint) {
   if (jup == null && JUPITER_API_KEY && jupRes?.status === "rejected"
       && /429|timeout|network|ECONN|aborted/i.test(jupRes.reason?.message || "")) {
     try {
-      jup = await jupiterLitePriceInSol(mint);
+      jup = await jupiterLitePriceInUsd(mint);
       console.warn(`[price] ${mint.slice(0,8)} Jupiter LITE tier rescued cross-source (paid tier: ${jupRes.reason?.message?.slice(0,60)})`);
     } catch { /* lite also down — proceed with jupiter marked down */ }
   }
