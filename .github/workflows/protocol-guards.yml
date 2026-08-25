@@ -23,6 +23,11 @@
 #                        (support brain stuck on a stale, less-favorable
 #                        posture). Pins the load-bearing facts consistent
 #                        across both.
+#   jup-client           The Jupiter price path. The paid key allows 10
+#                        requests per fixed 10s window; without coalescing +
+#                        loud omission handling, one 429 amplified into
+#                        per-mint fallback storms and silently-omitted
+#                        mints (SPCX) went hours unattested.
 #   x402-contracts       Cross-service field couplings with magpie-x402 that
 #                        the type system can't see. Their drift caused the
 #                        5-bug x402 outage (2026-06-24): agents charged, no
@@ -73,3 +78,5 @@ jobs:
         run: npm run check:conversion-metric
       - name: RPC failover + stale-provider detection
         run: npm run check:rpc-failover
+      - name: Jupiter price client (coalescing, loud omissions, window budgets)
+        run: npm run check:jup-client

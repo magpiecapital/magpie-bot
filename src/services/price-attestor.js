@@ -1039,7 +1039,10 @@ export function startPriceAttestor(intervalMs = 30_000) {
       priceMap = new Map();
       for (const t of tokens) {
         try {
-          const p = await getPriceInSol(t.mint);
+          // cls:"bulk" → coalesced + omission-negative-cached in the
+          // jupiter-price-client so this loop can never re-amplify a batch
+          // failure into per-mint Jupiter traffic.
+          const p = await getPriceInSol(t.mint, { cls: "bulk" });
           if (p) priceMap.set(t.mint, p);
         } catch (perMintErr) {
           // Skip silently — this individual mint will retry next tick
@@ -1063,7 +1066,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
     if (missing.length > 0) {
       for (const t of missing) {
         try {
-          const p = await getPriceInSol(t.mint);
+          const p = await getPriceInSol(t.mint, { cls: "bulk" });
           if (p) priceMap.set(t.mint, p);
         } catch {
           // skip silently — this mint will retry next tick

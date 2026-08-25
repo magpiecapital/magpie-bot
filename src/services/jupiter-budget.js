@@ -41,6 +41,11 @@
  * See project_jupiter_request_budgeting_p0.md for the design history.
  */
 import { query } from "../db/pool.js";
+import {
+  isClientEnabled as jupClientEnabled,
+  clientAvailability,
+  getJupiterClientStats,
+} from "./jupiter-price-client.js";
 
 const BUDGET_PER_SEC = Number(process.env.JUPITER_BUDGET_PER_SEC) || 10;
 const BUDGET_MAX = Number(process.env.JUPITER_BUDGET_MAX) || 30;
@@ -66,12 +71,32 @@ function refillTokens() {
  * sizes the HTTP-request rate, not the mint-coverage rate.
  */
 export function tryAcquireJupiterToken() {
+  // Client mode (2026-08-25): the coalescing jupiter-price-client enforces
+  // the REAL provider windows (paid 10/10s measured, lite separate) at
+  // flush time, so this legacy bucket must not double-gate. Report
+  // availability (unit free now or within the interactive patience window)
+  // WITHOUT spending — routing stays sensible, enforcement lives in one
+  // place.
+  if (jupClientEnabled()) {
+    return clientAvailability().available;
+  }
   refillTokens();
   if (tokens >= 1) {
     tokens -= 1;
     return true;
   }
   return false;
+}
+
+/**
+ * Non-spending availability check used by routeFor. Client mode asks the
+ * coalescing client (which owns the real windows); legacy mode peeks the
+ * local bucket without taking a token.
+ */
+function budgetLooksAvailable() {
+  if (jupClientEnabled()) return clientAvailability().available;
+  refillTokens();
+  return tokens >= 1;
 }
 
 export function jupiterBudgetSnapshot() {
@@ -161,16 +186,14 @@ export async function routeFor(mint) {
 
   // Memecoin in active backoff: respect the backoff.
   if (isMintInJupiterBackoff(mint)) {
-    refillTokens();
-    if (tokens < 1) {
+    if (!budgetLooksAvailable()) {
       return { route: "dexscreener_only", reason: "in-backoff+no-budget" };
     }
     return { route: "dexscreener_first", reason: "in-backoff" };
   }
 
   // No budget right now: defer to Dex.
-  refillTokens();
-  if (tokens < 1) {
+  if (!budgetLooksAvailable()) {
     return { route: "dexscreener_first", reason: "no-budget" };
   }
 
@@ -196,6 +219,13 @@ export function recordJupiter429(mint) {
   record("jup_429");
   bumpMintJupiterBackoff(mint);
 }
+// Client-mode variant: a coalesced-batch 429 is a WINDOW-level signal (the
+// whole key is throttled), not evidence about any one mint — count the
+// metric but never bump per-mint backoff (that would shunt healthy mints
+// to DexScreener-first for 30s+ per event).
+export function recordJupiter429Global() {
+  record("jup_429");
+}
 export function recordJupiterErr() { record("jup_err"); }
 export function recordBudgetDefer() { record("budget_defer"); }
 export function recordBackoffSkip() { record("backoff_skip"); }
@@ -217,5 +247,8 @@ export function getJupiterBudgetStats() {
     ratio_429,
     bucket: jupiterBudgetSnapshot(),
     mints_in_backoff: backoffByMint.size,
+    // True HTTP-call accounting lives in the coalescing client (the counts
+    // above are logical lookups in client mode — many share one HTTP call).
+    client: getJupiterClientStats(),
   };
 }

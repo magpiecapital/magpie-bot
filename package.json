@@ -21,6 +21,7 @@
     "check:cosign-admission": "node scripts/check-cosign-admission.mjs",
     "check:conversion-metric": "node scripts/check-conversion-metric.mjs",
     "check:sim-compat": "node scripts/check-sim-compat.mjs",
+    "check:jup-client": "node scripts/check-jup-price-client.mjs",
     "check:auto-extend": "node scripts/check-auto-extend.mjs",
     "check:symbol-collisions": "node scripts/check-symbol-collisions.mjs",
     "check:farm-guard": "node scripts/check-farm-guard.mjs",
