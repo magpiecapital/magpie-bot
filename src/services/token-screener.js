@@ -1044,9 +1044,19 @@ export async function checkSellable(mint, decimals) {
   // not require huge depth; large enough that fee/precision rounding doesn't
   // zero it out.
   const amount = Math.pow(10, Math.max(0, decimals ?? 6));
-  const url = `${JUP_QUOTE_API}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+  const qs = `inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+  const url = `${JUP_QUOTE_API}?${qs}`;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    let res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (res.status === 429 || res.status >= 500) {
+      // The lite tier rate-limits per IP; a burst of screening quotes
+      // trips it and every candidate defers forever (2026-08-25: 116
+      // pending). One paced retry rides out the limiter window.
+      await new Promise((r) => setTimeout(r, 4_000));
+      try {
+        res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+      } catch { /* fall through with the original res */ }
+    }
     if (!res.ok) {
       // Non-200 conflates a genuinely-unroutable token (400) with infra
       // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
@@ -1721,7 +1731,15 @@ async function processReviewQueue(bot) {
 
   if (rows.length === 0) return;
 
-  for (const t of rows) {
+  // Audit at most N candidates per cycle, spaced out — the full 100+ deep
+  // queue in one tight loop rate-limits the quote/rugcheck APIs against
+  // ourselves and nothing ever clears. Backlog drains across cycles.
+  const REVIEW_BATCH = Number(process.env.SCREENER_REVIEW_BATCH || 15);
+  const REVIEW_GAP_MS = Number(process.env.SCREENER_REVIEW_GAP_MS || 3_000);
+  const batch = rows.slice(0, REVIEW_BATCH);
+
+  for (const t of batch) {
+    if (t !== batch[0]) await new Promise((r) => setTimeout(r, REVIEW_GAP_MS));
     // Re-check on-chain safety before approving
     const onChain = await getOnChainInfo(t.mint);
     if (!onChain || onChain.hasMintAuthority || onChain.hasFreezeAuthority) {
