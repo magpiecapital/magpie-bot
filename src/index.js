@@ -204,6 +204,7 @@ import { startBorrowCanary } from "./services/borrow-canary.js";
 import { startX402PathCanary } from "./services/x402-path-canary.js";
 import { startAgentSurfaceCanary } from "./services/agent-surface-canary.js";
 import { startBorrowFailureWatcher } from "./services/borrow-failure-watcher.js";
+import { startHoardShadow } from "./services/hoard-shadow.js";
 import { startBootV4FeedSync } from "./services/boot-v4-feed-sync.js";
 import { ensureX402DestinationAtas } from "./services/x402-destination-atas.js";
 import { startFeedReadinessWarmup } from "./services/v4-feed-readiness.js";
@@ -1145,6 +1146,7 @@ bot.start({
     // read-only GETs; isolated from every program/on-chain surface.
     setTimeout(() => startAgentSurfaceCanary(bot), 120_000);
     setTimeout(() => startBorrowFailureWatcher(), 150_000);
+    startHoardShadow();
     // Boot-time V4 PriceFeed sync — at +90s, walk every enabled
     // supported_mints entry and ensure the V4 PriceFeed PDA exists.
     // Eliminates the AccountNotInitialized class for never-borrowed-
