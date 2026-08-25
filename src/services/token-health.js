@@ -132,6 +132,27 @@ async function checkMintAuthority(mintStr) {
   }
 }
 
+// ── Re-check before ANY delist ──────────────────────────────────────────────
+//
+// 2026-08-25: DexScreener under per-IP rate limiting returns PARTIAL pair
+// objects — missing marketCap/fdv/liquidity/volume fields coerce to 0, which
+// is indistinguishable from a collapse. Seven healthy same-day promotions
+// (HAMI, HOBBES, CHARLIE, MEMEFI, GOOSE, GUNICORN, PMV) were instantly
+// delisted that way. Every delist decision now gets ONE targeted single-mint
+// refetch after a breather; only a CONFIRMING fresh read may delist
+// ([[feedback_watchdog_must_recheck_before_alarming]]). A null/failed
+// re-read downgrades to the strike path — "can't see the token" is never
+// proof it's dead.
+async function recheckMarket(mint) {
+  try {
+    await new Promise((r) => setTimeout(r, 800));
+    const fresh = await getMarketData([mint]);
+    return fresh.get(mint) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Delist a token ──────────────────────────────────────────────────────────
 
 async function delistToken(mint, symbol, reason, bot) {
@@ -263,7 +284,17 @@ async function tick(bot) {
     // No market data found — token may be dead
     if (!market) {
       if (strikes >= STRIKES_TO_DELIST) {
-        await delistToken(mint, symbol, "No trading data found (token appears dead)", bot);
+        const fresh = await recheckMarket(mint);
+        if (fresh) {
+          // The token is visibly alive — the batch read was the problem.
+          await query(
+            `UPDATE supported_mints SET health_strikes = 0, liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+            [mint, fresh.liquidity, fresh.marketCap],
+          );
+          recovered.push(symbol);
+          continue;
+        }
+        await delistToken(mint, symbol, "No trading data found (token appears dead — confirmed by targeted re-check)", bot);
         delisted.push(symbol);
         delistCount++;
       } else {
@@ -278,11 +309,24 @@ async function tick(bot) {
 
     // ── Instant delist checks ──
 
-    // Market cap completely cratered (below $10K floor)
-    if (market.marketCap < MCAP_FLOOR) {
+    // Market cap completely cratered (below $10K floor).
+    // marketCap === 0 means the FIELD WAS MISSING (partial pair data), not a
+    // collapse — a real crater reads tiny-but-nonzero, and a genuinely dead
+    // token gets caught by the liquidity/rug/volume checks on real data.
+    if (market.marketCap > 0 && market.marketCap < MCAP_FLOOR) {
+      const fresh = await recheckMarket(mint);
+      const m2 = fresh ?? market;
+      if (fresh && !(m2.marketCap > 0 && m2.marketCap < MCAP_FLOOR)) {
+        // fresh read disagrees — data blip, not a collapse
+        await query(
+          `UPDATE supported_mints SET liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+          [mint, m2.liquidity, m2.marketCap],
+        );
+        continue;
+      }
       await delistToken(
         mint, symbol,
-        `Market cap collapsed to $${Math.floor(market.marketCap).toLocaleString()} (floor: $${MCAP_FLOOR.toLocaleString()})`,
+        `Market cap collapsed to $${Math.floor(m2.marketCap).toLocaleString()} (floor: $${MCAP_FLOOR.toLocaleString()})`,
         bot,
       );
       delisted.push(symbol);
@@ -293,6 +337,14 @@ async function tick(bot) {
     // Liquidity pulled AND market cap low — both must be true to prevent
     // false positives from DexScreener returning incomplete pair data
     if (market.liquidity < RUG_THRESHOLDS.maxLiquidityUsd && market.marketCap < RUG_THRESHOLDS.maxMarketCap) {
+      const freshRug = await recheckMarket(mint);
+      if (freshRug && !(freshRug.liquidity < RUG_THRESHOLDS.maxLiquidityUsd && freshRug.marketCap < RUG_THRESHOLDS.maxMarketCap)) {
+        await query(
+          `UPDATE supported_mints SET liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+          [mint, freshRug.liquidity, freshRug.marketCap],
+        );
+        continue;
+      }
       await delistToken(
         mint, symbol,
         `Rug detected — liquidity $${Math.floor(market.liquidity).toLocaleString()} AND mcap $${Math.floor(market.marketCap).toLocaleString()}`,
@@ -309,6 +361,14 @@ async function tick(bot) {
     // Skip large-cap tokens (>$1M mcap) where low liquidity reading is
     // likely a DexScreener batch-API quirk, not real degradation.
     if (market.liquidity < LIQUIDITY_FLOOR && market.marketCap < 1_000_000) {
+      const freshLiq = await recheckMarket(mint);
+      if (freshLiq && !(freshLiq.liquidity < LIQUIDITY_FLOOR && freshLiq.marketCap < 1_000_000)) {
+        await query(
+          `UPDATE supported_mints SET liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+          [mint, freshLiq.liquidity, freshLiq.marketCap],
+        );
+        continue;
+      }
       await delistToken(
         mint, symbol,
         `Liquidity below floor — $${Math.floor(market.liquidity).toLocaleString()} (min: $${LIQUIDITY_FLOOR.toLocaleString()})`,
@@ -323,6 +383,14 @@ async function tick(bot) {
     // can't serve as functional collateral even if stale liquidity remains.
     // Same large-cap escape hatch as above.
     if (market.volume24h < VOLUME_FLOOR && market.marketCap < 1_000_000) {
+      const freshVol = await recheckMarket(mint);
+      if (freshVol && !(freshVol.volume24h < VOLUME_FLOOR && freshVol.marketCap < 1_000_000)) {
+        await query(
+          `UPDATE supported_mints SET liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+          [mint, freshVol.liquidity, freshVol.marketCap],
+        );
+        continue;
+      }
       await delistToken(
         mint, symbol,
         `Volume below floor — $${Math.floor(market.volume24h).toLocaleString()} 24h (min: $${VOLUME_FLOOR.toLocaleString()})`,
@@ -361,6 +429,27 @@ async function tick(bot) {
     if (degraded) {
       const newStrikes = strikes + 1;
       if (newStrikes >= STRIKES_TO_DELIST) {
+        // Final strike — but the reading that put us here may be a partial
+        // pair object (this exact branch delisted 7 healthy same-day
+        // promotions on 2026-08-25: strike 1 = "no data", strike 2 = a
+        // volume-less partial row). Confirm with a targeted refetch; a
+        // healthy fresh read clears the strikes instead.
+        const freshDeg = await recheckMarket(mint);
+        if (freshDeg) {
+          const stillDegraded = !(freshDeg.marketCap > 1_000_000) && (
+            freshDeg.liquidity < WATCHLIST_THRESHOLDS.maxLiquidityUsd ||
+            freshDeg.volume24h < WATCHLIST_THRESHOLDS.maxVolume24h ||
+            freshDeg.marketCap < WATCHLIST_THRESHOLDS.maxMarketCap
+          );
+          if (!stillDegraded) {
+            await query(
+              `UPDATE supported_mints SET health_strikes = 0, liquidity_usd = $2, market_cap_usd = $3, screened_at = NOW() WHERE mint = $1`,
+              [mint, freshDeg.liquidity, freshDeg.marketCap],
+            );
+            recovered.push(symbol);
+            continue;
+          }
+        }
         const reasons = [];
         if (market.liquidity < WATCHLIST_THRESHOLDS.maxLiquidityUsd)
           reasons.push(`liquidity $${Math.floor(market.liquidity).toLocaleString()}`);
