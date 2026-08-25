@@ -60,7 +60,7 @@
     "eslint": "^9.17.0",
     "mocha": "^11.7.5",
     "ts-mocha": "^11.1.0",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "serialize-javascript": "^7.0.5"
