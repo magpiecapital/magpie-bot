@@ -1318,9 +1318,9 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // ============================================================
   // Operator-mandated 2026-06-19 PM after StalePriceAttestation surfaced
   // to the user: we should KNOW about staleness before the borrower
-  // does. Every 60s, sample 8 random enabled mints and check their
-  // V1/V3/V4 feed ages. If ANY age > STALE_THRESHOLD_SEC, CRIT-DM
-  // operator immediately with the list.
+  // does. Every 60s, sample 8 random mints from the continuously-attested
+  // set and check their V1/V3/V4 feed ages. If ANY age >
+  // STALE_THRESHOLD_SEC, CRIT-DM operator immediately with the list.
   //
   // Sampling rather than full sweep keeps the RPC cost bounded
   // (~24 reads per minute vs 540 if we walked all 174×3). At steady
@@ -1339,12 +1339,13 @@ export function startPriceAttestor(intervalMs = 30_000) {
   async function staleFeedAlarmTick() {
     try {
       const { PROGRAM_ID, PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
-      const r = await query(
-        `SELECT mint, decimals, category
-           FROM supported_mints
-          WHERE enabled = TRUE`,
-      );
-      const tokens = r.rows;
+      // Sample only the mints the attestor is responsible for keeping
+      // warm (same filter as the attest queue). With ATTEST_WARM_ALL=false
+      // the tiered filter leaves idle warm/cold mints un-attested BY
+      // DESIGN — sampling all enabled mints CRIT-DMs about those every
+      // minute forever, burying real staleness (a warm-set feed that
+      // drifted) in noise.
+      const tokens = await fetchMintsToAttest();
       if (tokens.length === 0) return;
       // Sample without replacement.
       const sample = tokens
