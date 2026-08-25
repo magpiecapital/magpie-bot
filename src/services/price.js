@@ -56,6 +56,24 @@ const JUP_BATCH_SIZE = 50;
  * to agree. This function is the low-stakes "just give me a price"
  * path used by the on-chain price-feed attestor.
  */
+
+/**
+ * Lite-tier fallback (2026-08-25): when the PAID api.jup.ag key is rate-limited
+ * (429 storms), the free lite-api.jup.ag tier has a SEPARATE quota and is very
+ * often still serving. Trying it before DexScreener keeps pricing on
+ * Jupiter-primary (cross-source posture intact) instead of dropping to the
+ * single-source escape hatch. No key sent — this is the anonymous tier.
+ */
+async function jupiterLitePriceInSol(mint) {
+  const resp = await axios.get("https://lite-api.jup.ag/price/v3", {
+    params: { ids: `${mint},${SOL_MINT}` },
+    timeout: 8_000,
+  });
+  const tokenUsd = resp.data?.[mint]?.usdPrice;
+  const solUsd = resp.data?.[SOL_MINT]?.usdPrice;
+  if (!tokenUsd || !solUsd) throw new Error(`lite: no price data for ${mint}`);
+  return tokenUsd / solUsd;
+}
 async function jupiterPriceInSol(mint) {
   try {
     const resp = await axios.get(JUPITER_API, {
@@ -168,7 +186,16 @@ export async function getPriceInSol(mint, opts = {}) {
       }
     }
 
-    // Transient — wait 200-700ms with jitter, retry Jupiter once IF budget allows.
+    // Transient — first try the FREE lite tier (separate quota from the Pro
+    // key) so a paid-tier 429 storm doesn't degrade us off Jupiter at all.
+    if (JUPITER_API_KEY) {
+      try {
+        const lite = await jupiterLitePriceInSol(mint);
+        console.warn(`[price] ${mint.slice(0, 8)} served by Jupiter LITE tier (paid tier: ${err1.message})`);
+        return lite;
+      } catch { /* lite also failing — continue to retry/Dex path */ }
+    }
+    // wait 200-700ms with jitter, retry Jupiter once IF budget allows.
     await new Promise((r) => setTimeout(r, 200 + Math.random() * 500));
     if (!tryAcquireJupiterToken()) {
       // No budget for retry. Skip to Dex.
