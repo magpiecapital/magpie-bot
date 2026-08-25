@@ -474,7 +474,17 @@ export async function getPriceInSolCrossSourced(mint) {
 
   const settled = await Promise.allSettled(promises);
   const [jupRes, dexRes, pythRes] = settled;
-  const jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  let jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  // Lite-tier rescue (2026-08-25): if the paid Jupiter tier rejected
+  // transiently (429 storm), the free lite-api often still serves — try it
+  // before treating Jupiter as down, so cross-source posture survives.
+  if (jup == null && JUPITER_API_KEY && jupRes?.status === "rejected"
+      && /429|timeout|network|ECONN|aborted/i.test(jupRes.reason?.message || "")) {
+    try {
+      jup = await jupiterLitePriceInSol(mint);
+      console.warn(`[price] ${mint.slice(0,8)} Jupiter LITE tier rescued cross-source (paid tier: ${jupRes.reason?.message?.slice(0,60)})`);
+    } catch { /* lite also down — proceed with jupiter marked down */ }
+  }
   const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
   const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
   const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
@@ -634,7 +644,17 @@ export async function getPriceInUsdCrossSourced(mint) {
 
   const settled = await Promise.allSettled(promises);
   const [jupRes, dexRes, pythRes] = settled;
-  const jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  let jup  = jupRes?.status === "fulfilled" ? jupRes.value : null;
+  // Lite-tier rescue (2026-08-25): if the paid Jupiter tier rejected
+  // transiently (429 storm), the free lite-api often still serves — try it
+  // before treating Jupiter as down, so cross-source posture survives.
+  if (jup == null && JUPITER_API_KEY && jupRes?.status === "rejected"
+      && /429|timeout|network|ECONN|aborted/i.test(jupRes.reason?.message || "")) {
+    try {
+      jup = await jupiterLitePriceInSol(mint);
+      console.warn(`[price] ${mint.slice(0,8)} Jupiter LITE tier rescued cross-source (paid tier: ${jupRes.reason?.message?.slice(0,60)})`);
+    } catch { /* lite also down — proceed with jupiter marked down */ }
+  }
   const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
   const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
   const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
