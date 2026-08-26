@@ -54,6 +54,9 @@ async function getParsedTxRaw(sig) {
 }
 
 const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4 || "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo";
+// V4.1 (Sec3-audited successor, live 2026-08-26) fires engine converts
+// too — the drain watcher covers the whole V4 line.
+const V4_LINE_PROGRAM_IDS = [V4_PROGRAM_ID, process.env.PROGRAM_ID_V4_1].filter(Boolean);
 const WATCH_INTERVAL_MS = Number(process.env.V4_CONVERT_DRAIN_INTERVAL_MS) || 3 * 60_000;
 const SCAN_LIMIT = Number(process.env.V4_CONVERT_DRAIN_SCAN_LIMIT) || 25;
 // SOL the proceeds vault must have gained for a real conversion; below this
@@ -92,7 +95,7 @@ function analyzeConvertTx(tx) {
   // locate the convert_collateral_slice instruction (top-level)
   const ix = (msg.instructions || []).find((i) => {
     const pid = i.programId ?? keys[i.programIdIndex];
-    if (pid !== V4_PROGRAM_ID) return false;
+    if (!V4_LINE_PROGRAM_IDS.includes(pid)) return false;
     if (typeof i.data !== "string") return false;
     let bytes;
     // jsonParsed encodes an unparsed instruction's data as base58.
@@ -132,11 +135,22 @@ function analyzeConvertTx(tx) {
   return null;
 }
 
+const _lastSigByProgram = new Map();
+
 async function scanOnce(bot) {
   _lastTickAt = Date.now(); // liveness: the interval fired and a scan is running
-  const program = new PublicKey(V4_PROGRAM_ID);
+  // Scan the WHOLE V4 line — V4.1 (audited successor) fires engine
+  // converts too; a watcher pinned to one program is a blind spot.
+  for (const pidStr of V4_LINE_PROGRAM_IDS) {
+    await scanProgram(bot, pidStr);
+  }
+}
+
+async function scanProgram(bot, pidStr) {
+  const program = new PublicKey(pidStr);
+  const cursor = _lastSigByProgram.get(pidStr) ?? _lastSig; // legacy cursor seeds V4
   const sigs = await withFailover((c) =>
-    c.getSignaturesForAddress(program, { limit: SCAN_LIMIT, ...(_lastSig ? { until: _lastSig } : {}) }),
+    c.getSignaturesForAddress(program, { limit: SCAN_LIMIT, ...(cursor ? { until: cursor } : {}) }),
   ).catch((e) => { _lastError = `getSignatures: ${e.message?.slice(0, 80)}`; return null; });
   if (!Array.isArray(sigs)) return;
   _lastScanSigs = sigs.length; _lastError = null;
@@ -166,7 +180,7 @@ async function scanOnce(bot) {
       } catch (e) { console.warn(`[v4-drain] notifyAdmin failed: ${e.message?.slice(0, 120)}`); }
     }
   }
-  if (newest) _lastSig = newest;
+  if (newest) { _lastSigByProgram.set(pidStr, newest); if (pidStr === V4_PROGRAM_ID) _lastSig = newest; }
 }
 
 export function startV4ConvertDrainWatcher(bot) {

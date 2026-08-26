@@ -1361,7 +1361,7 @@ export async function handleFundPool(ctx) {
       return ctx.reply("v3 pool requested but `PROGRAM_ID_V3` env not set. Set `PROGRAM_ID_V3=B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP` on Railway and redeploy.");
     }
     if (isV4 && !PROGRAM_ID_V4) {
-      return ctx.reply("v4 pool requested but `PROGRAM_ID_V4` env not set. Set `PROGRAM_ID_V4=HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo` on Railway and redeploy.");
+      return ctx.reply("v4 pool requested but `PROGRAM_ID_V4` env not set. Set `PROGRAM_ID_V4=HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo` (and `PROGRAM_ID_V4_1=FsGXFtStgdRVqHQgik879CFpxM23oBt63URCYEWcxj4z` for the audited successor) on Railway and redeploy.");
     }
     const programId = isV4
       ? PROGRAM_ID_V4
