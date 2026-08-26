@@ -863,10 +863,11 @@ export function registerBorrowCallbacks(bot) {
     // implementation left V3 RWA borrows exposed. See
     // [[feedback_twap_insufficient_history_never_again]].
     {
-      const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+      const { PROGRAM_ID_V3, PROGRAM_ID_V4, PROGRAM_ID_V4_1 } = await import("../solana/program.js");
       const usesTwapGate = !!(
         attestProgramId &&
         ((PROGRAM_ID_V4 && attestProgramId.equals(PROGRAM_ID_V4)) ||
+          (PROGRAM_ID_V4_1 && attestProgramId.equals(PROGRAM_ID_V4_1)) ||
           (PROGRAM_ID_V3 && attestProgramId.equals(PROGRAM_ID_V3)))
       );
       if (usesTwapGate) {

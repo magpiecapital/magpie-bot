@@ -957,6 +957,32 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // their feeds were fresh too — leaving the V3/V4 PDAs stale.
   const lastAttestAtV3 = new Map();
   const lastAttestAtV4 = new Map();
+  // V4.1 (Sec3-remediated, new id 2026-08-26): its PriceHistory PDAs are
+  // a THIRD independent feed set. Cost-bounded coverage: only mints that
+  // back an ACTIVE V4.1 loan get ongoing pushes (fires/extends need
+  // ≤120s freshness + TWAP window). Borrow-time warming is separate —
+  // the JIT warmer already receives the routed program id.
+  const lastAttestAtV41 = new Map();
+  let _v41ActiveMints = new Set();
+  let _v41ActiveMintsAt = 0;
+  async function v41ActiveMints() {
+    if (Date.now() - _v41ActiveMintsAt < 60_000) return _v41ActiveMints;
+    const { PROGRAM_ID_V4_1 } = await import("../solana/program.js");
+    if (!PROGRAM_ID_V4_1) { _v41ActiveMintsAt = Date.now(); _v41ActiveMints = new Set(); return _v41ActiveMints; }
+    try {
+      const r = await query(
+        `SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active' AND program_id = $1`,
+        [PROGRAM_ID_V4_1.toBase58()],
+      );
+      _v41ActiveMints = new Set(r.rows.map((x) => x.collateral_mint));
+      _v41ActiveMintsAt = Date.now();
+    } catch (e) {
+      // fail-open to the previous set — a query blip must not stop
+      // attestation for loans that DO exist
+      console.error(`[PriceAttestor] v41ActiveMints query failed: ${e.message?.slice(0, 120)}`);
+    }
+    return _v41ActiveMints;
+  }
   // Force a fresh on-chain attestation at least every MAX_GAP_MS so the
   // feed timestamp never crosses the contract's 120s staleness limit AND
   // so the V3 on-chain TWAP fills its 8-samples-in-5-minutes window even
@@ -1089,9 +1115,14 @@ export function startPriceAttestor(intervalMs = 30_000) {
     // then process with bounded concurrency. Per-worker error handling
     // mirrors the prior sequential logic so init fallback + drift skip
     // still apply.
-    const { PROGRAM_ID_V3: V3PID_LIVE, PROGRAM_ID_V4: V4PID_LIVE } = await import("../solana/program.js");
+    const { PROGRAM_ID_V3: V3PID_LIVE, PROGRAM_ID_V4: V4PID_LIVE, PROGRAM_ID_V4_1: V41PID_LIVE } = await import("../solana/program.js");
+    const v41Mints = await v41ActiveMints();
     const v3v4Targets = [
       V4PID_LIVE ? { id: V4PID_LIVE, label: "V4", lastMap: lastAttestAtV4 } : null,
+      // V4.1 rides the V4 cadence but ONLY for mints with an active
+      // V4.1 loan (see v41ActiveMints above) — onlyForMints gates it in
+      // the per-mint loop below.
+      V41PID_LIVE ? { id: V41PID_LIVE, label: "V4.1", lastMap: lastAttestAtV41, onlyForMints: v41Mints } : null,
       V3PID_LIVE ? { id: V3PID_LIVE, label: "V3", lastMap: lastAttestAtV3 } : null,
     ].filter(Boolean);
 
@@ -1109,6 +1140,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
         queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports, category });
       }
       for (const target of v3v4Targets) {
+        if (target.onlyForMints && !target.onlyForMints.has(mint)) continue;
         // V3 is the RWA-only program WHILE ROUTE_MEMECOINS_TO_V3 is off:
         // memecoins route V1+V4 and never borrow on V3, so writing their V3
         // feed every tick is pure wasted SOL. Skip the explicit V3 write for
