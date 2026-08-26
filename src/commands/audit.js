@@ -7,7 +7,10 @@
  * findings — 20 resolved, 4 acknowledged, NONE open. Both High-severity
  * findings resolved.
  *
- * HARD RULE, still: the remediated build deploys at a NEW program ID after
+ * UPDATE 2026-08-26: the remediated build IS LIVE at the new program ID
+ * (FsGXFt…) — new auto-sell loans run on it. Finding MECHANICS stay
+ * internal: the PRIOR V4 still runs existing loans + RWA exits. Old rule
+ * for reference: the remediated build deploys at a NEW program ID after
  * sign-off, so the audited code is NOT the live program yet. "The audit has
  * concluded" is true; "Magpie is audited" is NOT, and must not be implied.
  *
@@ -52,7 +55,7 @@ export async function handleAudit(ctx) {
     "",
     "*About those 4 acknowledged:* they're not unfixed bugs — they're design decisions Sec3 reviewed and accepted. One of them is a good example: our auto-sell prices off spot rather than a smoothed average, and Sec3 agreed that's correct, because a take-profit *has* to be able to fire on a genuine price spike. Forcing it to wait would break the whole point of the product.",
     "",
-    "*What happens next:* the remediated build deploys at a *new program ID* once signed off. Until that's live, we don't call Magpie \"audited\" — the audited code isn't the code you're borrowing against yet, and we're not going to blur that line. We'll say it plainly the day it ships. After V4: *V3* and our *credit-oracle* program are next in line.",
+    "*It shipped:* as of *2026-08-26* the remediated build is *LIVE* at a new program ID — every new auto-sell loan runs on the code Sec3 audited, with zero open findings. Loans opened earlier finish out on the prior V4 program, and tokenized-stock/RWA exits stay on V4 by design. After V4: *V3* and our *credit-oracle* program are next in line.",
     "",
     "Straight talk: an audit is a rigorous independent review, *not a guarantee*. It reduces risk; it doesn't eliminate it. Anyone who tells you otherwise is selling something.",
     "",

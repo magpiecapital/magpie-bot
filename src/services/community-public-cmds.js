@@ -775,12 +775,13 @@ export async function handleCommunityAudit(ctx) {
   // COMPLETE — final report delivered 2026-08-09 (20 resolved, 4
   // acknowledged, 2 returned and since fixed + resubmitted). Never say
   // "audited" until the final re-checked report publishes. Counts are fine to
-  // share; finding MECHANICS are not — the remediated build is not deployed,
+  // share; finding MECHANICS are not — the PRIOR V4 program still runs
+  // existing loans + the RWA-exit lane with the pre-fix code,
   // so describing an unresolved issue would point at the live program.
   const text = [
     `*Audit status — honest answer*`,
     ``,
-    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. *Their final report is in, delivered 2026-08-09.* Across the engagement: *24 findings* — *20 resolved*, *4 acknowledged* (accepted with documented rationale), and *none left open*. *Both High-severity findings are resolved.* Fixes sit on a dedicated fix branch and deploy at a *new program ID* after sign-off, so the audited build is *not the live program yet* — which is why we say V4's assessment is complete rather than "Magpie is audited". *V3 + the credit-oracle program are next in line.* And remember an audit reduces risk, it doesn't eliminate it.`,
+    `Magpie *engaged and paid Sec3* — a Solana-native security firm (formerly Soteria) — for a formal audit of *V4*, the in-vault auto-sell flagship program. *Their final report is in, delivered 2026-08-09.* Across the engagement: *24 findings* — *20 resolved*, *4 acknowledged* (accepted with documented rationale), and *none left open*. *Both High-severity findings are resolved.* *And as of 2026-08-26 the remediated build is LIVE* — deployed at a *new program ID* (FsGXFt…). Every *new* auto-sell loan runs on the audited code; loans opened earlier finish out on the prior V4 program, and tokenized-stock/RWA exits stay on V4 by design (the audited custody hardening rejects the token extension regulated RWAs use). *V3 + the credit-oracle program are next in line.* And remember an audit reduces risk, it doesn't eliminate it.`,
     ``,
     `*What compensates in the meantime*`,
     `• *Open source* — both repos are public (github.com/magpiecapital). Every line is readable and forkable.`,
@@ -821,7 +822,7 @@ export async function handleCommunityRisk(ctx) {
     `In a flash crash, a token can move faster than liquidators. The keeper network is designed for this, but in extreme markets LPs can see partial losses. Tier LTVs are set conservatively to bound this.`,
     ``,
     `*3. Smart-contract risk*`,
-    `*Sec3's final report on V4 is in* — 24 findings, *20 resolved, 4 acknowledged, none open*, both High-severity resolved (see /audit). The remediated build deploys at a new program ID after sign-off, so it isn't live yet. An audit reduces risk but doesn't eliminate it — a bug anywhere in the program could still result in loss of funds.`,
+    `*Sec3's final report on V4 is in* — 24 findings, *20 resolved, 4 acknowledged, none open*, both High-severity resolved (see /audit). *As of 2026-08-26 the remediated build is LIVE at a new program ID* — every new auto-sell loan runs on the audited code (earlier loans finish on the prior V4; RWA exits stay on V4 by design). An audit reduces risk but doesn't eliminate it — a bug anywhere in the program could still result in loss of funds.`,
     ``,
     `*4. Custodial risk*`,
     `Your Magpie wallet IS the bot wallet — that's what enables one-click co-signing. Keys are AES-256-GCM encrypted, but a compromise of the infrastructure would expose them. /export your private key and self-custody if you'd prefer that trade-off.`,
