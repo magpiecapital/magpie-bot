@@ -32,6 +32,7 @@ const VERSION_LABELS = {
   "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe": "V2",
   "B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP": "V3",
   "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo": "V4",
+  "FsGXFtStgdRVqHQgik879CFpxM23oBt63URCYEWcxj4z": "V4.1",
 };
 
 // Anti-spam: dedupe on the set of overdue loan IDs; re-alert only when the set

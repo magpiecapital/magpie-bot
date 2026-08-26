@@ -1619,6 +1619,7 @@ async function handleProtocolPulse() {
     "6wSpKAGuiRf3nYHj9raVwmoTPbG5MswBzTy6aMXZHBe": "V2 (deprecated)",
     "B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP": "V3 (RWA)",
     "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo": "V4 (in-vault)",
+    "FsGXFtStgdRVqHQgik879CFpxM23oBt63URCYEWcxj4z": "V4.1 (in-vault · audited)",
   };
   let byVersion = [];
   try {
