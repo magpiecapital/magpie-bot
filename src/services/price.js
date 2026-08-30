@@ -1,5 +1,6 @@
 import axios from "axios";
 import "dotenv/config";
+import { dexCall, isDexBreakerOpen } from "../lib/dexscreener-breaker.js";
 import { hasPythCoverage, pythPriceInSol, pythPriceInUsd } from "./pyth-price.js";
 import {
   routeFor,
@@ -463,10 +464,10 @@ function agreeOnPrice({ mint, sources, maxDivergence }) {
 }
 
 async function dexscreenerPriceInSol(mint) {
-  const resp = await axios.get(
+  const resp = await dexCall(() => axios.get(
     `https://api.dexscreener.com/tokens/v1/solana/${mint},${SOL_MINT}`,
     { timeout: 10_000 },
-  );
+  ));
   const pairs = Array.isArray(resp.data) ? resp.data : [];
   // Best (deepest) pair per token by liquidity.
   let bestToken = null, bestSol = null;
@@ -483,6 +484,28 @@ async function dexscreenerPriceInSol(mint) {
   }
   if (!bestToken || !bestSol) throw new Error("DexScreener missing price for mint or SOL");
   return bestToken.priceUsd / bestSol.priceUsd;
+}
+
+// GeckoTerminal — independent stand-in for the DexScreener slot ONLY when
+// DexScreener is down (2026-08-30 outage). Different operator, different
+// indexer, so the two-source agreement check stays meaningful. Anonymous
+// tier is ~30 req/min; we only reach here while the breaker is open, and a
+// short cache keeps a burst of borrow quotes from tripping their limit.
+const GECKO_CACHE = new Map(); // mint -> { price, at }
+const GECKO_CACHE_TTL_MS = 10_000;
+async function geckoterminalPriceInSol(mint) {
+  const hit = GECKO_CACHE.get(mint);
+  if (hit && Date.now() - hit.at < GECKO_CACHE_TTL_MS) return hit.price;
+  const resp = await axios.get(
+    `https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/${mint},${SOL_MINT}`,
+    { timeout: 8_000, headers: { accept: "application/json", "User-Agent": "magpie-bot" } },
+  );
+  const prices = resp.data?.data?.attributes?.token_prices || {};
+  const tok = parseFloat(prices[mint]); const sol = parseFloat(prices[SOL_MINT]);
+  if (!(tok > 0) || !(sol > 0)) throw new Error("GeckoTerminal missing price for mint or SOL");
+  const price = tok / sol;
+  GECKO_CACHE.set(mint, { price, at: Date.now() });
+  return price;
 }
 
 // Fail-closed policy (security audit F-2, 2026-06-12):
@@ -545,7 +568,19 @@ export async function getPriceInSolCrossSourced(mint) {
       console.warn(`[price] ${mint.slice(0,8)} Jupiter LITE tier rescued cross-source (paid tier: ${jupRes.reason?.message?.slice(0,60)})`);
     } catch { /* lite also down — proceed with jupiter marked down */ }
   }
-  const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  let dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  let dexName = "DexScreener";
+  // DexScreener down (breaker open or this call failed) → swap in
+  // GeckoTerminal as the independent second source so the borrow/limit-
+  // close valuation stays two-source instead of dropping to the
+  // single-source escape hatch. (2026-08-30 DexScreener outage.)
+  if (dex == null) {
+    try {
+      dex = await geckoterminalPriceInSol(mint);
+      dexName = "GeckoTerminal";
+      console.warn(`[price] ${mint.slice(0,8)} DexScreener down${isDexBreakerOpen() ? " (breaker open)" : ""} — GeckoTerminal filled the second slot`);
+    } catch (e) { /* gecko also unavailable — fall through to existing single-source handling */ }
+  }
   const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
   const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
   const dexErr = dexRes?.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
@@ -553,7 +588,7 @@ export async function getPriceInSolCrossSourced(mint) {
 
   const sources = [
     { name: "Jupiter", price: jup },
-    { name: "DexScreener", price: dex },
+    { name: dexName, price: dex },
   ];
   if (usePyth) sources.push({ name: "Pyth", price: pyth });
   const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;

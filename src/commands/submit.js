@@ -10,6 +10,7 @@
  * Rate-limited to 1 submission per user per 60 seconds.
  */
 import { query } from "../db/pool.js";
+import { dexCall } from "../lib/dexscreener-breaker.js";
 import { Connection, PublicKey } from "@solana/web3.js";
 import { connection } from "../solana/connection.js";
 import { ensureMintFeedsInitialized } from "../services/price-attestor.js";
@@ -52,9 +53,9 @@ async function getOnChainInfo(mintStr) {
 // ── Market data ─────────────────────────────────────────────────────────────
 
 async function fetchMarketData(mint) {
-  const res = await fetch(
+  const res = await dexCall(() => fetch(
     `https://api.dexscreener.com/tokens/v1/solana/${mint}`,
-  );
+  ));
   if (!res.ok) return null;
   const pairs = await res.json();
   if (!Array.isArray(pairs) || pairs.length === 0) return null;
@@ -83,9 +84,9 @@ async function fetchMarketData(mint) {
 
 async function resolveSymbol(input) {
   try {
-    const res = await fetch(
+    const res = await dexCall(() => fetch(
       `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(input)}`,
-    );
+    ));
     if (!res.ok) return null;
     const data = await res.json();
     if (!data?.pairs) return null;

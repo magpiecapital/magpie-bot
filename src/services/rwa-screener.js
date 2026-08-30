@@ -27,6 +27,7 @@
  * token per month), and we don't want to thrash the DexScreener API.
  */
 import { PublicKey } from "@solana/web3.js";
+import { dexCall } from "../lib/dexscreener-breaker.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   getMint,
@@ -78,9 +79,9 @@ async function discoverRwaCandidates() {
   for (const q of queries) {
     let json;
     try {
-      const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, {
+      const r = await dexCall(() => fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, {
         signal: AbortSignal.timeout(15_000),
-      });
+      }));
       if (!r.ok) {
         console.warn(`[rwa-screener] DexScreener search "${q}" returned ${r.status}`);
         continue;
@@ -629,9 +630,9 @@ async function tick(bot) {
     if (!row.enabled) continue;
     if (candidateMints.has(row.mint)) continue;
     try {
-      const r = await fetch(`https://api.dexscreener.com/tokens/v1/solana/${row.mint}`, {
+      const r = await dexCall(() => fetch(`https://api.dexscreener.com/tokens/v1/solana/${row.mint}`, {
         signal: AbortSignal.timeout(10_000),
-      });
+      }));
       if (!r.ok) {
         warnings.push({ symbol: row.symbol, reason: `direct probe HTTP ${r.status}` });
         continue;
