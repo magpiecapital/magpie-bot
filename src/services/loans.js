@@ -1235,6 +1235,12 @@ export async function executeExtendLoan({ userId, loanDbRow }) {
     const [priceHistoryPda] = priceFeedPda(extendCollateralMint, lendingPool, programId);
     v41ExtendAccounts.collateralMint = extendCollateralMint;
     v41ExtendAccounts.priceHistory = priceHistoryPda;
+    // Explicit null: Anchor's client auto-fills an omitted optional SIGNER with
+    // the provider wallet (the borrower), which the program then rejects as
+    // Unauthorized (6008) instead of the intended ExtendRequiresAuthority
+    // (6031). Passing null encodes "absent" (program-id placeholder) so an
+    // unhealthy loan fails with the right, actionable error. (2026-08-30 canary)
+    v41ExtendAccounts.authority = null;
   }
 
   const sig = await program.methods
