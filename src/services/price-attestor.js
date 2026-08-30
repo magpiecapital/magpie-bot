@@ -133,9 +133,9 @@ export async function getPriceFeedAgeSeconds(mintStr, programIdOverride = null) 
     const [priceFeed] = priceFeedPda(mintPk, pool, programId);
     const info = await connection.getAccountInfo(priceFeed);
     if (!info) return null;
-    const { PROGRAM_ID_V3, PROGRAM_ID_V4 } = await import("../solana/program.js");
+    const { PROGRAM_ID_V3, PROGRAM_ID_V4, PROGRAM_ID_V4_1 } = await import("../solana/program.js");
     const isV3 = PROGRAM_ID_V3 && programId.equals(PROGRAM_ID_V3);
-    const isV4 = PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+    const isV4 = (PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) || (PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1));
     let ts;
     if (isV3 || isV4) {
       // PriceHistory layout — minimum is disc+mint+pool+authority+
@@ -437,6 +437,14 @@ export async function ensureMintFeedsInitialized(mintStr) {
   const programs = [];
   if (defaultPid) programs.push(defaultPid);
   if (PROGRAM_ID_V4 && !programs.some((p) => p.equals(PROGRAM_ID_V4))) programs.push(PROGRAM_ID_V4);
+  // Exit lane per operator plan: memecoins → V4.1 (RWA stays V4, already
+  // covered above). A memecoin's V4.1 feed PDA must exist before its first
+  // exit-armed borrow or the borrow hits AccountNotInitialized.
+  {
+    const { exitProgramForCategory } = await import("../solana/program.js");
+    const exitPid = exitProgramForCategory(category);
+    if (exitPid && !programs.some((p) => p.equals(exitPid))) programs.push(exitPid);
+  }
 
   const out = [];
   let allExist = true;

@@ -268,7 +268,9 @@ export function registerRepayCallbacks(bot) {
       // The loan row was fetched BEFORE the repay so its
       // sol_proceeds_amount is the exact balance just released.
       const v4ProgramIdRepay = process.env.PROGRAM_ID_V4 || null;
-      const isV4Repay = !!v4ProgramIdRepay && loan.program_id === v4ProgramIdRepay;
+      const isV4Repay =
+        (!!v4ProgramIdRepay && loan.program_id === v4ProgramIdRepay) ||
+        (!!process.env.PROGRAM_ID_V4_1 && loan.program_id === process.env.PROGRAM_ID_V4_1);
       const vaultLamportsReleased = isV4Repay
         ? BigInt(loan.sol_proceeds_amount || 0)
         : 0n;

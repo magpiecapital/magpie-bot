@@ -1049,7 +1049,9 @@ export function registerBorrowCallbacks(bot) {
     // landed on, not on whether arming was requested.
     const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
     const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
-    const isV4Loan = !!v4ProgramId && result.programId === v4ProgramId;
+    const isV4Loan =
+      (!!v4ProgramId && result.programId === v4ProgramId) ||
+      (!!process.env.PROGRAM_ID_V4_1 && result.programId === process.env.PROGRAM_ID_V4_1);
     const canArmExits = isV4Loan || !v4Enforced;
 
     // Build inline keyboard. Show protect buttons only when (a) some leg

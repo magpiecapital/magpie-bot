@@ -252,7 +252,9 @@ export async function handleAgentBuildRepay(req) {
     // V1/V3 paths unchanged. Mirrors the TG repay pattern in loans.js (task
     // #267). Audit-mandated 2026-06-19 PM after full-protocol audit revealed
     // agent-repay diverged from TG repay on V4 accounts.
-    const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+    const isV4 =
+      (!!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) ||
+      (!!process.env.PROGRAM_ID_V4_1 && programId.toBase58() === process.env.PROGRAM_ID_V4_1);
     let v4ExtraAccounts = {};
     if (isV4) {
       const [solProceedsVault] = PublicKey.findProgramAddressSync(

@@ -300,7 +300,9 @@ export async function executeBorrow({
   const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
   const programIdB58 = programId.toBase58();
   const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
-  const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+  const isV4 =
+    (process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4) ||
+    (process.env.PROGRAM_ID_V4_1 && programIdB58 === process.env.PROGRAM_ID_V4_1); // V4-family: V4.1 takes the same 5-arg shape
   // V3 and V4 both take the 5-arg shape (extra `category` u8).
   const needsCategoryArg = isV3 || isV4;
   const categoryByte = RWA_CATEGORIES.has(category) ? 1 : 0;
@@ -512,7 +514,9 @@ async function _executeRepayImpl({ userId, loanDbRow }) {
   // it can `init_if_needed` the vault for loans whose auto-sell never
   // fired. Without these the V4 repay tx fails AccountNotEnoughKeys.
   // V1/V2/V3 paths unchanged.
-  const isV4 = !!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4);
+  const isV4 =
+    (!!PROGRAM_ID_V4 && programId.equals(PROGRAM_ID_V4)) ||
+    (!!PROGRAM_ID_V4_1 && programId.equals(PROGRAM_ID_V4_1)); // V4.1 repay_loan has the identical accounts struct
   let v4ExtraAccounts = {};
   if (isV4) {
     const [solProceedsVault] = PublicKey.findProgramAddressSync(
@@ -1022,7 +1026,9 @@ export async function executeAddCollateral({ userId, loanDbRow, extraRawAmount }
   // mitigation: block topup while the order is armed. User can cancel
   // the order, topup, then re-arm — explicit and predictable.
   const v4ProgramIdStr = process.env.PROGRAM_ID_V4 || null;
-  const isV4Loan = v4ProgramIdStr && programId.toBase58() === v4ProgramIdStr;
+  const isV4Loan =
+    (v4ProgramIdStr && programId.toBase58() === v4ProgramIdStr) ||
+    (process.env.PROGRAM_ID_V4_1 && programId.toBase58() === process.env.PROGRAM_ID_V4_1);
   if (isV4Loan) {
     const { rows: [armed] } = await query(
       `SELECT id FROM limit_close_orders

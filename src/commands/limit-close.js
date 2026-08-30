@@ -533,7 +533,9 @@ export async function handleLimitClose(ctx, direction = "above", opts = {}) {
   // The success DM must describe what will actually happen so users
   // know to repay when they want their SOL.
   const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
-  const isV4 = !!v4ProgramId && loan?.program_id === v4ProgramId;
+  const isV4 =
+    (!!v4ProgramId && loan?.program_id === v4ProgramId) ||
+    (!!process.env.PROGRAM_ID_V4_1 && loan?.program_id === process.env.PROGRAM_ID_V4_1);
   const purpose = isV4
     ? (isStopLoss
         ? `If ${symbol} ${triggerVerb} your floor, I'll sell that slice into SOL on-chain — the proceeds accumulate inside your loan's vault (V4 in-vault auto-sell). The loan stays Active; run /repay when you want the SOL released to your wallet.`
@@ -718,7 +720,9 @@ export async function handleTrailingStop(ctx) {
   // loan STAYS active until borrower-signed repay. Legacy programs
   // close the loan on fire.
   const v4ProgramIdTrail = process.env.PROGRAM_ID_V4 || null;
-  const isV4Trail = !!v4ProgramIdTrail && armed.loan?.program_id === v4ProgramIdTrail;
+  const isV4Trail =
+    (!!v4ProgramIdTrail && armed.loan?.program_id === v4ProgramIdTrail) ||
+    (!!process.env.PROGRAM_ID_V4_1 && armed.loan?.program_id === process.env.PROGRAM_ID_V4_1);
   const fireLine = isV4Trail
     ? `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak — sells into SOL on-chain, proceeds accumulate inside your loan's vault. Run /repay when you want the SOL released.`
     : `Fires when price retraces ${(trailingDistanceBps / 100).toFixed(1)}% from peak.`;
@@ -975,7 +979,9 @@ export async function handleBracket(ctx) {
   // and sibling-cancels the other leg; the loan stays Active and the
   // user releases the SOL via /repay. Legacy programs close the loan.
   const v4ProgramIdBracket = process.env.PROGRAM_ID_V4 || null;
-  const isV4Bracket = !!v4ProgramIdBracket && tpArm.loan?.program_id === v4ProgramIdBracket;
+  const isV4Bracket =
+    (!!v4ProgramIdBracket && tpArm.loan?.program_id === v4ProgramIdBracket) ||
+    (!!process.env.PROGRAM_ID_V4_1 && tpArm.loan?.program_id === process.env.PROGRAM_ID_V4_1);
   const bracketFireLine = isV4Bracket
     ? `First leg to fire converts that slice to SOL inside your loan's vault, auto-cancels the other leg, and leaves the loan Active. Run /repay when you want the SOL released.`
     : `First leg to fire closes the loan and auto-cancels the other.`;

@@ -52,6 +52,7 @@ function fmtAgeMs(ms) {
 
 function programLabel(program, v4ProgramId) {
   if (v4ProgramId && program === v4ProgramId) return "V4 (in-vault exits)";
+  if (process.env.PROGRAM_ID_V4_1 && program === process.env.PROGRAM_ID_V4_1) return "V4.1 (audited, memecoin exits)";
   if (program === "legacy") return "legacy/V1";
   return `program ${String(program).slice(0, 8)}…`;
 }
