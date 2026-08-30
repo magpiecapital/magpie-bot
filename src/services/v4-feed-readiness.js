@@ -131,6 +131,26 @@ const state = {
 /**
  * Public snapshot for health endpoint consumers. Cheap — no I/O.
  */
+// ── Per-mint exit program (operator plan 2026-08-30) ─────────────────────
+// V4 = exit-armed tokenized stocks/RWA; V4.1 = exit-armed memecoins. The
+// feed we warm MUST be the one on the program the borrow will land on —
+// warming V4 for a memecoin that borrows on V4.1 leaves the V4.1 feed cold
+// and the borrow hits TwapInsufficientHistory / AccountNotInitialized.
+const _categoryCache = new Map(); // mint → { category, at }
+async function categoryForMint(mintStr) {
+  const hit = _categoryCache.get(mintStr);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.category;
+  const { rows: [row] } = await query(`SELECT category FROM supported_mints WHERE mint = $1`, [mintStr]);
+  const category = row?.category ?? null;
+  _categoryCache.set(mintStr, { category, at: Date.now() });
+  return category;
+}
+async function programForMint(mintStr, category) {
+  const { exitProgramForCategory } = await import("../solana/program.js");
+  const cat = category !== undefined ? category : await categoryForMint(mintStr);
+  return exitProgramForCategory(cat);
+}
+
 export function getFeedReadinessSnapshot() {
   const total = state.priorityMints.length;
   const warm = state.warmMints.size;
@@ -250,11 +270,12 @@ async function feedIsWarm(mintStr, lenderPk, programIdV4) {
   );
 }
 
-async function ensureMintWarm(mint, lenderPk, programIdV4) {
+async function ensureMintWarm(mint, lenderPk, _programIdV4) {
   if (state.warmMints.has(mint.mint)) return { mint: mint.mint, action: "already_warm" };
   if (state.inFlight.has(mint.mint)) return { mint: mint.mint, action: "in_flight_skip" };
   state.inFlight.add(mint.mint);
   try {
+    const programIdV4 = (await programForMint(mint.mint, mint.category)) || _programIdV4;
     // Quick read first — maybe already warm from on-chain ring buffer
     // (samples persist across bot restarts within the 5-min window).
     if (await feedIsWarm(mint.mint, lenderPk, programIdV4)) {
@@ -265,7 +286,7 @@ async function ensureMintWarm(mint, lenderPk, programIdV4) {
     // wraps the ring and resets the span clock (see burst_paused_history_aging).
     // Site polls hit this path repeatedly; without the gate, each poll would
     // keep the feed perpetually 150s from ready.
-    const r = await checkMintReadiness(mint.mint);
+    const r = await checkMintReadiness(mint.mint, programIdV4);
     if (r.reason === "history_aging") {
       return { mint: mint.mint, action: "history_aging_no_attest", eta_seconds: r.eta_seconds };
     }
@@ -384,16 +405,17 @@ export async function startFeedReadinessWarmup() {
  * Used by the /api/v1/v4/feed-ready endpoint and as the source of
  * truth in requestMintWarm.
  */
-export async function checkMintReadiness(mintStr) {
+export async function checkMintReadiness(mintStr, programIdOverride = null) {
   const { PROGRAM_ID_V4 } = await import("../solana/program.js");
   if (!PROGRAM_ID_V4 || !process.env.LENDER_PUBKEY) {
     return { ready: false, reason: "v4_not_configured", samples_in_window: 0 };
   }
+  const targetPid = programIdOverride || (await programForMint(mintStr)) || PROGRAM_ID_V4;
   const lenderPk = new PublicKey(process.env.LENDER_PUBKEY);
   const { lendingPoolPda, priceFeedPda } = await import("../solana/pdas.js");
   const mintPk = new PublicKey(mintStr);
-  const [pool] = lendingPoolPda(lenderPk, PROGRAM_ID_V4);
-  const [pf] = priceFeedPda(mintPk, pool, PROGRAM_ID_V4);
+  const [pool] = lendingPoolPda(lenderPk, targetPid);
+  const [pf] = priceFeedPda(mintPk, pool, targetPid);
 
   let info;
   try {
@@ -425,7 +447,7 @@ export async function checkMintReadiness(mintStr) {
   }
   const spanSec = oldestInWindowTs != null ? Number(now - oldestInWindowTs) : 0;
   if (inWindow >= MIN_SAMPLES_FOR_TWAP && spanSec >= MIN_HISTORY_SECONDS) {
-    return { ready: true, samples_in_window: inWindow, span_seconds: spanSec };
+    return { ready: true, samples_in_window: inWindow, span_seconds: spanSec, program: targetPid.toBase58() };
   }
   if (inWindow >= MIN_SAMPLES_FOR_TWAP) {
     // Count met — only history age is missing. ETA is exact: the remaining
@@ -882,12 +904,25 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
       // Guard against double-attest races with the on-demand/burst loops.
       for (const it of items) state.inFlight.add(it.mint);
       try {
-        const res = await attestPriceBatch(items, programIdV4, { label: "v4-continuous" });
-        state.continuousAttestations += res.attested.length;
-        state.continuousErrors += res.failed.length;
-        if (res.failed.length) {
-          state.lastError = `v4-continuous batch: ${res.failed[0].err}`;
-          state.lastErrorAt = new Date().toISOString();
+        // Group by the program each mint actually borrows on (memecoin →
+        // V4.1, RWA → V4) — one batch per program.
+        const byProgram = new Map();
+        for (const it of items) {
+          const m = needy.find((n) => n.mint === it.mint);
+          const pid = (await programForMint(it.mint, m?.category)) || programIdV4;
+          const key = pid.toBase58();
+          if (!byProgram.has(key)) byProgram.set(key, { pid, items: [] });
+          byProgram.get(key).items.push(it);
+        }
+        for (const { pid, items: group } of byProgram.values()) {
+          const label = process.env.PROGRAM_ID_V4_1 && pid.toBase58() === process.env.PROGRAM_ID_V4_1 ? "v41-continuous" : "v4-continuous";
+          const res = await attestPriceBatch(group, pid, { label });
+          state.continuousAttestations += res.attested.length;
+          state.continuousErrors += res.failed.length;
+          if (res.failed.length) {
+            state.lastError = `${label} batch: ${res.failed[0].err}`;
+            state.lastErrorAt = new Date().toISOString();
+          }
         }
       } finally {
         for (const it of items) state.inFlight.delete(it.mint);

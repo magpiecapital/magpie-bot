@@ -551,7 +551,8 @@ export async function handleSiteLimitCloseList(req, url) {
     // V4 enforcement: non-V4 loans can't take new exits. NOTE: this
     // intentionally does NOT touch already-armed orders — those keep
     // firing through their legacy path. Only blocks NEW arms.
-    if (v4EnforceOn && v4ProgramIdStr && l.program_id && l.program_id !== v4ProgramIdStr) {
+    const lIsV4Family = l.program_id === v4ProgramIdStr || (!!process.env.PROGRAM_ID_V4_1 && l.program_id === process.env.PROGRAM_ID_V4_1);
+    if (v4EnforceOn && v4ProgramIdStr && l.program_id && !lIsV4Family) {
       baseReasons.push("exits_require_v4_loan");
     }
     // 2026-06-13 (PR C): RWA categories (stock/etf/metal) are NOW eligible

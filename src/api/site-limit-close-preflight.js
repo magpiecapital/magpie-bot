@@ -98,7 +98,9 @@ export async function handleSiteLimitCloseArmPreflight(req) {
   // signing.
   const v4Enforce = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
   const v4ProgramId = process.env.PROGRAM_ID_V4 ?? null;
-  if (v4Enforce && v4ProgramId && loan.program_id && loan.program_id !== v4ProgramId) {
+  const v41ProgramId = process.env.PROGRAM_ID_V4_1 ?? null;
+  const loanIsV4Family = loan.program_id === v4ProgramId || (!!v41ProgramId && loan.program_id === v41ProgramId);
+  if (v4Enforce && v4ProgramId && loan.program_id && !loanIsV4Family) {
     return {
       status: 409,
       body: {
@@ -265,7 +267,7 @@ export async function handleSiteLimitCloseArmPreflight(req) {
         loan_db_id: loan.id,
         loan_id_chain: loan.loan_id,
         program_id: loan.program_id,
-        is_v4_loan: !!(v4ProgramId && loan.program_id === v4ProgramId),
+        is_v4_loan: !!(v4ProgramId && loan.program_id === v4ProgramId) || !!(process.env.PROGRAM_ID_V4_1 && loan.program_id === process.env.PROGRAM_ID_V4_1),
         collateral_mint: loan.collateral_mint,
         collateral_symbol: mintRow.symbol,
         trigger_kind: triggerKind,

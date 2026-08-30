@@ -73,6 +73,7 @@ function resolveProgramPubkey(programIdStr) {
     if (pk.equals(PROGRAM_ID)) return PROGRAM_ID;
     if (PROGRAM_ID_V3 && pk.equals(PROGRAM_ID_V3)) return PROGRAM_ID_V3;
     if (PROGRAM_ID_V4 && pk.equals(PROGRAM_ID_V4)) return PROGRAM_ID_V4;
+    if (process.env.PROGRAM_ID_V4_1 && pk.toBase58() === process.env.PROGRAM_ID_V4_1) return pk;
     return pk; // unknown but parseable — caller may handle defensively
   } catch {
     return null;

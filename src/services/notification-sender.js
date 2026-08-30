@@ -424,7 +424,9 @@ function renderLimitCloseNearTrigger(p) {
   const dirLabel = p.trigger_direction === "below" ? "stop-loss" : "take-profit";
   const moveDir  = p.trigger_direction === "below" ? "drops" : "moves up";
   const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
-  const isV4 = !!v4ProgramId && p.engine_program_id === v4ProgramId;
+  const isV4 =
+    (!!v4ProgramId && p.engine_program_id === v4ProgramId) ||
+    (!!process.env.PROGRAM_ID_V4_1 && p.engine_program_id === process.env.PROGRAM_ID_V4_1);
   const owedSol = p.owed_lamports
     ? (Number(p.owed_lamports) / 1e9).toFixed(3)
     : null;

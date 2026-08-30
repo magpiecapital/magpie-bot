@@ -133,6 +133,28 @@ const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
 // their own stored program_id via chooseProgramIdForLoan.
 const ROUTE_EXITS_TO_V4_1 = process.env.ROUTE_EXITS_TO_V4_1 === "true";
 
+// ── V4 FAMILY ────────────────────────────────────────────────────────────
+// Operator pool plan (2026-08-30): V4 = exit-armed TOKENIZED STOCKS/RWA,
+// V4.1 = exit-armed MEMECOINS. Both are "V4-family" for every lifecycle
+// concern (in-vault exits, sol_proceeds_vault on repay, category arg on
+// borrow, TWAP gate, topup-while-armed block, exit eligibility). Any code
+// that asks "is this a V4 loan?" must use these helpers, never a bare
+// PROGRAM_ID_V4 equality — that exact bare check is what left the website
+// routing memecoin exits to old V4 after V4.1 went live.
+export const V4_FAMILY_IDS = new Set(
+  [process.env.PROGRAM_ID_V4, process.env.PROGRAM_ID_V4_1].filter(Boolean),
+);
+export function isV4Family(programId) {
+  if (!programId) return false;
+  const s = typeof programId === "string" ? programId : programId.toBase58();
+  return V4_FAMILY_IDS.has(s);
+}
+/** Which exit-capable program a NEW exit-armed borrow of this category lands on. */
+export function exitProgramForCategory(category) {
+  const rwa = isRwaCategory(category);
+  return PROGRAM_ID_V4_1 && ROUTE_EXITS_TO_V4_1 && !rwa ? PROGRAM_ID_V4_1 : PROGRAM_ID_V4;
+}
+
 // Categories that should route to v2 once it's deployed. Source of truth
 // for the category vocabulary lives in supported_mints.category — keep in
 // sync with isRwa() in token-screener.js.

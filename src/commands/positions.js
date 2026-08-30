@@ -185,7 +185,9 @@ export async function handlePositions(ctx) {
     const v4ProgramId = process.env.PROGRAM_ID_V4 || null;
     const v4Enforced = process.env.V4_EXIT_EXCLUSIVE_ENFORCE === "true";
     const canArmExits =
-      (!!v4ProgramId && loan.program_id === v4ProgramId) || !v4Enforced;
+      (!!v4ProgramId && loan.program_id === v4ProgramId) ||
+      (!!process.env.PROGRAM_ID_V4_1 && loan.program_id === process.env.PROGRAM_ID_V4_1) ||
+      !v4Enforced;
     if (!existing) {
       if (canArmExits) {
         lines.push(`   _no take-profit set_ · \`/takeprofit ${loan.loan_id} at 2x\``);

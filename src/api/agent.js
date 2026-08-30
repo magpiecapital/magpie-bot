@@ -375,7 +375,9 @@ export async function buildBorrowTx({
     const RWA_CATEGORIES = new Set(["stock", "etf", "metal"]);
     const programIdB58 = programId.toBase58();
     const isV3 = process.env.PROGRAM_ID_V3 && programIdB58 === process.env.PROGRAM_ID_V3;
-    const isV4 = process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4;
+    const isV4 =
+      (process.env.PROGRAM_ID_V4 && programIdB58 === process.env.PROGRAM_ID_V4) ||
+      (process.env.PROGRAM_ID_V4_1 && programIdB58 === process.env.PROGRAM_ID_V4_1);
     const needsCategoryArg = isV3 || isV4;
     const categoryByte = RWA_CATEGORIES.has(mintRow.category) ? 1 : 0;
     const ixArgs = needsCategoryArg

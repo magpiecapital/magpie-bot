@@ -41,6 +41,7 @@ import {
   PROGRAM_ID_V2,
   PROGRAM_ID_V3,
   PROGRAM_ID_V4,
+  PROGRAM_ID_V4_1,
 } from "../solana/program.js";
 
 const MIN_SAMPLES_FOR_TWAP = 8;
@@ -98,6 +99,7 @@ const VERSIONS = {
   v2: { programId: PROGRAM_ID_V2, kind: "single" },
   v3: { programId: PROGRAM_ID_V3, kind: "history" },
   v4: { programId: PROGRAM_ID_V4, kind: "history" },
+  v41: { programId: PROGRAM_ID_V4_1, kind: "history" },
 };
 
 function isValidPubkey(s) {

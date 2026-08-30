@@ -177,6 +177,14 @@ const ROUTE_RWA_TO_V3 = process.env.ROUTE_RWA_TO_V3 === "true";
 const V4_PROGRAM_ID = process.env.PROGRAM_ID_V4
   ? new PublicKey(process.env.PROGRAM_ID_V4)
   : null;
+// V4.1 — Sec3-remediated build; the memecoin exit lane (operator plan
+// 2026-08-30: V4 = RWA exits, V4.1 = memecoin exits). MUST be on the
+// allowlist or every website memecoin exit-borrow is refused as a
+// "drain attempt" the moment the site routes to V4.1.
+const V4_1_PROGRAM_ID = process.env.PROGRAM_ID_V4_1
+  ? new PublicKey(process.env.PROGRAM_ID_V4_1)
+  : null;
+const ROUTE_EXITS_TO_V4_1 = process.env.ROUTE_EXITS_TO_V4_1 === "true";
 const ROUTE_MEMECOINS_TO_V4 = process.env.ROUTE_MEMECOINS_TO_V4 === "true";
 const ROUTE_RWA_TO_V4 = process.env.ROUTE_RWA_TO_V4 === "true";
 
@@ -212,6 +220,7 @@ const OUTER_INSTRUCTION_PROGRAM_ALLOWLIST = new Set([
   ...(V2_PROGRAM_ID ? [V2_PROGRAM_ID.toBase58()] : []),
   ...(V3_PROGRAM_ID ? [V3_PROGRAM_ID.toBase58()] : []),
   ...(V4_PROGRAM_ID ? [V4_PROGRAM_ID.toBase58()] : []),
+  ...(V4_1_PROGRAM_ID ? [V4_1_PROGRAM_ID.toBase58()] : []),
   "ComputeBudget111111111111111111111111111111",
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  // Associated Token Account
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
@@ -515,6 +524,7 @@ function isMagpieProgram(programIdPk) {
   if (V2_PROGRAM_ID && programIdPk.equals(V2_PROGRAM_ID)) return true;
   if (V3_PROGRAM_ID && programIdPk.equals(V3_PROGRAM_ID)) return true;
   if (V4_PROGRAM_ID && programIdPk.equals(V4_PROGRAM_ID)) return true;
+  if (V4_1_PROGRAM_ID && programIdPk.equals(V4_1_PROGRAM_ID)) return true;
   return false;
 }
 
@@ -1194,7 +1204,34 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
           // (limit-close-arm-core's exits_require_v4_loan refusal) is
           // what enforces "V4 loans are the only ones that can host
           // exits"; this endpoint just signs the borrow.
-          const isV4Borrow = V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID);
+          const isV41Borrow = !!(V4_1_PROGRAM_ID && ixProgramId.equals(V4_1_PROGRAM_ID));
+          const isV4Borrow =
+            !!(V4_PROGRAM_ID && ixProgramId.equals(V4_PROGRAM_ID)) || isV41Borrow;
+
+          // ── POOL PLAN ENFORCEMENT (operator 2026-08-30) ─────────────────
+          // V4 = exit-armed tokenized stocks/RWA; V4.1 = exit-armed memecoins.
+          // (a) RWA on V4.1 can never work — V4.1's H-01 fix rejects the
+          //     PermanentDelegate extension every xStock carries — so refuse
+          //     with a readable reason instead of an opaque on-chain error.
+          // (b) Memecoin on OLD V4 while V4.1 routing is on = a stale client
+          //     bundle. Don't block the borrower (loan execution is #1), but
+          //     alarm so it's never silent again.
+          if (isV41Borrow && isRwaMint) {
+            return {
+              status: 400,
+              body: {
+                error: "rwa_exits_use_v4",
+                detail: `${mintRow.symbol || collateralMintStr} is a tokenized ${mintRow.category}; exit-armed RWA borrows run on the V4 program, not V4.1. Refresh the page and try again.`,
+              },
+            };
+          }
+          if (isV4Borrow && !isV41Borrow && !isRwaMint && V4_1_PROGRAM_ID && ROUTE_EXITS_TO_V4_1) {
+            console.warn(`[cosign-borrow] PLAN DRIFT: memecoin ${mintRow.symbol || collateralMintStr} exit-borrow targets OLD V4 while ROUTE_EXITS_TO_V4_1=true — stale client bundle? Signing anyway (loan execution first).`);
+            try {
+              const { notifyAdmin } = await import("../services/admin-notify.js");
+              notifyAdmin(`⚠️ Memecoin exit-borrow (${mintRow.symbol || collateralMintStr.slice(0, 8)}) landed on OLD V4 instead of V4.1 — a client is still routing to V4. Check site deploy / NEXT_PUBLIC_ROUTE_EXITS_TO_V4_1.`).catch(() => {});
+            } catch {}
+          }
 
           // ── CRITICAL: validate the on-chain LTV-tier `category` byte ──────
           // (2026-06-28 security audit.) V3/V4 request_and_fund_loan takes a
@@ -1572,6 +1609,8 @@ async function _handleCosignBorrowImpl(req, _convCtx) {
         const usesTwapGate =
           (process.env.PROGRAM_ID_V4 &&
             borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4) ||
+          (process.env.PROGRAM_ID_V4_1 &&
+            borrowProgramId.toBase58() === process.env.PROGRAM_ID_V4_1) ||
           (process.env.PROGRAM_ID_V3 &&
             borrowProgramId.toBase58() === process.env.PROGRAM_ID_V3);
 
