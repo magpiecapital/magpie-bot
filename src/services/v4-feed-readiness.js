@@ -405,7 +405,7 @@ export async function startFeedReadinessWarmup() {
  * Used by the /api/v1/v4/feed-ready endpoint and as the source of
  * truth in requestMintWarm.
  */
-export async function checkMintReadiness(mintStr, programIdOverride = null) {
+export async function checkMintReadiness(mintStr, programIdOverride = null, { requireFresh = true } = {}) {
   const { PROGRAM_ID_V4 } = await import("../solana/program.js");
   if (!PROGRAM_ID_V4 || !process.env.LENDER_PUBKEY) {
     return { ready: false, reason: "v4_not_configured", samples_in_window: 0 };
@@ -446,8 +446,25 @@ export async function checkMintReadiness(mintStr, programIdOverride = null) {
     }
   }
   const spanSec = oldestInWindowTs != null ? Number(now - oldestInWindowTs) : 0;
+  // Chain freshness wall: request_and_fund_loan / extend_loan reject when the
+  // NEWEST sample is >120s old (StalePriceAttestation / ExtendRequiresAuthority).
+  // A full-but-idle ring buffer is NOT ready — report it so the burst /
+  // continuous loops push one more sample. (2026-08-30 V4.1 canary.)
+  let newestTs = null;
+  for (let i = 0; i < Math.min(count, 32); i++) {
+    const idx = (head - 1 - i + 32) % 32;
+    const start = 112 + idx * 16;
+    if (start + 16 > info.data.length) break;
+    const ts = info.data.readBigInt64LE(start + 8);
+    if (newestTs == null || ts > newestTs) newestTs = ts;
+  }
+  const newestAgeSec = newestTs != null ? Number(now - newestTs) : Infinity;
+  const FRESH_MAX_SEC = Number(process.env.V4_READY_FRESH_MAX_SEC) || 90;
+  if (requireFresh && inWindow >= MIN_SAMPLES_FOR_TWAP && spanSec >= MIN_HISTORY_SECONDS && newestAgeSec > FRESH_MAX_SEC) {
+    return { ready: false, reason: "stale_latest_sample", samples_in_window: inWindow, span_seconds: spanSec, newest_age_seconds: newestAgeSec, eta_seconds: 5 };
+  }
   if (inWindow >= MIN_SAMPLES_FOR_TWAP && spanSec >= MIN_HISTORY_SECONDS) {
-    return { ready: true, samples_in_window: inWindow, span_seconds: spanSec, program: targetPid.toBase58() };
+    return { ready: true, samples_in_window: inWindow, span_seconds: spanSec, newest_age_seconds: newestAgeSec, program: targetPid.toBase58() };
   }
   if (inWindow >= MIN_SAMPLES_FOR_TWAP) {
     // Count met — only history age is missing. ETA is exact: the remaining
@@ -860,7 +877,10 @@ async function continuousAllMintsLoop(lenderPk, programIdV4) {
     batch.map(async (m) => {
       if (state.inFlight.has(m.mint)) return;
       try {
-        const readiness = await checkMintReadiness(m.mint);
+        // Count-based only (no freshness) — keeps the continuous loop's spend
+        // profile unchanged; borrow/extend-time freshness is the JIT warmer's
+        // and the burst loop's job. [[feedback_tiered_attestation_cost_conscious]]
+        const readiness = await checkMintReadiness(m.mint, null, { requireFresh: false });
         const buffered =
           readiness.ready &&
           typeof readiness.samples_in_window === "number" &&
