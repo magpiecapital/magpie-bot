@@ -17,6 +17,7 @@ import { assessFarmRisk } from "./farm-guard.js";
 import { connection } from "../solana/connection.js";
 import { cachedJson } from "../lib/http-cache.js";
 import { markCycle } from "../lib/heartbeat.js";
+import { dexBreakerState } from "../lib/dexscreener-breaker.js";
 
 const POLL_INTERVAL_MS = Number(process.env.SCREENER_INTERVAL_MS) || 600_000; // 10 min
 const ADMIN_TG_ID = process.env.ADMIN_TELEGRAM_ID;
@@ -1996,6 +1997,8 @@ export function startTokenScreener(bot) {
     running = true;
     let ok = true;
     try {
+      const brk = dexBreakerState();
+      if (brk.state !== "closed") console.warn(`[screener] DexScreener breaker ${brk.state} (${brk.consecutiveFailures} failures, last: ${brk.lastError}) — discovery will be sparse this cycle; pricing stays cross-sourced via GeckoTerminal`);
       await tick(bot);
       await processReviewQueue(bot);
     } catch (err) {

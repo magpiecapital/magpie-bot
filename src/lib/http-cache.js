@@ -64,6 +64,8 @@ async function fetchWithRetry(url, fetchOpts) {
  * - On 429/5xx/network errors, retries with exponential backoff
  * - Returns null on terminal failure
  */
+import { dexGuard, dexReport } from "./dexscreener-breaker.js";
+
 export async function cachedJson(url, { ttlMs = DEFAULT_TTL_MS, ...fetchOpts } = {}) {
   const now = Date.now();
   const cached = cache.get(url);
@@ -75,9 +77,15 @@ export async function cachedJson(url, { ttlMs = DEFAULT_TTL_MS, ...fetchOpts } =
   const existing = inflight.get(url);
   if (existing) return existing;
 
+  const isDex = url.includes("api.dexscreener.com");
   const p = (async () => {
     try {
+      // DexScreener circuit breaker (2026-08-30 outage): fail fast instead of
+      // burning retry+timeout budget on a dead upstream. null == "no data",
+      // which every caller already handles.
+      if (isDex) { try { dexGuard(); } catch (e) { return null; } }
       const value = await fetchWithRetry(url, fetchOpts);
+      if (isDex) dexReport(value !== null, value === null ? new Error("dexscreener fetch failed") : undefined);
       if (value !== null) {
         cache.set(url, { value, expiresAt: Date.now() + ttlMs });
       }

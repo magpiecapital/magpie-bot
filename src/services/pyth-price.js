@@ -29,6 +29,11 @@ import axios from "axios";
 
 const HERMES_BASE = process.env.PYTH_HERMES_URL || "https://hermes.pyth.network";
 const HERMES_TIMEOUT_MS = 5_000;
+// Hermes requires an API key since the 2026-08-26 Pyth Core upgrade
+// (public hermes.pyth.network returns 401 without one). Optional: when
+// unset, Pyth simply stays out of the source set (2-source mode).
+const PYTH_API_KEY = process.env.PYTH_API_KEY || "";
+let warnedNoKey = false;
 
 // Stale-after threshold. Pyth feeds publish every ~400ms; anything over
 // 60s old means something is broken upstream and we shouldn't trust the
@@ -107,9 +112,19 @@ async function fetchHermesFeeds(feedIds) {
   // Hermes rejects with "expected a sequence". Use an explicit custom
   // serializer to guarantee the bracket form for any array size.
   const idsParam = stillNeeded.map((id) => `ids%5B%5D=0x${id}`).join("&");
-  const resp = await axios.get(`${HERMES_BASE}/v2/updates/price/latest?${idsParam}`, {
-    timeout: HERMES_TIMEOUT_MS,
-  });
+  let resp;
+  try {
+    resp = await axios.get(`${HERMES_BASE}/v2/updates/price/latest?${idsParam}`, {
+      timeout: HERMES_TIMEOUT_MS,
+      headers: PYTH_API_KEY ? { Authorization: `Bearer ${PYTH_API_KEY}` } : {},
+    });
+  } catch (e) {
+    if (e?.response?.status === 401 && !warnedNoKey) {
+      warnedNoKey = true;
+      console.warn("[pyth] Hermes returned 401 — an API key is now required (set PYTH_API_KEY on Railway). Pyth is out of the source set until then; pricing continues 2-source.");
+    }
+    throw e;
+  }
 
   const parsed = Array.isArray(resp.data?.parsed) ? resp.data.parsed : [];
   for (const item of parsed) {

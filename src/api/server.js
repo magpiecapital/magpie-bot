@@ -10,6 +10,7 @@
  * Rate limiting: per-key, configurable
  */
 import http from "node:http";
+import { dexCall, dexBreakerState } from "../lib/dexscreener-breaker.js";
 import { gzip, brotliCompress } from "node:zlib";
 import { promisify } from "node:util";
 import { query } from "../db/pool.js";
@@ -958,10 +959,10 @@ async function handleWalletBalance(req, url) {
       const BATCH = 30;
       for (let i = 0; i < unknownMints.length; i += BATCH) {
         const batch = unknownMints.slice(i, i + BATCH);
-        const res = await fetch(
+        const res = await dexCall(() => fetch(
           `https://api.dexscreener.com/tokens/v1/solana/${batch.join(",")}`,
           { signal: AbortSignal.timeout(8_000) },
-        );
+        ));
         if (!res.ok) continue;
         const pairs = await res.json();
         if (!Array.isArray(pairs)) continue;
@@ -2093,6 +2094,7 @@ async function router(req, res) {
       uptimeMs: hb.uptimeMs,
       startedAt: hb.startedAt,
       heartbeats: hb.services,
+      dexscreener: dexBreakerState(),
       v4_feeds: v4Feeds,
       limit_close_engine: limitCloseEngine,
       v4_convert_drain_watcher: v4DrainWatcher,

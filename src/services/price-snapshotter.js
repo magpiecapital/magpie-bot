@@ -17,6 +17,7 @@
  * prunes data older than 24h so the table stays small.
  */
 import { query } from "../db/pool.js";
+import { dexCall } from "../lib/dexscreener-breaker.js";
 
 const SNAPSHOT_INTERVAL_MS = Math.max(
   30_000,
@@ -84,10 +85,10 @@ async function fetchMarketBatch(mints) {
   for (let i = 0; i < mints.length; i += chunkSize) {
     const chunk = mints.slice(i, i + chunkSize);
     try {
-      const res = await fetch(
+      const res = await dexCall(() => fetch(
         `https://api.dexscreener.com/tokens/v1/solana/${chunk.join(",")}`,
         { signal: AbortSignal.timeout(10_000) },
-      );
+      ));
       if (!res.ok) continue;
       const body = await res.json();
       const pairs = Array.isArray(body) ? body : [];
