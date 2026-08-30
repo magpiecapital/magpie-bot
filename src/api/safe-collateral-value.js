@@ -137,7 +137,7 @@ function decodeSingleAttestation(data) {
 export async function computeSafeCollateralValue({ mintStr, decimals, amountRaw, version, category }) {
   const headroomBps = headroomBpsForCategory(category);
   const cfg = VERSIONS[version];
-  if (!cfg) return { ok: false, status: 400, body: { error: "invalid_program", detail: "program must be v1|v2|v3|v4" } };
+  if (!cfg) return { ok: false, status: 400, body: { error: "invalid_program", detail: "program must be v1|v2|v3|v4|v41" } };
   if (!cfg.programId) {
     return { ok: true, status: 200, body: { ok: true, mint: mintStr, recommendation: "wait_for_warmup", reason: `${version}_not_configured`, fallback_multiplier: 0.89 } };
   }

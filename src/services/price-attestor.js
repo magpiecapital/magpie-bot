@@ -317,16 +317,29 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
     // means "will pass on-chain", which closes the sign-then-fail path.
     const nowSec = Math.floor(Date.now() / 1000);
     const spanSec = status.oldestInWindowTs != null ? nowSec - status.oldestInWindowTs : 0;
-    if (status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= MIN_HISTORY_SEC) {
+    // FRESHNESS (2026-08-30 V4.1 canary): the program ALSO rejects a borrow
+    // when the NEWEST sample is older than 120s (StalePriceAttestation 6013)
+    // — count + span alone is not "will pass on-chain". On V4 the attestor
+    // tick masked this (every mint refreshed every 35s); on the V4.1 lane a
+    // mint with a full-but-idle ring buffer failed 3 cosign attempts in a
+    // row with "oracle finalizing". A newest sample older than FRESH_MAX_SEC
+    // gets exactly one more push (only once span is already met, so the
+    // wrap-the-buffer hazard below cannot apply).
+    const FRESH_MAX_SEC = Number(process.env.V4_TWAP_FRESH_MAX_SEC) || 75;
+    const newestAgeSec = status.newestTs != null ? nowSec - status.newestTs : Infinity;
+    const fresh = newestAgeSec <= FRESH_MAX_SEC;
+    if (status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= MIN_HISTORY_SEC && fresh) {
       return {
         ok: true,
         inWindow: status.inWindow,
         spanSec,
+        newestAgeSec,
         waitedMs: Date.now() - START,
         attests,
         programId: programId.toBase58().slice(0, 8),
       };
     }
+    const needsFreshPush = status.inWindow >= REQUIRED_IN_WINDOW && spanSec >= MIN_HISTORY_SEC && !fresh;
     // Fire an attest ONLY when we're short on SAMPLES. Once the window is
     // populated (count met) but the SPAN is still < 300s, firing more would
     // wrap the 32-slot circular buffer and keep the oldest in-window sample
@@ -334,7 +347,7 @@ export async function ensureV4TwapReady(mintStr, decimals, opts = {}) {
     // become borrowable. When count is met, just WAIT for the span to age
     // (the transient-interest continuous attestor the caller registers keeps
     // the feed fresh at the ~30s cadence that lets span grow naturally).
-    if (status.inWindow < REQUIRED_IN_WINDOW) {
+    if (status.inWindow < REQUIRED_IN_WINDOW || needsFreshPush) {
       try {
         await attestPrice(mintStr, decimals, undefined, programId);
         attests++;
@@ -971,6 +984,32 @@ export function startPriceAttestor(intervalMs = 30_000) {
   // ≤120s freshness + TWAP window). Borrow-time warming is separate —
   // the JIT warmer already receives the routed program id.
   const lastAttestAtV41 = new Map();
+  // Lane-aware coverage (operator pool plan 2026-08-30: V4 = RWA exits,
+  // V4.1 = memecoin exits). Each program's feed set is kept ≤35s fresh for
+  // exactly the mints that can BORROW or FIRE there:
+  //   V4   → RWA mints (new RWA exit-borrows) + mints backing an ACTIVE V4 loan
+  //   V4.1 → memecoins (new memecoin exit-borrows) + mints backing an ACTIVE V4.1 loan
+  // Memecoins therefore MOVE from the V4 tick to the V4.1 tick — cost-neutral —
+  // instead of being attested on both. Active-loan sets come from the DB and
+  // are refreshed every 60s.
+  const _activeMintsCache = new Map(); // programId → { set, at }
+  async function activeMintsFor(programId) {
+    const key = programId.toBase58();
+    const hit = _activeMintsCache.get(key);
+    if (hit && Date.now() - hit.at < 60_000) return hit.set;
+    let set = hit?.set ?? new Set();
+    try {
+      const r = await query(
+        `SELECT DISTINCT collateral_mint FROM loans WHERE status = 'active' AND program_id = $1`,
+        [key],
+      );
+      set = new Set(r.rows.map((x) => x.collateral_mint));
+    } catch (e) {
+      console.error(`[PriceAttestor] activeMintsFor ${key.slice(0, 8)} query failed: ${e.message?.slice(0, 120)}`);
+    }
+    _activeMintsCache.set(key, { set, at: Date.now() });
+    return set;
+  }
   let _v41ActiveMints = new Set();
   let _v41ActiveMintsAt = 0;
   async function v41ActiveMints() {
@@ -1123,14 +1162,22 @@ export function startPriceAttestor(intervalMs = 30_000) {
     // then process with bounded concurrency. Per-worker error handling
     // mirrors the prior sequential logic so init fallback + drift skip
     // still apply.
-    const { PROGRAM_ID_V3: V3PID_LIVE, PROGRAM_ID_V4: V4PID_LIVE, PROGRAM_ID_V4_1: V41PID_LIVE } = await import("../solana/program.js");
-    const v41Mints = await v41ActiveMints();
+    const { PROGRAM_ID_V3: V3PID_LIVE, PROGRAM_ID_V4: V4PID_LIVE, PROGRAM_ID_V4_1: V41PID_LIVE, isRwaCategory: isRwaCat } = await import("../solana/program.js");
+    const routeMemeExitsToV41 = !!V41PID_LIVE && process.env.ROUTE_EXITS_TO_V4_1 === "true";
+    const v4Active = V4PID_LIVE ? await activeMintsFor(V4PID_LIVE) : new Set();
+    const v41Active = V41PID_LIVE ? await activeMintsFor(V41PID_LIVE) : new Set();
+    // `wants(mint, category)` decides per target whether this mint's feed on
+    // that program must stay fresh. RWA-vs-memecoin uses the same predicate as
+    // exitProgramForCategory(), so routing and attestation flip together.
     const v3v4Targets = [
-      V4PID_LIVE ? { id: V4PID_LIVE, label: "V4", lastMap: lastAttestAtV4 } : null,
-      // V4.1 rides the V4 cadence but ONLY for mints with an active
-      // V4.1 loan (see v41ActiveMints above) — onlyForMints gates it in
-      // the per-mint loop below.
-      V41PID_LIVE ? { id: V41PID_LIVE, label: "V4.1", lastMap: lastAttestAtV41, onlyForMints: v41Mints } : null,
+      V4PID_LIVE ? {
+        id: V4PID_LIVE, label: "V4", lastMap: lastAttestAtV4,
+        wants: (mint, category) => !routeMemeExitsToV41 || isRwaCat(category) || v4Active.has(mint),
+      } : null,
+      V41PID_LIVE ? {
+        id: V41PID_LIVE, label: "V4.1", lastMap: lastAttestAtV41,
+        wants: (mint, category) => (routeMemeExitsToV41 && !isRwaCat(category)) || v41Active.has(mint),
+      } : null,
       V3PID_LIVE ? { id: V3PID_LIVE, label: "V3", lastMap: lastAttestAtV3 } : null,
     ].filter(Boolean);
 
@@ -1148,7 +1195,7 @@ export function startPriceAttestor(intervalMs = 30_000) {
         queue.push({ kind: "legacy", mint, decimals, priceSol, priceLamports, category });
       }
       for (const target of v3v4Targets) {
-        if (target.onlyForMints && !target.onlyForMints.has(mint)) continue;
+        if (target.wants && !target.wants(mint, category)) continue;
         // V3 is the RWA-only program WHILE ROUTE_MEMECOINS_TO_V3 is off:
         // memecoins route V1+V4 and never borrow on V3, so writing their V3
         // feed every tick is pure wasted SOL. Skip the explicit V3 write for
