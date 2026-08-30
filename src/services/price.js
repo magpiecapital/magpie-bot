@@ -732,10 +732,10 @@ async function jupiterLitePriceInUsd(mint) {
 }
 
 async function dexscreenerPriceInUsd(mint) {
-  const resp = await axios.get(
+  const resp = await dexCall(() => axios.get(
     `https://api.dexscreener.com/tokens/v1/solana/${mint}`,
     { timeout: 10_000 },
-  );
+  ));
   const pairs = Array.isArray(resp.data) ? resp.data : [];
   let best = null;
   for (const p of pairs) {
@@ -748,6 +748,22 @@ async function dexscreenerPriceInUsd(mint) {
   }
   if (!best) throw new Error("DexScreener missing USD price for mint");
   return best.priceUsd;
+}
+
+// USD twin of geckoterminalPriceInSol — GeckoTerminal's token_price endpoint
+// is USD-native, so this is the direct read (no SOL conversion).
+const GECKO_USD_CACHE = new Map();
+async function geckoterminalPriceInUsd(mint) {
+  const hit = GECKO_USD_CACHE.get(mint);
+  if (hit && Date.now() - hit.at < GECKO_CACHE_TTL_MS) return hit.price;
+  const resp = await axios.get(
+    `https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/${mint}`,
+    { timeout: 8_000, headers: { accept: "application/json", "User-Agent": "magpie-bot" } },
+  );
+  const price = parseFloat(resp.data?.data?.attributes?.token_prices?.[mint]);
+  if (!(price > 0)) throw new Error("GeckoTerminal missing USD price for mint");
+  GECKO_USD_CACHE.set(mint, { price, at: Date.now() });
+  return price;
 }
 
 // Same fail-closed policy as getPriceInSolCrossSourced (security audit F-2).
@@ -773,7 +789,16 @@ export async function getPriceInUsdCrossSourced(mint) {
       console.warn(`[price] ${mint.slice(0,8)} Jupiter LITE tier rescued cross-source (paid tier: ${jupRes.reason?.message?.slice(0,60)})`);
     } catch { /* lite also down — proceed with jupiter marked down */ }
   }
-  const dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  let dex  = dexRes?.status === "fulfilled" ? dexRes.value : null;
+  let dexName = "DexScreener";
+  // DexScreener down → GeckoTerminal fills the second slot (2026-08-30 outage).
+  if (dex == null) {
+    try {
+      dex = await geckoterminalPriceInUsd(mint);
+      dexName = "GeckoTerminal";
+      console.warn(`[price-usd] ${mint.slice(0,8)} DexScreener down${isDexBreakerOpen() ? " (breaker open)" : ""} — GeckoTerminal filled the second slot`);
+    } catch { /* gecko also unavailable — existing single-source handling below */ }
+  }
   const pyth = pythRes?.status === "fulfilled" ? pythRes.value : null;
   const jupErr = jupRes?.status === "rejected" ? jupRes.reason?.message?.slice(0, 80) : null;
   const dexErr = dexRes?.status === "rejected" ? dexRes.reason?.message?.slice(0, 80) : null;
@@ -781,7 +806,7 @@ export async function getPriceInUsdCrossSourced(mint) {
 
   const sources = [
     { name: "Jupiter", price: jup },
-    { name: "DexScreener", price: dex },
+    { name: dexName, price: dex },
   ];
   if (usePyth) sources.push({ name: "Pyth", price: pyth });
   const respondingCount = sources.filter((s) => s.price != null && s.price > 0).length;
