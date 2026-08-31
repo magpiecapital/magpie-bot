@@ -47,13 +47,20 @@ async function tick(bot) {
   let rows;
   try {
     const r = await query(
+      // Overdue means past the CURRENT due date. due_timestamp advances every
+      // time the borrower pays to extend (and the reconciler keeps it synced to
+      // chain); the original term (start + duration_days) does NOT. Computing
+      // from the original term flagged healthy, repeatedly-extended loans as
+      // "overdue 761h" on 2026-08-31 (loans 1795/1925 — both due days in the
+      // FUTURE on-chain) and cried keeper-down when nothing was wrong.
+      // start+duration remains only as a fallback for rows missing due_timestamp.
       `SELECT id, program_id,
-              EXTRACT(EPOCH FROM (NOW() - (start_timestamp + (duration_days || ' days')::interval)))::int
+              EXTRACT(EPOCH FROM (NOW() - COALESCE(due_timestamp, start_timestamp + (duration_days || ' days')::interval)))::int
                 AS overdue_secs
          FROM loans
         WHERE status = 'active'
-          AND duration_days IS NOT NULL
-          AND NOW() > start_timestamp + (duration_days || ' days')::interval
+          AND COALESCE(due_timestamp, start_timestamp + (duration_days || ' days')::interval) IS NOT NULL
+          AND NOW() > COALESCE(due_timestamp, start_timestamp + (duration_days || ' days')::interval)
                        + ($1 || ' minutes')::interval
         ORDER BY overdue_secs DESC`,
       [GRACE_MIN],
