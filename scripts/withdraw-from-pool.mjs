@@ -14,7 +14,7 @@
  * Usage:
  *   LENDER_PRIVATE_KEY=<bs58> | LENDER_KEYPAIR_PATH=<file> \
  *   SOLANA_RPC_URL=<...> [WITHDRAW_IXS_PER_TX=10] \
- *   node scripts/withdraw-from-pool.mjs <v1|v3|v4> <sol_amount> --dry-run|--execute
+ *   node scripts/withdraw-from-pool.mjs <v1|v3|v4|v41> <sol_amount> --dry-run|--execute
  */
 import "dotenv/config";
 import { readFileSync, existsSync } from "node:fs";
@@ -39,9 +39,10 @@ const MAP = {
   v1: { idl: "./src/solana/idl/magpie_lending.json", pid: process.env.PROGRAM_ID || "4FEFPeMH68BbkrrZW2ak9wWXUS7JCkvXqBkGf5Bg6wmh" },
   v3: { idl: "./src/solana/idl/magpie-v3.json", pid: process.env.PROGRAM_ID_V3 || "B8AwYzFmc3ZB5EWWVtJcJhJtEmKL78W5i3kZrL1uMCmP" },
   v4: { idl: "./src/solana/idl/magpie-v4.json", pid: process.env.PROGRAM_ID_V4 || "HA1hgvskN1goEsb33rNHFBcDXBaYyLyyqfGwGMgTUwNo" },
+  v41: { idl: "./src/solana/idl/magpie-v4-1.json", pid: process.env.PROGRAM_ID_V4_1 || "FsGXFtStgdRVqHQgik879CFpxM23oBt63URCYEWcxj4z" },
 };
 if (!MAP[version] || !amountSol || amountSol <= 0) {
-  console.error("Usage: node scripts/withdraw-from-pool.mjs <v1|v3|v4> <sol_amount> --dry-run|--execute");
+  console.error("Usage: node scripts/withdraw-from-pool.mjs <v1|v3|v4|v41> <sol_amount> --dry-run|--execute");
   process.exit(1);
 }
 if (!dryRun && !execute) { console.error("Specify --dry-run (simulate) or --execute (real withdrawal)."); process.exit(1); }
