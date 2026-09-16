@@ -1041,37 +1041,55 @@ const JUP_QUOTE_API = process.env.JUPITER_QUOTE_API || "https://lite-api.jup.ag/
  * attack that pure threshold checks miss.
  */
 export async function checkSellable(mint, decimals) {
-  // Quote a sell of 1 whole token (10^decimals raw units). Small enough to
-  // not require huge depth; large enough that fee/precision rounding doesn't
-  // zero it out.
-  const amount = Math.pow(10, Math.max(0, decimals ?? 6));
-  const qs = `inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
-  const url = `${JUP_QUOTE_API}?${qs}`;
+  // Probe sizes: 1 whole token, then 1,000 tokens. Jupiter's router (since
+  // ~2026-09-05) returns HTTP 400 NO_ROUTES_FOUND for dust-sized quotes on
+  // micro-priced tokens — 1 token of a $0.002 memecoin is unroutable dust,
+  // while the same token routes fine at 1,000. The escalation only happens
+  // AFTER a 400, so normally-priced tokens (which quote 200 at 1 token)
+  // never probe at the larger size and can't false-fail on depth.
+  const one = Math.pow(10, Math.max(0, decimals ?? 6));
+  const probes = [one, one * 1_000];
+  let last = null;
   try {
-    let res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-    if (res.status === 429 || res.status >= 500) {
-      // The lite tier rate-limits per IP; a burst of screening quotes
-      // trips it and every candidate defers forever (2026-08-25: 116
-      // pending). One paced retry rides out the limiter window.
-      await new Promise((r) => setTimeout(r, 4_000));
+    for (const amount of probes) {
+      const qs = `inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=500&onlyDirectRoutes=false`;
+      const url = `${JUP_QUOTE_API}?${qs}`;
+      let res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+      if (res.status === 429 || res.status >= 500) {
+        // The lite tier rate-limits per IP; a burst of screening quotes
+        // trips it and every candidate defers forever (2026-08-25: 116
+        // pending). One paced retry rides out the limiter window.
+        await new Promise((r) => setTimeout(r, 4_000));
+        try {
+          res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+        } catch { /* fall through with the original res */ }
+      }
+      if (res.ok) {
+        const data = await res.json();
+        if (!data?.outAmount || data.outAmount === "0") {
+          // Jupiter returned a SUCCESSFUL response with NO sell route — the
+          // clearest honeypot signal, safe for a borrow-time hard block.
+          return { sellable: false, definitive: true, reason: "Jupiter returned no sell route" };
+        }
+        return { sellable: true };
+      }
+      let code = "";
       try {
-        res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-      } catch { /* fall through with the original res */ }
+        code = (await res.json())?.errorCode || "";
+      } catch { /* non-JSON error body */ }
+      last = { status: res.status, code };
+      if (res.status !== 400) break; // 429/5xx after retry: no point re-probing larger
     }
-    if (!res.ok) {
-      // Non-200 conflates a genuinely-unroutable token (400) with infra
-      // (429/5xx), so it is NOT a DEFINITIVE honeypot signal. Screening still
-      // treats !sellable as a fail (err on caution at approval time); the
-      // borrow-time re-check fails OPEN on non-definitive results.
-      return { sellable: false, definitive: false, reason: `Jupiter quote ${res.status}` };
-    }
-    const data = await res.json();
-    if (!data?.outAmount || data.outAmount === "0") {
-      // Jupiter returned a SUCCESSFUL response with NO sell route — the
-      // clearest honeypot signal, safe for a borrow-time hard block.
-      return { sellable: false, definitive: true, reason: "Jupiter returned no sell route" };
-    }
-    return { sellable: true };
+    // Non-200 at every probe size conflates a genuinely-unroutable token
+    // with infra trouble and dust-size router refusals, so it is NOT a
+    // DEFINITIVE honeypot signal. Screening still treats !sellable as a fail
+    // (err on caution at approval time); the borrow-time re-check fails OPEN
+    // on non-definitive results.
+    return {
+      sellable: false,
+      definitive: false,
+      reason: `Jupiter quote ${last?.status ?? "?"}${last?.code ? ` ${last.code}` : ""} (both probe sizes)`,
+    };
   } catch (err) {
     // Network errors don't necessarily mean honeypot, but we err on the
     // side of caution at APPROVAL time and require a successful sellability
