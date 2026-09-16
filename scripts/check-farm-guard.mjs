@@ -22,7 +22,7 @@ expect("creator single prior is NOT hard", classifyFarmSignals({ creatorScreens7
 
 // Soft signals
 {
-  const r = classifyFarmSignals({ autoApprovals24h: 10 });
+  const r = classifyFarmSignals({ autoApprovals24h: 25 });
   expect("approval wave at cap is soft", r.soft.length === 1 && r.hard.length === 0);
 }
 {
@@ -45,7 +45,7 @@ expect("healthy vol/liq is clean", classifyFarmSignals({ volume24h: 500_000, liq
 {
   const r = classifyFarmSignals({
     nameCloneCount: 4, imageReuseCount: 1, creatorScreens7d: 4,
-    autoApprovals24h: 15, volume24h: 5_000_000, liquidity: 150_000,
+    autoApprovals24h: 30, volume24h: 5_000_000, liquidity: 150_000,
     normalizedName: "unitedoiltrustfund",
   });
   expect("full farm signature: 3 hard + 2 soft", r.hard.length === 3 && r.soft.length === 2);
