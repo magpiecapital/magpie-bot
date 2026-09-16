@@ -457,6 +457,25 @@ async function discoverTokens() {
     }
   }
 
+  // Source 9: Jupiter organic volume leaders (venue-agnostic). Every
+  // DexScreener boost/profile feed above is pay-to-play — a token that
+  // trends on pure volume without ever buying a boost is INVISIBLE to
+  // sources 1-3 (2026-09-16: $EMBER ran to $10.8M mcap / $5.7M daily
+  // volume on Meteora and was never discovered; $PAID hit #2 on
+  // toptraded and was only caught late by keyword search). Jupiter's
+  // trending/toptraded lists rank by actual routed volume across every
+  // venue it aggregates, closing the organic blind spot. Same free lite
+  // tier as the sell-check; both fall through silently on error.
+  for (const cat of ["toptrending", "toptraded"]) {
+    const data = await cachedJson(`https://lite-api.jup.ag/tokens/v2/${cat}/24h?limit=50`);
+    if (Array.isArray(data)) {
+      for (const t of data) {
+        const addr = t?.id || t?.address;
+        if (addr) addSolanaToken(addr, `jup_${cat}`);
+      }
+    }
+  }
+
   return Array.from(tokens.values());
 }
 
@@ -1509,7 +1528,7 @@ async function tick(bot) {
 
 export async function handleReviewTokens(ctx) {
   const { rows } = await query(
-    `SELECT * FROM token_screen_queue WHERE status = 'pending' ORDER BY safety_score DESC LIMIT 25`,
+    `SELECT * FROM token_screen_queue WHERE status = 'pending' ORDER BY safety_score DESC, liquidity_usd DESC NULLS LAST LIMIT 25`,
   );
 
   if (rows.length === 0) {

@@ -22,7 +22,11 @@
  */
 import { query } from "../db/pool.js";
 
-const AUTO_APPROVALS_24H_CAP = Number(process.env.FARM_GUARD_AUTO_APPROVALS_24H_CAP) || 10;
+// 10 → 25 (2026-09-16, operator: "be even more proactive… we need to stay
+// active"): candidate inflow (~90/day) and the post-outage backlog (1,600+)
+// dwarf the old cap; every approval still passes the full scam gauntlet —
+// this is throughput, not a quality change. Env override wins as before.
+const AUTO_APPROVALS_24H_CAP = Number(process.env.FARM_GUARD_AUTO_APPROVALS_24H_CAP) || 25;
 const WASH_VOL_LIQ_RATIO = Number(process.env.FARM_GUARD_WASH_VOL_LIQ_RATIO) || 25;
 const CREATOR_CLUSTER_MIN = Number(process.env.FARM_GUARD_CREATOR_CLUSTER_MIN) || 2;
 
