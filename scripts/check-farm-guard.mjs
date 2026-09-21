@@ -16,6 +16,15 @@ expect("normalize handles garbage", normalizeName(null) === "" && normalizeName(
 
 // Hard signatures
 expect("name clone is hard", classifyFarmSignals({ nameCloneCount: 1, normalizedName: "unitedoiltrustfund" }).hard.length === 1);
+{
+  // dominance resolution: the biggest same-named listing is the original
+  const orig = classifyFarmSignals({ nameCloneCount: 2, normalizedName: "embercurve", liquidity: 900_000, nameCloneMaxOtherLiq: 355_000 });
+  expect("name twin where candidate is largest is SOFT (original)", orig.hard.length === 0 && orig.soft.length === 1);
+  const copy = classifyFarmSignals({ nameCloneCount: 1, normalizedName: "embercurve", liquidity: 20_000, nameCloneMaxOtherLiq: 900_000 });
+  expect("small copy of a larger listing stays HARD", copy.hard.length === 1);
+  const noData = classifyFarmSignals({ nameCloneCount: 1, normalizedName: "embercurve", liquidity: NaN });
+  expect("missing liquidity data fails closed (hard)", noData.hard.length === 1);
+}
 expect("image reuse is hard", classifyFarmSignals({ imageReuseCount: 2 }).hard.length === 1);
 expect("creator cluster ≥2 is hard", classifyFarmSignals({ creatorScreens7d: 2 }).hard.length === 1);
 expect("creator single prior is NOT hard", classifyFarmSignals({ creatorScreens7d: 1 }).hard.length === 0);

@@ -45,7 +45,26 @@ export function classifyFarmSignals(ctx) {
   const soft = [];
 
   if (Number.isFinite(ctx?.nameCloneCount) && ctx.nameCloneCount > 0) {
-    hard.push(`name clone — ${ctx.nameCloneCount} other listing(s) share the normalized name "${ctx.normalizedName}"`);
+    // Same-name listings are only a FARM signature when the candidate is the
+    // small copy of something bigger. A runner's own knockoffs flood the
+    // 14-day queue window, and the unqualified count made the ORIGINAL count
+    // its clones as evidence against itself (2026-09-18: $EMBER and $PAID —
+    // the two tokens the operator named as misses — were both hard-rejected
+    // this way). Resolve by relative liquidity:
+    //   candidate ≥ biggest collider        → likely the original: soft note
+    //   candidate < 1/5 of biggest collider → knockoff of an established
+    //                                          listing: hard, as before
+    //   in between (or liq data missing)    → ambiguous twins: hard stays,
+    //                                          fail-closed, manual review
+    const candLiq = Number.isFinite(ctx?.liquidity) ? ctx.liquidity : null;
+    const maxOther = Number.isFinite(ctx?.nameCloneMaxOtherLiq) ? ctx.nameCloneMaxOtherLiq : null;
+    if (candLiq !== null && maxOther !== null && candLiq >= maxOther) {
+      soft.push(
+        `name twin(s) — ${ctx.nameCloneCount} other listing(s) share "${ctx.normalizedName}" but this candidate is the largest ($${Math.round(candLiq).toLocaleString()} vs $${Math.round(maxOther).toLocaleString()}) — likely the original being cloned`,
+      );
+    } else {
+      hard.push(`name clone — ${ctx.nameCloneCount} other listing(s) share the normalized name "${ctx.normalizedName}"${maxOther !== null ? ` (largest $${Math.round(maxOther).toLocaleString()} vs candidate $${Math.round(candLiq ?? 0).toLocaleString()})` : ""}`);
+    }
   }
   if (Number.isFinite(ctx?.imageReuseCount) && ctx.imageReuseCount > 0) {
     hard.push(`image reuse — logo URL already used by ${ctx.imageReuseCount} other listing(s)`);
@@ -124,19 +143,28 @@ export async function assessFarmRisk({ mint, name, imageUrl, liquidity, volume24
   if (ctx.normalizedName.length >= 4) {
     try {
       const { rows } = await query(
-        `SELECT (
-           SELECT COUNT(*) FROM supported_mints
+        `WITH sm AS (
+           SELECT liquidity_usd FROM supported_mints
             WHERE mint <> $1
               AND (enabled = TRUE OR source = 'disabled_symbol_collision')
               AND LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]', '', 'g')) = $2
-         ) + (
-           SELECT COUNT(*) FROM token_screen_queue
+         ), tq AS (
+           SELECT liquidity_usd FROM token_screen_queue
             WHERE mint <> $1 AND created_at > NOW() - INTERVAL '14 days'
               AND LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]', '', 'g')) = $2
-         ) AS n`,
+         )
+         SELECT (SELECT COUNT(*) FROM sm) + (SELECT COUNT(*) FROM tq) AS n,
+                GREATEST(
+                  COALESCE((SELECT MAX(liquidity_usd) FROM sm), 0),
+                  COALESCE((SELECT MAX(liquidity_usd) FROM tq), 0)
+                ) AS max_other_liq`,
         [mint, ctx.normalizedName],
       );
       ctx.nameCloneCount = Number(rows[0]?.n);
+      // Largest same-named listing's liquidity (stored snapshots) — the
+      // candidate's side of the comparison is its LIVE liquidity, so a real
+      // original that keeps growing clears twins whose snapshots went stale.
+      ctx.nameCloneMaxOtherLiq = Number(rows[0]?.max_other_liq);
     } catch (e) {
       console.warn(`[farm-guard] name-clone check failed for ${mint}: ${e.message?.slice(0, 80)}`);
     }
