@@ -43,6 +43,11 @@ export function normalizeName(name) {
 export function classifyFarmSignals(ctx) {
   const hard = [];
   const soft = [];
+  // info: observations worth logging that must NOT gate promotion — soft
+  // signals hold a candidate in queue, and the name-twin dominance note was
+  // doing exactly that to the originals it exists to clear (EMBER/PAID sat
+  // in limbo on their own exoneration, 2026-09-21).
+  const info = [];
 
   if (Number.isFinite(ctx?.nameCloneCount) && ctx.nameCloneCount > 0) {
     // Same-name listings are only a FARM signature when the candidate is the
@@ -59,7 +64,7 @@ export function classifyFarmSignals(ctx) {
     const candLiq = Number.isFinite(ctx?.liquidity) ? ctx.liquidity : null;
     const maxOther = Number.isFinite(ctx?.nameCloneMaxOtherLiq) ? ctx.nameCloneMaxOtherLiq : null;
     if (candLiq !== null && maxOther !== null && candLiq >= maxOther) {
-      soft.push(
+      info.push(
         `name twin(s) — ${ctx.nameCloneCount} other listing(s) share "${ctx.normalizedName}" but this candidate is the largest ($${Math.round(candLiq).toLocaleString()} vs $${Math.round(maxOther).toLocaleString()}) — likely the original being cloned`,
       );
     } else {
@@ -83,7 +88,7 @@ export function classifyFarmSignals(ctx) {
     soft.push(`wash-trade shape — 24h volume $${Math.floor(ctx.volume24h)} is >${WASH_VOL_LIQ_RATIO}x liquidity $${Math.floor(ctx.liquidity)}`);
   }
 
-  return { hard, soft };
+  return { hard, soft, info };
 }
 
 // ── Context gathering ───────────────────────────────────────────────────────

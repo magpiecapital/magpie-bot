@@ -19,7 +19,7 @@ expect("name clone is hard", classifyFarmSignals({ nameCloneCount: 1, normalized
 {
   // dominance resolution: the biggest same-named listing is the original
   const orig = classifyFarmSignals({ nameCloneCount: 2, normalizedName: "embercurve", liquidity: 900_000, nameCloneMaxOtherLiq: 355_000 });
-  expect("name twin where candidate is largest is SOFT (original)", orig.hard.length === 0 && orig.soft.length === 1);
+  expect("name twin where candidate is largest is non-blocking INFO (original)", orig.hard.length === 0 && orig.soft.length === 0 && orig.info.length === 1);
   const copy = classifyFarmSignals({ nameCloneCount: 1, normalizedName: "embercurve", liquidity: 20_000, nameCloneMaxOtherLiq: 900_000 });
   expect("small copy of a larger listing stays HARD", copy.hard.length === 1);
   const noData = classifyFarmSignals({ nameCloneCount: 1, normalizedName: "embercurve", liquidity: NaN });
