@@ -1957,6 +1957,9 @@ async function processReviewQueue(bot) {
       console.log(`[screener] FARM-GUARD holding ${t.symbol} in queue: ${farm.soft.join("; ")}`);
       continue;
     }
+    if (farm.info?.length) {
+      console.log(`[screener] FARM-GUARD note (non-blocking) for ${t.symbol}: ${farm.info.join("; ")}`);
+    }
 
     // Automatic path: an enabled incumbent always keeps the ticker — a
     // copycat approved alongside it would make every "$SYMBOL" surface
